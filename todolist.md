@@ -244,7 +244,12 @@ not a nice-to-have.
   Scheduling correction — this is not "revisit if inference is
   impractically slow," it is **"do this once the model runs end-to-end,
   and directly check the performance difference"** — a required,
-  scheduled step at the end of Phase A, not a maybe:
+  scheduled step, not a maybe. Concretely this means: implement A1/A2/
+  A6/A3/A4 now (Phase A proper), but **execute A5 after Phase B7**
+  (first working dense-forward conversion of MiniCPM5 exists) and
+  **before B8/B9** (column-averaging training) — not before Phase B
+  starts, since "the model runs end-to-end" is a Phase B milestone, not
+  something available yet inside Phase A itself:
   - Switch `FoldedLayer`'s hot path to the sparse fast path
     (`SparseRNNAgent.forward`'s `CSR.from_dense` pattern is the existing
     precedent) for both forward and backward.
