@@ -84,7 +84,27 @@ These are genuine library gaps blocking correctness or the user's
 explicit "training-through-attention" requirement — fix upstream in
 `sili__new`, then depend on it from `sili_peridot`, per the standing
 instruction to only modify the library repos when they're lacking
-something as a library.
+something as a library. **Push access**: `claude_sili.token` (fine-grained
+GitHub token, HTTPS push, same pattern as `sili_peridot_access.token` —
+`git push https://x-access-token:<token>@github.com/SimLeek/sili__new.git`,
+never persisted into `.git/config`). Confirmed via fetch that nothing new
+is on the remote beyond what's checked out locally (`main` @ `87daa2e`)
+— the energy-dynamics redesign below (from a separate chat with another
+Claude session) exists only as design notes, not committed code anywhere;
+it needs to be implemented fresh against the current `sili/energy.py`
+(that session called the file `energy_dynamics.py` — treat that as a
+proposed rename to fold in, not evidence of a second file).
+
+**Correctness requirement that cuts across all of Phase A: the converted
+model must actually run sparse, not merely "compile against sparse
+types."** `FoldedLayer.from_descriptor`'s CSR round-trip and
+`forward_dense`/`backward_dense` can produce something that is
+structurally CSR but behaviorally dense (near-100% activity density, or
+a `from_dense`-style independent top-k re-derivation that ignores which
+indices are actually energy-gated). Verify empirically post-conversion
+and post-energy-gating (measured sparsity ratio, not just "it runs") at
+every phase boundary — this is the actual point of using `sili` at all,
+not a nice-to-have.
 
 - [ ] **A1. Thread real hparams into the Llama reconstruction path
   instead of guessing.** `model_reconstruct.py:361` hardcodes
@@ -98,7 +118,8 @@ something as a library.
   that aren't recoverable from weights alone. Also override
   `rnn_fold.infer_seq_len_from_attn_weight`'s `band_half_width` heuristic
   explicitly for RoPE models (it's tuned for fixed-position attention by
-  default, per its own docstring).
+  default, per its own docstring). **Status: agreed, unchanged from
+  original plan.**
 - [ ] **A2. Wire attention into the Python `Tensor` autograd graph
   ("training-through-attention").** The C++ backward kernels already
   exist and are pybind-bound (`sparse_attention_backward`,
@@ -114,54 +135,282 @@ something as a library.
   /`TestBandedAttention`/`TestSparseBandedAttention` only check forward
   shapes/values). This is required before any transformer-attention layer
   in the converted model can be fine-tuned rather than frozen at
-  conversion-time weights.
-- [ ] **A3. Build the "column-averaging" energy mechanism.** Already
-  scoped (not built) in `refactoring_todo.md`'s "Energy-as-input and
-  column energy" note: partition hidden state into columns of `c`
-  neurons mapped to input indices; loss ties `mean(column_i)` to
-  `input_i`; gradient `(col_mean - input) * 2/(n*c)` broadcasts to column
-  members. For our case, "column" = one neuron per fold-depth step (24
-  neurons) per input index `i` in `input_size`, and the target is
-  "average of the column over the fold-depth recurrence." Concretely:
+  conversion-time weights. **Status: agreed, unchanged from original
+  plan.**
+- [ ] **A3. Build the column-averaging energy mechanism — revised
+  parameterization.** Already scoped (not built) in
+  `refactoring_todo.md`'s "Energy-as-input and column energy" note, and
+  independently corroborated by the other session's "column/fiber
+  averaging" note for `energy.py` — these are the *same* feature, unify
+  them into one implementation. "Column" = one neuron per fold-depth
+  step (24 neurons) per input index `i`; target = "average of the
+  column over the fold-depth recurrence."
+  - **`p` (hard top-p ceiling) is a hardware/telemetry compute-limit
+    factor, not a learning-quality knob, and must sit clearly *above*
+    the KL density target — not below or equal to it.** Corrected
+    defaults: `p ≈ 0.05`, KL target density `≈ 0.01` (roughly 5x–10x
+    apart, not the same order). Rationale (direct correction to the
+    original plan, which had this backwards): the *actual* sparsified
+    output should usually land below `p` on its own, driven down by KL/
+    shutoff/forced-firing competing against the column-averaging
+    pressure — `p` should only ever bind when genuinely resource
+    -constrained (thermal/battery/compute-budget), not act as the
+    default limiter of learned sparsity. Add
+    `assert density <= p * 0.8` (or similar margin) so the two can't
+    silently collide/invert.
+  - **Do not exempt column neurons from KL/shutoff/forced-firing
+    competition.** The original plan's instinct ("give column neurons a
+    reserved slot, exclude them from shutoff") was wrong per direct
+    correction: the whole point is that KL sparsity, shutoff, and forced
+    firing should genuinely *fight* the column-averaging objective, so
+    the network is forced to learn to manage energy **and** predict the
+    next input well simultaneously, under real competitive pressure —
+    not have column tracking made artificially easy by carving out
+    protected neurons. Column neurons compete on equal footing;
+    convergence is a training outcome, not a structural guarantee.
   - Add a target-aware loss term alongside `EnergyDynamics`'s existing
-    `energy_loss` (in `_apply_energy_dynamics`, `sili/energy.py`) or as a
-    sibling module (`ColumnAveragingEnergy`) called from wherever the
-    folded-layer recurrence lives (see A4) — needs both `h`/`h_out` *and*
-    the original per-token input, which `EnergyDynamics.forward` doesn't
-    currently receive at all.
-  - **Must reconcile with three existing hard constraints that will
-    otherwise fight an averaging objective** (see energy research
-    findings): the hard top-p ceiling (`p`, globally competitive, no
-    concept of "this neuron is reserved for column i") — give column
-    neurons a reserved slot or a per-column top-p; the KL sparsity term
-    (targets a global scalar density, neuron-identity-agnostic) — needs
-    to not fight column-neuron selection; and the shutoff path (emits an
-    energy-derived constant with no gradient to `h`) — must be excluded
-    from the column mean or corrupt averages silently. Likely resolution:
-    per-column `EnergyDynamics` parameters (already consistent with the
-    docs' "parameters must be set per-region" design principle), not one
-    global instance.
-  - Add unit tests: verify column mean converges toward a target input
-    over training steps, verify energy/sparsity budget is still
-    respected (active fraction ≤ `p`), verify shutoff-path neurons are
-    excluded from the column-mean computation.
-- [ ] **A4. Retain per-fold-step hidden state instead of summing
-  immediately.** `FoldedLayer.forward` currently reshapes
-  `[batch, n_folds, out_dim]` and sums over the fold axis right away
-  (`sparse_rnn.py:416`) — the per-fold-step values needed to form
-  "columns" are not retained after the forward pass. Add a mode/flag (or
-  a small subclass, e.g. `FoldedColumnLayer`) that keeps the pre-sum
-  `[batch, n_folds, out_dim]` tensor available for the column-averaging
-  loss in A3, while leaving the existing summed behavior as the default
-  for callers that don't need it (avoid changing `FoldedLayer`'s current
-  contract, since existing tests depend on it).
-- [ ] A5 (explicitly lower priority, correctness > perf for v1):
-  `FoldedLayer.forward`/`backward` are dense-only even though the
-  energy-gated state is mostly zero after the top-p gate —
-  `refactoring_todo.md` already flags the sparse fast path
-  (`SparseRNNAgent.forward`'s `CSR.from_dense` pattern) as a 10x+ win.
-  Not required for a correct v1 conversion; revisit once the model runs
-  end-to-end if inference is impractically slow.
+    `energy_loss` (in `_apply_energy_dynamics`, `sili/energy.py`) — needs
+    both `h`/`h_out` *and* the original per-token input, which
+    `EnergyDynamics.forward` doesn't currently receive at all.
+  - Add unit tests: verify column mean moves toward the target input
+    over training steps *despite* KL/shutoff/forced-firing pressure
+    (not in spite of it being disabled), verify `actual_p` stays below
+    `p` under normal (non-resource-constrained) operation, verify the
+    assert catches a misconfigured `density > p` setup.
+- [ ] **A4. Columns must track "next input average" at *every* fold
+  step, not just after the full depth pass — this requires pre-seeded
+  cross-depth synapses, not synaptogenesis alone.** Direct correction to
+  the original plan (which had column convergence implicitly happening
+  only "at the end," which is wrong): since folding an LLM into an RNN
+  means one recurrence step only advances *one* virtual layer, the
+  column average after step 1 should already approximate the next input
+  — imperfectly at first, improving with training, but present from
+  step 1, not only after 24 steps.
+  - **Why synaptogenesis alone can't get there in practical training
+    time (the math the user asked to work through):** `build_probes(k)`
+    with the library's intended `k=4` evaluates a `k×k=16`-candidate
+    cartesian window *per row, per synaptogenesis round* — sampled from
+    a search space of size `n_in * n_out` per suffix (on the order of
+    `1536 * 2048` ~ 3M for q_proj alone). The specific cross-fold-depth
+    connections a working column needs are a tiny, structured subset of
+    that space (roughly `input_size * n_folds` ≈ `1536 * 24` ≈ 37k
+    target pairs out of millions of candidate positions). Random/
+    activity-correlated `build_probes` sampling has vanishingly small
+    per-round odds of proposing the *specific* pair a column needs, and
+    each round already costs ~14x a plain backward pass (measured, see
+    `benchmark_synaptogenesis.py`). Expecting synaptogenesis to
+    *discover* the right cross-depth topology from scratch, at that cost
+    per round, is not practical within any reasonable training budget.
+  - **Fix: manually pre-seed zero-value, low-importance synapses
+    connecting many virtual (fold-depth) layers to each other during the
+    folding/conversion step itself**, so the CSR already has the
+    *structural* connectivity a column needs before training starts —
+    training only has to adjust weights (fast, ordinary backprop),
+    not discover topology (slow, synaptogenesis-bound). These synapses
+    start at value 0 / low importance so they don't disturb the
+    pretrained-weight forward pass until the column-averaging objective
+    actually needs and grows them.
+  - **Weight the pre-seeding toward the "output" side, or duplicate
+    those synapses, for columns at conversion time.** Because these
+    zero-value synapses start with low importance, ordinary importance
+    -based synaptogenesis pruning could kill them before the
+    column-averaging loss has had a chance to make them useful — give
+    the synapses feeding a column's *output*-facing connections either
+    elevated initial importance or duplicate multiplicity (redundant
+    parallel synapses) so the column-tracking signal reliably survives
+    early pruning rounds while training ramps up its usefulness.
+  - **Why this should work despite lag**: central/deeper virtual layers
+    are closer to abstract concepts than to literal next-token identity,
+    so a column average computed after only 1–2 virtual-layer steps will
+    initially lag the true next input — but per direct guidance this is
+    expected to be fixable with a modest amount of training, *given* the
+    CSR is pre-seeded for it, precisely because deeper layers still
+    carry usable (if less literal) predictive signal even before
+    training converges.
+  - Add a `FoldedColumnLayer`-style mode/subclass that (a) retains
+    per-fold-step hidden state instead of summing immediately
+    (`FoldedLayer.forward` currently reshapes
+    `[batch, n_folds, out_dim]` and sums over the fold axis right away,
+    `sparse_rnn.py:416` — the per-step values needed for columns aren't
+    retained today), and (b) exposes the pre-seeded cross-depth synapse
+    construction as an explicit conversion-time step, leaving
+    `FoldedLayer`'s existing summed-output contract untouched for
+    callers that don't need columns.
+- [ ] **A5. Sparse activation + sparse backprop conversion — this is
+  core to why `sili` exists, not a deferred perf nice-to-have.** Direct
+  correction to the original plan, which mis-scoped this as low
+  priority: `FoldedLayer.forward`/`backward` are dense-only today even
+  though the energy-gated state is mostly zero after the top-p gate.
+  Scheduling correction — this is not "revisit if inference is
+  impractically slow," it is **"do this once the model runs end-to-end,
+  and directly check the performance difference"** — a required,
+  scheduled step at the end of Phase A, not a maybe:
+  - Switch `FoldedLayer`'s hot path to the sparse fast path
+    (`SparseRNNAgent.forward`'s `CSR.from_dense` pattern is the existing
+    precedent) for both forward and backward.
+  - This directly composes with the branching-ratio/CSR-construction
+    fix below (A6 item 4): the sparse CSR fed into `FoldedLayer`'s
+    sparse forward should be built from `EnergyDynamics`'s own
+    kept-index set, not a redundant independent top-k pass.
+  - Measure and report the actual sparsity ratio and the dense-vs-sparse
+    wall-clock/throughput difference on the real converted MiniCPM5
+    model, not a toy example — this is the concrete evidence that the
+    conversion produced a genuinely sparse, not just nominally-CSR,
+    model.
+
+## Phase A6 — `SparseRNNCell`/`EnergyDynamics` measurement fix (from a
+parallel design discussion; implement in strict order, each item unblocks
+the next)
+
+Context: a separate conversation identified a real identifiability
+failure in how recurrent "healthiness" is measured. `SparseRNNCell.
+forward` computes `h = input_proj(obs) + recurrent(state)` and only ever
+measures activity on the *summed* `h` — so a `BranchingRatioTracker`
+watching `h` cannot distinguish "the recurrent pathway genuinely
+self-propagates" from "fresh input alone keeps activity in the target
+band while the recurrent branching factor is silently 0." This matters
+here specifically because column-averaging (A3/A4) *depends on* the
+recurrent/fold-depth pathway actually carrying signal forward — if the
+measurement can't tell recurrence-driven from input-driven activity, we
+also can't tell whether training is actually building a working column
+mechanism or just riding fresh input every step. Branching-process theory
+adds a second reason this isn't cosmetic: a branching process with no
+immigration term has an absorbing extinction state, and for branching
+ratio `m <= 1` (the entire intended target band, `0.97`–`0.99`),
+extinction is the eventual almost-sure outcome without something acting
+like immigration (self-loop/leak/bias independent of fresh input) —
+"keep `m` near 1" alone doesn't guarantee real persistence.
+
+Order matters — items build on each other; do not skip ahead:
+
+0. ~~[Blocking] repo access~~ — resolved, `claude_sili.token` grants
+   push access to `sili__new`.
+1. **Call-site fix**: `SparseRNNCell.__init__`'s `EnergyDynamics(...,
+   kl_eps=1e-4, ...)` call needs the `kl_eps` → `activation_threshold`
+   rename (see energy.py changes below) applied at the call site too, or
+   it throws on construction once the rename lands.
+2. **`CSR` gets an `nnz` property** (`len(self.indices)` — trivial),
+   unblocks everything downstream that wants an activation-side count.
+3. **`Tensor` gets `__getattr__` delegation** to `self.data` when it
+   wraps a `CSR` (so `tensor.nnz`, `tensor.rows` work directly without
+   unwrapping), plus `is_csr`/`is_dense` properties. Keep this concept
+   separate from whatever flag marks the *weight*-side novel delta-CSR
+   format — different axis, don't conflate the two.
+4. **Unify the two sparsification passes.** Stop calling `CSR.from_dense`
+   's independent top-k on every step; construct the recurrent state's
+   CSR from `EnergyDynamics`'s own kept-index set instead — **indices
+   from the gate decision, but values pulled from the pre-gating dense
+   `h`, not from `h_out`'s post-gating constants** (energy decides
+   *which* neurons pass; the real pre-gating magnitude is what should
+   travel forward — that's what the original "don't flatten to a
+   constant" design was protecting against losing in the first place).
+   Keep `CSR.from_dense`'s independent top-k only as the true step-0
+   fallback, before any gate decision exists yet (state starts as a
+   zero-init dense array with nothing for `EnergyDynamics` to have
+   decided about).
+5. **Split the branching-ratio measurement.** Track `recurrent(state)`'s
+   own dense output *before* it's summed with `input_proj(obs)`, as its
+   own `BranchingRatioTracker` instance, distinct from whatever
+   (optionally) watches the combined `h`. This is the actual fix for the
+   zero-activation degenerate solution described above — by the time
+   `h`/`h_out` exists the sum has already happened and the two
+   contributions can no longer be told apart.
+6. **Open design question — decide before wiring item 5, since it
+   changes what "healthy" means for the new tracker's target band**:
+   does the recurrent pathway need something acting like an internal
+   immigration term (self-loop, leak, or a bias independent of `obs`) to
+   have a fixed point other than extinction under `m <= 1`? Resolve this
+   with a short design note in `energy-params.md` or a new doc before
+   building the item-5 tracker's target band around it.
+
+### `sili/energy.py` changes (bundle with A3, same file)
+
+- [ ] Rename `kl_eps` → `activation_threshold` (name described the
+  mechanism, not the purpose) — update all call sites (`SparseRNNCell`,
+  any others found via grep) in the same change.
+- [ ] `p` default corrected upward (see A3) and documented explicitly as
+  a hardware/telemetry-driven ceiling (thermal, battery, update-rate),
+  never a tuning knob for learning quality.
+- [ ] `assert density <= p * 0.8` (or similar margin) — this was the
+  actual bug in the original defaults, not just a documentation gap.
+- [ ] Docstrings for `precision` (`lambda_kl`) and `reactivity` (`alpha`)
+  made explicit that these are two *different* control loops —
+  population-level (KL, achieved density vs. target density) vs.
+  per-neuron (energy_loss, `new_energy_t` vs. `setpoint`) — current
+  docstring states both mechanisms but not that they're doing different
+  jobs.
+- [ ] **Biggest structural change**: compute the KL term's target
+  dynamically from the *measured branching factor of the recurrent-only
+  pathway* (input-projection contribution subtracted out per neuron
+  before estimating `m`, per A6 item 5), rather than a static `density`
+  constant.
+- [ ] Add column/fiber averaging as an optional mode: for
+  `state_space >= ~2x input_space`, a subset of the state space is
+  forced to track the per-input-neuron average — this is A3/A4's
+  column-averaging mechanism; implement once, here, rather than as a
+  separate parallel system.
+- [ ] Keep `exploration < drive/2` as-is, but add a doc line on *why*:
+  symmetry-breaking between otherwise-identical neurons, not merely
+  "avoid the hallucination/REM regime" (that's a real consequence too,
+  but not the only reason).
+- [ ] **Instrumentation only, not dynamics changes**: per-region
+  recurrent-only branching ratio (check it tracks `1 - drive_normalized`
+  as predicted, and feed it into the dynamic-KL-target item above);
+  avalanche size distribution (consecutive fire cascades) to check for
+  the power-law tail SOC predicts — the actual falsifiable test that
+  tuning is in the right regime, independent of whether the code is
+  merely bug-free; `actual_p` vs. `p` over time, specifically watching
+  for `actual_p` chronically pinned near `p` (the original failure
+  sign this whole correction is fixing).
+- [ ] **Noted dependency, not a change to this file**: a per-neuron
+  critic (e.g. a transformer over energy/aux_loss context) needs to
+  exist before any energy-management-via-world-modification action
+  pathway is safe rather than wireheading-prone — relevant to the
+  eventual Minecraft/robot capstone (Phase E), tracked as a blocker on
+  *that* work, not on the MiniCPM5 conversion. Also note (no change
+  needed): synaptogenesis already handles long-timescale resolution for
+  neurons that persistently lose slot competition — this is load-bearing
+  for "no permanently-starved rump population," worth documenting as a
+  relied-upon existing property rather than something to (re)build.
+- [ ] **Citations** — add to `energy-proofs.md`/`energy-params.md` (or a
+  new `CITATIONS.md`) as the design decisions above land, grouped by
+  topic:
+  - *Homeostasis/cybernetics*: Ashby, W. R. — Homeostat (1948); *Design
+    for a Brain*; Ashby's Law of Requisite Variety.
+  - *Active inference/free energy*: Friston, K. — Free Energy Principle;
+    predictive coding; dark-room problem resolution via interoceptive
+    priors.
+  - *Self-organized criticality/avalanches*: Bak, Tang, Wiesenfeld
+    (1987) — sandpile model, SOC; Beggs & Plenz (2003) — neuronal
+    avalanches; Wilting & Priesemann — multistep-regression (MR)
+    estimator for branching ratio, separating external drive from
+    internal propagation; Williams-García et al. — quasicriticality/
+    "Widom line."
+  - *Metabolic constraints/efficient coding*: Attwell & Laughlin (2001)
+    — energy budget for cortical signaling; Levy & Baxter — efficient
+    coding under energy constraint; Olshausen & Field (1996) — sparse
+    coding.
+  - *Reservoir computing*: echo state property/spectral radius tuning
+    near 1 (Jaeger — echo state networks).
+  - *Intrinsic motivation/curiosity*: Schmidhuber — "Driven by
+    Compression Progress" (2009); Pathak et al. (2017) — Intrinsic
+    Curiosity Module (ICM).
+  - *Homeostatic RL (formal)*: Keramati & Gutkin — homeostatic
+    reinforcement learning; Hull, C. — drive-reduction theory (1943).
+  - *Sparse coding mechanisms*: Willmore & Tolhurst — lifetime vs.
+    population sparsity (following Foldiak); Makhzani & Frey (2013) —
+    k-sparse autoencoders; Rozell et al. (2008) — locally competitive
+    algorithms (LCA).
+  - *Signal detection/stochastic resonance*: signal detection theory
+    (general); stochastic resonance literature (general).
+  - *Multi-agent credit assignment* (relevant to the eventual
+    action-pathway/critic work in Phase E): Wolpert & Tumer (1999) —
+    COIN, factoredness/sensitivity, difference/aristocrat utility;
+    Foerster et al. (2018) — COMA; Sunehag et al. (2017) — VDN; Rashid
+    et al. (2018) — QMIX.
+  - *Indirect encoding/decoupled updates*: Stanley, D'Ambrosio, Gauci
+    (2009) — HyperNEAT/CPPN indirect encoding; Jaderberg et al. (2016) —
+    synthetic gradients/Decoupled Neural Interfaces (DNI).
 
 ## Phase B — Convert MiniCPM5-1B-Base (in sili_peridot)
 
@@ -188,6 +437,12 @@ something as a library.
   untied [130560, 1536] matrices, a meaningful chunk of the model; decide
   per `_keep_dense_reason()`'s existing rules, verify it makes a sane
   call for these shapes rather than assuming).
+- [ ] **B3a. Verify actual sparsity, not just CSR-shaped output.** Per
+  Phase A's cross-cutting correctness requirement: after pruning, check
+  the real density (nnz / (n_in*n_out)) per tensor and log it — a
+  threshold that leaves the model 60%+ dense defeats the point of this
+  whole conversion, regardless of whether it technically round-trips
+  through CSR types.
 - [ ] **B4. Fold each of the 7 per-layer 2-D suffixes independently**
   (`self_attn.q_proj`, `k_proj`, `v_proj`, `o_proj`, `mlp.gate_proj`,
   `up_proj`, `down_proj`) across all 24 layers via
@@ -227,16 +482,30 @@ something as a library.
   comparison baseline).
 - [ ] **B8. Column-averaging training loop**: for each input index `i`,
   the column of 24 fold-depth neurons should average toward `input[i]`
-  over the recurrence (the "next-input predictor" — forming a
-  representation that stays anchored to the input manifold rather than
-  drifting into private internal dynamics, exactly the failure mode the
-  NCD-based `ncd_view_hidden` metric in the Mandelbrot experiment was
-  designed to catch). Use the Phase A3 column-averaging energy loss,
-  sparse activation throughout (Hoyer-routed dense/sparse dispatch or
-  explicit CSR conversion of the energy-gated state), sparse backprop
-  (real per-row synaptogenesis: `build_probes(k=4)` once per layer, then
-  `synap_step` once per row — not once total, and never scale `k` by row
-  count, an already-reverted n²-blowup bug elsewhere in this codebase).
+  **at every fold step, from step 1 onward** — not only after the full
+  24-step pass (see A4's correction). This depends on B7's pre-seeded
+  cross-fold-depth synapses (weighted/duplicated toward each column's
+  output-facing connections, per A4) actually being in place before
+  training starts — without them, expect the column mean to only ever
+  reflect whatever a given step's *local* block naturally produces, with
+  no path for gradient/importance signal to reach across depth steps.
+  Use the Phase A3 column-averaging energy loss with corrected
+  `p`/density parameterization (`p≈0.05`, density≈0.01, KL/shutoff/
+  forced-firing left genuinely competing against the averaging
+  objective — do not exempt column neurons), sparse activation
+  throughout (Phase A5's sparse forward/backward, CSR built from
+  `EnergyDynamics`'s kept-index set per A6 item 4 — not an independent
+  top-k pass), sparse backprop (real per-row synaptogenesis:
+  `build_probes(k=4)` once per layer, then `synap_step` once per row —
+  not once total, and never scale `k` by row count, an already-reverted
+  n²-blowup bug elsewhere in this codebase).
+- [ ] **B9. Verify sparsity survives training, not just conversion.**
+  Log density/energy stats (`actual_p` vs `p`, per-region recurrent-only
+  branching ratio, avalanche size distribution) throughout training —
+  these are the concrete falsifiable signals (per A6) that the model is
+  actually operating in the intended sparse/critical regime, not one
+  that collapsed to dense-and-thresholded or to input-only propagation
+  with a silently-dead recurrent pathway.
 
 ## Phase C — Testing, evaluation, examples
 
@@ -284,20 +553,76 @@ something as a library.
   https://x-access-token:<token>@github.com/SimLeek/sili_peridot.git
   main`), without persisting the token into `.git/config`.
 
+### Access tokens (`/home/simleek/claude_code/`, gitignored from any repo,
+never printed to logs)
+
+- `sili_peridot_access.token` — push access to `sili_peridot` (used
+  above, working).
+- `claude_sili.token` — fine-grained push access to `sili__new`, for
+  Phase A/A6. Confirmed working (fetch succeeded); nothing new on the
+  remote beyond local `main` @ `87daa2e` as of this writing.
+- `claud_robot_pa_token.txt` — access for `robonet_sili`, for **later**
+  (Phase E) — not needed while that repo stays empty/out of scope.
+
+## Phase E — Future scope: embodiment (not started; do not begin before
+Phase A–D are solid and validated)
+
+Long-term destination for the converted model, laid out for continuity
+so later sessions don't lose the plan, but explicitly **not** part of
+the current conversion/training deliverable:
+
+- **End goal**: an `ardu_blimp` robot with a tiny camera/mic/speaker —
+  parked for now, since it costs money and needs in-person/IRL testing.
+- **Interim testbed**: connect to a `robonet` endpoint running
+  Minecraft. Capstone behavior: move around; when "very surprised"
+  (large energy/prediction-error spike), route energy into a TTS-like
+  output network that produces a sound on the speaker — the model
+  "yelps" when startled, choosing whatever noise it wants (not a
+  hardcoded scripted sound).
+- **All I/O is neuralese (raw neuron activation), never token-based**:
+  STT feeds directly into the tiny LLM's neuron space; a CNN over a
+  heavily downscaled camera/vision input feeds directly into the LLM;
+  TTS output comes directly from the LLM's neurons; plus a state-input/
+  action-output network for movement. No tokenization anywhere in this
+  loop.
+- `robonet_sili`'s existing text-highlighting/reading-via-`xsel` feature
+  doesn't apply to Minecraft (no text buffer to select from) — this
+  capstone needs a genuinely different, vision/audio/action-based
+  interface, not a rehash of the text-focused one.
+- **Realistic expectations, stated directly by the user**: a 1B model
+  probably isn't practically useful for much *in general*, but with
+  vision + movement it's plausibly a good **surprise detector** that can
+  navigate a routine path — especially if energy is placed on the
+  vision/camera-lightness parameter inputs, so the model "desires"
+  varying light/visual complexity for a while (an intrinsic-motivation
+  pressure, same family as the curiosity citations above). Concrete
+  target behaviors: "yelp" on spotting a threat (e.g. a Minecraft
+  creeper), return to base when it needs food/recharge.
+- **Explicit blocker carried over from Phase A6**: before any
+  energy-management-via-world-modification action pathway ships, it
+  needs a per-neuron critic (e.g. a transformer over energy/aux_loss
+  context) anchoring action-selection to task outcome — otherwise the
+  action pathway is wireheading-prone (it could learn to make itself
+  feel less "surprised"/depleted without actually doing anything useful
+  in the world). Do not wire an action-output network straight to the
+  energy signal without this in place.
+- Do not start any of this before Phase A–D produce a converted,
+  trained, evaluated MiniCPM5 that demonstrably works as a sparse
+  next-input predictor — this phase is here for continuity, not as a
+  near-term task.
+
 ## Explicitly out of scope / backburner (mirrors sili__new's own
 deferred list — do not chase these for v1)
 
 - MoE expert-merge, conv-kernel sparsification, vision per-patch/spatial
   merge — MiniCPM5-1B-Base is dense, text-only, no vision tower.
-- RTAC critic-through-trunk / replay buffer — unrelated RL workstream.
-- `robonet_sili` integration — empty repo, no serving/networking need
-  for this task; revisit only if/when a served-inference use case shows
-  up.
+- RTAC critic-through-trunk / replay buffer — unrelated RL workstream
+  (though its critic need reappears, differently scoped, in Phase E).
+- `robonet_sili` integration — empty repo today; Phase E depends on it
+  eventually, but nothing to do there until Phase A–D land.
 - GPU/Kompute device abstraction — no GPU compute path in scope here
   (though note: hardware notes mention the Vega iGPU could in principle
   take a Vulkan compute role later; not this task).
-- `FoldedLayer` sparse forward/backward dispatch (A5) — perf-only,
-  correctness-first for v1.
 - Adaptive hoyer dense/sparse routing threshold, work-pointer-set
   redesign, `compact()`/`expand_headroom()` auto-handling — pre-existing
   `sili__new` backlog items, only touch if they concretely block this
