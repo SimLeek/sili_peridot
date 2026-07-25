@@ -15,7 +15,10 @@ lower quality than the dense original; the bar is "usable," not parity.
 
 This file is the living plan. Update statuses as work lands. Keep
 individual source files under ~1k lines where practical; tests/examples
-are exempt from that budget.
+are exempt from that budget. Discovery narrative (why something was
+built a certain way, gotchas found along the way, rejected approaches)
+belongs in `JOURNAL.md`, not here and not in code docstrings — link to it
+rather than repeating it.
 
 ## Environment (done)
 
@@ -402,6 +405,23 @@ not a nice-to-have.
     always will). Documented in `sili__new/TODO.md` as an emergent
     property worth deliberately harnessing later (e.g. as a Phase E
     action-pathway input), not something to clamp away.
+  - **`csr_union`** — general construction/load-time CSR merge (not a
+    forward-pass merge of `in_proj`/`recurrent`, which must stay separate
+    calls). Needed because converting a dense LLM gives `recurrent` zero
+    real skip-connection weights to bring forward. Added `csr_union`,
+    `state_dict_to_true_csr`, and `build_fold_skip_layer(...,
+    existing=None)` / `FoldedColumnLayer.from_descriptor(...,
+    existing_recurrent=None)` to plumb it through. 10 new tests, full
+    suite green. See JOURNAL.md for the design reasoning.
+  - **`in_proj` skip pre-seed** — follow-up: `in_proj` needed the same
+    zero-valued trainable skip-connection treatment `recurrent` got, so
+    input can reach every fold-depth column directly (not just fold step
+    1), speeding up column-averaging convergence. Added
+    `_build_rectangular_banded_csr`, `build_input_skip_preseed`,
+    `_rebuild_layer_with_preseed`, and
+    `FoldedColumnLayer.from_descriptor(..., input_skip_bandwidth=None)`.
+    16 new tests, full suite green. See JOURNAL.md for the design
+    reasoning.
 - [ ] **A5. Sparse activation + sparse backprop conversion — this is
   core to why `sili` exists, not a deferred perf nice-to-have.** Direct
   correction to the original plan, which mis-scoped this as low
