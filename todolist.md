@@ -265,46 +265,67 @@ not a nice-to-have.
     construction as an explicit conversion-time step, leaving
     `FoldedLayer`'s existing summed-output contract untouched for
     callers that don't need columns.
-  - **Done as `sili.sparse_rnn.FoldedColumnLayer(FoldedLayer)`** — (a)
-    `forward()` override skips the fold-sum, returns
-    `[n_folds*out_dim]`; verified by manually summing it over the fold
-    axis and confirming it exactly reproduces plain `FoldedLayer`'s
-    output. `from_descriptor` is inherited unchanged — no override needed.
-  - **(b) redesigned once already, per direct review, before landing.**
+  - **Done as `sili.sparse_rnn.FoldedColumnLayer(FoldedLayer)`, redesigned
+    twice per review before landing on its final form.**
     First version pre-seeded *within* one suffix's existing stacked
     weight matrix (row `i` → column `(fold_step, i)` for every fold
-    step). Review caught two real problems: (1) that construction creates
-    **no actual connection between virtual layers** — row space stays the
-    shared, non-fold-indexed input, so there's no pathway for layer `t`'s
-    output to influence layer `t+1` at all, contradicting "skip
-    connections from virtual layer i to virtual layer j." (2) the
-    `out_dim == in_dim` requirement doesn't fit **any** of MiniCPM5's real
-    suffixes — checked, none are square (`down_proj` 4608→1536, `o_proj`
-    2048→1536, etc.) — so the whole mechanism as first built couldn't
-    attach to the actual target model.
-    Traced both back to `RNNFoldedBlock.forward` (`conversion/rnn_fold.py`,
-    the real reference recurrence: `state=0; for i: state +=
-    block_i(x+state)`, each layer seeing everything accumulated by every
-    *prior* layer) — `FoldedLayer`'s single-matmul-then-sum trick is a
-    cheap first-order approximation of that (every fold step computed
-    independently from the same external input, no cross-step
-    dependency). Neither problem is fixable by pre-seeding inside one
-    suffix's existing matrix at all.
-    **Current design**: `build_fold_skip_layer(n_folds, out_dim)` — a
-    fresh, from-scratch sparse layer mapping a `FoldedColumnLayer`'s own
-    `[n_folds*out_dim]` *output* space back to itself (always square,
-    resolving problem 2 directly, regardless of the wrapped suffix's
-    in/out shape), pre-seeded as a banded diagonal (bandwidth = `out_dim`
-    by default — "manhattan distance less than the original layer size,"
-    per direct guidance), all zero-valued since this connectivity has no
-    pretrained equivalent in the original unfolded model. Genuine virtual
-    -layer-to-virtual-layer skip connections (resolving problem 1).
-    `apply_fold_skip(skip, raw, lr)` wires it into the Tensor autograd
-    graph; typical use `refined = raw + apply_fold_skip(skip, raw, lr)`.
-    24 tests total across A3/A4 (`build_fold_skip_layer` shape/banding/
-    finiteness, composed with `FoldedColumnLayer` end-to-end incl.
-    gradient reaching both layers and skip weights moving off zero).
-    PR [#5](https://github.com/SimLeek/sili__new/pull/5).
+    step) — review caught that this creates **no actual connection
+    between virtual layers** (row space stays the shared, non-fold
+    -indexed input) and that `out_dim == in_dim` doesn't fit **any**
+    real MiniCPM5 suffix (none are square: `down_proj` 4608→1536,
+    `o_proj` 2048→1536, etc.).
+    Second version built the cross-depth connectivity as a separate
+    object (`build_fold_skip_layer`) the caller had to manually compose
+    on top of the layer's output via `apply_fold_skip`.
+    **Final design, per direct feedback**: `FoldedColumnLayer` mirrors
+    `SparseRNNCell`'s own architecture exactly —
+    `forward(x, state) = in_proj(x) + recurrent(state)`, returned as the
+    new state to feed back in on the next call (state defaults to zeros
+    — true step-0, matching `RNNFoldedBlock.forward`'s `state=0` start).
+    `in_proj` is the existing per-suffix pretrained-weight computation
+    (retains the pre-fold-sum tensor rather than collapsing it — verified
+    by manually summing it over the fold axis and confirming it exactly
+    reproduces plain `FoldedLayer`'s output). `recurrent` is
+    `build_fold_skip_layer(n_folds, out_dim)` — a fresh, from-scratch
+    sparse layer mapping the layer's own `[n_folds*out_dim]` output space
+    back to itself (always square, resolving the shape problem
+    regardless of the wrapped suffix's in/out shape), pre-seeded as a
+    banded diagonal (bandwidth = `out_dim` by default — "manhattan
+    distance less than the original layer size," per direct guidance),
+    all zero-valued since this connectivity has no pretrained equivalent
+    — now built **automatically** in `from_descriptor`, not requiring a
+    caller to wire it in by hand. Traced the justification back to
+    `RNNFoldedBlock.forward` (`conversion/rnn_fold.py`'s real reference
+    recurrence: `state=0; for i: state += block_i(x+state)`) —
+    `FoldedLayer`'s single-matmul-then-sum trick is a cheap first-order
+    approximation of that (every fold step computed independently from
+    the same external input); `recurrent` is the cheap correction toward
+    the true recurrence's behavior. Per direct guidance: don't shrink
+    `recurrent`'s scale defensively for memory — "sparse AIs can have
+    absolutely massive layers," that's the actual point of this whole
+    library.
+    Verified genuine multi-step recurrence works (state threaded through
+    repeated `forward(x, state)` calls lets gradient reach `recurrent`'s
+    weights and move them off zero). Also confirmed (documented, not
+    hidden) that under FULL energy competition specifically, gradient
+    reaching `recurrent` is real but can legitimately fall below FP4's
+    quantization step for many steps — consistent with the end-to-end
+    test's own "stability not convergence" scope, not a new bug.
+    28 tests total across A3/A4. PR
+    [#5](https://github.com/SimLeek/sili__new/pull/5).
+  - **Forward-looking generalization, noted but not built yet**: per
+    direct guidance, this `in_proj`/`recurrent` split naturally
+    generalizes beyond one suffix at a time — with different in/out sizes
+    per original layer, the combined matrices become
+    `[in1+in2+in3+..., out1+out2+out3+...]` (concatenated block spans,
+    not a uniform `n_folds*shared_dim`), and taken all the way, an
+    *entire* previously-dense model could be represented as one massive
+    sparse `in_proj` + one massive sparse `recurrent`, with q/k/v/o/gate/
+    up/down (and all 24 layers) as slices of the same two structures
+    rather than 7 separate `FoldedColumnLayer` objects. Not attempted in
+    this PR (single-suffix scope was already enough to get right across
+    two redesigns) — worth deliberately revisiting once Phase B's actual
+    model-assembly requirements are clearer.
   - **FP4 landmine hit and fixed while testing the composed pipeline**:
     `build_fold_skip_layer`'s all-zero initial weights were structurally
     stuck at zero — the same per-row `value_scale` FP4 gotcha this
