@@ -325,7 +325,53 @@ not a nice-to-have.
     rather than 7 separate `FoldedColumnLayer` objects. Not attempted in
     this PR (single-suffix scope was already enough to get right across
     two redesigns) — worth deliberately revisiting once Phase B's actual
-    model-assembly requirements are clearer.
+    model-assembly requirements are clearer. Per direct follow-up: full
+    whole-model unification is probably rare in practice anyway
+    (attention and other real per-layer differences don't collapse
+    cleanly into one shared structure), but merging *several* layers at
+    once (not all 24, and not necessarily every suffix) is plausible and
+    worth keeping the door open for.
+  - **Checked whether `FoldedColumnLayer` should subclass/merge with
+    `SparseRNNCell`, since they landed on the identical `h = a(x) +
+    b(state)` shape — concluded not yet, real divergent content**:
+    `SparseRNNCell` bundles `EnergyDynamics`/`BranchingRatioTracker`/CSR
+    -caching directly inside `forward()`; `FoldedColumnLayer` deliberately
+    keeps energy gating external (the caller composes it with
+    `column_averaging_loss`, which needs to see the gated state
+    specifically — baking `EnergyDynamics` in would remove that
+    flexibility). `SparseRNNCell.input_proj`/`.recurrent` are the
+    currently-broken `DISLDOLayer`/`SISLDOLayer` (see A6's
+    `sili__new/TODO.md` finding); `FoldedColumnLayer`'s are
+    `SparseLinearLayer`-based on purpose, specifically to avoid that bug
+    — subclassing now would inherit the brokenness. Documented in
+    `sili__new/TODO.md` right next to that bug entry: once
+    `DISLDOLayer`/`SISLDOLayer` are rebuilt on `SparseLinearLayer` (the
+    tracked fix), both classes would share the same real underlying
+    primitive rather than just resembling each other — that's the
+    genuinely-motivated point to revisit extracting a shared
+    `h = a(x) + b(state)` base, not now (one working example, not two).
+  - **Real, unrelated bug found and fixed while doing that comparison**:
+    `FoldedLayer.state_dict()` only ever saved `in_proj` — `recurrent`'s
+    trained weights were silently dropped on save. Also, per
+    `set_value_scale_raw`'s documented units (`weights_vals` are RAW
+    quantized levels; true value = `weights_vals[i] * value_scale[row]`),
+    `state_dict()` saved weights but never the per-row `value_scale`/
+    `importance_scale` needed to interpret them — a round trip would
+    have silently defaulted every row back to `scale=1.0`, corrupting
+    every true weight value with no error (the save/reload variant of
+    the exact FP4 gotcha that already bit `build_fold_skip_layer` twice
+    this project). Also: `FoldedLayer` had **no `load_state_dict()` at
+    all** — `state_dict()`'s output could be produced but never loaded
+    back through the public API. Fixed: new shared save/restore helpers
+    covering weights + both per-row scales (shared by `in_proj` and
+    `recurrent`); `FoldedLayer` gets a real `load_state_dict()`;
+    `FoldedColumnLayer` overrides both to also cover `recurrent`.
+    `importance` itself is saved (for inspection) but documented as NOT
+    restorable — `SparseLinearLayer.load_weights` has no per-connection
+    importance parameter at all (same gap already known from
+    `build_fold_skip_layer`). 5 new tests, including one verifying a full
+    save/reload cycle produces IDENTICAL `forward()` output, not just
+    matching internal arrays.
   - **FP4 landmine hit and fixed while testing the composed pipeline**:
     `build_fold_skip_layer`'s all-zero initial weights were structurally
     stuck at zero — the same per-row `value_scale` FP4 gotcha this
