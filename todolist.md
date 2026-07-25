@@ -290,83 +290,111 @@ Order matters — items build on each other; do not skip ahead:
 
 0. ~~[Blocking] repo access~~ — resolved, `claude_sili.token` grants
    push access to `sili__new`.
-1. **Call-site fix**: `SparseRNNCell.__init__`'s `EnergyDynamics(...,
+1. [x] **Call-site fix**: `SparseRNNCell.__init__`'s `EnergyDynamics(...,
    kl_eps=1e-4, ...)` call needs the `kl_eps` → `activation_threshold`
-   rename (see energy.py changes below) applied at the call site too, or
-   it throws on construction once the rename lands.
-2. **`CSR` gets an `nnz` property** (`len(self.indices)` — trivial),
-   unblocks everything downstream that wants an activation-side count.
-3. **`Tensor` gets `__getattr__` delegation** to `self.data` when it
-   wraps a `CSR` (so `tensor.nnz`, `tensor.rows` work directly without
-   unwrapping), plus `is_csr`/`is_dense` properties. Keep this concept
-   separate from whatever flag marks the *weight*-side novel delta-CSR
-   format — different axis, don't conflate the two.
-4. **Unify the two sparsification passes.** Stop calling `CSR.from_dense`
-   's independent top-k on every step; construct the recurrent state's
-   CSR from `EnergyDynamics`'s own kept-index set instead — **indices
-   from the gate decision, but values pulled from the pre-gating dense
-   `h`, not from `h_out`'s post-gating constants** (energy decides
-   *which* neurons pass; the real pre-gating magnitude is what should
-   travel forward — that's what the original "don't flatten to a
-   constant" design was protecting against losing in the first place).
-   Keep `CSR.from_dense`'s independent top-k only as the true step-0
-   fallback, before any gate decision exists yet (state starts as a
-   zero-init dense array with nothing for `EnergyDynamics` to have
-   decided about).
-5. **Split the branching-ratio measurement.** Track `recurrent(state)`'s
-   own dense output *before* it's summed with `input_proj(obs)`, as its
-   own `BranchingRatioTracker` instance, distinct from whatever
-   (optionally) watches the combined `h`. This is the actual fix for the
-   zero-activation degenerate solution described above — by the time
-   `h`/`h_out` exists the sum has already happened and the two
-   contributions can no longer be told apart.
-6. **Open design question — decide before wiring item 5, since it
-   changes what "healthy" means for the new tracker's target band**:
-   does the recurrent pathway need something acting like an internal
-   immigration term (self-loop, leak, or a bias independent of `obs`) to
-   have a fixed point other than extinction under `m <= 1`? Resolve this
-   with a short design note in `energy-params.md` or a new doc before
-   building the item-5 tracker's target band around it.
+   rename applied at the call site too. Done, PR
+   [#3](https://github.com/SimLeek/sili__new/pull/3).
+2. [x] **`CSR` gets an `nnz` property** (`len(self.indices)`). Done.
+3. [x] **`Tensor` gets `__getattr__` delegation** to `self.data` when it
+   wraps a `CSR`, plus `is_csr`/`is_dense` properties, kept separate from
+   the weight-side delta-CSR format flag. Done.
+4. [x] **Unify the two sparsification passes.** `_apply_energy_dynamics`
+   now returns `kept_indices` (the gate decision it already made);
+   `CSR.from_kept_indices` builds a CSR from indices-from-the-gate +
+   values-from-pre-gating-`h` (not `h_out`'s post-gating constants).
+   `SparseRNNCell` caches `(_prev_kept_indices, _prev_h_dense)` and uses
+   them for the next step's recurrent CSR, falling back to
+   `CSR.from_dense`'s independent top-k only at true step-0 or after
+   `reset()`/`load()` (cache invalidated there). Done.
+5. [x] **Split the branching-ratio measurement.** `SparseRNNCell.forward`
+   measures `recurrent(state)`'s own activity *before* summing with
+   `input_proj(obs)`, feeding a new `BranchingRatioTracker` (single-lag
+   OLS slope, a simplified Wilting & Priesemann-style estimator, plus
+   `avalanche_sizes()` for the SOC power-law-tail check). Done.
+6. [~] **Open design question, documented not resolved** (deliberately —
+   this needs real design thought, not a rushed answer): does the
+   recurrent pathway need something acting like an internal immigration
+   term (self-loop, leak, or a bias independent of `obs`) to have a fixed
+   point other than extinction under `m <= 1`? Flagged in code comments;
+   still needs an actual short design note in `energy-params.md` before
+   anything depends on the answer.
+
+**Also fixed alongside 1-5** (the actual bug, not just a docs gap): `p`
+was inverted relative to `density` in both `EnergyDynamics`'s own default
+(was `0.02`) and `SparseRNNCell`'s derivation (`density` could reach
+`0.9*p`). New: `EnergyDynamics.p` defaults to `0.05`;
+`SparseRNNCell` sets `density=percent_active`, `p=min(1.0,
+percent_active*5)`; added `assert density <= p*0.8`. Also added
+(opt-in, default off): `EnergyDynamics.forward(h,
+density_override=...)` and `SparseRNNCell`'s
+`dynamic_density_from_branching_ratio` flag — a first-cut proportional
+nudge of the KL density target from the measured recurrent-only
+branching ratio, explicitly labeled as a first cut, not a
+first-principles derivation.
+
+**Found and documented (`sili__new/TODO.md`), NOT fixed — separate task,
+not on the MiniCPM5 critical path**: `SparseRNNCell`/`SparseRNNAgent`
+cannot actually be constructed today. `DISLDOLayer`/`SISLDOLayer`
+(Python) call C++ methods (`_cpu.DISLDOLayer`, `_cpu.SISLDOLayer`,
+`optim_weights`, `decay_importance`, `optim_synaptogenesis`) that don't
+exist on *any* currently-bound C++ class — three incompatible C++-layer
+API generations exist in this codebase (whatever `DISLDOLayer`/
+`SISLDOLayer` assume — never implemented; `DISLDOLayerV` — bound but a
+different API; `SparseLinearLayer` — bound and what actually works,
+proven by `FoldedLayer`/`test_toy_mistral` and Mandelbrot's
+`SparseCore`/`MistralCore` via `make_grown_sparse_layer`). **Not blocking
+MiniCPM5 conversion** (that goes through `FoldedLayer`/`SparseLinearLayer`
+directly, never `SparseRNNCell`) — worth fixing eventually (rebuild
+`DISLDOLayer`/`SISLDOLayer` on `SparseLinearLayer`'s real API) but not
+urgent for this project. `tests/unit/python/test_sparse_rnn_cell.py` has
+33 tests: 20 pass (everything above, verified without needing a working
+`SparseRNNCell`), 13 marked `xfail(strict=True)` citing this bug, ready
+to flip green once it's fixed.
 
 ### `sili/energy.py` changes (bundle with A3, same file)
 
 - [ ] Rename `kl_eps` → `activation_threshold` (name described the
   mechanism, not the purpose) — update all call sites (`SparseRNNCell`,
-  any others found via grep) in the same change.
-- [ ] `p` default corrected upward (see A3) and documented explicitly as
+  any others found via grep) in the same change. Done.
+- [x] `p` default corrected upward (`0.05`) and documented explicitly as
   a hardware/telemetry-driven ceiling (thermal, battery, update-rate),
-  never a tuning knob for learning quality.
-- [ ] `assert density <= p * 0.8` (or similar margin) — this was the
-  actual bug in the original defaults, not just a documentation gap.
-- [ ] Docstrings for `precision` (`lambda_kl`) and `reactivity` (`alpha`)
+  never a tuning knob for learning quality. Done.
+- [x] `assert density <= p * 0.8` — this was the actual bug in the
+  original defaults, not just a documentation gap. Done, and confirmed
+  every existing `EnergyDynamics(...)` call site in the tree already
+  used `density=p/2`, so nothing else needed updating.
+- [x] Docstrings for `precision` (`lambda_kl`) and `reactivity` (`alpha`)
   made explicit that these are two *different* control loops —
   population-level (KL, achieved density vs. target density) vs.
-  per-neuron (energy_loss, `new_energy_t` vs. `setpoint`) — current
-  docstring states both mechanisms but not that they're doing different
-  jobs.
-- [ ] **Biggest structural change**: compute the KL term's target
+  per-neuron (energy_loss, `new_energy_t` vs. `setpoint`). Done.
+- [x] **Biggest structural change**: compute the KL term's target
   dynamically from the *measured branching factor of the recurrent-only
-  pathway* (input-projection contribution subtracted out per neuron
-  before estimating `m`, per A6 item 5), rather than a static `density`
-  constant.
+  pathway*. Done as an explicit **opt-in** (`density_override` param on
+  `EnergyDynamics.forward`, `dynamic_density_from_branching_ratio` flag
+  on `SparseRNNCell`, default off) — a first-cut proportional nudge
+  around the base density, NOT a first-principles derivation; labeled as
+  such in code. Land the real formula later once avalanche/branching
+  -ratio instrumentation (next item) has actually been run and observed,
+  per the design discussion's own "needs real design thought" framing.
 - [ ] Add column/fiber averaging as an optional mode: for
   `state_space >= ~2x input_space`, a subset of the state space is
   forced to track the per-input-neuron average — this is A3/A4's
   column-averaging mechanism; implement once, here, rather than as a
-  separate parallel system.
-- [ ] Keep `exploration < drive/2` as-is, but add a doc line on *why*:
+  separate parallel system. **Not done here** — belongs with A3/A4's
+  fuller column-averaging design (fold-depth columns, pre-seeded
+  cross-depth synapses), not bundled into the A6 measurement-fix commit.
+- [x] Keep `exploration < drive/2` as-is, but add a doc line on *why*:
   symmetry-breaking between otherwise-identical neurons, not merely
-  "avoid the hallucination/REM regime" (that's a real consequence too,
-  but not the only reason).
-- [ ] **Instrumentation only, not dynamics changes**: per-region
-  recurrent-only branching ratio (check it tracks `1 - drive_normalized`
-  as predicted, and feed it into the dynamic-KL-target item above);
-  avalanche size distribution (consecutive fire cascades) to check for
-  the power-law tail SOC predicts — the actual falsifiable test that
-  tuning is in the right regime, independent of whether the code is
-  merely bug-free; `actual_p` vs. `p` over time, specifically watching
-  for `actual_p` chronically pinned near `p` (the original failure
-  sign this whole correction is fixing).
+  "avoid the hallucination/REM regime". Done.
+- [~] **Instrumentation, not dynamics changes**: `BranchingRatioTracker`
+  (per-region recurrent-only branching ratio) and `avalanche_sizes()`
+  now exist and are wired into `SparseRNNCell.forward` — the
+  *measurement* infrastructure is done and tested. **Not yet done**:
+  actually logging/plotting these from a real training run (e.g. wiring
+  into Mandelbrot's own metrics output) to check `m` tracks
+  `1 - drive_normalized` as predicted, check for the SOC power-law tail,
+  and watch `actual_p` vs. `p` for chronic pinning — that validation
+  pass hasn't been run yet, only the plumbing to make it possible.
 - [ ] **Noted dependency, not a change to this file**: a per-neuron
   critic (e.g. a transformer over energy/aux_loss context) needs to
   exist before any energy-management-via-world-modification action
@@ -377,9 +405,8 @@ Order matters — items build on each other; do not skip ahead:
   neurons that persistently lose slot competition — this is load-bearing
   for "no permanently-starved rump population," worth documenting as a
   relied-upon existing property rather than something to (re)build.
-- [ ] **Citations** — add to `energy-proofs.md`/`energy-params.md` (or a
-  new `CITATIONS.md`) as the design decisions above land, grouped by
-  topic:
+- [x] **Citations** — added as `sili__new/CITATIONS.md` (linked from
+  `energy.py`'s module docstring), grouped by topic:
   - *Homeostasis/cybernetics*: Ashby, W. R. — Homeostat (1948); *Design
     for a Brain*; Ashby's Law of Requisite Variety.
   - *Active inference/free energy*: Friston, K. — Free Energy Principle;
