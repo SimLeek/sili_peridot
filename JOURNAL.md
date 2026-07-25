@@ -80,3 +80,60 @@ lives instead of in code docstrings/comments, so the code can stay terse.
   when a mechanism lands on one half of an `input_proj`/`recurrent`-style
   split, check whether the other half needs the same treatment before
   calling the task done.
+
+- **`csr_union`'s per-row Python dict-merge loop doesn't scale to real
+  model-sized weight matrices.** `load_weights` already goes through
+  `delta_csr_from_absolute` in C++ once a merged CSR is built (confirmed
+  by reading `cpu_backend.cpp`), so the only slow part was building the
+  merge itself. Each row's merge is an independent two-pointer walk over
+  two sorted column lists — no cross-row coordination needed (unlike
+  `linear_sisldo.hpp`'s `synap_parallel_fill`, which also enforces a
+  global importance budget across rows) — so it parallelizes directly
+  over rows with a plain `#pragma omp parallel for`: one pass to count
+  each row's union size, prefix-sum for ptrs, one pass to fill. Added
+  `csr_union<>` to `sili/lib/headers/csr.hpp`, bound as `_cpu.csr_union`,
+  with `sili.sparse_rnn.csr_union` now a thin wrapper. New
+  `tests/unit/test_csr_union.cpp` (the legacy `test_csr.cpp` isn't even
+  in the active CMake build — had to add a fresh file rather than extend
+  it).
+
+- **Column-averaging training does NOT reliably distinguish "predict the
+  next input" from "echo the current input" without deliberately
+  constructing a task where they diverge.** Both
+  `TestColumnAveragingLossTraining` (trains the loss against a free `h`
+  parameter, no layer at all) and `TestColumnAveragingEndToEnd` (target
+  unrelated to the actual input sequence) were silent on this. Built a
+  diagnostic: train on a constant sequence (no memory needed), a
+  deterministic cycle (next symbol is a fixed function of the current
+  one — solvable by `in_proj` alone), and an "ambiguous" cycle (the same
+  symbol has different successors at different points in the cycle —
+  provably *not* solvable without tracking position, only `recurrent`'s
+  accumulated state can carry that). `recurrent`'s trained true-unit
+  weight magnitude after training tracks this ordering cleanly (constant
+  < deterministic < ambiguous) — but only:
+  1. **With a heavily amplified `column_averaging_loss` weight (30x).**
+     At the loss's normal scale, the gradient reaching `recurrent` is
+     tiny (already documented in `TestColumnAveragingEndToEnd`'s own
+     scope note) and doesn't move it perceptibly within a practical
+     epoch budget for a unit test.
+  2. **Without `EnergyDynamics` in the loop.** Wrapping the exact same
+     three-regime comparison in energy gating (tried both a low-density/
+     low-p and a high-density/high-p config) completely washed out the
+     ordering — energy's stochastic top-p gating dominates which pathway
+     gets gradient far more than the underlying task structure does, at
+     this toy scale within a practical epoch budget. Matches
+     `TestColumnAveragingEndToEnd`'s own finding that gradient reaching
+     `recurrent` through the full energy-gated path is real but tiny and
+     unpredictable — a second confirmation from a different angle, not a
+     new problem.
+  3. Raw weight-movement is more reliable than an ablation-loss metric
+     (comparing full forward vs. `in_proj` alone with state forced to
+     zero) here: on a constant/trivial sequence, gradient descent still
+     happily routes some signal through `recurrent` even though it's not
+     needed (no "minimal circuit" bias in plain SGD), so the ablation gap
+     doesn't order cleanly by task complexity the way raw magnitude does.
+  Landed as `tests/integration/test_column_averaging_predictive.py` — the
+  no-energy ordering test is a real, useful diagnostic; the with-energy
+  tests only assert training stays finite/stable (the ordering claim
+  doesn't survive there at toy scale, and forcing it would just be
+  re-tuning hyperparameters to fake a demo).
