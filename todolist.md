@@ -182,9 +182,16 @@ not a nice-to-have.
     hand-derived gradient, kept as its own function (not folded into
     `_apply_energy_dynamics`) and combined via the existing
     `combine_losses` pattern. Runs on `h_out`, per the "don't exempt
-    column neurons" requirement above. 7 tests (gradient vs. finite
-    differences, SGD convergence, `combine_losses` integration, weight
-    scaling). PR [#5](https://github.com/SimLeek/sili__new/pull/5).
+    column neurons" requirement above. Takes an optional `indices`
+    parameter (a new general `Tensor.gather` op) so it can track a
+    *subset* of a larger state rather than requiring the whole tensor to
+    be exactly column-shaped — added after review pointed out state
+    should be allowed to be bigger than what's tracked (see A4's
+    redesign note below for the fuller story). 11 tests (gradient vs.
+    finite differences, SGD convergence, `combine_losses` integration,
+    weight scaling, `indices` subset-selection/gradient-isolation).
+    Docstring trimmed after review (was several times longer than the
+    function itself). PR [#5](https://github.com/SimLeek/sili__new/pull/5).
   - **Honest caveat found while validating end-to-end**: full
     convergence under REAL energy competition (this loss +
     `EnergyDynamics` gating + a real sparse layer, all three jointly
@@ -262,41 +269,72 @@ not a nice-to-have.
     `forward()` override skips the fold-sum, returns
     `[n_folds*out_dim]`; verified by manually summing it over the fold
     axis and confirming it exactly reproduces plain `FoldedLayer`'s
-    output (same weights, no pre-seeding difference case). (b) pre-seeded
-    diagonal column synapses added via a new `preseed_fn` hook on
-    `FoldedLayer.from_descriptor` (`None` by default — zero behavior
-    change for `FoldedLayer` itself), inserted as zero-value entries
-    right after the base CSR is built, before FP4 row-scaling. Column
-    semantics require `out_dim == in_dim` for the wrapped suffix (e.g.
-    `down_proj`/`o_proj`, not `q_proj`/`gate_proj`) — documented in the
-    class docstring, not enforced beyond an assert on `n_out % n_folds`.
-    12 tests (pre-seeding correctness incl. no-duplication when already
-    present, redundancy neighbors, forward/backward shapes/gradients,
-    layer-only convergence via real `backward_dense`, end-to-end
-    stability). PR [#5](https://github.com/SimLeek/sili__new/pull/5).
-  - **Found and documented, not silently worked around** (`sili__new/TODO.md`):
-    the "elevated per-connection importance for pre-seeded synapses"
-    protection this bullet's own text asks for isn't achievable with the
-    currently-bound C++ API — `SparseLinearLayer.load_weights` takes no
-    importance array at all, and `set_importance_scale_raw` is a per-ROW
-    scale (would elevate every connection in that row, not just the
-    pre-seeded ones). `column_redundancy` (seed a small neighborhood of
-    columns, not just the exact diagonal) is the practical substitute
-    implemented instead. Real fix needs either a new C++ binding for
-    per-connection importance, or a documented synaptogenesis-warmup
-    convention for callers.
-  - **Second finding, also documented in TODO.md, not fixed**: while
-    tuning the end-to-end validation, found that a fired-but-not-top-p
-    -selected neuron's energy is never reset in `_apply_energy_dynamics`
-    — under a literally repeated-identical input, `aux_loss` grew
-    unboundedly (0.08 → 177+ over 270 steps) since
-    `drive > 2*activation_cost` nets positive energy growth for a
-    chronic top-p loser. Confirmed not a column-averaging bug (isolated,
-    both pieces converge correctly) — a property of the energy dynamics
-    under a degenerate input distribution every other real usage in this
-    codebase avoids by having inputs that vary; fixed for testing by
-    using a varying input (matches the real MiniCPM5 use case anyway —
-    different tokens every step, never a literal repeat).
+    output. `from_descriptor` is inherited unchanged — no override needed.
+  - **(b) redesigned once already, per direct review, before landing.**
+    First version pre-seeded *within* one suffix's existing stacked
+    weight matrix (row `i` → column `(fold_step, i)` for every fold
+    step). Review caught two real problems: (1) that construction creates
+    **no actual connection between virtual layers** — row space stays the
+    shared, non-fold-indexed input, so there's no pathway for layer `t`'s
+    output to influence layer `t+1` at all, contradicting "skip
+    connections from virtual layer i to virtual layer j." (2) the
+    `out_dim == in_dim` requirement doesn't fit **any** of MiniCPM5's real
+    suffixes — checked, none are square (`down_proj` 4608→1536, `o_proj`
+    2048→1536, etc.) — so the whole mechanism as first built couldn't
+    attach to the actual target model.
+    Traced both back to `RNNFoldedBlock.forward` (`conversion/rnn_fold.py`,
+    the real reference recurrence: `state=0; for i: state +=
+    block_i(x+state)`, each layer seeing everything accumulated by every
+    *prior* layer) — `FoldedLayer`'s single-matmul-then-sum trick is a
+    cheap first-order approximation of that (every fold step computed
+    independently from the same external input, no cross-step
+    dependency). Neither problem is fixable by pre-seeding inside one
+    suffix's existing matrix at all.
+    **Current design**: `build_fold_skip_layer(n_folds, out_dim)` — a
+    fresh, from-scratch sparse layer mapping a `FoldedColumnLayer`'s own
+    `[n_folds*out_dim]` *output* space back to itself (always square,
+    resolving problem 2 directly, regardless of the wrapped suffix's
+    in/out shape), pre-seeded as a banded diagonal (bandwidth = `out_dim`
+    by default — "manhattan distance less than the original layer size,"
+    per direct guidance), all zero-valued since this connectivity has no
+    pretrained equivalent in the original unfolded model. Genuine virtual
+    -layer-to-virtual-layer skip connections (resolving problem 1).
+    `apply_fold_skip(skip, raw, lr)` wires it into the Tensor autograd
+    graph; typical use `refined = raw + apply_fold_skip(skip, raw, lr)`.
+    24 tests total across A3/A4 (`build_fold_skip_layer` shape/banding/
+    finiteness, composed with `FoldedColumnLayer` end-to-end incl.
+    gradient reaching both layers and skip weights moving off zero).
+    PR [#5](https://github.com/SimLeek/sili__new/pull/5).
+  - **FP4 landmine hit and fixed while testing the composed pipeline**:
+    `build_fold_skip_layer`'s all-zero initial weights were structurally
+    stuck at zero — the same per-row `value_scale` FP4 gotcha this
+    project's own notes already documented, which got missed on the first
+    pass here too. Fixed via a new `expected_lr` parameter that sets
+    `value_scale`/`importance_scale` relative to the learning rate the
+    layer will actually be trained with — must match whatever `lr` is
+    passed to `apply_fold_skip` later, or connections silently never move.
+  - **The original "elevated per-connection importance" ask is still not
+    achievable** with the currently-bound C++ API (`SparseLinearLayer.
+    load_weights` has no importance array; `set_importance_scale_raw` is
+    a per-ROW scale, not per-connection) — moot in the new design's exact
+    original form (no pretrained/new-synapse mixing to protect against
+    within a row anymore), but the underlying C++ gap is still real if a
+    future need for true per-connection importance protection comes up.
+  - **Second finding — reframed after review, not a bug**: while tuning
+    the end-to-end validation, found that a fired-but-not-top-p-selected
+    neuron's energy is never reset in `_apply_energy_dynamics` — under a
+    literally repeated-identical input, `aux_loss` grew unboundedly
+    (0.08 → 177+ over 270 steps) since `drive > 2*activation_cost` nets
+    positive energy growth for a chronic top-p loser. Confirmed not a
+    column-averaging bug (isolated, both pieces converge correctly).
+    **Per direct feedback, this is curiosity/novelty-seeking pressure
+    working as intended** — "nothing new is happening, pressure should
+    build" is the correct response to a truly static input, not a defect;
+    every other real usage in this codebase never exercises this regime
+    because inputs vary step to step (as MiniCPM5's real token stream
+    always will). Documented in `sili__new/TODO.md` as an emergent
+    property worth deliberately harnessing later (e.g. as a Phase E
+    action-pathway input), not something to clamp away.
 - [ ] **A5. Sparse activation + sparse backprop conversion — this is
   core to why `sili` exists, not a deferred perf nice-to-have.** Direct
   correction to the original plan, which mis-scoped this as low
