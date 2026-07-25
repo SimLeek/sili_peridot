@@ -109,8 +109,12 @@ and post-energy-gating (measured sparsity ratio, not just "it runs") at
 every phase boundary — this is the actual point of using `sili` at all,
 not a nice-to-have.
 
-- [ ] **A1. Thread real hparams into the Llama reconstruction path
-  instead of guessing.** `model_reconstruct.py:361` hardcodes
+- [x] **A1. Thread real hparams into the Llama reconstruction path
+  instead of guessing.** Confirmed done (not marked at the time): `model_reconstruct.py`
+  now reads `rms_norm_eps`/`rope_theta` from `config.json` via an explicit
+  override path, and `rnn_fold.fold_sparse_payload` has a
+  `band_half_width_override` param for RoPE models. Original text below
+  kept for reference. `model_reconstruct.py:361` hardcodes
   `rms_eps=1e-5` (MiniCPM5 needs `1e-6`); `_LlamaRotaryEmbedding.__init__`
   (`model_reconstruct.py:195`) hardcodes RoPE `base=10000` (MiniCPM5
   needs `5000000`), and nothing in the module reads `config.json` at all
@@ -123,8 +127,14 @@ not a nice-to-have.
   explicitly for RoPE models (it's tuned for fixed-position attention by
   default, per its own docstring). **Status: agreed, unchanged from
   original plan.**
-- [ ] **A2. Wire attention into the Python `Tensor` autograd graph
-  ("training-through-attention").** The C++ backward kernels already
+- [x] **A2. Wire attention into the Python `Tensor` autograd graph
+  ("training-through-attention").** Confirmed done (not marked at the
+  time): `sparse_attention`/`banded_attention`/`sparse_banded_attention`
+  Tensor-graph wrappers exist in `sili/tensor.py`
+  (commit `c67248d`, on `main`), and
+  `tests/unit/python/test_attention_autograd.py` has finite-difference
+  dQ/dK/dV gradient checks for all three (10/10 passing). Original text
+  below kept for reference. The C++ backward kernels already
   exist and are pybind-bound (`sparse_attention_backward`,
   `banded_attention_backward`, `sparse_banded_attention_backward`,
   confirmed real softmax-Jacobian gradient math in `attention.hpp`, not
@@ -549,9 +559,10 @@ to flip green once it's fixed.
 
 ### `sili/energy.py` changes (bundle with A3, same file)
 
-- [ ] Rename `kl_eps` → `activation_threshold` (name described the
+- [x] Rename `kl_eps` → `activation_threshold` (name described the
   mechanism, not the purpose) — update all call sites (`SparseRNNCell`,
-  any others found via grep) in the same change. Done.
+  any others found via grep) in the same change. Done (confirmed no
+  `kl_eps` references remain anywhere in the tree).
 - [x] `p` default corrected upward (`0.05`) and documented explicitly as
   a hardware/telemetry-driven ceiling (thermal, battery, update-rate),
   never a tuning knob for learning quality. Done.
@@ -572,13 +583,13 @@ to flip green once it's fixed.
   such in code. Land the real formula later once avalanche/branching
   -ratio instrumentation (next item) has actually been run and observed,
   per the design discussion's own "needs real design thought" framing.
-- [ ] Add column/fiber averaging as an optional mode: for
+- [x] Add column/fiber averaging as an optional mode: for
   `state_space >= ~2x input_space`, a subset of the state space is
   forced to track the per-input-neuron average — this is A3/A4's
   column-averaging mechanism; implement once, here, rather than as a
-  separate parallel system. **Not done here** — belongs with A3/A4's
-  fuller column-averaging design (fold-depth columns, pre-seeded
-  cross-depth synapses), not bundled into the A6 measurement-fix commit.
+  separate parallel system. Satisfied by A3/A4 below (`column_averaging_loss`,
+  `FoldedColumnLayer`'s `in_proj`+`recurrent` split, both merged in PR #5)
+  rather than bundled into the original A6 measurement-fix commit.
 - [x] Keep `exploration < drive/2` as-is, but add a doc line on *why*:
   symmetry-breaking between otherwise-identical neurons, not merely
   "avoid the hallucination/REM regime". Done.
