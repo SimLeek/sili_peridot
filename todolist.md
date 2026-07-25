@@ -671,11 +671,21 @@ to flip green once it's fixed.
   `config.json`, skipped if that file isn't present) — `q_proj_out !=
   hidden_size` is asserted directly so the non-square gotcha can't
   regress silently.
-- [ ] **B2. Load the checkpoint.** Single safetensors shard, ~2.16GB
+- [x] **B2. Load the checkpoint.** Single safetensors shard, ~2.16GB
   bf16 — fits fully in RAM (machine has 15GB, mostly free); the
   streaming/two-phase path (`streaming_prune.py`) is not needed for a
   model this size, use the plain in-RAM path
   (`sparse_prune.load_state_dict`/`model_reconstruct`'s loader).
+  Done: `model/checkpoint.py`'s `load_minicpm5_checkpoint` (thin wrapper
+  over `sparse_prune.load_state_dict`, ~2s memory-mapped load) plus
+  `verify_checkpoint_matches_config`, which asserts every tensor's actual
+  shape against `MiniCPM5Config` (all 219 tensors: embed_tokens/lm_head/
+  norm + 24 layers × 9 tensors each) and that no attention bias or
+  qk-norm tensors are present — fails loudly at load time instead of a
+  cryptic matmul error during folding. Confirmed against the real
+  checkpoint: embed_tokens/lm_head are genuinely untied (different
+  storage), all weights bf16. 12 tests (8 against fake tiny checkpoints
+  exercising each failure mode, 4 against the real file).
 - [ ] **B3. Prune to CSR.** Run `sparse_prune.sparsify_model` (or its
   primitives directly) with a threshold calibrated against MiniCPM5's own
   weight-magnitude distribution — don't reuse the toy-Mistral defaults
