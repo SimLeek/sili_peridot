@@ -137,3 +137,23 @@ lives instead of in code docstrings/comments, so the code can stay terse.
   tests only assert training stays finite/stable (the ordering claim
   doesn't survive there at toy scale, and forcing it would just be
   re-tuning hyperparameters to fake a demo).
+
+- **Follow-up on the energy-interaction finding above: it was too
+  pessimistic.** The first EnergyDynamics attempt (`drive=
+  activation_cost=0.08, exploration=0.002`) wasn't tuned tightly against
+  this project's own constraints (`activation_cost >= 0.01`, `exploration
+  < drive/2`). Sweeping `drive` in `[0.01, 0.04]` with `activation_cost=
+  drive` and `exploration` properly scaled found a real result missed
+  the first time: under aggressive/low-density gating, the coarse
+  property (constant sequence uses `recurrent` least) DOES survive energy
+  gating -- it just needed better-tuned drive, exactly as suspected in
+  review. The finer distinction (deterministic-but-varying vs. ambiguous)
+  still doesn't reliably separate under energy at this toy scale across
+  the whole range tried, though -- a genuine open question, not
+  something a slightly-different drive value fixed.
+- **`EnergyDynamics`'s exploration noise uses the global, unseeded
+  `np.random`**, discovered because the new energy test was flaky across
+  reruns despite every other seed in the harness being fixed. Any test
+  asserting something more specific than "stays finite" through
+  `EnergyDynamics` needs `np.random.seed(...)` called explicitly first.
+  Documented in `sili__new/TODO.md`.
