@@ -310,7 +310,17 @@ Order matters — items build on each other; do not skip ahead:
    measures `recurrent(state)`'s own activity *before* summing with
    `input_proj(obs)`, feeding a new `BranchingRatioTracker` (single-lag
    OLS slope, a simplified Wilting & Priesemann-style estimator, plus
-   `avalanche_sizes()` for the SOC power-law-tail check). Done.
+   `avalanche_sizes()` for the SOC power-law-tail check). Done. **Update
+   per review**: added `EMABranchingRatioTracker` alongside it (same
+   OLS-slope estimator, O(1) memory via exponentially-weighted running
+   statistics instead of a hard window — `alpha` trades fast-response
+   against long-term-smoothness continuously, where `window` only offered
+   that indirectly/discretely; run two instances at different alphas for
+   both at once). `SparseRNNCell(branching_tracker="window"|"ema", ...)`
+   switches which backs `self.branching_recurrent`, default `"window"`
+   (unchanged behavior). `avalanche_sizes()` stays windowed-only
+   (inherently needs a retained sequence). PR
+   [#3](https://github.com/SimLeek/sili__new/pull/3).
 6. [~] **Open design question, documented not resolved** (deliberately —
    this needs real design thought, not a rushed answer): does the
    recurrent pathway need something acting like an internal immigration
