@@ -653,7 +653,7 @@ to flip green once it's fixed.
 
 ## Phase B — Convert MiniCPM5-1B-Base (in sili_peridot)
 
-- [ ] **B1. Explicit hparams module** (`sili_peridot/model/config.py`):
+- [x] **B1. Explicit hparams module** (`sili_peridot/model/config.py`):
   read `MiniCPM5-1B-Base/config.json` directly (don't rely on
   `model_reconstruct`'s shape-inference guesses) — hidden_size=1536,
   intermediate_size=4608, num_attention_heads=16, num_key_value_heads=2,
@@ -663,6 +663,14 @@ to flip green once it's fixed.
   vocab_size=130560, rms_norm_eps=1e-6, rope_theta=5000000,
   tie_word_embeddings=False, num_hidden_layers=24, hidden_act=silu, no
   attention bias, no qk-norm.
+  Done: `MiniCPM5Config` (frozen dataclass) with a `from_json` classmethod
+  and explicit `q_proj_out`/`kv_proj_out`/`o_proj_in`/`mlp_hidden`/etc.
+  properties so no downstream code ever derives a projection shape from
+  `hidden_size`/`num_heads` itself. 9 tests in `tests/test_config.py`
+  (inline-fixture tests plus one against the real checkpoint's own
+  `config.json`, skipped if that file isn't present) — `q_proj_out !=
+  hidden_size` is asserted directly so the non-square gotcha can't
+  regress silently.
 - [ ] **B2. Load the checkpoint.** Single safetensors shard, ~2.16GB
   bf16 — fits fully in RAM (machine has 15GB, mostly free); the
   streaming/two-phase path (`streaming_prune.py`) is not needed for a
