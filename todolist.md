@@ -719,6 +719,10 @@ to flip green once it's fixed.
   numpy at inference — no PyTorch dependency in the runtime path (torch
   only used offline during conversion, and only by transformers for the
   comparison baseline).
+  **Once this is working end-to-end, go do A5** (sparse activation +
+  sparse backprop conversion) — that's the scheduled trigger point A5
+  itself names ("execute A5 after Phase B7"), not a maybe. Don't move on
+  to B8 training without at least checking A5 first.
 - [ ] **B8. Column-averaging training loop**: for each input index `i`,
   the column of 24 fold-depth neurons should average toward `input[i]`
   **at every fold step, from step 1 onward** — not only after the full
