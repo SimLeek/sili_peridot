@@ -157,3 +157,77 @@ lives instead of in code docstrings/comments, so the code can stay terse.
   asserting something more specific than "stays finite" through
   `EnergyDynamics` needs `np.random.seed(...)` called explicitly first.
   Documented in `sili__new/TODO.md`.
+
+## sili_peridot: B3 pruning -- global threshold destroys the model
+
+- **A "prune to CSR" threshold chosen purely from sparsity/compression
+  math (B3's own `DEFAULT_TARGET_SPARSITY=0.8`) turned out to
+  completely destroy the model's next-token prediction, with no
+  retraining involved.** Never checked until asked to specifically:
+  "load both the sparse and the dense model... and check how well they
+  do in next token prediction tasks." Built `model/eval_pruning.py`
+  (loads the real HF model dense and with pruning applied, no
+  folding/columns/sili runtime involved -- purely "does zeroing these
+  weights hurt") and found accuracy 0.0 (from 0.503 dense) at 0.8 global
+  sparsity. Swept target_sparsity globally: quality holds through ~0.2,
+  degrades continuously (not one sharp cliff) from ~0.3, catastrophic by
+  ~0.4-0.5 -- nowhere near the ~70%+ per-tensor sparsity real CSR
+  compression needs. A single global threshold cannot get both real
+  compression and preserved quality on this model; there is no
+  "conservative default" middle ground to just pick.
+- **Per-tensor-role sensitivity turned out to vary enormously** --
+  `embed_tokens` tolerated 90% sparsity fine; `v_proj`, architecturally
+  near-identical to `k_proj` (which tolerated 70%), collapsed already
+  past ~25-30%. A first coarse sweep (0.3/0.5/0.7/0.9 only) suggested
+  v_proj's safe zone was ~0.05; a finer sweep (0.03 steps) found the
+  real safe zone is actually ~0.2 -- the coarse grid was simply too
+  coarse to see it, not evidence the fine-grained safe zone didn't
+  exist. No "improvement dip" from removing pure noise below the safe
+  zone was found (the user's hypothesis going in) -- degradation was
+  flat/negligible then smoothly increasing, no local minimum below
+  baseline. Perplexity degrades earlier and more smoothly than accuracy
+  as target_sparsity rises -- a more sensitive leading indicator worth
+  watching even when accuracy still looks fine.
+- **Combining each role's own isolated-safe threshold compounded MUCH
+  worse than isolation predicted.** First combined attempt (every role
+  at its own isolated-safe number) gave accuracy 0.111, not the ~0.4-0.5
+  isolated numbers implied. `q_proj`+`k_proj` together cost about 2x
+  either alone (they interact directly in QK^T -- makes sense in
+  hindsight, wasn't obvious going in); `o_proj` and `v_proj` each
+  roughly quadrupled the cumulative damage on their own turn in the
+  stepwise trace. Reaching an acceptable combined result (accuracy
+  0.482) took 3 rounds of "find whichever role caused the biggest single
+  jump in the cumulative trace, shrink just that one, recheck the
+  combined result" by hand.
+- **Generalized the whole procedure into `sili__new` instead of leaving
+  it as a one-off MiniCPM5 investigation** (per direct request: "this is
+  a pretty important pattern/research to put in with the sili__new
+  conversion tools too"). `sili.conversion.prune_sensitivity`
+  (`group_tensor_names_by_role`, `sweep_group_sensitivity`,
+  `apply_group_thresholds`, `stepwise_cumulative_eval`,
+  `iterative_threshold_search`) makes the grouping/sweeping/combining
+  -verification/threshold-walkback loop a reusable tool for the next
+  model instead of ad hoc scripts -- the only model-specific piece
+  callers provide is `eval_fn` (a scalar, higher-is-better quality
+  metric over a candidate state dict). `iterative_threshold_search`
+  specifically automates the "shrink the worst offender, recheck"
+  manual loop above -- greedy, not globally optimal (shrinking one role
+  changes how much a role added AFTER it costs, since costs compound
+  along the step order), but it's exactly the procedure that worked
+  here, made repeatable.
+- **Held-out validation on a second, disjoint text sample (never used
+  during the threshold search) confirmed the final thresholds aren't
+  overfit**: pruned accuracy held steady across both sets (0.482 search
+  / 0.478 held-out) even though the dense baseline itself varied more
+  between them (0.503 / 0.584 -- natural variance in how predictable
+  different short texts are for the dense model, not a pruning effect).
+- **Background-process hygiene lesson, mid-investigation**: manually
+  backgrounding heavy model-loading scripts via shell `&`/`wait` (rather
+  than the harness's own background-task tracking) left orphaned
+  processes running when a foreground `wait` timed out -- four Python
+  processes ended up competing for the same 15GB of RAM simultaneously,
+  making everything far slower than any single run should have been.
+  Fixed by using the tool's own `run_in_background` exclusively going
+  forward and checking `ps aux` for stray processes before starting a
+  new heavy one -- worth remembering for any future multi-round
+  iterative search that needs repeated real-model loads.

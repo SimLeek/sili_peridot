@@ -727,6 +727,60 @@ to flip green once it's fixed.
   at the calibrated default (vs. < 1.1x at sili__new's own 0.5 default,
   locking in the finding above) and overall sparsity staying under
   sili__new's own 95% catastrophe ceiling.
+- [x] **B3b. Verify pruning doesn't destroy model quality, not just that
+  it round-trips through CSR types.** Not originally scoped as a
+  separate item -- added after review flagged that B3/B3a's sparsity
+  -percentage framing never actually checked whether the model still
+  *works*. Loaded the real HF model dense and with pruning applied (no
+  folding/columns/sili runtime involved -- purely "does zeroing these
+  weights hurt"), compared next-token perplexity/accuracy via teacher
+  forcing (`model/eval_pruning.py`).
+  **Critical finding**: `DEFAULT_TARGET_SPARSITY=0.8` (B3's global
+  threshold, needed for real CSR compression) collapses next-token
+  accuracy to 0.0 (from a 0.503 dense baseline) with NO retraining
+  involved -- this would have shipped broken had it not been checked.
+  Swept target_sparsity globally: quality holds fine through ~0.2, then
+  degrades continuously (not a single sharp cliff) from ~0.3, catastrophic
+  by ~0.4-0.5. Since real CSR compression needs ~70%+ per-tensor
+  sparsity (see B3's own finding) and quality collapses well before
+  that, a single global threshold cannot get both at once on this model.
+  **Per-tensor-role sensitivity** (`sili.conversion.prune_sensitivity`,
+  new in sili__new PR #7, merged): sensitivity varies enormously by
+  role -- `embed_tokens` tolerated 90% sparsity with only a mild quality
+  drop; `v_proj` (architecturally near-identical to `k_proj`, which
+  tolerated 70% fine) collapsed already past ~25-30% (fine-grained
+  sweep found the real safe zone is ~0.2, not the ~0.05 a coarse first
+  pass suggested -- perplexity degrades earlier/more gradually than
+  accuracy as a leading indicator).
+  **Combining per-role "safe" thresholds compounded MUCH worse than
+  isolation suggested**: first combined attempt (each role's own
+  isolated-safe threshold) gave accuracy 0.111, not the ~0.4-0.5 the
+  isolated numbers implied -- `q_proj`+`k_proj` together cost ~2x either
+  alone (they interact directly in QK^T), and `o_proj`/`v_proj` each
+  roughly quadrupled the damage on their own turn in the cumulative
+  trace. Took 3 rounds of "shrink whichever role caused the biggest
+  jump, recheck the combined result" to reach an acceptable combined
+  result -- automated as `iterative_threshold_search` (sili__new PR #8,
+  merged) so the next model doesn't need to redo this by hand.
+  **Final validated thresholds** (`DEFAULT_TARGET_SPARSITY_BY_ROLE` in
+  `model/prune.py`): embed_tokens=0.8, q_proj=k_proj=0.4, lm_head=0.3,
+  gate_proj=0.2, up_proj=0.25, down_proj=o_proj=0.1, v_proj=0.05.
+  Combined result: accuracy 0.482 (search-set text) / 0.478 (independent
+  held-out text never used during the search) vs. 0.503 dense baseline
+  -- real quality preserved, confirmed not overfit to the search text.
+  Most roles are still well below CSR-viable sparsity at these values --
+  intentional (see model/prune.py's module docstring): the actual memory
+  win this pipeline chases is B4's folding, not conversion-time
+  magnitude pruning; deeper sparsification is left to training-time
+  synaptogenesis. `model/eval_pruning.py` refactored to pure
+  evaluation (no pruning-construction logic of its own -- see
+  `model/prune.py`'s `prune_state_dict_by_role` +
+  `sparse_state_to_dense_state_dict`, avoiding two parallel pruning
+  implementations). See JOURNAL.md for the full search trace and
+  numbers. 7 new tests in `test_eval_pruning.py` (including the global
+  -threshold-destroys-quality regression and the per-role-preserves
+  -quality regression, both against the real checkpoint) plus updates to
+  `test_prune.py` for the new per-role functions.
 - [ ] **B4. Fold each of the 7 per-layer 2-D suffixes independently**
   (`self_attn.q_proj`, `k_proj`, `v_proj`, `o_proj`, `mlp.gate_proj`,
   `up_proj`, `down_proj`) across all 24 layers via
