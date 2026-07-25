@@ -686,7 +686,7 @@ to flip green once it's fixed.
   checkpoint: embed_tokens/lm_head are genuinely untied (different
   storage), all weights bf16. 12 tests (8 against fake tiny checkpoints
   exercising each failure mode, 4 against the real file).
-- [ ] **B3. Prune to CSR.** Run `sparse_prune.sparsify_model` (or its
+- [x] **B3. Prune to CSR.** Run `sparse_prune.sparsify_model` (or its
   primitives directly) with a threshold calibrated against MiniCPM5's own
   weight-magnitude distribution — don't reuse the toy-Mistral defaults
   uncritically. Keep 1-D tensors (norms) and embeddings' decision
@@ -694,12 +694,39 @@ to flip green once it's fixed.
   untied [130560, 1536] matrices, a meaningful chunk of the model; decide
   per `_keep_dense_reason()`'s existing rules, verify it makes a sane
   call for these shapes rather than assuming).
-- [ ] **B3a. Verify actual sparsity, not just CSR-shaped output.** Per
+  Done: `model/prune.py`'s `prune_state_dict` (built on sili__new's
+  `calibrate_min_abs_param`/`_keep_dense_reason`/`csr_bytes` primitives
+  directly, not `sparsify_model`, so it can consume the checkpoint we
+  already loaded in B2 and return a structured `PruneReport` instead of
+  console-only output). **Real finding, not assumed**: sili__new's own
+  `target_sparsity=0.5` default leaves MiniCPM5 almost entirely dense
+  here (2/170 eligible tensors go sparse, ~1.00x compression) — CSR only
+  beats dense once a tensor's own sparsity clears ~70%, given
+  `_keep_dense_reason`'s 12-bytes-per-nonzero estimate vs. dense's 4
+  bytes/element. `DEFAULT_TARGET_SPARSITY = 0.8` calibrated instead
+  (127/170 sparse, ~1.65x compression, `stored_MB≈2614`). `embed_tokens`/
+  `lm_head` DO go sparse at this threshold, and individually end up MORE
+  sparse than the nominal global target (85–90% vs. 80%) — their weight
+  magnitudes skew smaller than the transformer body's, so the shared
+  global percentile threshold prunes them harder. Also found while
+  running this on the real checkpoint: a single `calibrate_min_abs_param`
+  call peaked at ~15.3GB RAM on this 15GB machine (heavy swap
+  thrashing) — fixed upstream in `sili__new` (PR #6, sampling-based
+  `max_sample` param, default 5M, peak now tracks the single largest
+  eligible tensor instead of the whole population's sum).
+- [x] **B3a. Verify actual sparsity, not just CSR-shaped output.** Per
   Phase A's cross-cutting correctness requirement: after pruning, check
   the real density (nnz / (n_in*n_out)) per tensor and log it — a
   threshold that leaves the model 60%+ dense defeats the point of this
   whole conversion, regardless of whether it technically round-trips
   through CSR types.
+  Done: `PruneReport` tracks per-tensor sparsity/format/dense-reason plus
+  overall sparsity/compression ratio; `print_report` gives the same kind
+  of per-tensor visibility `sparsify_model`'s own console output does.
+  11 tests, including real-checkpoint ones asserting compression > 1.5x
+  at the calibrated default (vs. < 1.1x at sili__new's own 0.5 default,
+  locking in the finding above) and overall sparsity staying under
+  sili__new's own 95% catastrophe ceiling.
 - [ ] **B4. Fold each of the 7 per-layer 2-D suffixes independently**
   (`self_attn.q_proj`, `k_proj`, `v_proj`, `o_proj`, `mlp.gate_proj`,
   `up_proj`, `down_proj`) across all 24 layers via
