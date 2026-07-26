@@ -1,31 +1,40 @@
 """
 sili_peridot/model/quantize.py
 ─────────────────────────────
-Simulate B5's real FP4 quantization (sili__new's
-FoldedLayer.from_descriptor, sili/lib/headers/fp4quant.hpp's 16-level
-lookup table) on MiniCPM5's per-layer suffix weights, entirely in
-torch/numpy -- no sili runtime involved. Same "isolate one variable,
-measure real next-token quality" methodology as model/prune.py +
-model/eval_pruning.py (B3b), applied to the quantization step instead
-of the pruning step -- see model/eval_quantization.py for the
-next-token comparison this feeds.
+Simulate B5's FP4 quantization (sili__new's FoldedLayer.from_descriptor,
+sili/lib/headers/fp4quant.hpp's 16-level lookup table) on MiniCPM5's
+per-layer suffix weights, entirely in torch/numpy -- no sili runtime
+involved. Same "isolate one variable, measure real next-token quality"
+methodology as model/prune.py + model/eval_pruning.py (B3b), applied to
+the quantization step instead of the pruning step -- see
+model/eval_quantization.py for the next-token comparison this feeds.
 
-from_descriptor's real scheme, replicated exactly here (not a
-simplified/approximate quantizer):
-  - Scale is per INPUT FEATURE (a "row" of the stacked-and-transposed
-    matrix), shared across ALL 24 layers' folded output rows for that
-    suffix -- NOT computed independently per original layer. Folding
-    concatenates all 24 layers' weights along the output axis before
-    the per-row scale is ever computed, so a layer whose own weights
-    are small relative to another layer's outliers (same input
-    feature) still gets quantized at that OTHER layer's coarser
-    resolution. Quantizing each layer against its own local max would
-    understate the real error B5 actually introduces.
-  - scale = max(|values in that row|) / FP4_MAX (6.0); values divided
-    by scale before nearest-neighbour lookup into FP4_TABLE, multiplied
-    back after.
-  - Only NONZERO elements are quantized -- zeros represent "no synapse"
-    in the sparse encoding, not a real weight to round.
+TWO schemes are simulated here, matching from_descriptor's two
+value_scale_mode options (sili__new PR #10):
+
+  "per_row" (from_descriptor's ORIGINAL scheme, kept for regression
+  documentation -- see PER_ROW functions below): one scale per INPUT
+  FEATURE, shared across ALL 24 layers' folded output rows for that
+  suffix. Found catastrophic on the real checkpoint: next-token
+  accuracy 0.482 -> ~0.09-0.12 (~200x perplexity increase), with NO
+  bug found in the simulation (unit-tested, and the shared scale isn't
+  dominated by a rogue outlier layer -- see JOURNAL.md).
+
+  "rank1" (the fix, RANK1 functions below, now from_descriptor's
+  default): a genuine per-OUTPUT scale too, via a rank-1 (outer
+  -product) envelope fit (sili__new's fit_rank1_scale_envelope) --
+  found necessary because per-output magnitude within one folded layer
+  varies by a min/max ratio as low as ~0.05-0.10, which a per-row-only
+  scale can't represent at all. Recovers to ~0.297 accuracy -- real
+  progress (perplexity ~36x lower than "per_row"), though still short
+  of "small drop". See JOURNAL.md for the full investigation, including
+  why a finer per-layer-only scale and percentile-based clipping were
+  tried and rejected (percentile-clipping made it WORSE, not better).
+
+Both share the same real 16-level FP4 table and the same "only NONZERO
+elements are quantized" rule (zeros represent "no synapse" in the
+sparse encoding, not a real weight to round) -- they differ only in
+how the scale is computed.
 """
 from __future__ import annotations
 
@@ -92,6 +101,118 @@ def simulate_fp4_quantize_layer(
     quantized = fp4_round(scaled) * scale
     out = np.where(mask, quantized, w)
     return torch.from_numpy(out.astype(np.float32)).reshape(weight.shape)
+
+
+def fit_rank1_scale_envelope(abs_mat: np.ndarray, n_iters: int = 6):
+    """
+    Pure-Python mirror of sili__new's sili.sparse_rnn.fit_rank1_scale_envelope
+    (kept as a separate copy here so this module's simulation doesn't need
+    to import sili -- see module docstring for why this exists: a
+    per-row-only scale wastes most of FP4's resolution on any output well
+    below that row's max). Alternating max-fit producing a rank-1
+    (outer-product) envelope: row_scale[r] * col_scale[c] >= abs_mat[r,c]
+    for every entry, using O(rows+cols) parameters instead of
+    O(rows*cols). Returns (row_scale, col_scale), float32 -- deliberately
+    NOT float64: row_scale/col_scale's dtype determines what dtype every
+    `abs_mat / scale` broadcast upcasts to internally, so float64 here
+    would silently double the transient memory of every iteration for
+    the largest suffixes (materializing a float64-sized copy of abs_mat
+    each time) even if abs_mat itself is stored as float32 -- exactly
+    what OOM-killed this machine once with a real HF model also loaded
+    (see JOURNAL.md). A max/divide envelope fit has no numerical
+    stability need for float64 (unlike an accumulating sum).
+    """
+    n_rows, n_cols = abs_mat.shape
+    col_scale = np.ones(n_cols, dtype=np.float32)
+    row_scale = np.ones(n_rows, dtype=np.float32)
+    for _ in range(n_iters):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_scale = np.nanmax(np.where(col_scale > 0, abs_mat / col_scale[None, :], 0.0), axis=1)
+        row_scale = np.maximum(row_scale, 1e-12)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            col_scale = np.nanmax(np.where(row_scale[:, None] > 0, abs_mat / row_scale[:, None], 0.0), axis=0)
+        col_scale = np.maximum(col_scale, 1e-12)
+    return row_scale, col_scale
+
+
+def simulate_fp4_quantize_layer_rank1(
+    weight: torch.Tensor, input_scale: np.ndarray, output_scale_slice: np.ndarray,
+    fp4_max: float = FP4_MAX,
+) -> torch.Tensor:
+    """
+    Rank-1 counterpart to simulate_fp4_quantize_layer: quantize ONE
+    layer's own [out_dim, in_dim] weight tensor using BOTH a shared
+    per-input scale (row_scale/fp4_max, from fit_rank1_scale_envelope,
+    shared across all 24 folded layers) AND that layer's own slice of
+    the per-output scale (col_scale, one value per output neuron in
+    THIS layer -- a slice of the full stacked envelope's column vector,
+    since folding concatenates all 24 layers' outputs along that axis).
+    """
+    w = weight.detach().float().numpy()
+    mask = w != 0
+    effective_scale = np.outer(output_scale_slice, input_scale) / fp4_max
+    scaled = np.divide(w, effective_scale, out=np.zeros_like(w), where=mask)
+    quantized = fp4_round(scaled) * effective_scale
+    out = np.where(mask, quantized, w)
+    return torch.from_numpy(out.astype(np.float32)).reshape(weight.shape)
+
+
+def compute_suffix_rank1_scales_streaming(
+    sparse_state: Dict[str, dict],
+    cfg: MiniCPM5Config,
+    suffixes: List[str] = SUFFIXES,
+    prefix: str = "model.layers.",
+    band_half_width_override=None,
+    rank1_iters: int = 6,
+) -> Dict[str, tuple]:
+    """
+    Rank-1 counterpart to compute_suffix_scales_streaming: folds one
+    suffix at a time (same memory discipline -- pops sparse_state as it
+    goes, discards each descriptor before the next), fitting a rank-1
+    envelope on each suffix's stacked matrix instead of a plain per-row
+    max. Returns {suffix: (input_scale, output_scale)} -- input_scale is
+    shared across all cfg.num_hidden_layers layers (length in_dim),
+    output_scale spans the full stacked output axis (length
+    n_folds*out_dim) and must be SLICED per layer (see
+    apply_rank1_quantization).
+    """
+    from .fold import _EXPECTED_OUT_DIM_PROPERTY
+    scales: Dict[str, tuple] = {}
+    for suffix in suffixes:
+        desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
+        stacked = desc.stacked_weights[suffix]
+        dense_t = stacked.to_dense().t().numpy().astype(np.float32)   # [in_dim, n_folds*out_dim]
+        in_scale, out_scale = fit_rank1_scale_envelope(np.abs(dense_t), n_iters=rank1_iters)
+        scales[suffix] = (in_scale, out_scale)
+        for i in range(cfg.num_hidden_layers):
+            del sparse_state[f"{prefix}{i}{suffix}"]
+        del desc, dense_t
+    return scales
+
+
+def apply_rank1_quantization(
+    dense_state_dict: Dict[str, torch.Tensor],
+    rank1_scales: Dict[str, tuple],
+    cfg: MiniCPM5Config,
+    suffixes: List[str] = SUFFIXES,
+    prefix: str = "model.layers.",
+) -> Dict[str, torch.Tensor]:
+    """
+    Rank-1 counterpart to apply_quantization: returns a COPY of
+    dense_state_dict with every one of the 7*24=168 per-layer suffix
+    tensors replaced by its rank-1 FP4-quantization-simulated version.
+    `rank1_scales` is compute_suffix_rank1_scales_streaming's output.
+    """
+    from .fold import _EXPECTED_OUT_DIM_PROPERTY
+    out = dict(dense_state_dict)
+    for suffix in suffixes:
+        in_scale, out_scale = rank1_scales[suffix]
+        out_dim = getattr(cfg, _EXPECTED_OUT_DIM_PROPERTY[suffix])
+        for i in range(cfg.num_hidden_layers):
+            name = f"{prefix}{i}{suffix}"
+            layer_out_scale = out_scale[i * out_dim:(i + 1) * out_dim]
+            out[name] = simulate_fp4_quantize_layer_rank1(out[name], in_scale, layer_out_scale)
+    return out
 
 
 def compute_suffix_scales(

@@ -338,3 +338,102 @@ FP4 quantization quality catastrophe
   running the streaming/destructive scale computation, since the latter
   pops entries out of `sparse_state` -- doing it in the other order
   would silently produce an incomplete `pruned_dense`.
+
+## sili_peridot/sili__new: B5a -- rank-1 quantization scale fixes most of
+the catastrophe
+
+- **User's diagnosis, confirmed directly before building anything**: "the
+  layers were originally trained as separate dense layers, so merging
+  them would harm things" -- i.e. `from_descriptor`'s per-row scale,
+  SHARED across all 24 folded layers, forces every layer to share ONE
+  input-side scale even though they were never trained with that
+  constraint. Their proposed fix: per-input AND per-output scale (a rank
+  -1/outer-product pair of vectors, not a full per-element matrix).
+  Their diagnostic proposal -- check whether per-OUTPUT magnitude is
+  roughly uniform WITHIN one folded layer (if so, per-layer scaling
+  alone would already be "enough" and rank-1 wouldn't help) -- was run
+  first, on the real checkpoint: within-layer coefficient of variation
+  of per-output max|.| ~0.32-0.38, within-layer min/max ratio ~0.05-0.10
+  (gate_proj/q_proj/down_proj all similar). Confirmed real structure a
+  per-row-only OR per-layer-only scale can't capture.
+- **Simulated in pure numpy before touching any C++** (per direct
+  guidance -- validate the concept cheaply first): an alternating max
+  -fit ("Sinkhorn-style, but max-based") producing a rank-1 envelope
+  `row_scale[i] * col_scale[o] >= |W[i,o]|` for every entry, using
+  O(n_in+n_out) parameters instead of O(n_in*n_out). Real end-to-end
+  next-token result: accuracy 0.482 (baseline) -> 0.094 (old per-row
+  scheme) -> **0.297 (rank-1)**, perplexity 3328 -> 91 (~36x lower).
+  Real, substantial progress -- not full recovery.
+- **Two further simulated attempts, both informative negatives**:
+  (a) percentile-based envelope fitting (letting rare outlier weights
+  clip/saturate instead of forcing the whole scale to cover them, a
+  standard clipping-based quantization technique) tested WORSE than the
+  plain max-envelope (accuracy 0.181 vs 0.297) -- rejected, not pursued
+  further. (b) Confirmed the shared-scale catastrophe wasn't caused by
+  one outlier layer dominating the scale (per-layer/global max_abs
+  ratio: mean=0.71, only 1.1% of pairs below 0.3) before spending effort
+  on a fix that wouldn't have addressed the real cause.
+- **Built the real sili__new library support** once the concept was
+  validated (sili__new PR #10): `output_scale` (per-column, mirroring
+  `value_scale`'s existing per-row design exactly) added to
+  `SparseLinearWeightsDelta`, wired through `disldo_forward`/
+  `disldo_backward`'s dequantization (`true_w = stored_w * value_scale
+  [row] * output_scale[col]`). `value_scale`'s OWN gradient (used when a
+  layer is later trained, not at conversion time) had to be corrected to
+  account for the new fixed `output_scale[col]` factor too -- easy to
+  miss since `output_scale` itself isn't gradient-updated, but
+  `value_scale`'s gradient formula still needs to know about it.
+  `output_scale` deliberately NOT gradient-updated -- a fixed, write
+  -once conversion-time constant, not a re-learned parameter (matches
+  how `value_scale` is actually USED in `from_descriptor` today, even
+  though the class also supports gradient-updating `value_scale`
+  elsewhere, e.g. Mandelbrot RL). `FoldedLayer.from_descriptor` gets an
+  opt-in `value_scale_mode="rank1"` (default stays `"per_row"` for exact
+  backward compatibility) -- now `sili_peridot`'s own default once
+  wired through `model/fold.py`'s builder functions.
+- **Real (not simulated) C++ validation, on the actual checkpoint**:
+  built a real `FoldedLayer` for `gate_proj` via both modes, compared
+  `forward()` output against the exact unquantized analytic reference
+  (`reference_fold_forward`) -- rank1's real reconstruction error was
+  ~30% lower than per_row's (mean_abs_err 0.75 vs 1.08), confirming the
+  wiring works correctly, not just the simulation.
+- **A real bug found writing sili_peridot's OWN simulation copy of the
+  fix** (`model/quantize.py`): the envelope fit needs `abs(W)`, not raw
+  signed values -- a first draft dropped the `.abs()` call (present
+  correctly in the original probe script and in sili__new's own
+  `from_descriptor`), which silently made the simulated "rank1" result
+  WORSE than per-row (error 180 vs 105 on synthetic data) rather than
+  better. Caught because the new module-level test used i.i.d. random
+  weights with no real per-output structure for rank1 to exploit in the
+  first place -- fixed the test to build data WITH genuine per-output
+  magnitude structure (matching what the real checkpoint actually has),
+  which is what surfaced the missing-`.abs()` bug clearly.
+- **A `float64` memory bug, found by a real, repeated OOM** (confirmed
+  via kernel oom-killer log each time, not inferred): `fit_rank1_scale_
+  envelope`'s `row_scale`/`col_scale` were `float64` by construction,
+  which silently upcasts every `abs_mat / scale` broadcast to float64
+  internally regardless of `abs_mat`'s own dtype -- doubling the
+  transient memory of every envelope-fit iteration for the largest
+  suffixes. Combined with a real HF model also loaded for the next
+  -token comparison, this OOM-killed the machine three times before
+  being found and fixed (switched to float32 throughout -- a max/divide
+  fit has no numerical-stability need for float64). Fixed in both
+  sili__new's copy and sili_peridot's own mirror.
+- **Even after that fix, running BOTH real-checkpoint quantization test
+  classes (per_row's and rank1's) together in one pytest invocation
+  still risks OOM on this 15GB machine** -- each passes reliably in
+  isolation. Documented directly in the test file rather than chased
+  further: a real hardware constraint on this specific machine, not a
+  code bug (the module-scoped fixtures are each individually correct
+  and necessary).
+- **Per direct instruction, this is where the search stops for now**:
+  "0.297 isn't the best but it also isn't noise" -- real, substantial,
+  validated progress (accuracy 3.2x higher, perplexity 36x lower than
+  the original scheme), locked in as the new baseline via a real
+  -checkpoint regression test, rather than continuing to chase full
+  parity with the 0.482 dense-pruned baseline right now. B5a is closed
+  as "addressed", not "solved" -- a finer-than-rank-1 group size or
+  genuine calibration (Hessian/activation-aware rounding, e.g.
+  GPTQ-style) remains a real, documented option if more quality is
+  needed later, most likely resolved via B8's post-quantization
+  training rather than further conversion-time work.

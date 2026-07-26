@@ -114,23 +114,32 @@ def build_folded_layers(
     descriptors: Dict[str, FoldedBlockDescriptor],
     learning_rate: float = 0.01,
     num_cpus: int = 4,
+    value_scale_mode: str = "rank1",
 ) -> Dict[str, FoldedLayer]:
     """
     B5: turn each suffix's FoldedBlockDescriptor into a real sili
-    FoldedLayer (sili.sparse_rnn.FoldedLayer.from_descriptor -- already
-    does the correct FP4 handling this needed: per-row pre-scale to
-    max_abs/FP4_MAX, load_weights, set_value_scale_raw, plus
-    set_importance_scale_raw(lr/FP4_MAX) so future importance updates
-    are representable. No new library code required here -- B5's
-    remaining work was calling it once per suffix and confirming it
-    actually builds at MiniCPM5's real scale, not toy-Mistral scale.)
-    One suffix at a time -- each descriptor's stacked_weights has
-    exactly one key, so from_descriptor builds exactly one internal
+    FoldedLayer (sili.sparse_rnn.FoldedLayer.from_descriptor). One
+    suffix at a time -- each descriptor's stacked_weights has exactly
+    one key, so from_descriptor builds exactly one internal
     SparseLinearLayer per call, never bundling suffixes (see module
     docstring).
+
+    value_scale_mode="rank1" (default, B5a): from_descriptor's original
+    "per_row" scheme (one value_scale per input row, shared across all
+    n_out output positions) collapsed real next-token accuracy from
+    0.482 to ~0.09-0.12 on MiniCPM5 -- per-output magnitude within one
+    folded layer varies by a min/max ratio as low as ~0.05-0.10, so a
+    single per-row scale wastes most of FP4's resolution on most
+    outputs. "rank1" adds a genuine per-output scale too (sili__new's
+    fit_rank1_scale_envelope), recovering to ~0.297 accuracy in
+    simulation before this was wired into the real C++ path. See
+    JOURNAL.md for the full investigation and eval_quantization.py for
+    the real (not simulated) confirmation.
     """
     return {
-        suffix: FoldedLayer.from_descriptor(desc, learning_rate=learning_rate, num_cpus=num_cpus)
+        suffix: FoldedLayer.from_descriptor(
+            desc, learning_rate=learning_rate, num_cpus=num_cpus,
+            value_scale_mode=value_scale_mode)
         for suffix, desc in descriptors.items()
     }
 
@@ -143,6 +152,7 @@ def build_folded_layers_streaming(
     learning_rate: float = 0.01,
     num_cpus: int = 4,
     band_half_width_override: Optional[int] = None,
+    value_scale_mode: str = "rank1",
 ) -> Dict[str, FoldedLayer]:
     """
     Fold and build a real sili FoldedLayer for each suffix ONE AT A
@@ -175,7 +185,8 @@ def build_folded_layers_streaming(
         for i in range(cfg.num_hidden_layers):
             del sparse_state[f"{prefix}{i}{suffix}"]
         layers[suffix] = FoldedLayer.from_descriptor(
-            desc, learning_rate=learning_rate, num_cpus=num_cpus)
+            desc, learning_rate=learning_rate, num_cpus=num_cpus,
+            value_scale_mode=value_scale_mode)
         del desc
     return layers
 
@@ -201,6 +212,7 @@ def build_and_save_folded_layers(
     learning_rate: float = 0.01,
     num_cpus: int = 4,
     band_half_width_override: Optional[int] = None,
+    value_scale_mode: str = "rank1",
 ) -> Dict[str, str]:
     """
     Same one-suffix-at-a-time streaming discipline as
@@ -225,7 +237,9 @@ def build_and_save_folded_layers(
         desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
         for i in range(cfg.num_hidden_layers):
             del sparse_state[f"{prefix}{i}{suffix}"]
-        layer = FoldedLayer.from_descriptor(desc, learning_rate=learning_rate, num_cpus=num_cpus)
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=learning_rate, num_cpus=num_cpus,
+            value_scale_mode=value_scale_mode)
         del desc
         paths[suffix] = _save_folded_layer_state_dict(suffix, layer, out_dir)
         del layer

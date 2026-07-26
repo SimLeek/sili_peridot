@@ -12,6 +12,8 @@ from model.fold import fold_suffix, SUFFIXES
 from model.quantize import (
     FP4_TABLE, FP4_MAX, fp4_round, compute_input_column_scale,
     simulate_fp4_quantize_layer, quantize_suffixes_in_state_dict,
+    fit_rank1_scale_envelope, simulate_fp4_quantize_layer_rank1,
+    compute_suffix_rank1_scales_streaming, apply_rank1_quantization,
 )
 
 
@@ -137,3 +139,86 @@ class TestQuantizeSuffixesInStateDict:
 
         for name in dense_state:
             assert torch.equal(dense_state[name], original[name])
+
+
+class TestFitRank1ScaleEnvelope:
+    def test_envelope_property_holds(self):
+        rng = np.random.RandomState(0)
+        abs_mat = np.abs(rng.randn(12, 9)) * rng.choice([0.01, 1.0, 50.0], size=(12, 9))
+        row_scale, col_scale = fit_rank1_scale_envelope(abs_mat, n_iters=8)
+        envelope = row_scale[:, None] * col_scale[None, :]
+        assert np.all(envelope >= abs_mat - 1e-9)
+
+    def test_recovers_true_rank1_matrix(self):
+        rng = np.random.RandomState(1)
+        true_row = np.abs(rng.randn(7)) + 0.1
+        true_col = np.abs(rng.randn(5)) + 0.1
+        abs_mat = np.outer(true_row, true_col)
+        row_scale, col_scale = fit_rank1_scale_envelope(abs_mat, n_iters=10)
+        assert np.allclose(row_scale[:, None] * col_scale[None, :], abs_mat, rtol=1e-3)
+
+
+def _fake_sparse_state_with_output_structure(cfg: MiniCPM5Config) -> dict:
+    """Like _fake_sparse_state, but each output row's magnitude is scaled
+    by a random per-output factor (spanning ~2 orders of magnitude) --
+    mimics the real per-output variance found in the actual checkpoint
+    (min/max ratio ~0.05-0.10 within one folded layer). Pure i.i.d.
+    torch.randn (what _fake_sparse_state uses) has no such structure for
+    rank1 to exploit, so a test built on it can't demonstrate rank1's
+    actual point."""
+    torch.manual_seed(3)
+    sd = {}
+    for i in range(cfg.num_hidden_layers):
+        p = f"model.layers.{i}"
+        for suffix, out_dim, in_dim in [
+            (".self_attn.q_proj.weight", cfg.q_proj_out, cfg.attn_in),
+            (".self_attn.k_proj.weight", cfg.kv_proj_out, cfg.attn_in),
+            (".self_attn.v_proj.weight", cfg.kv_proj_out, cfg.attn_in),
+            (".self_attn.o_proj.weight", cfg.attn_out, cfg.o_proj_in),
+            (".mlp.gate_proj.weight", cfg.mlp_hidden, cfg.mlp_in),
+            (".mlp.up_proj.weight", cfg.mlp_hidden, cfg.mlp_in),
+            (".mlp.down_proj.weight", cfg.mlp_out, cfg.mlp_hidden),
+        ]:
+            row_factor = torch.abs(torch.randn(out_dim, 1)) * torch.exp(torch.randn(out_dim, 1))
+            w = torch.randn(out_dim, in_dim) * row_factor
+            sd[p + suffix] = {"raw": w, "shape": (out_dim, in_dim)}
+    return sd
+
+
+class TestRank1QuantizationRecoversMoreThanPerRow:
+    def test_rank1_reconstruction_error_lower_than_per_row(self):
+        # Same idea as sili__new's own from_descriptor test: a case with
+        # real per-output magnitude spread within one suffix's stack --
+        # rank1 should reconstruct it more faithfully than per_row.
+        cfg = _tiny_config(n_layers=3)
+        sparse_state = _fake_sparse_state_with_output_structure(cfg)
+        dense_state = {name: (entry["csr"].to_dense() if "csr" in entry else entry["raw"])
+                       for name, entry in sparse_state.items()}
+        sparse_state_for_rank1 = {k: v for k, v in sparse_state.items()}
+
+        descriptors = {
+            suffix: fold_suffix(sparse_state, suffix, cfg, prefix="model.layers.")
+            for suffix in SUFFIXES
+        }
+        per_row_scales = {
+            suffix: compute_input_column_scale(descriptors[suffix].stacked_weights[suffix])
+            for suffix in SUFFIXES
+        }
+        quantized_per_row = dict(dense_state)
+        for suffix in SUFFIXES:
+            for i in range(cfg.num_hidden_layers):
+                name = f"model.layers.{i}{suffix}"
+                quantized_per_row[name] = simulate_fp4_quantize_layer(dense_state[name], per_row_scales[suffix])
+
+        rank1_scales = compute_suffix_rank1_scales_streaming(sparse_state_for_rank1, cfg, prefix="model.layers.")
+        quantized_rank1 = apply_rank1_quantization(dense_state, rank1_scales, cfg)
+
+        err_per_row = sum(
+            (quantized_per_row[f"model.layers.{i}{suffix}"] - dense_state[f"model.layers.{i}{suffix}"]).abs().sum().item()
+            for suffix in SUFFIXES for i in range(cfg.num_hidden_layers)
+        )
+        err_rank1 = sum(
+            (quantized_rank1[f"model.layers.{i}{suffix}"] - dense_state[f"model.layers.{i}{suffix}"]).abs().sum().item()
+            for suffix in SUFFIXES for i in range(cfg.num_hidden_layers)
+        )
+        assert err_rank1 < err_per_row

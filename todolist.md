@@ -869,33 +869,50 @@ to flip green once it's fixed.
   the real peak further — needs a `sili__new` change, tracked but not
   blocking.
   **Quantization QUALITY validation (the actual "pre-quantized vs
-  post-quantized ability" check) found a real, unresolved catastrophe,
-  not the expected small drop** — see JOURNAL.md's full writeup and
+  post-quantized ability" check) initially found a real catastrophe, not
+  the expected small drop** — see JOURNAL.md's full writeup and
   `model/quantize.py`/`model/eval_quantization.py`/
-  `tests/test_eval_quantization.py`. `from_descriptor`'s real scheme
+  `tests/test_eval_quantization.py`. `from_descriptor`'s original scheme
   (one scale per input feature, SHARED across all 24 folded layers)
   collapses next-token accuracy from 0.482 (B3b baseline) to ~0.09-0.12,
   ~200x perplexity increase. Ruled out as a simulation bug (unit-tested
   scale computation; confirmed the shared scale isn't dominated by a
-  rogue outlier layer — mean per-layer/global ratio 0.71). A finer
-  per-layer-only scale helps substantially (accuracy -> 0.265) but still
-  falls far short of acceptable. **Needs the same per-role sensitivity
-  search B3b built for pruning, not yet attempted for quantization** —
-  tracked as new item **B5a** below.
-- [ ] **B5a. Quantization sensitivity search, per suffix/role** (mirrors
-  B3b's `sili.conversion.prune_sensitivity` methodology exactly, applied
-  to quantization instead of pruning). Open questions to resolve: does a
-  finer-than-per-layer group size (e.g. per-N-column blocks within a
-  row, not one scale per up-to-110K-wide row) recover more quality than
-  per-layer alone did? Do some suffixes (by analogy to `v_proj`'s
-  pruning sensitivity) tolerate FP4 fine while others need to stay
-  full-precision or get a coarser fold-group size? Is calibration
-  (e.g. picking the scale/rounding to minimize downstream activation
-  error rather than pure weight-magnitude round-to-nearest, GPTQ-style)
-  worth the complexity here, or does per-suffix granularity alone get
-  close enough? This blocks B7 (real inference needs SOME quantization
-  scheme that doesn't destroy the model) — do not proceed to B6/B7
-  assuming quantization is "handled" until this lands.
+  rogue outlier layer — mean per-layer/global ratio 0.71). **Fixed as
+  B5a below** (rank-1 quantization scale) — real, substantial recovery
+  (accuracy -> 0.297, perplexity 36x lower), not full parity with dense,
+  accepted per direct instruction as the number this pipeline proceeds
+  with.
+- [x] **B5a. Quantization sensitivity search, per suffix/role** — user's
+  own diagnosis, confirmed before building anything: the folded layers
+  were originally trained as separate dense layers, so forcing them all
+  to share one per-row (input-only) quantization scale "would harm
+  things." Verified directly: within-layer coefficient of variation of
+  per-output magnitude ~0.32-0.38, min/max ratio ~0.05-0.10 (gate_proj/
+  q_proj/down_proj) — real structure a per-row-only scale can't capture.
+  **Fix**: a rank-1 (outer-product: one vector per input, one per
+  output) quantization scale, simulated in pure numpy first to validate
+  the concept, then built into `sili__new` for real (`output_scale` on
+  `SparseLinearWeightsDelta`, `FoldedLayer.from_descriptor(..., value_scale_mode="rank1")`,
+  sili__new PR #10) once confirmed worthwhile. **Real, measured result**:
+  accuracy 0.482 (dense-pruned baseline) → 0.094 (old per-row scheme) →
+  **0.297 (rank-1)**, perplexity 3328 → 91 (~36x lower) — locked in as a
+  real-checkpoint regression test (`tests/test_eval_quantization.py`).
+  Two negative results along the way, both worth keeping: percentile
+  -based envelope clipping tested WORSE than plain max-envelope (0.181
+  vs 0.297, rejected); confirmed the original catastrophe wasn't one
+  outlier layer dominating the shared scale (mean per-layer/global ratio
+  0.71) before chasing a fix that wouldn't have addressed the real
+  cause. **Per direct instruction, this is where the search stops for
+  now** — "0.297 isn't the best but it also isn't noise." Closed as
+  "addressed", not "solved to parity with dense": a finer-than-rank-1
+  group size or genuine activation/Hessian-aware calibration (GPTQ
+  -style) remains available if more quality is needed later, most
+  likely resolved via B8's post-quantization training rather than
+  further conversion-time work. See JOURNAL.md for the full
+  investigation, including two real OOM crashes found and fixed along
+  the way (a `float64` upcast doubling transient memory in the envelope
+  fit, and a missing `.abs()` in sili_peridot's own simulation copy of
+  the fix).
 - [ ] **B6. Attention assembly**: GQA (16 query heads : 2 KV heads,
   groups=8) + RoPE (`theta=5e6`) computed around the Q/K/V `FoldedLayer`
   outputs, using the new autograd-wrapped attention op from A2. Override
