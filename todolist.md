@@ -841,6 +841,59 @@ to flip green once it's fixed.
   `build_probes(k=4)` once per layer, then `synap_step` once per row —
   not once total, and never scale `k` by row count, an already-reverted
   n²-blowup bug elsewhere in this codebase).
+
+  **B8a. Train the averaging window as a curriculum, growing backward
+  from the last fold-depth position, not all-24-at-once from a cold
+  start.** Direct correction to the naive version of the plan above
+  (asking the *entire* column's average to predict the next token from
+  the very first training step): the LAST fold-depth position (fold
+  step 24, the original model's actual final layer) already IS a good
+  next-token predictor with zero additional training -- it's the same
+  computation the original dense model used to predict next tokens,
+  unmodified by folding. Every OTHER position encodes whatever that
+  original layer's own (very different) intermediate representation
+  was, with no reason to already look anything like a next-token
+  distribution. Averaging 23 positions that don't yet predict next-token
+  in with the 1 that already does will, at the start of training, mostly
+  just dilute the one working signal -- forcing a simultaneous
+  reorganization of the whole column at once is a much harder
+  optimization problem than growing it incrementally, and risks
+  catastrophic forgetting of what the last position already knew.
+  Proposed procedure:
+  1. **Sanity check first, no training**: verify fold-step 24's own
+     output *alone* (no averaging at all) already predicts next-token
+     about as well as the original dense model does on the same input
+     (within the expected first-order-approximation gap already
+     documented for `FoldedLayer`/folding generally) — this should hold
+     with zero column-averaging training, since it's approximately the
+     same computation. If it doesn't hold, something upstream (folding,
+     B4-B7) is wrong and needs fixing before B8 curriculum training even
+     starts.
+  2. **Curriculum stage 1**: train the average of the *last 2*
+     fold-depth positions (23 and 24) to predict next-token.
+  3. **Curriculum stage 2**: last 3 (22, 23, 24). Then last 4. Continue
+     growing the window by one position at a time, backward from the
+     end, until the full 24-position column average is the target —
+     each stage only asks the training to reorganize ONE additional
+     position's worth of representation at a time, starting from an
+     already-mostly-correct base rather than cold.
+  4. Once the full-column curriculum converges, reconcile with the
+     "at every fold step, from step 1 onward" requirement above (a
+     DIFFERENT axis — that one is about the running average WITHIN a
+     single forward pass as the recurrence unfolds step 1→24, not about
+     training-time curriculum order) — likely as a further refinement
+     stage on top of the completed backward curriculum, not a
+     replacement for it.
+  Training data source (either, or both): (a) real text with actual
+  next-token labels (standard LM training, matching B8's own loop), or
+  (b) distillation against the ORIGINAL dense (PyTorch) model's own
+  output logits on the same input, run once per batch as a fixed
+  teacher signal — needs a **temperature** on the teacher's softmax if
+  used (standard distillation practice: softens the target distribution
+  so it carries more than just the argmax choice). (b) has the
+  advantage of not needing real held-out text at all (the base model can
+  generate its own training signal from any input), at the cost of one
+  extra dense-model forward pass per training example.
 - [ ] **B9. Verify sparsity survives training, not just conversion.**
   Log density/energy stats (`actual_p` vs `p`, per-region recurrent-only
   branching ratio, avalanche size distribution) throughout training —
