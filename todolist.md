@@ -835,7 +835,7 @@ to flip green once it's fixed.
   — confirmed against the real MiniCPM5-1B-Base weights: all 7 suffixes
   fold to 24 folds each, `out_dims` match `MiniCPM5Config` exactly, and
   folding is lossless (nnz before == nnz after for every suffix).
-- [ ] **B5. `FoldedLayer.from_descriptor()` per suffix**, with correct
+- [x] **B5. `FoldedLayer.from_descriptor()` per suffix**, with correct
   FP4 handling: pre-scale rows to `max_abs/FP4_MAX`, `load_weights`,
   `set_value_scale_raw(r, row_scale)` (never `rescale_value_row()` after
   a pre-scaled load — re-encodes already-scaled values). Separately,
@@ -846,6 +846,56 @@ to flip green once it's fixed.
   (faithful pretrained magnitude vs. trainable new-synapse step size);
   plan for a resync pass after initial conversion and before training
   starts.
+  Done: `sili.sparse_rnn.FoldedLayer.from_descriptor` already implements
+  BOTH requirements above out of the box (per-row pre-scale + value_scale,
+  AND `set_importance_scale_raw(lr/FP4_MAX)` for future-importance
+  representability) — no new sili__new library code needed, B5's real
+  work was calling it at MiniCPM5's actual scale and confirming it
+  builds. `model/fold.py`'s `build_folded_layers`/
+  `build_folded_layers_streaming`/`build_and_save_folded_layers` do
+  exactly that; `reference_fold_forward` gives the unquantized analytic
+  comparison point. Real-checkpoint memory finding (see JOURNAL.md,
+  "B5 -- FoldedLayer construction memory"): naive "build all 7
+  descriptors, hold everything" would have needed way more than 15GB for
+  the largest suffixes — root-caused to `fold_block_group`'s own
+  per-layer dense-to-CSR conversion (not `from_descriptor`'s C++
+  construction, which measured at ~0 marginal memory even at full
+  170M-budget scale), fixed via `build_folded_layers_streaming`'s
+  release-as-you-go discipline. Confirmed on the real checkpoint, twice:
+  all 7 real `FoldedLayer`s buildable simultaneously, peak ~13.5-13.9GB
+  on this 15GB machine, ~4-5 min. **Follow-up, not done here**: true
+  per-row streaming inside `fold_block_group`/`from_descriptor` itself
+  (never materializing a whole suffix's dense form at once) would cut
+  the real peak further — needs a `sili__new` change, tracked but not
+  blocking.
+  **Quantization QUALITY validation (the actual "pre-quantized vs
+  post-quantized ability" check) found a real, unresolved catastrophe,
+  not the expected small drop** — see JOURNAL.md's full writeup and
+  `model/quantize.py`/`model/eval_quantization.py`/
+  `tests/test_eval_quantization.py`. `from_descriptor`'s real scheme
+  (one scale per input feature, SHARED across all 24 folded layers)
+  collapses next-token accuracy from 0.482 (B3b baseline) to ~0.09-0.12,
+  ~200x perplexity increase. Ruled out as a simulation bug (unit-tested
+  scale computation; confirmed the shared scale isn't dominated by a
+  rogue outlier layer — mean per-layer/global ratio 0.71). A finer
+  per-layer-only scale helps substantially (accuracy -> 0.265) but still
+  falls far short of acceptable. **Needs the same per-role sensitivity
+  search B3b built for pruning, not yet attempted for quantization** —
+  tracked as new item **B5a** below.
+- [ ] **B5a. Quantization sensitivity search, per suffix/role** (mirrors
+  B3b's `sili.conversion.prune_sensitivity` methodology exactly, applied
+  to quantization instead of pruning). Open questions to resolve: does a
+  finer-than-per-layer group size (e.g. per-N-column blocks within a
+  row, not one scale per up-to-110K-wide row) recover more quality than
+  per-layer alone did? Do some suffixes (by analogy to `v_proj`'s
+  pruning sensitivity) tolerate FP4 fine while others need to stay
+  full-precision or get a coarser fold-group size? Is calibration
+  (e.g. picking the scale/rounding to minimize downstream activation
+  error rather than pure weight-magnitude round-to-nearest, GPTQ-style)
+  worth the complexity here, or does per-suffix granularity alone get
+  close enough? This blocks B7 (real inference needs SOME quantization
+  scheme that doesn't destroy the model) — do not proceed to B6/B7
+  assuming quantization is "handled" until this lands.
 - [ ] **B6. Attention assembly**: GQA (16 query heads : 2 KV heads,
   groups=8) + RoPE (`theta=5e6`) computed around the Q/K/V `FoldedLayer`
   outputs, using the new autograd-wrapped attention op from A2. Override

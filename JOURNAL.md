@@ -231,3 +231,110 @@ lives instead of in code docstrings/comments, so the code can stay terse.
   forward and checking `ps aux` for stray processes before starting a
   new heavy one -- worth remembering for any future multi-round
   iterative search that needs repeated real-model loads.
+
+## sili_peridot: B5 -- FoldedLayer construction memory, and a real
+FP4 quantization quality catastrophe
+
+- **First alarm on `FoldedLayer.from_descriptor()` at real scale was a
+  measurement artifact, not a real problem.** Testing v_proj -> k_proj
+  -> o_proj sequentially in one long-running process showed a "4.4GB
+  jump" landing on o_proj's construction; extrapolating that rate to
+  `gate_proj`/`up_proj` (budget ~170M vs o_proj's ~75M) suggested ~10GB
+  more, which wouldn't fit alongside the ~8GB already used loading+
+  pruning the checkpoint. Re-tested each suffix in an ISOLATED fresh
+  process instead: `from_descriptor`'s own C++ construction
+  (SparseLinearLayer alloc, load_weights, scale-setting,
+  equalize_to_capacity) added **zero** measurable peak RSS beyond what
+  `fold_suffix` itself already used -- true even for `gate_proj` at its
+  full ~170M budget (nnz~=136M, already ~80% of the dense ceiling). The
+  "4.4GB" was cumulative fragmentation from testing 3 suffixes
+  back-to-back in one process without releasing memory between them
+  (Python/glibc doesn't reliably return freed large-tensor memory to the
+  OS within a process's lifetime) -- misattributed entirely to whichever
+  suffix happened to run last.
+- **The REAL memory driver is `fold_block_group`'s own per-layer
+  dense-to-CSR conversion loop, not `from_descriptor`.** Confirmed by
+  isolated single-suffix tests: `fold_suffix(gate_proj)` alone jumped
+  from ~8GB (post load+prune) to ~11.5GB. Root cause: B3's per-role
+  thresholds deliberately leave most suffixes 80-93% dense by row
+  (`gate_proj` mean row occupancy ~80% of its dense ceiling) -- "prune
+  gently, let training-time synaptogenesis do the real sparsification
+  later" was always the intentional trade (see B3b above), but it means
+  folding, a pure reshape, has almost no headroom to work with:
+  converting 24 already-mostly-dense per-layer tensors to CSR and
+  stacking them costs real memory regardless of how the C++ layer itself
+  stores things.
+- **Fix: stream, don't accumulate.** `fold_all_suffixes` (build all 7
+  descriptors, hold them all) let dead weight from already-folded
+  suffixes pile up across the loop. `build_folded_layers_streaming`
+  (`model/fold.py`) folds ONE suffix, pops its 24 raw per-layer tensors
+  out of the caller's `sparse_state` dict immediately, THEN builds the
+  real `FoldedLayer`, before moving to the next suffix. Confirmed on the
+  real checkpoint, twice: all 7 real `FoldedLayer` objects buildable
+  simultaneously, peak ~13.5-13.9GB on this 15GB machine, ~4-5 minutes.
+  A further variant, `build_and_save_folded_layers`, additionally
+  serializes each suffix's `state_dict()` to a `.npz` and discards the
+  live C++ object right after -- didn't reduce the measured PEAK much
+  further (the peak moment is dominated by whichever single suffix is
+  largest at the time it's processed, not by how many are held
+  afterward), but does mean the CONVERSION step itself doesn't need to
+  hold all 7 simultaneously once written to disk. True per-row streaming
+  (converting each suffix's dense-to-CSR-to-C++ pipeline in row batches,
+  never materializing a whole suffix's dense form at once) would cut the
+  real peak further but requires changes inside `fold_block_group`/
+  `from_descriptor` in `sili__new` itself -- tracked as a follow-up
+  (todolist B5), not done in this pass.
+- **A real FP4 quantization catastrophe, found while building the
+  "pre-quantized vs post-quantized" comparison the user asked for.**
+  Simulated `from_descriptor`'s EXACT quantization scheme in
+  numpy/torch (`model/quantize.py`: fp4quant.hpp's real 16-level table,
+  the real per-input-column scale computed on the STACKED/folded matrix
+  -- shared across all 24 layers, not computed independently per layer)
+  and ran the same real end-to-end next-token comparison methodology
+  B3b used for pruning (`model/eval_quantization.py`, reusing
+  `eval_pruning.evaluate_next_token_prediction`). Result: accuracy
+  collapses from 0.482 (B3b's pruned baseline) to ~0.09-0.12, perplexity
+  jumps ~200x (16 -> ~3300) -- nowhere near the "small drop" expected
+  going in. Ruled out a simulation bug before treating this as real:
+  (a) unit-tested the scale computation against a hand-worked example
+  (`test_quantize.py`), (b) checked whether the shared (across-24-layers)
+  scale is dominated by a rogue outlier layer for `gate_proj` -- it
+  isn't (per-layer/global max_abs ratio: mean=0.71, median=0.71, only
+  1.1% of (layer,column) pairs below 0.3, 0% below 0.1), ruling out
+  "one weird layer wrecks everyone's resolution" as the mechanism.
+  Tried a finer, per-layer-only scale (each layer quantized against its
+  own weights, not the shared/stacked one) as the obvious first fix:
+  helps a lot (accuracy 0.094 -> 0.265) but still falls far short of
+  "small drop" -- naive round-to-nearest 4-bit weight quantization with
+  no calibration (no GPTQ-style Hessian-aware rounding, no smoothing,
+  no outlier handling) is just genuinely destructive at this model
+  scale, stacked on top of already-pruned weights. Locked in as a real
+  regression test (`tests/test_eval_quantization.py`,
+  `test_shared_scale_quantization_currently_destroys_quality`) rather
+  than hidden -- same pattern as B3b's
+  `test_global_threshold_pruning_destroys_the_model`: document the
+  current bad number so a future fix has something concrete to beat.
+  **Not yet resolved** -- needs the same kind of per-role/per-suffix
+  sensitivity search B3b built for pruning
+  (`sili.conversion.prune_sensitivity`), not yet attempted for
+  quantization; plausibly some suffixes tolerate FP4 fine and others
+  (like `v_proj` for pruning) don't, and per-suffix granularity /
+  selective full-precision retention for sensitive suffixes is the
+  natural next experiment.
+- **A second, real OOM directly caused by NOT applying the same
+  streaming discipline everywhere.** `fold_all_suffixes` alone (no real
+  `FoldedLayer` construction, just building all 7 descriptors to extract
+  their scale vectors) OOM-killed this machine (confirmed via
+  `journalctl`/kernel oom-killer log, not inferred) once a real HF model
+  was ALSO loaded at the same time for the next-token comparison --
+  holding all 7 suffixes' full stacked CSRs (hundreds of MB to ~1.8GB
+  each for the largest) simultaneously, on top of the HF model's own
+  ~4.3GB float32 footprint and the still-resident pruned `sparse_state`,
+  exceeded 15GB. Fixed the same way as the FoldedLayer construction
+  case: `compute_suffix_scales_streaming` (`model/quantize.py`) folds
+  one suffix, extracts its (small, ~1536-float) scale vector, discards
+  the descriptor, before moving to the next. **Order matters**: build
+  `pruned_dense` (needed for the whole rest of the comparison) BEFORE
+  running the streaming/destructive scale computation, since the latter
+  pops entries out of `sparse_state` -- doing it in the other order
+  would silently produce an incomplete `pruned_dense`.
