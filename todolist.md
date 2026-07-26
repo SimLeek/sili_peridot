@@ -781,7 +781,7 @@ to flip green once it's fixed.
   -threshold-destroys-quality regression and the per-role-preserves
   -quality regression, both against the real checkpoint) plus updates to
   `test_prune.py` for the new per-role functions.
-- [ ] **B4. Fold each of the 7 per-layer 2-D suffixes independently**
+- [x] **B4. Fold each of the 7 per-layer 2-D suffixes independently**
   (`self_attn.q_proj`, `k_proj`, `v_proj`, `o_proj`, `mlp.gate_proj`,
   `up_proj`, `down_proj`) across all 24 layers via
   `rnn_fold.detect_repeated_block_groups` + `stack_csr_vertical` +
@@ -791,6 +791,50 @@ to flip green once it's fixed.
   suffixes down to the *first* suffix's `out_dim`, silently wrong for
   suffixes with different `out_dim` (q=2048, k/v=256, o=1536,
   gate/up=4608, down=1536, all different).
+  Done: `model/fold.py`'s `fold_suffix`/`fold_all_suffixes` call
+  `fold_block_group` directly, once per suffix, filtered to just that
+  suffix's 24 per-layer names — never the whole state dict at once, so
+  each `FoldedBlockDescriptor` covers exactly one suffix (`stacked_weights`
+  has a single key), sidestepping `fold_block_group`'s all-suffixes
+  -at-once bundling entirely rather than working around it after the
+  fact. Each fold's `out_dim` is checked against `MiniCPM5Config`'s
+  explicit per-projection property (`q_proj_out`/`kv_proj_out`/`attn_out`/
+  `mlp_hidden`/`mlp_out`) so a shape mismatch fails loudly at fold time,
+  not as a confusing error deep in later assembly. `band_half_width` is
+  deliberately left at `fold_block_group`'s own (RoPE-wrong) auto
+  -heuristic default via a `band_half_width_override` passthrough — B6 is
+  where the real value gets decided, not B4.
+  **Real bug found and fixed upstream while starting this** (in
+  `sili__new`, not sili_peridot): `fold_block_group`'s dict-entry handling
+  silently treated any `{"raw": tensor}` entry (sparse_prune.py's format
+  for dense-stored 2-D tensors — used for the *majority* of MiniCPM5's
+  suffixes at B3's validated per-role thresholds, not just true
+  scalars/vectors) as non-stackable and skipped it — and
+  `fold_sparse_payload`'s removal step deletes a block's keys by
+  (prefix, index) alone regardless, so the real weight values were
+  silently deleted from the payload with no trace, not merely left
+  unfolded. Also found `fold_sparse_payload` does its own separate flat
+  -tensor unwrapping before calling `fold_block_group`, so it never
+  actually exercises the dict-handling branch at all — only direct
+  `fold_block_group` calls with dict-shaped entries do, which is exactly
+  the pattern B4 needs (per-suffix folding can't go through
+  `fold_sparse_payload`'s all-at-once entry point anyway, see above).
+  Fixed: a `"raw"` dict entry is now handled identically to a plain dense
+  tensor (same reshape/stacking rules, no special-casing); a dict with
+  neither `"csr"` nor `"raw"` raises `ValueError`. 7 new tests in
+  `test_fold_block_group.py` (sili__new PR #9, merged) — including one
+  confirming raw- and csr-stored versions of the same data fold to
+  numerically identical results, and one confirming true scalars still
+  stack as `(n_folds, 1)` (never skipped, matching the pre-existing
+  plain-tensor branch's own behavior).
+  `model/fold.py` also has `verify_lossless`/`FoldReport`: total nonzero
+  count per suffix must be identical before and after folding (stacking
+  changes storage layout only, never drops or duplicates real values).
+  14 tests in `tests/test_fold.py` (9 synthetic-tiny-config, 5 against
+  the real checkpoint using B3's actual per-role-pruned output as input)
+  — confirmed against the real MiniCPM5-1B-Base weights: all 7 suffixes
+  fold to 24 folds each, `out_dims` match `MiniCPM5Config` exactly, and
+  folding is lossless (nnz before == nnz after for every suffix).
 - [ ] **B5. `FoldedLayer.from_descriptor()` per suffix**, with correct
   FP4 handling: pre-scale rows to `max_abs/FP4_MAX`, `load_weights`,
   `set_value_scale_raw(r, row_scale)` (never `rescale_value_row()` after
