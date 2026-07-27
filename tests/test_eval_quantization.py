@@ -16,26 +16,29 @@ from model.prune import (
 from model.quantize import build_quantized_dense_state_dict_streaming
 from model.eval_quantization import compare_pruned_vs_quantized
 from model.eval_pruning import EVAL_TEXTS, EVAL_TEXTS_HELDOUT
+from conftest import trim_memory
 
 REAL_CHECKPOINT_DIR = os.path.join(
     os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
 
-# Both real-checkpoint classes below now run together in one invocation
-# (`pytest tests/test_eval_quantization.py`, confirmed clean on this
-# 15GB dev machine) -- two fixes made that possible: model.quantize now
-# builds real FoldedLayer weights one suffix at a time instead of
-# holding a Python simulation's several full-model-sized copies (see
-# build_quantized_dense_state_dict_streaming), and the fixtures below
-# are class-scoped, not module-scoped -- with two classes in one
-# module, module scope kept both classes' HF model + pruned-dense
-# fixtures resident simultaneously, which used to be the dominant cost.
-#
-# Still OOM-kills on this machine if run in the SAME pytest invocation
-# as test_fold.py/test_quantize.py (confirmed via kernel oom-killer
-# log): freed sili/torch objects from ~30 preceding tests don't fully
-# release back to the OS by the time this file's two real HF models
-# load, and that's enough on top to tip a 15GB machine over. Run this
-# file as its own pytest invocation on memory-constrained hardware.
+# This file's two real-checkpoint classes, and the whole test suite
+# (`pytest tests/test_fold.py tests/test_quantize.py
+# tests/test_eval_quantization.py`), now run together in one invocation
+# confirmed clean on this 15GB dev machine. Three fixes made that
+# possible: model.quantize now builds real FoldedLayer weights one
+# suffix at a time instead of holding a Python simulation's several
+# full-model-sized copies (see build_quantized_dense_state_dict_streaming);
+# the fixtures below are class-scoped, not module-scoped, so the two
+# classes' HF models don't stay resident simultaneously; and
+# conftest.py's pytest_runtest_teardown hook calls glibc's
+# malloc_trim(0) after every test. That last one matters because the
+# freed memory here was never actually leaked (confirmed via a
+# two-round load/prune/quantize/free measurement: bounded, not
+# growing, RSS) -- glibc's allocator just keeps freed pages in its
+# arena for reuse by this same process instead of returning them to
+# the OS, and without an explicit trim that retained-but-free memory
+# accumulates across a whole pytest session, which was enough on its
+# own to OOM-kill this machine even after the two fixes above.
 
 
 @pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
@@ -88,6 +91,7 @@ class TestRealCheckpointQuantizationQuality:
         sd = load_minicpm5_checkpoint(REAL_CHECKPOINT_DIR)
         sparse_state, _ = prune_state_dict_by_role(sd, DEFAULT_TARGET_SPARSITY_BY_ROLE)
         del sd
+        trim_memory()   # prune's own transients peak ~12GB on this machine -- see conftest.py
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
         quantized_dense = build_quantized_dense_state_dict_streaming(
             sparse_state, cfg, value_scale_mode="per_row", prefix="model.layers.")
@@ -155,6 +159,7 @@ class TestRealCheckpointRank1QuantizationQuality:
         sd = load_minicpm5_checkpoint(REAL_CHECKPOINT_DIR)
         sparse_state, _ = prune_state_dict_by_role(sd, DEFAULT_TARGET_SPARSITY_BY_ROLE)
         del sd
+        trim_memory()   # prune's own transients peak ~12GB on this machine -- see conftest.py
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
         quantized_dense = build_quantized_dense_state_dict_streaming(
             sparse_state, cfg, value_scale_mode="rank1", prefix="model.layers.")
