@@ -22,7 +22,7 @@ import scipy.sparse
 
 from .config import MiniCPM5Config
 from .eval_pruning import EvalResult
-from .sili_block import build_step_layers, run_folded_recurrence
+from .sili_block import _ActivationDensity, build_step_layers, run_folded_recurrence
 
 _EmbedOrHead = Union[np.ndarray, scipy.sparse.csr_matrix]
 
@@ -92,15 +92,23 @@ def compute_logits_sili(
     cfg: MiniCPM5Config,
     half_bandwidth: int,
     num_cpus: int = 4,
+    activation_density: Union[_ActivationDensity, List[_ActivationDensity]] = None,
 ) -> np.ndarray:
-    """Returns [T, vocab_size] float32 logits."""
+    """Returns [T, vocab_size] float32 logits. activation_density: None
+    (default) = dense forward throughout (current behavior); a float in
+    (0, 1] sparsifies every projection's input activation to that
+    per-token top-k density and routes through SISLDO's forward_sparse
+    instead; a dict isolates specific suffixes; a list of length
+    cfg.num_hidden_layers isolates specific fold steps -- see
+    sili_block.apply_fold_step's _forward helper and
+    run_folded_recurrence's per_step handling."""
     embed_tokens = sili_model["embed_tokens"]
     x = embed_tokens[token_ids]   # [T, hidden] -- cheap row gather either way
     if scipy.sparse.issparse(x):
         x = x.toarray()
     hidden = run_folded_recurrence(
         x, sili_model["step_layers"], sili_model["input_ln"], sili_model["post_ln"],
-        sili_model["final_norm"], cfg, half_bandwidth, num_cpus)
+        sili_model["final_norm"], cfg, half_bandwidth, num_cpus, activation_density)
 
     lm_head = sili_model["lm_head"]
     if scipy.sparse.issparse(lm_head):
@@ -129,14 +137,16 @@ def evaluate_next_token_prediction_sili(
     half_bandwidth: int,
     texts: List[str],
     num_cpus: int = 4,
+    activation_density: Union[_ActivationDensity, List[_ActivationDensity]] = None,
 ) -> EvalResult:
     """sili-only counterpart to eval_pruning.evaluate_next_token_prediction
     -- same teacher-forced next-token loss/top-1-accuracy definition,
-    same EvalResult, so perplexity/accuracy are directly comparable."""
+    same EvalResult, so perplexity/accuracy are directly comparable.
+    See compute_logits_sili for activation_density."""
     losses, accs = [], []
     for text in texts:
         ids = tokenizer(text, return_tensors="pt")["input_ids"][0].numpy()
-        logits = compute_logits_sili(ids, sili_model, cfg, half_bandwidth, num_cpus)
+        logits = compute_logits_sili(ids, sili_model, cfg, half_bandwidth, num_cpus, activation_density)
         loss, acc = _cross_entropy_and_accuracy(logits[:-1], ids[1:])
         losses.append(loss)
         accs.append(acc)

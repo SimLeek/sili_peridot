@@ -766,3 +766,107 @@ from the estimate in an instructive way.
   building the same weights both ways (CSR vs. densified-by-hand
   reference) and checking `compute_logits_sili` gives numerically
   identical results either way.
+
+## sili_peridot: activation sparsity -- a real sili__new bug, then real results
+
+Added `_forward` (`model/sili_block.py`) so every projection in a fold
+step can route through DISLDO (`forward_dense`, current default) or
+SISLDO (`forward_sparse`, when `activation_density` is set) -- keeps
+only the top `round(density*n_features)` entries by magnitude per
+token before the sparse forward pass. `activation_density` also
+accepts a dict (per-suffix: sparsify only some of q/k/v/o/gate/up/
+down) or a list of length `num_hidden_layers` (per-fold-step) via
+`_density_for_suffix`/`run_folded_recurrence`'s `per_step` branch --
+manual stand-ins for true per-layer adaptive sparsity, which doesn't
+exist yet (needs energy RL / branching factor).
+
+- **First real-checkpoint run collapsed to ~0.0 accuracy at EVERY
+  density tested, including 0.9** -- a uniform floor, not the smooth
+  degradation genuine information loss would produce. Traced through
+  three layers of investigation, in order:
+  1. `_cpu.dense_to_top_k_csr`'s `k` is a GLOBAL budget over the whole
+     flattened `[rows, cols]` batch, not per-row (verified directly:
+     5 rows x 8 cols, k=4 gave nnz-per-row `[3,0,0,1,0]`, not
+     `[4]*5`) -- calling it once on the full multi-token `x` starved
+     most tokens of any active features at all. Fixed in
+     `_forward` by looping per row (later replaced, see below).
+  2. Row-budget fix alone didn't help -- even 90% density still
+     collapsed (0.0071 accuracy). Isolated with fresh-layer,
+     single-call synthetic tests (avoiding a real but harmless
+     `forward_sparse`/`forward_dense` return-value ALIASING gotcha:
+     the returned array is a live view into the layer's own
+     `output_buf`, silently overwritten by the layer's next
+     forward call -- copy immediately if holding onto more than one
+     result from the same layer instance) down to a genuine bug in
+     **sili__new**: `csr.hpp`'s `top_k_indices` sorted candidates by
+     raw signed value (`a.second > b.second`), not magnitude. For
+     zero-mean data (any post-RMSNorm activation) that keeps only the
+     largest POSITIVE entries and discards every negative one
+     regardless of magnitude -- even at k close to the full row
+     width, since it's the most-negative (often highest-magnitude)
+     entries that get dropped first. Fixed upstream: sili__new PR #15
+     (`fix/top-k-indices-sort-by-magnitude`, both `partial_sort`
+     comparators now compare `std::abs(...)`), 855 assertions passing,
+     merge pending user review as of this writing.
+  3. With both fixes, the real-checkpoint curve became sensible:
+     dense=0.2652 acc/173.37 ppl; 0.9=0.2591-0.2663 acc/~173 ppl
+     (matches dense); 0.5=0.15-0.17 acc/~870 ppl; 0.2=0.008-0.03
+     acc/~170k-370k ppl; 0.1 and below=0.0 acc. **Real cliff is
+     between 0.5 and 0.2 density, not near the low end** -- so the
+     5%/2%/0.5% densities from the original request are all well past
+     collapse; only ~90% (matches dense, no speed win) and marginally
+     ~50% (meaningfully degraded) preserve any real accuracy.
+- **Separately, the per-row Python loop itself (`dense_to_top_k_csr`
+  called once per token) was ~74x slower than necessary** -- measured
+  directly (T=30, F=1536, density=0.5): 57.06ms/call looped vs
+  0.77ms/call for a fully vectorized `np.argpartition`-based
+  per-row top-k (partition + per-row sort + `np.take_along_axis` to
+  gather values, then build the CSR triplet directly -- no C++ call
+  per row at all). Replaced the loop with this in `_forward`; `idx`
+  sets per row confirmed identical between the two approaches before
+  switching. `num_cpus` dropped from `_forward`'s signature (was only
+  ever used by the removed per-row `_cpu` calls).
+- **Even with vectorized top-k, global activation sparsity still has
+  no density where speed and accuracy both hold**: real-checkpoint
+  eval time was 215s at density=0.9 (vs ~65s dense -- 3.3x SLOWER),
+  101s at 0.5, ~62s at 0.2 (roughly dense speed), 40s at 0.1 and below
+  (faster, but already collapsed). `forward_sparse`'s own per-synapse
+  delta-CSR walk has real fixed overhead per active connection that a
+  batched dense matmul doesn't -- confirmed with a clean (no
+  concurrent load) isolated single-layer microbenchmark across 8
+  different layer shapes (512-4096 dims), weight densities
+  (0.3-0.9), and batch sizes (5-50 tokens): the dense/sparse
+  wall-clock crossover point landed consistently in the **0.15-0.2
+  density range** across all 8 configs, not just the one shape first
+  measured. Stable enough across shapes to be worth exposing in
+  sili__new itself as a real auto-dispatch threshold (see
+  `hoyer_sparsify.hpp`'s existing-but-unwired hoyer-score machinery
+  and TODO.md's planned "auto-dispatching version" -- this is real
+  data toward the "not obvious" threshold decision mentioned there),
+  though not yet proposed/implemented -- flagging as a candidate,
+  not treating one session's benchmark as final.
+- **Local (per-projection / per-fold-step) sparsity at density=0.2,
+  real checkpoint, dense baseline 0.2652 acc / 173.37 ppl**:
+
+  | variant | accuracy | perplexity |
+  |---|---|---|
+  | attn-only (q/k/v/o, all 24 steps) | 0.0557 | 8311.48 |
+  | mlp-only (gate/up/down, all 24 steps) | 0.0157 | 72971.38 |
+  | early-8 fold steps (all 7 suffixes) | 0.0077 | 11962.08 |
+  | **late-8 fold steps** | **0.2148** | **569.97** |
+  | middle-8 fold steps | 0.1261 | 2223.70 |
+
+  Late-8 is close to dense; early-8 is nearly as collapsed as
+  sparsifying everything globally. Matches the fold-depth recurrence's
+  own structure (`state=0; for step: out=block(x+state); state+=out`)
+  -- corrupting an EARLY step's output poisons every subsequent step's
+  input via the accumulated `state`, while corrupting only the last
+  few steps limits the damage to whatever's added at the very end.
+  MLP-only also hurts more than attn-only, consistent with B3's own
+  role-based pruning thresholds already treating MLP and attention
+  weights differently for a similar reason (different parts of the
+  network carry different amounts of irreplaceable signal).
+- **Follow-up depth/density sweep** (how many trailing steps tolerate
+  0.2, and does the tail tolerate lower/faster density too) --
+  results pending as of this writing, see JOURNAL.md's next entry or
+  the PR for this branch.

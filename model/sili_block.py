@@ -21,7 +21,7 @@ plain float32 vectors, not built into any SparseLinearLayer.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -186,6 +186,53 @@ def silu(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(-x))
 
 
+def _forward(layer, x: np.ndarray, activation_density: Optional[float]) -> np.ndarray:
+    """
+    activation_density=None (default): dense DISLDO forward_dense, current
+    behavior, unchanged.
+
+    activation_density=d (0 < d <= 1): keep only the top round(d*n_features)
+    entries by magnitude PER ROW (per token) of x, route through the
+    existing SISLDO forward_sparse path instead.
+
+    Per-row top-k is done via np.argpartition (not a Python loop calling
+    _cpu.dense_to_top_k_csr once per row -- that was ~74x slower at
+    T=30,F=1536, measured directly: 57ms/call vs 0.77ms/call, dominated
+    by per-call pybind overhead x T rows x 7 projections x 24 layers).
+    dense_to_top_k_csr's own k is a GLOBAL budget over the whole
+    flattened [rows, cols] array (see sili__new's csr.hpp top_k_csr ->
+    top_k_indices), not a per-row budget -- np.argpartition(..., axis=1)
+    is naturally per-row, sidestepping that mismatch entirely.
+    """
+    if activation_density is None:
+        return layer.forward_dense(x, learning_rate=0.0)
+    T, n_features = x.shape
+    k = max(1, round(activation_density * n_features))
+    abs_x = np.abs(x)
+    top_idx = np.argpartition(abs_x, n_features - k, axis=1)[:, n_features - k:]
+    top_idx = np.sort(top_idx, axis=1)
+    top_vals = np.take_along_axis(x, top_idx, axis=1)
+    idx = top_idx.ravel().astype(np.int32)
+    vals = top_vals.ravel().astype(np.float32)
+    ptrs = np.arange(0, (T + 1) * k, k, dtype=np.int32)
+    return layer.forward_sparse(ptrs, idx, vals, T, learning_rate=0.0)
+
+
+_ActivationDensity = Union[None, float, Dict[str, Optional[float]]]
+
+
+def _density_for_suffix(step_density: _ActivationDensity, suffix: str) -> Optional[float]:
+    """step_density is either a single value (None/float, applies to every
+    projection this step -- the original global behavior) or a dict
+    {suffix: None/float} that isolates individual projections (q/k/v/o/
+    gate/up/down) -- lets a diagnostic sparsify only e.g. the MLP suffixes
+    while leaving attention dense, to localize which projections tolerate
+    top-k activation sparsification and which collapse it."""
+    if isinstance(step_density, dict):
+        return step_density.get(suffix)
+    return step_density
+
+
 # ── One fold step: RMSNorm -> GQA causal attention (RoPE) -> RMSNorm -> SwiGLU MLP
 
 def apply_fold_step(
@@ -197,9 +244,12 @@ def apply_fold_step(
     cos: np.ndarray, sin: np.ndarray,   # from rope_cos_sin(T, head_dim, rope_theta)
     half_bandwidth: int,
     num_cpus: int = 4,
+    activation_density: _ActivationDensity = None,
 ) -> np.ndarray:
     """Returns this step's own output [T, hidden] (the recurrence's caller
-    accumulates it into state)."""
+    accumulates it into state). See _forward for activation_density; may
+    also be a dict keyed by suffix to sparsify only some projections --
+    see _density_for_suffix."""
     T = x.shape[0]
     n_heads, n_kv_heads, head_dim = (cfg.num_attention_heads,
                                      cfg.num_key_value_heads, cfg.head_dim)
@@ -207,9 +257,12 @@ def apply_fold_step(
 
     normed = rmsnorm(x, input_ln_weight, cfg.rms_norm_eps)
 
-    q = layers[".self_attn.q_proj.weight"].forward_dense(normed, learning_rate=0.0)
-    k = layers[".self_attn.k_proj.weight"].forward_dense(normed, learning_rate=0.0)
-    v = layers[".self_attn.v_proj.weight"].forward_dense(normed, learning_rate=0.0)
+    q = _forward(layers[".self_attn.q_proj.weight"], normed,
+                 _density_for_suffix(activation_density, ".self_attn.q_proj.weight"))
+    k = _forward(layers[".self_attn.k_proj.weight"], normed,
+                 _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))
+    v = _forward(layers[".self_attn.v_proj.weight"], normed,
+                 _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))
 
     q = q.reshape(T, n_heads, head_dim)
     k = k.reshape(T, n_kv_heads, head_dim)
@@ -226,15 +279,18 @@ def apply_fold_step(
         attn_out[:, h, :] = out_h.data
 
     attn_out = attn_out.reshape(T, n_heads * head_dim)
-    attn_out = layers[".self_attn.o_proj.weight"].forward_dense(attn_out, learning_rate=0.0)
+    attn_out = _forward(layers[".self_attn.o_proj.weight"], attn_out,
+                        _density_for_suffix(activation_density, ".self_attn.o_proj.weight"))
 
     x = x + attn_out
     normed2 = rmsnorm(x, post_attn_ln_weight, cfg.rms_norm_eps)
 
-    gate = layers[".mlp.gate_proj.weight"].forward_dense(normed2, learning_rate=0.0)
-    up   = layers[".mlp.up_proj.weight"].forward_dense(normed2, learning_rate=0.0)
-    mlp_out = layers[".mlp.down_proj.weight"].forward_dense(
-        silu(gate) * up, learning_rate=0.0)
+    gate = _forward(layers[".mlp.gate_proj.weight"], normed2,
+                    _density_for_suffix(activation_density, ".mlp.gate_proj.weight"))
+    up   = _forward(layers[".mlp.up_proj.weight"], normed2,
+                    _density_for_suffix(activation_density, ".mlp.up_proj.weight"))
+    mlp_out = _forward(layers[".mlp.down_proj.weight"], silu(gate) * up,
+                       _density_for_suffix(activation_density, ".mlp.down_proj.weight"))
 
     return attn_out + mlp_out
 
@@ -248,20 +304,33 @@ def run_folded_recurrence(
     cfg: MiniCPM5Config,
     half_bandwidth: int,
     num_cpus: int = 4,
+    activation_density: Union[_ActivationDensity, List[_ActivationDensity]] = None,
 ) -> np.ndarray:
     """state=0; for step: out=block(x+state); state+=out -- see
     RNNFoldedBlock.forward's docstring in sili__new for why this recurrence
     (not a plain 24-layer sequential replay) and why averaging/summing
     per-step outputs is not done here (skip_connection_outputs=False:
-    final accumulated state is returned, RMSNorm'd, ready for lm_head)."""
+    final accumulated state is returned, RMSNorm'd, ready for lm_head).
+    See _forward for activation_density; may also be a per-step list of
+    length num_hidden_layers (each entry itself None/float/dict) to
+    isolate which LAYERS tolerate sparsification, not just which
+    projections -- errors from top-k truncation compound through the
+    fold-depth recurrence's accumulated state, so a layer near the start
+    is not necessarily equivalent to the same layer near the end."""
     T = x.shape[0]
     cos, sin = rope_cos_sin(T, cfg.head_dim, cfg.rope_theta)
+    per_step = isinstance(activation_density, list)
+    if per_step and len(activation_density) != cfg.num_hidden_layers:
+        raise ValueError(
+            f"activation_density list has {len(activation_density)} entries, "
+            f"expected cfg.num_hidden_layers={cfg.num_hidden_layers}")
 
     state = np.zeros_like(x)
     for i in range(cfg.num_hidden_layers):
+        step_density = activation_density[i] if per_step else activation_density
         out = apply_fold_step(
             x + state, step_layers[i], input_ln_weights[i], post_attn_ln_weights[i],
-            cfg, cos, sin, half_bandwidth, num_cpus)
+            cfg, cos, sin, half_bandwidth, num_cpus, step_density)
         state = state + out
 
     return rmsnorm(state, final_norm_weight, cfg.rms_norm_eps)
