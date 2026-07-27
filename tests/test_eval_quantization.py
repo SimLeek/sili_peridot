@@ -13,30 +13,29 @@ from model.prune import (
     prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE,
     sparse_state_to_dense_state_dict,
 )
-from model.quantize import (
-    compute_suffix_scales_streaming, apply_quantization,
-    compute_suffix_rank1_scales_streaming, apply_rank1_quantization,
-)
+from model.quantize import build_quantized_dense_state_dict_streaming
 from model.eval_quantization import compare_pruned_vs_quantized
 from model.eval_pruning import EVAL_TEXTS, EVAL_TEXTS_HELDOUT
 
 REAL_CHECKPOINT_DIR = os.path.join(
     os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
 
-# NOTE on running this file: the two real-checkpoint classes below each
-# pass reliably in isolation (`pytest tests/test_eval_quantization.py::
-# TestRealCheckpointQuantizationQuality` / `::TestRealCheckpointRank1Quant
-# izationQuality`), but running BOTH together in one pytest invocation
-# has OOM-killed this 15GB dev machine (confirmed via kernel oom-killer
-# log, not inferred -- see JOURNAL.md) -- each class's own module-scoped
-# HF model + pruned-dense fixtures don't fully release before the next
-# class's fixtures build, on top of everything else already resident.
-# This is a real hardware constraint on this machine, not a code bug (the
-# module-scoped fixtures are each individually correct and necessary --
-# see model/quantize.py's compute_suffix_scales_streaming docstring for
-# why they're built in the specific order they are). On memory-
-# constrained hardware, run the two classes as separate pytest
-# invocations rather than one combined `pytest tests/test_eval_quantization.py`.
+# Both real-checkpoint classes below now run together in one invocation
+# (`pytest tests/test_eval_quantization.py`, confirmed clean on this
+# 15GB dev machine) -- two fixes made that possible: model.quantize now
+# builds real FoldedLayer weights one suffix at a time instead of
+# holding a Python simulation's several full-model-sized copies (see
+# build_quantized_dense_state_dict_streaming), and the fixtures below
+# are class-scoped, not module-scoped -- with two classes in one
+# module, module scope kept both classes' HF model + pruned-dense
+# fixtures resident simultaneously, which used to be the dominant cost.
+#
+# Still OOM-kills on this machine if run in the SAME pytest invocation
+# as test_fold.py/test_quantize.py (confirmed via kernel oom-killer
+# log): freed sili/torch objects from ~30 preceding tests don't fully
+# release back to the OS by the time this file's two real HF models
+# load, and that's enough on top to tip a 15GB machine over. Run this
+# file as its own pytest invocation on memory-constrained hardware.
 
 
 @pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
@@ -68,30 +67,30 @@ class TestRealCheckpointQuantizationQuality:
     real number this pipeline now ships with.
     """
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def cfg(self):
         return MiniCPM5Config.from_json(os.path.join(REAL_CHECKPOINT_DIR, "config.json"))
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def tokenizer(self):
         return AutoTokenizer.from_pretrained(REAL_CHECKPOINT_DIR)
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def model(self):
         return AutoModelForCausalLM.from_pretrained(REAL_CHECKPOINT_DIR, dtype=torch.float32)
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def pruned_and_quantized(self, cfg):
-        """Builds pruned_dense BEFORE the streaming scale computation on
-        purpose (see model/quantize.py's compute_suffix_scales_streaming
-        docstring) -- this ordering is itself part of what fixed a real
-        OOM this investigation hit (see JOURNAL.md)."""
+        """Builds pruned_dense BEFORE quantization on purpose --
+        build_quantized_dense_state_dict_streaming pops sparse_state's
+        entries as it folds+quantizes each suffix, so pruned_dense must
+        already hold its own copy first."""
         sd = load_minicpm5_checkpoint(REAL_CHECKPOINT_DIR)
         sparse_state, _ = prune_state_dict_by_role(sd, DEFAULT_TARGET_SPARSITY_BY_ROLE)
         del sd
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
-        scales = compute_suffix_scales_streaming(sparse_state, cfg, prefix="model.layers.")
-        quantized_dense = apply_quantization(pruned_dense, scales, cfg)
+        quantized_dense = build_quantized_dense_state_dict_streaming(
+            sparse_state, cfg, value_scale_mode="per_row", prefix="model.layers.")
         return pruned_dense, quantized_dense
 
     def test_shared_scale_quantization_currently_destroys_quality(
@@ -139,26 +138,26 @@ class TestRealCheckpointRank1QuantizationQuality:
     not "solved to parity with dense".
     """
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def cfg(self):
         return MiniCPM5Config.from_json(os.path.join(REAL_CHECKPOINT_DIR, "config.json"))
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def tokenizer(self):
         return AutoTokenizer.from_pretrained(REAL_CHECKPOINT_DIR)
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def model(self):
         return AutoModelForCausalLM.from_pretrained(REAL_CHECKPOINT_DIR, dtype=torch.float32)
 
-    @pytest.fixture(scope="module")
+    @pytest.fixture(scope="class")
     def pruned_and_quantized_rank1(self, cfg):
         sd = load_minicpm5_checkpoint(REAL_CHECKPOINT_DIR)
         sparse_state, _ = prune_state_dict_by_role(sd, DEFAULT_TARGET_SPARSITY_BY_ROLE)
         del sd
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
-        rank1_scales = compute_suffix_rank1_scales_streaming(sparse_state, cfg, prefix="model.layers.")
-        quantized_dense = apply_rank1_quantization(pruned_dense, rank1_scales, cfg)
+        quantized_dense = build_quantized_dense_state_dict_streaming(
+            sparse_state, cfg, value_scale_mode="rank1", prefix="model.layers.")
         return pruned_dense, quantized_dense
 
     def test_rank1_quantization_recovers_most_of_the_loss(

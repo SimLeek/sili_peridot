@@ -1,21 +1,15 @@
 """
 sili_peridot/model/eval_quantization.py
 ─────────────────────────────────────────
-Does B5's real FP4 quantization (simulated in model/quantize.py,
-matching sili__new's FoldedLayer.from_descriptor's exact
-per-input-column scale scheme) degrade MiniCPM5-1B-Base's next-token
-prediction quality by an unacceptable amount, ON TOP OF B3's
-already-validated pruning? Same methodology as
+Does B5's real FP4 quantization (model/quantize.py's real
+FoldedLayer.from_descriptor, sili__new PR #10) degrade
+MiniCPM5-1B-Base's next-token prediction quality by an unacceptable
+amount, ON TOP OF B3's already-validated pruning? Same methodology as
 model/eval_pruning.py's compare_dense_vs_pruned (B3b) -- load the real
 HF model, evaluate with B3's pruned weights (the accepted baseline),
 then with those SAME weights additionally FP4-quantized, and compare
 next-token loss/perplexity/accuracy -- isolating quantization's own
 effect from pruning's (already measured separately).
-
-No sili runtime involved here either -- purely "does representing
-these already-pruned weights in FP4 hurt", using the real
-per-input-column scale B5's from_descriptor will actually apply (via
-model/quantize.py), not a naive/simplified quantization scheme.
 """
 from __future__ import annotations
 
@@ -35,17 +29,17 @@ def compare_pruned_vs_quantized(
 ) -> dict:
     """
     Evaluate `model` with pruned_dense_state_dict loaded (B3's already
-    -validated baseline), then with quantized_dense_state_dict (the
-    same weights, additionally FP4-quantized per model.quantize), then
-    restore the model's original weights so the caller isn't left with
-    a mutated model.
+    -validated baseline), then with quantized_dense_state_dict applied
+    on top (partial -- only the suffixes model.quantize actually
+    touches, loaded with strict=False), then restore the model's
+    original weights so the caller isn't left with a mutated model.
     """
-    original_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+    original_state_dict = {k: model.state_dict()[k].clone() for k in pruned_dense_state_dict}
     try:
         model.load_state_dict(pruned_dense_state_dict)
         pruned_result = evaluate_next_token_prediction(model, tokenizer, texts)
 
-        model.load_state_dict(quantized_dense_state_dict)
+        model.load_state_dict(quantized_dense_state_dict, strict=False)
         quantized_result = evaluate_next_token_prediction(model, tokenizer, texts)
     finally:
         model.load_state_dict(original_state_dict)
