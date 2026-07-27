@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import numpy as np
+import scipy.sparse
 import torch
 import pytest
 
@@ -37,6 +38,23 @@ def _fake_sparse_state(cfg: MiniCPM5Config, seed=3) -> dict:
     sd["model.embed_tokens.weight"] = {"raw": torch.randn(cfg.vocab_size, cfg.hidden_size), "shape": (cfg.vocab_size, cfg.hidden_size)}
     sd["lm_head.weight"]            = {"raw": torch.randn(cfg.vocab_size, cfg.hidden_size), "shape": (cfg.vocab_size, cfg.hidden_size)}
     sd["model.norm.weight"]         = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
+    return sd
+
+
+def _fake_sparse_state_csr_embed(cfg: MiniCPM5Config, seed=3) -> dict:
+    """Same as _fake_sparse_state, but embed_tokens/lm_head are stored as
+    {"csr": ...} (with real structural zeros) instead of {"raw": ...} --
+    matches what B3's real pruning produces for these two tensors (both
+    2-D, so eligible for CSR) and exercises build_sili_model's scipy-CSR
+    path instead of the dense fallback."""
+    sd = _fake_sparse_state(cfg, seed=seed)
+    torch.manual_seed(seed + 100)
+    for name in ("model.embed_tokens.weight", "lm_head.weight"):
+        dense = torch.randn(cfg.vocab_size, cfg.hidden_size)
+        mask = torch.rand(cfg.vocab_size, cfg.hidden_size) < 0.4   # ~40% density
+        sparse = dense * mask
+        csr = sparse.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+        sd[name] = {"csr": csr, "shape": (cfg.vocab_size, cfg.hidden_size)}
     return sd
 
 
@@ -95,3 +113,60 @@ class TestEvaluateNextTokenPredictionSili:
         assert all(np.isfinite(l) and l >= 0 for l in result.per_text_loss)
         assert all(0.0 <= a <= 1.0 for a in result.per_text_accuracy)
         assert np.isfinite(result.perplexity) and result.perplexity >= 1.0
+
+
+class TestSparseEmbedAndLmHead:
+    """embed_tokens/lm_head are stored as scipy CSR (not dense) whenever
+    B3 pruned them to {"csr": ...} -- real checkpoint density is ~20%/
+    ~70%, previously always densified regardless (~1.2GB wasted)."""
+
+    def test_build_sili_model_keeps_csr_entries_sparse(self):
+        cfg = _tiny_config(n_layers=1)
+        sparse_state = _fake_sparse_state_csr_embed(cfg)
+
+        m = build_sili_model(sparse_state, cfg)
+
+        assert scipy.sparse.issparse(m["embed_tokens"])
+        assert scipy.sparse.issparse(m["lm_head"])
+        assert m["embed_tokens"].shape == (cfg.vocab_size, cfg.hidden_size)
+        assert m["lm_head"].shape == (cfg.vocab_size, cfg.hidden_size)
+
+    def test_raw_entries_still_stay_dense(self):
+        # The pre-existing fixture never has embed/lm_head pruned to CSR --
+        # confirms the dense fallback path is still reachable/correct.
+        cfg = _tiny_config(n_layers=1)
+        sparse_state = _fake_sparse_state(cfg)
+
+        m = build_sili_model(sparse_state, cfg)
+
+        assert isinstance(m["embed_tokens"], np.ndarray)
+        assert isinstance(m["lm_head"], np.ndarray)
+
+    def test_sparse_path_logits_match_dense_reference(self):
+        # Build the SAME underlying weights two ways -- once as {"csr":...}
+        # (exercises the scipy path), once densified to {"raw":...}
+        # ourselves as the reference -- and confirm compute_logits_sili
+        # gives numerically identical results either way.
+        cfg = _tiny_config(n_layers=1)
+        sparse_state_csr = _fake_sparse_state_csr_embed(cfg)
+
+        # Build a dense-equivalent fixture from the exact same CSR tensors.
+        # dict(...) is a fresh top-level dict -- build_sili_model only pops
+        # top-level keys, never mutates an entry dict in place, so the two
+        # calls below don't interfere with each other despite sharing the
+        # per-layer entry objects.
+        sparse_state_dense = dict(sparse_state_csr)
+        for name in ("model.embed_tokens.weight", "lm_head.weight"):
+            csr_entry = sparse_state_csr[name]
+            sparse_state_dense[name] = {
+                "raw": csr_entry["csr"].to_dense(), "shape": csr_entry["shape"],
+            }
+
+        m_csr   = build_sili_model(dict(sparse_state_csr), cfg)
+        m_dense = build_sili_model(sparse_state_dense, cfg)
+
+        token_ids = np.array([1, 4, 2], dtype=np.int64)
+        logits_csr   = compute_logits_sili(token_ids, m_csr, cfg, half_bandwidth=3)
+        logits_dense = compute_logits_sili(token_ids, m_dense, cfg, half_bandwidth=3)
+
+        np.testing.assert_allclose(logits_csr, logits_dense, rtol=1e-4, atol=1e-4)
