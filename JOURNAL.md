@@ -866,7 +866,60 @@ exist yet (needs energy RL / branching factor).
   role-based pruning thresholds already treating MLP and attention
   weights differently for a similar reason (different parts of the
   network carry different amounts of irreplaceable signal).
-- **Follow-up depth/density sweep** (how many trailing steps tolerate
-  0.2, and does the tail tolerate lower/faster density too) --
-  results pending as of this writing, see JOURNAL.md's next entry or
-  the PR for this branch.
+- **Follow-up depth sweep, density=0.2, trailing N fold steps sparsified
+  (rest dense), same 5-text eval**:
+
+  | trailing steps | accuracy | perplexity | eval time |
+  |---|---|---|---|
+  | 4 | 0.1974 | 292.76 | 65.07s |
+  | 8 | 0.2148 | 569.97 | 57.86s |
+  | 12 | 0.1512 | 1569.46 | 57.09s |
+  | 16 | 0.0622 | 8658.95 | 54.58s |
+  | 20 | 0.0080 | 64926.17 | 51.90s |
+  | 24 (=global) | 0.0319 | 167598.48 | 50.80s |
+
+  Clear boundary: 4-8 trailing steps stay close to dense accuracy,
+  12 is visibly degrading but not collapsed, 16+ falls off a cliff
+  toward the same collapse as sparsifying globally. (late-24 here
+  is the same "global 0.2" case as the earlier curve/local-sparsity
+  runs -- 0.0319 vs those runs' 0.03/0.0077 is normal run-to-run
+  noise on a 5-text eval set, not a contradiction.)
+  eval time drops MONOTONICALLY as more trailing steps are
+  sparsified (65s @ N=4 down to 51s @ N=24) even though accuracy
+  does not improve monotonically past N=8 -- consistent with
+  `forward_sparse` genuinely being cheaper per call at this density
+  once contention/measurement noise is controlled for (matches the
+  clean crossover benchmark below), but the win from sparsifying
+  only a handful of steps out of 24 is modest in absolute terms
+  (a few seconds out of ~60s total), since most of the network stays
+  dense regardless.
+- **late-8 also degrades gracefully (not catastrophically) as density
+  drops further**, unlike the sharp global cliff: 0.2->0.2148 acc,
+  0.15->0.1415, 0.1->0.0953, 0.05->0.0876 acc (172, 1193, 2024, 10682
+  ppl respectively) -- some usable signal survives even at 5% density
+  when confined to the last 8 steps, where the same density applied
+  globally gives exactly 0.0.
+- **Checked whether trading depth for density beats late-8@0.2**
+  (the best point found so far): late-12 at lower densities does
+  NOT help -- 0.15->0.0795 acc, 0.1->0.0400, 0.05->0.0077 (4603,
+  28203, 472728 ppl), all worse than late-8's own values at the same
+  densities (0.1415/0.0953/0.0876 acc). late-10@0.2->0.1438 acc,
+  sitting between late-8 (0.2148) and late-12 (0.1512) as expected.
+  **late-8@density=0.2 is the best accuracy/speed point found in
+  this whole sweep** -- pushing either axis (more steps, or the same
+  step count at lower density) past that point loses more accuracy
+  than it's worth for this checkpoint/eval set.
+- **Net read**: a uniform global density has no usable
+  accuracy/speed tradeoff point in this checkpoint. Confining
+  sparsification to the LAST ~8 fold steps does have real accuracy
+  headroom (and confirms the fold-recurrence's state-accumulation
+  structure is the actual mechanism, not a fluke of one density
+  value), but the speed win from sparsifying only 8 of 24 steps is
+  modest, not dramatic -- getting a genuinely large speedup out of
+  this direction would need a smarter (adaptive/learned, e.g. energy
+  RL) mechanism for deciding per-step/per-token density rather than
+  a fixed manual schedule; naively pushing the fixed schedule further
+  (more steps, or lower density) has already been checked and both
+  lose accuracy faster than they gain speed. Not pursued further this
+  session; flagging as the natural next step for whoever picks this
+  back up.
