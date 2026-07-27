@@ -919,6 +919,19 @@ to flip green once it's fixed.
   `band_half_width` explicitly (RoPE, not fixed-position — the auto
   heuristic assumes the latter); pick a practical band/context width for
   this environment rather than the full 131072 training context.
+  **Status: core mechanism built and passing on synthetic dims
+  (`model/sili_block.py`, branch `feature/b6-sili-attention`) — the
+  real fold-depth recurrence with a real per-step GQA causal-attention
+  + SwiGLU-MLP block, every projection via a real per-step
+  FP4-quantized `SparseLinearLayer`, no torch in the compute path.
+  Required fixing a real gap first: none of sili__new's three attention
+  kernels masked the future at all (see JOURNAL.md) — fixed in
+  sili__new PRs #11/#12 (compact()-after-build + causal masking),
+  needed before this could be correct for an autoregressive LM. NOT yet
+  validated at real MiniCPM5 scale or with real per-layer weights (only
+  synthetic small-dim tests so far, including end-to-end causal-leakage
+  checks). Not checked off until that validation + B7 integration
+  happens.**
 - [ ] **B7. Assemble `MiniCPM5SparseModel`** (Python class in
   `sili_peridot/model/`): embedding lookup → 24-step fold-depth
   recurrence through the one folded transformer "layer" (mirrors

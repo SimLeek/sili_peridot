@@ -437,3 +437,116 @@ the catastrophe
   GPTQ-style) remains a real, documented option if more quality is
   needed later, most likely resolved via B8's post-quantization
   training rather than further conversion-time work.
+
+## sili_peridot/sili__new: retiring the torch quantization simulation,
+## a real memory investigation, and B6 attention assembly
+
+- **`model/quantize.py` was a pure-Python/numpy simulation of sili__new's
+  FP4 quantization, duplicating `fit_rank1_scale_envelope` and doing its
+  own `.to_dense()` calls** -- justified originally as "no sili runtime
+  involved" so quantization quality could be measured without a full
+  sili build, but once sili__new's real `FoldedLayer.from_descriptor`
+  path existed and had the no-densify/rank-1 fixes (B5a), this was
+  strictly worse duplicate code, per direct instruction ("we really
+  don't need or want a pure python simulation anymore"). Replaced with
+  `build_quantized_dense_state_dict_streaming`, which builds a real
+  `FoldedLayer` per suffix and reads back the true post-quantization
+  weights via its zero-copy `ptrs`/`indices`/`weights_vals` -- no
+  simulation, one densify per suffix (unavoidable: HF's `nn.Linear`
+  needs a real dense tensor) instead of the old path's two-plus.
+- **The real-checkpoint `test_eval_quantization.py` tests OOM-killed at
+  13.8GB even after that rewrite** (confirmed via kernel oom-killer
+  log). Root cause was NOT the quantize.py rewrite -- it was two
+  things: (1) `test_eval_quantization.py`'s two test classes used
+  `scope="module"` fixtures, but since both classes live in one module,
+  pytest never released the first class's ~4.3GB HF model before
+  loading the second's (fixed: `scope="class"`); (2) freed
+  Python/torch/sili objects were never actually leaked (confirmed via a
+  standalone two-round load/prune/quantize/free script sampling RSS at
+  each step: bounded, not growing, round to round) but glibc's
+  allocator keeps freed arena pages for reuse by the SAME process
+  instead of returning them to the OS, and that retained-but-free
+  memory piles up across a whole pytest session. `gc.collect()` +
+  `ctypes...malloc_trim(0)` dropped RSS by ~90% after each round in the
+  diagnostic. Added a `conftest.py` `pytest_runtest_teardown` hook to
+  trim after every test -- the full 3-file suite (33 tests, both
+  real-checkpoint classes) now passes together in one invocation.
+- **Direct follow-up question: fp4 weights + fp4 importances + scale
+  vectors + ULEB128 delta indices should be ~2 bytes/param (~2GB for
+  this checkpoint's ~1B params), so why does the real pipeline reach
+  ~12GB?** Measured directly rather than guessed: built all 7 real
+  `FoldedLayer`s for the pruned checkpoint (544.5M total connections)
+  and sampled RSS after each suffix. The suspected culprit --
+  `sparse_rnn.py`'s `budget = n_in * n_out` passed as `from_descriptor`'s
+  reserve size (the theoretical fully-dense ceiling, e.g. ~170M for
+  `mlp.gate_proj`) -- turned out NOT to be the driver:
+  `std::vector::reserve()` on that size is virtual/lazy on Linux
+  (mmap-backed, uncommitted pages until written), confirmed empirically
+  (RSS actually DROPPED while building the two largest suffixes, since
+  freeing the consumed pruned-torch-tensors outweighed the new sili
+  storage). After all 7 layers + `malloc_trim`: 1951MB against a
+  1039MB theoretical minimum -- only ~1.9x, not 6x. The real remaining
+  lever was `equalize_to_capacity(mrw=n_out by default, ...)`, which
+  DOES reserve real per-row growth headroom (20%+ per row, for
+  synaptogenesis that isn't happening yet at conversion time) --
+  calling `.compact()` after took it to 1118MB, within 8% of the
+  theoretical minimum. Added `compact_after_build=True` (default) to
+  `from_descriptor` in sili__new (PR #11) -- the old "~13.5GB for all 7
+  layers" number documented in `fold.py` was measured before the
+  `malloc_trim` fix existed, same root cause as the test-suite OOM
+  above, not a uleb128/budget bug.
+- **Asked directly whether sili is used for eval anywhere in the
+  codebase: no, not anywhere, not even partially.** `sili` is imported
+  only in `checkpoint.py`/`prune.py`/`quantize.py`/`fold.py` (all
+  conversion-time); `eval_pruning.py`/`eval_quantization.py` always
+  reload the converted weights back into the real HF
+  `AutoModelForCausalLM` and run `model(**ids)` -- 100% torch forward,
+  every time. `FoldedLayer.forward()` is only ever called from
+  `reference_fold_forward`, a correctness-check helper, never in an
+  actual quality-eval path. Direct instruction: get real evals running
+  on sili, not torch, and build B6 (attention assembly) on real sili
+  ops -- `sili/conversion/model_reconstruct.py` looked promising at
+  first glance (RoPE, RMSNorm, causal LLaMA attention with GQA) but
+  turned out to be pure-torch (an architecture-reconstruction/
+  inspection tool, unrelated to sili compute) -- useful only as a
+  verified reference spec to replicate against sili ops, not reusable
+  code.
+- **None of sili__new's three attention kernels
+  (`banded_attention`/`sparse_banded_attention`/`sparse_attention`)
+  masked the future** -- `banded_attention`'s band is centered
+  symmetrically on a geometric-diagonal point, so a query attends to
+  keys on both sides of its own position; `sparse_attention`'s global
+  top-k selects queries and keys independently by L2 norm with no
+  position awareness at all. Silently wrong for an autoregressive LM.
+  Added `causal=false` to all three forward/backward pairs in sili__new
+  (PR #12) -- banded variants clamp the band's upper bound to the
+  query's own position (requires T==K), `sparse_attention` masks any
+  selected (query,key) pair where the key's position is later. Also
+  threaded `causal` through the `sili.tensor` autograd wrappers
+  (`sparse_attention`/`banded_attention`/`sparse_banded_attention`),
+  which existed (A2, already done) but didn't expose the new flag.
+- **B6 (attention assembly) confirmed NOT yet built anywhere**: neither
+  `RNNFoldedBlock` (torch reference skeleton, `_apply_block` raises
+  `NotImplementedError` until subclassed) nor `SiliBlock.forward_sili`
+  (sums every suffix's stacked-matrix output together with no actual
+  attention computation at all -- a placeholder, not real attention)
+  implement it. Built `model/sili_block.py`: the real fold-depth
+  recurrence (`state=0; for step: out=block(x+state); state+=out`, per
+  `RNNFoldedBlock.forward`'s own docstring) with a real per-step GQA
+  causal-attention + SwiGLU-MLP block, every projection computed by a
+  real per-step FP4-quantized `SparseLinearLayer` built from
+  `FoldedBlockDescriptor.fold_weight_csr` (quantized independently per
+  fold step, not reusing B5a's stacked/rank-1 scheme, which shares one
+  scale across all 24 layers for storage efficiency -- not what running
+  each original layer separately would see). RMSNorm/RoPE/SiLU are
+  plain numpy (no sparsity, sili doesn't claim these as ops).
+  Validated on synthetic dims only so far: RMSNorm/RoPE match a torch
+  reference numerically, and causal integrity holds both for one fold
+  step and end-to-end across the full recurrence (perturbing a token
+  after position t never changes output at or before t). NOT yet
+  validated at real MiniCPM5 scale, and B7 (full model assembly --
+  embed_tokens/lm_head, a real next-token accuracy number entirely on
+  sili, replacing eval_pruning.py/eval_quantization.py's torch-forward
+  methodology) is not started. Scoped this way deliberately given the
+  size of B6+B7 combined -- get the core mechanism right and tested
+  first, real-checkpoint integration next.
