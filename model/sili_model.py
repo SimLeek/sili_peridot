@@ -15,21 +15,43 @@ sili_block.py's layernorm weights.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
+import scipy.sparse
 
 from .config import MiniCPM5Config
 from .eval_pruning import EvalResult
 from .sili_block import build_step_layers, run_folded_recurrence
 
+_EmbedOrHead = Union[np.ndarray, scipy.sparse.csr_matrix]
+
 
 def _to_dense_numpy(entry: dict) -> np.ndarray:
-    """entry is a prune.py sparse_state value ({"csr": ...} or {"raw": ...})
-    -- B3's role-based thresholds do prune embed_tokens/lm_head (both 2-D),
-    so either format is possible here, unlike the 1-D layernorm vectors."""
+    """entry is a prune.py sparse_state value ({"csr": ...} or {"raw": ...})."""
     t = entry["csr"].to_dense() if "csr" in entry else entry["raw"]
     return t.float().numpy().copy()
+
+
+def _to_sparse_or_dense(entry: dict) -> _EmbedOrHead:
+    """
+    B3's role-based thresholds DO prune embed_tokens/lm_head (both 2-D,
+    ~20%/~70% density respectively on the real checkpoint) -- storing
+    them fully dense regardless (the previous behavior) cost ~1.5GB for
+    two tensors that compress to ~360MB combined at their real density.
+    Keeps a real {"csr": ...} entry as a scipy CSR matrix (cheap row
+    gather for embed_tokens, cheap sparse-dense matmul for lm_head) --
+    scipy is already a transitive dependency (via sili__new), not a new
+    one. {"raw": ...} entries (never pruned to CSR) fall back to dense,
+    matching the 1-D layernorm vectors' own always-raw convention.
+    """
+    if "csr" not in entry:
+        return entry["raw"].float().numpy().copy()
+    t = entry["csr"]
+    ptrs = t.crow_indices().numpy().astype(np.int32)
+    idx  = t.col_indices().numpy().astype(np.int32)
+    vals = t.values().float().numpy()
+    return scipy.sparse.csr_matrix((vals, idx, ptrs), shape=tuple(t.shape))
 
 
 def build_sili_model(
@@ -45,9 +67,13 @@ def build_sili_model(
     layers out of `sparse_state` (MUTATES it -- same streaming discipline
     as build_step_layers). Returns a dict bundling everything
     compute_logits_sili/evaluate_next_token_prediction_sili need.
+
+    embed_tokens/lm_head are kept as scipy CSR matrices when B3 pruned
+    them (the real checkpoint case), not densified -- see
+    _to_sparse_or_dense.
     """
-    embed_tokens = _to_dense_numpy(sparse_state.pop("model.embed_tokens.weight"))
-    lm_head      = _to_dense_numpy(sparse_state.pop("lm_head.weight"))
+    embed_tokens = _to_sparse_or_dense(sparse_state.pop("model.embed_tokens.weight"))
+    lm_head      = _to_sparse_or_dense(sparse_state.pop("lm_head.weight"))
     final_norm   = _to_dense_numpy(sparse_state.pop("model.norm.weight"))
 
     step_layers, input_ln, post_ln = build_step_layers(
@@ -68,11 +94,20 @@ def compute_logits_sili(
     num_cpus: int = 4,
 ) -> np.ndarray:
     """Returns [T, vocab_size] float32 logits."""
-    x = sili_model["embed_tokens"][token_ids]   # [T, hidden]
+    embed_tokens = sili_model["embed_tokens"]
+    x = embed_tokens[token_ids]   # [T, hidden] -- cheap row gather either way
+    if scipy.sparse.issparse(x):
+        x = x.toarray()
     hidden = run_folded_recurrence(
         x, sili_model["step_layers"], sili_model["input_ln"], sili_model["post_ln"],
         sili_model["final_norm"], cfg, half_bandwidth, num_cpus)
-    return hidden @ sili_model["lm_head"].T
+
+    lm_head = sili_model["lm_head"]
+    if scipy.sparse.issparse(lm_head):
+        # sparse [vocab, hidden] @ dense [hidden, T] -> dense [vocab, T],
+        # never materializes lm_head densely -- .T to hidden @ lm_head.T's shape.
+        return (lm_head @ hidden.T).T.astype(np.float32)
+    return hidden @ lm_head.T
 
 
 def _cross_entropy_and_accuracy(logits: np.ndarray, targets: np.ndarray) -> Tuple[float, float]:

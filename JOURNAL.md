@@ -725,3 +725,44 @@ everything else.
     1530MB dense -- a real ~1.2GB reduction available, left on the
     table because these two tensors were assumed out of scope rather
     than actually checked.
+
+## sili_peridot: compact embed_tokens/lm_head, direct follow-up
+
+Took the ~1.2GB estimate above as the next task. Real result differs
+from the estimate in an instructive way.
+
+- **`lm_head` stays dense on purpose, and that's correct, not a bug.**
+  Storing it as scipy CSR (standard int32-index + float32-value format,
+  8 bytes/nnz) at its real ~70% density would cost ~1125MB -- MORE than
+  its current 765MB dense. B3's own pruning already made this call
+  upstream (only stores `{"csr": ...}` when the resulting format is
+  actually smaller; `lm_head` gets `{"raw": ...}` instead) -- the
+  ~1.2GB estimate wrongly assumed BOTH tensors would compress to
+  sili's own compact ~2-bytes/nnz FP4 scheme, but embed_tokens/lm_head
+  were never routed through `SparseLinearLayer` at all (out of B3/B5's
+  original suffix set), so they only ever get scipy's plainer format
+  when B3 decides CSR is worth it in the first place.
+  `model/sili_model.py`'s new `_to_sparse_or_dense` just respects
+  whatever B3 already decided (`"csr"` key present -> scipy CSR,
+  `"raw"` -> dense) rather than forcing a format.
+- **`embed_tokens` (real ~20% density) is where the real savings are**:
+  scipy CSR costs ~309MB (154.2MB values + 154.2MB int32 indices +
+  0.5MB row pointers) vs. 765MB dense -- a real ~456MB reduction for
+  that one tensor, plus avoiding the transient `.to_dense()` spike
+  during `build_sili_model` that used to briefly materialize it in
+  full.
+- **Measured total peak RSS: ~6.8-7.1GB before -> ~4.5GB after** (real
+  checkpoint, `build_sili_model` + one real `compute_logits_sili`
+  call) -- a ~2.3-2.6GB reduction, larger than the single tensor's own
+  ~456MB would suggest on its own, consistent with also no longer
+  paying that transient densify-then-discard spike during the build
+  step. `scipy.sparse` used for this (already a transitive dependency
+  via sili__new, not new) rather than hand-rolling a sparse-dense
+  matmul in numpy -- a naive vectorized `[T, nnz]` intermediate for
+  lm_head's matmul would be ~11GB for T~20-30 and nnz~140M, so this
+  genuinely needed either scipy or a much more careful chunked
+  implementation; scipy was the lower-risk choice given the time
+  already spent this session. Verified correct via a synthetic test
+  building the same weights both ways (CSR vs. densified-by-hand
+  reference) and checking `compute_logits_sili` gives numerically
+  identical results either way.
