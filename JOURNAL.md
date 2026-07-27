@@ -1088,17 +1088,66 @@ scalar reference in every case before any timing was trusted):
    does. A genuinely good idea that needs different hardware
    (AVX-512's better gather, or an actual GPU) to pay off here.
 
-**Where this leaves things**: six substantively different strategies,
-including two (v3, v5) with provably zero scalar/branchy work in the
-hot path, converge on the same real ceiling -- **~1.6-2.5x at the
-actual relevant per-row scale**, not the hoped-for 8x. This isn't
-"the hypothesis was wrong," it's a real, verified, hardware-grounded
-finding: the binding constraint is the cumulative-sum dependency
-chain's LATENCY (not throughput, not branchiness, not memory
-bandwidth -- each of those was directly tested and ruled out in turn)
-combined with AVX2 cross-lane operations being relatively expensive.
-v3 or v5 (group-varint re-encoding) would be the ones actually worth
-integrating into sili__new if this is pursued further -- v3 for
-simplicity, v5 for the extra ~20-30% on top. Neither has been wired
-into the real library; this is prototype-only, `sili__new`'s actual
-`DeltaCSRRowCursor`/encoder are untouched.
+**Where these six left things**: converged on the same real ceiling --
+~1.6-2.5x at real per-row scale, all still fundamentally limited by
+SOME form of prefix-sum/cumulative-dependency latency, even the
+zero-scalar-work designs (v3, v5). Superseded by attempt 7 below --
+the actual fix was a different axis than any of v1-v6 tried.
+
+## ULEB128 SIMD, attempt 7: the real fix -- eliminate the dependency via encoding
+
+User's correction to the round-2 conclusion above: v1-v6 all still
+encoded delta-from-PREVIOUS-element, which forces reconstructing
+absolute values via a prefix sum no matter how cleverly the SIMD
+itself is written (v4's two-pass design only removed the CROSS-group
+portion of that dependency; v3/v5 still had an intra-group shift-add
+tree). The actual fix is a different axis: encode
+OFFSET-FROM-GROUP-START instead. Since deltas are all positive (column
+indices are monotonic), every value in a group is independently
+computable as `group_start + offset[i]` with NO dependency on any
+other value in the group -- decode collapses to widening the
+fixed-width offsets and ONE broadcast-add per group, no shift-add tree
+at all. The group's own last (already-computed) output value doubles
+as next group's `group_start` for free -- the cross-group dependency
+that v4 needed a whole separate pass for here costs nothing extra.
+
+Implemented as `ForCodec<G>` (Frame-of-Reference-style) in
+`uleb128_simd_v7_for.cpp`, reusing v3's per-group width-tier
+descriptor (1/2/4 bytes, chosen by each group's own max offset) but
+applied to group-relative offsets instead of raw deltas. Tested
+G=8/16/32/64, correctness verified exactly against scalar ULEB128
+reference in every case (real checkpoint's data shape: median
+delta=1, ~100% single-byte in the current per-delta encoding):
+
+| G | speedup (0% multi-byte, real per-row N) | size overhead (0% mb) | size overhead (1% mb) |
+|---|---|---|---|
+| 8 | 1.7-2.6x | ~12-19% | ~17-20% |
+| 16 | 2.8-3.9x | ~6-19% | ~17-22% |
+| 32 | 4.0-5.3x | ~3-32% | ~27-53% |
+| 64 | 4.3-12.0x (mostly 5-7x) | ~2-30% | ~52-53% |
+
+**This clears the originally-hoped-for 8x at several points (G=64:
+up to 11.98x at N=500)**, and sits solidly in the 4.5-7x range at
+larger G for the density that actually matches the real checkpoint
+(0% multi-byte column). Bigger groups amortize the 1-byte tier
+descriptor over more values (lower overhead when tier stays low) but
+are more exposed to a single large delta forcing the WHOLE group to a
+wider tier (overhead grows faster with G as the multi-byte rate
+rises) -- a real, visible tradeoff in the table above, not
+hand-waved. Given the real checkpoint's actual distribution is
+overwhelmingly single-byte (this session's earlier measurement:
+~100% single-byte for the suffixes sampled), G=32 or G=64 both look
+like strong, honest candidates -- G=64's higher peak speedup comes
+with a noisier/higher worst-case size tax if the real multi-byte
+rate turns out higher than the sampled suffixes suggested.
+
+**This is the first attempt (of 7) that looks genuinely worth
+integrating into sili__new**, not just documenting as a negative
+result. It would need: a new encoder (replacing the current
+delta-to-ULEB128 packer) and a new decoder (replacing
+`DeltaCSRRowCursor`'s sequential `advance()`/`uleb128_decode`), plus
+handling for the size/tier tradeoff above. Not yet started --
+this is still prototype-only
+(`/home/simleek/.claude/jobs/4c378ed3/tmp/uleb128_simd_v7_for.cpp`),
+`sili__new` itself is untouched. Worth a real PR if the user wants to
+proceed, given how much stronger this result is than attempts 1-6.
