@@ -37,6 +37,8 @@ def build_sili_model(
     cfg: MiniCPM5Config,
     band_half_width_override=None,
     num_cpus: int = 4,
+    value_scale_mode: str = "per_row",
+    rank1_iters: int = 6,
 ) -> dict:
     """
     Pops embed_tokens/lm_head/final-norm and every fold step's real sili
@@ -50,7 +52,7 @@ def build_sili_model(
 
     step_layers, input_ln, post_ln = build_step_layers(
         sparse_state, cfg, band_half_width_override=band_half_width_override,
-        num_cpus=num_cpus)
+        num_cpus=num_cpus, value_scale_mode=value_scale_mode, rank1_iters=rank1_iters)
 
     return dict(
         embed_tokens=embed_tokens, lm_head=lm_head, final_norm=final_norm,

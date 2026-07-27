@@ -24,9 +24,9 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 
 from sili import _cpu
+from sili.sparse_rnn import fit_rank1_scale_envelope
 from sili.tensor import Tensor, banded_attention
 
 from .config import MiniCPM5Config
@@ -38,38 +38,58 @@ _ATTN_SUFFIXES = (".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
 _MLP_SUFFIXES  = (".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight")
 
 
-def _build_step_layer(csr_slice_out_in: torch.Tensor, num_cpus: int):
+def _build_step_layer_from_arrays(
+    n_in: int, n_out: int, ptrs: np.ndarray, idx: np.ndarray, vals: np.ndarray, num_cpus: int,
+    value_scale_mode: str = "per_row", rank1_iters: int = 6,
+):
     """
-    csr_slice_out_in: torch sparse CSR [out_dim, in_dim], one fold step's
-    weight slice (FoldedBlockDescriptor.fold_weight_csr's own layout).
+    ptrs/idx/vals: one fold step's own [n_in, n_out] CSR, already sliced
+    out of the suffix's full stacked-and-transposed matrix (see
+    build_step_layers -- the transpose/conversion happens ONCE per suffix,
+    not once per step, since torch's to_sparse_csr()/t() carry real
+    per-call overhead that a 24x-per-suffix call count made the dominant
+    cost of building the model at all).
 
-    Real FP4-quantized SparseLinearLayer, per-row (per-input-feature) value
-    scale -- same scheme as FoldedLayer.from_descriptor's "per_row" mode
-    (see sparse_rnn.py), just applied to one step's own [out_dim, in_dim]
-    slice instead of the full stacked matrix.
+    Real FP4-quantized SparseLinearLayer. value_scale_mode="per_row"
+    (default): one value_scale per input row, matching
+    FoldedLayer.from_descriptor's "per_row" mode. "rank1": also fits a
+    per-output-column scale (fit_rank1_scale_envelope), same scheme as
+    B5a's from_descriptor "rank1" mode but fit independently per fold
+    step instead of shared across all 24 -- each step's own weight
+    distribution gets its own row+col envelope, not a compromise shared
+    across the whole stacked matrix.
     """
-    csr_t = csr_slice_out_in.t().to_sparse_csr()   # [in_dim, out_dim]
-    n_in, n_out = int(csr_t.shape[0]), int(csr_t.shape[1])
-    nnz = int(csr_t.values().numel())
+    nnz = int(vals.shape[0])
     layer = _cpu.SparseLinearLayer(n_in, n_out, int(nnz * 1.3) + 64, num_cpus)
 
-    ptrs = csr_t.crow_indices().numpy().astype(np.int32)
-    idx  = csr_t.col_indices().numpy().astype(np.int32)
-    vals = csr_t.values().float().numpy().copy()
-
-    row_scales = np.ones(n_in, dtype=np.float32)
-    for r in range(n_in):
-        start, end = int(ptrs[r]), int(ptrs[r + 1])
-        if end > start:
-            max_abs = float(np.abs(vals[start:end]).max())
-            if max_abs > 0.0:
-                row_scales[r] = max_abs / _FP4_MAX
-                vals[start:end] /= row_scales[r]
+    vals = vals.copy()
+    if value_scale_mode == "rank1":
+        row_of_nnz = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs))
+        row_env, col_env = fit_rank1_scale_envelope(
+            row_of_nnz, idx.astype(np.int64), np.abs(vals), n_in, n_out, n_iters=rank1_iters)
+        row_scales = (row_env / _FP4_MAX).astype(np.float32)
+        col_scales = col_env.astype(np.float32)
+        combined = row_scales[row_of_nnz] * col_scales[idx]
+        nonzero_combined = combined > 0
+        vals[nonzero_combined] /= combined[nonzero_combined]
+    else:
+        row_scales = np.ones(n_in, dtype=np.float32)
+        col_scales = np.ones(n_out, dtype=np.float32)
+        for r in range(n_in):
+            start, end = int(ptrs[r]), int(ptrs[r + 1])
+            if end > start:
+                max_abs = float(np.abs(vals[start:end]).max())
+                if max_abs > 0.0:
+                    row_scales[r] = max_abs / _FP4_MAX
+                    vals[start:end] /= row_scales[r]
 
     layer.load_weights(ptrs, idx, vals)
     for r in range(n_in):
         if row_scales[r] != 1.0:
             layer.set_value_scale_raw(r, row_scales[r])
+    for c in range(n_out):
+        if col_scales[c] != 1.0:
+            layer.set_output_scale_raw(c, col_scales[c])
     return layer
 
 
@@ -79,6 +99,8 @@ def build_step_layers(
     prefix: str = "model.layers.",
     band_half_width_override=None,
     num_cpus: int = 4,
+    value_scale_mode: str = "per_row",
+    rank1_iters: int = 6,
 ) -> Tuple[List[Dict[str, object]], List[np.ndarray], List[np.ndarray]]:
     """
     Build every fold step's real sili layers (one suffix-keyed dict per
@@ -93,6 +115,15 @@ def build_step_layers(
       step_layers[i]        -- {suffix: SparseLinearLayer} for fold step i
       input_ln_weights[i]   -- float32 [hidden_size], layer i's input_layernorm
       post_attn_ln_weights[i] -- float32 [hidden_size], layer i's post_attention_layernorm
+
+    NOTE: two different attempts to reduce build time by cutting the
+    number of torch .t().to_sparse_csr() calls (transposing the whole
+    suffix once instead of once per step, and separately a pure-numpy
+    stable-sort transpose avoiding torch's CSR machinery altogether) were
+    both measured SLOWER on the real checkpoint than the current
+    per-step fold_weight_csr approach below (real regressions: ~150-165s
+    vs ~77-81s) -- reducing call count wasn't the actual lever, and the
+    real bottleneck hasn't been isolated yet. See JOURNAL.md.
     """
     n = cfg.num_hidden_layers
     step_layers: List[Dict[str, object]] = [dict() for _ in range(n)]
@@ -103,7 +134,14 @@ def build_step_layers(
             del sparse_state[f"{prefix}{i}{suffix}"]
         for i in range(n):
             csr_slice = desc.fold_weight_csr(suffix, i)
-            step_layers[i][suffix] = _build_step_layer(csr_slice, num_cpus)
+            csr_t = csr_slice.t().to_sparse_csr()
+            n_in, out_dim = int(csr_t.shape[0]), int(csr_t.shape[1])
+            ptrs = csr_t.crow_indices().numpy().astype(np.int32)
+            idx  = csr_t.col_indices().numpy().astype(np.int32)
+            vals = csr_t.values().float().numpy()
+            step_layers[i][suffix] = _build_step_layer_from_arrays(
+                n_in, out_dim, ptrs, idx, vals, num_cpus,
+                value_scale_mode=value_scale_mode, rank1_iters=rank1_iters)
         del desc
 
     input_ln = []

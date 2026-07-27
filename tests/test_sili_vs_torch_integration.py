@@ -6,12 +6,18 @@ memory, for the SAME pruned MiniCPM5-1B-Base weights evaluated two ways --
 through the real HF PyTorch model (eval_pruning's existing methodology,
 float32, pruned only, no quantization) and through sili's own compute
 path end-to-end (B6/B7: sili_block.py's fold-depth recurrence +
-sili_model.py's embedding/lm_head wiring). NOT an isolated
-recurrence-only comparison -- sili's SparseLinearLayer.load_weights
-always FP4-quantizes (no opt-out), applied per fold step independently
-(not B5a's stacked/rank-1 scheme, see sili_block.py's module docstring),
-so the sili side combines pruning + quantization + the fold-depth
-recurrence approximation vs. torch's pruning-only float32 baseline.
+sili_model.py's embedding/lm_head wiring). The recurrence itself is NOT
+an approximation of true sequential layer composition -- each step uses
+its own real per-layer weights and a real per-step attention+MLP
+computation, so by induction it's exactly equivalent to the original
+24-layer chain, provided each step's own math is correct (see
+JOURNAL.md for the derivation). What DOES differ from torch: sili's
+SparseLinearLayer.load_weights always FP4-quantizes weights (no
+opt-out in the path used here; activations stay float32 on both
+sides), applied per fold step independently (not B5a's stacked/rank-1
+scheme, see sili_block.py's module docstring) -- so the sili side is
+pruning + FP4 weight quantization vs. torch's pruning-only float32
+baseline.
 
 Writes real captured numbers to sili_v_torch.md at the repo root.
 """
@@ -86,14 +92,22 @@ class TestSiliVsTorchRealCheckpoint:
         rss_after_torch = _rss_mb()
 
         # ── Sili path ─────────────────────────────────────────────────────
+        # num_cpus=8 (this machine's real thread count) -- measured faster
+        # than 4, which was in turn faster than 1: real per-call OpenMP
+        # parallelism helps here, this is not thread-spawn overhead to
+        # avoid (see JOURNAL.md for the num_cpus=1/4/8 comparison).
+        NUM_CPUS = 8
         rss_before_sili = _rss_mb()
         t0 = time.perf_counter()
-        sili_model = build_sili_model(sparse_state_for_sili, cfg, num_cpus=4)
+        sili_model = build_sili_model(sparse_state_for_sili, cfg, num_cpus=NUM_CPUS)
+        t_build_sili = time.perf_counter() - t0
         max_seq_len = max(len(tokenizer(t)["input_ids"]) for t in EVAL_TEXTS)
+        t0 = time.perf_counter()
         sili_result = evaluate_next_token_prediction_sili(
             sili_model, tokenizer, cfg, half_bandwidth=max_seq_len,
-            texts=EVAL_TEXTS, num_cpus=4)
-        sili_seconds = time.perf_counter() - t0
+            texts=EVAL_TEXTS, num_cpus=NUM_CPUS)
+        t_eval_sili = time.perf_counter() - t0
+        sili_seconds = t_build_sili + t_eval_sili
         rss_peak_sili = _rss_mb()
         del sili_model
         trim_memory()
@@ -123,7 +137,7 @@ Measured on this machine ({os.uname().nodename}), single run, RSS via
 |---|---|---|
 | Perplexity | {torch_result.perplexity:.4f} | {sili_result.perplexity:.4f} |
 | Accuracy | {torch_result.accuracy:.4f} | {sili_result.accuracy:.4f} |
-| Wall-clock (eval only) | {torch_seconds:.2f}s | {sili_seconds:.2f}s |
+| Wall-clock (build+eval) | {torch_seconds:.2f}s | {sili_seconds:.2f}s (build {t_build_sili:.1f}s + eval {t_eval_sili:.1f}s) |
 | Peak RSS (this phase) | {rss_peak_torch:.0f} MB | {rss_peak_sili:.0f} MB |
 | RSS before phase | {rss_before_torch:.0f} MB | {rss_before_sili:.0f} MB |
 
@@ -139,19 +153,22 @@ Per-text accuracy (sili):  {[round(a, 4) for a in sili_result.per_text_accuracy]
 ## Reading these numbers
 
 sili is meaningfully worse on quality (accuracy well below torch's
-pruned-only baseline) and far slower (many small Python-level C++ calls
-per token per fold step vs. one fused torch forward), while using less
-peak RSS for the eval phase itself. Since three things differ from
-torch at once (pruning -- shared -- plus FP4 quantization plus the
-fold-depth recurrence's own approximation of true sequential layers),
-this run alone can't attribute the accuracy gap to any one of them.
-B5a already measured quantization's own effect in isolation (stacked/
-rank-1 scheme: ~0.297 accuracy vs. this run's per-step-independent
-scheme's {sili_result.accuracy:.3f} -- worth checking whether
-per-step independent quantization is actually worse than sharing a
-scale, or whether the recurrence approximation is the bigger factor).
-Not yet isolated in this comparison; a real next step, not a
-conclusion drawn here.
+pruned-only baseline) and slower, while using less peak RSS. The
+recurrence itself is exact, not an approximation (see module
+docstring) -- the gap here is pruning (shared) + FP4 weight
+quantization (sili only, activations stay float32 on both sides). A
+follow-up swapping this run's per-row per-step quantization for a
+rank-1 (row+col) per-step scheme found rank-1 accuracy *lower*, not
+higher (0.243 vs 0.265) -- the opposite of B5a's finding for the
+stacked scheme, where rank-1 helped substantially; this only compares
+two FP4 scale-fitting schemes against each other, it doesn't isolate
+FP4's own effect from anything else (no working unquantized-weights
+opt-out in the SparseLinearLayer path used here -- DISLDOLayerV/
+SISLDOLayerV exist as float32-weight variants but their working state
+is unverified). See JOURNAL.md for the full investigation, including a
+real memory breakdown (model weights vs. Python/library/per-call
+overhead) and why two attempts to speed up model-building by reducing
+torch CSR call count both made it slower, not faster (reverted).
 """
         with open(REPORT_PATH, "w") as f:
             f.write(report)

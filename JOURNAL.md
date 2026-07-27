@@ -582,3 +582,146 @@ the catastrophe
   one scale across all 24 layers, OR that the recurrence approximation
   itself is the larger factor -- genuinely not isolated by this test,
   flagged as the real next step rather than guessed at.
+
+## sili_peridot: chasing sili's slowness/memory on the real head-to-head
+
+Direct follow-up to the sili-vs-torch numbers above (161s wall-clock,
+accuracy well below torch): profile it, try num_cpus=4 vs 8, check
+disldo_forward for redundant per-loop scale multiplication, try
+prune-then-quantize-separately (rank-1 per fold step) to see if it
+reaches B5a's 0.297, and break down peak RSS into model weights vs.
+everything else.
+
+- **cProfile is unreliable for this workload -- badly undercounts real
+  wall-clock whenever the profiled call involves OpenMP worker threads
+  or torch's own internal threading.** First attempt: wrapped
+  `evaluate_next_token_prediction_sili` in cProfile -- it reported 0.535
+  CPU-seconds total while the surrounding `time.perf_counter()` showed
+  70s elapsed. Same story for `build_sili_model` (55.9s reported vs.
+  79.4s real). Whatever cProfile's calling-thread-based timer is
+  actually measuring, it isn't attributing genuine multi-threaded C++
+  work correctly. Confirmed this wasn't "OpenMP thread-spawn overhead
+  dominates, so serial is faster" either: forcing num_cpus=1 made eval
+  slower (204s), not faster, than num_cpus=4 (70s) -- real parallelism
+  is helping, not hurting. Switched to `py-spy record --native
+  --format raw` (a sampling profiler, installed into the project venv
+  since pip is externally-managed at the system level) for a trustworthy
+  breakdown: 21358 samples, `disldo_forward` itself is ~27.5% of ALL
+  samples across both phases (genuine sili compute, not overhead) --
+  confirms the eval phase's cost is mostly real work.
+- **num_cpus: 8 (this machine's real thread count) beats 4 beats 1 for
+  the eval phase** (204s @ 1, ~70s @ 4, ~48-53s @ 8, all same real
+  checkpoint) -- real parallelism benefit, not thread-spawn overhead to
+  avoid. Switched sili_model.py's default to 8.
+- **Checked disldo_forward directly for the "a*b+a*c=a*(b+c)" pattern
+  (per direct instruction) -- already optimal, nothing to hoist.**
+  `w = w_stored * val_scale * out_scale` (linear_disldo.hpp:109) is
+  computed once per synapse, outside the batch loop, not recomputed per
+  token -- the maximum possible hoisting given val_scale/out_scale
+  genuinely differ per (row,col). py-spy's hottest single LINE (17.8%
+  of all samples) is instead `mo[b*n_out+col] += contrib` (line 121) --
+  the output accumulator write. Read the surrounding code closely (per
+  direct follow-up: "this is DISLDO though, not SISLDO... we should be
+  able to avoid cache-access issues if we're doing things right" --
+  correct, and worth two concrete notes for a future kernel change, not
+  made in this session since it's a shared-library change needing
+  careful re-verification): (1) `t_out` is sized `num_cpus * batch *
+  n_out`, one full PRIVATE [batch, n_out] buffer per thread, freshly
+  allocated and zeroed on every single disldo_forward call then reduced
+  after -- a fixed per-call cost that scales with num_cpus, cheap for
+  few large calls but paid thousands of times for this session's
+  many-small-calls B6/B7 usage pattern; (2) within one thread's private
+  buffer, `mo[b*n_out+col] += contrib`'s batch loop (for a FIXED
+  synapse/col) strides by `n_out` elements between writes, since `mo`
+  is laid out batch-major ([batch, n_out]) -- since DISLDO's output is
+  dense (unlike SISLDO), there's no sparsity forcing this layout;
+  storing it output-major ([n_out, batch]) instead would make that same
+  inner loop write contiguously.
+- **Two different attempts to speed up build_sili_model by reducing the
+  number of torch `.t().to_sparse_csr()` calls both made it SLOWER, a
+  real regression, not the fix expected -- reverted.** py-spy also
+  showed `to_sparse_csr`/`to_sparse` dominating the ~77-81s build phase
+  (38+9.6 of ~56 cProfile-reported seconds, itself an undercount per
+  above). Attempt 1: transpose each suffix's whole stacked matrix ONCE
+  (7 calls total) instead of once per fold step (168 calls), then slice
+  per-step from numpy arrays -- measured 151-163s, WORSE than the
+  original 77-81s. Attempt 2: same call-count reduction but replacing
+  torch's CSR transpose with a pure-numpy stable-sort/bucket transpose
+  (no torch CSR machinery at all) -- still 163s, no better. Cutting call
+  count wasn't the actual lever; CSR transpose's cost scales with data
+  volume more than with fixed per-call overhead (which was the original
+  hypothesis), and the real bottleneck in the reverted-to per-step
+  approach hasn't been isolated. Reverted both attempts to the original
+  `FoldedBlockDescriptor.fold_weight_csr`-per-step approach (confirmed
+  fastest of the three, ~77-81s) rather than ship a regression.
+- **Prune-then-quantize-separately, rank-1 per fold step: does NOT
+  reach B5a's 0.297 -- it's worse than per-row, not better** (0.2426
+  accuracy / 248.6 perplexity vs. per-row's 0.2652 / 173.4), the
+  opposite of B5a's finding for the STACKED scheme (where rank-1 fixed
+  a real catastrophe: 0.09-0.12 -> 0.297). Real, evidence-backed
+  conclusion: each fold step's own weight matrix is already small and
+  reasonably well-conditioned on its own (not an artificial 24-layer
+  concatenation with wildly different per-layer scales the way B5a's
+  stacked matrix was), so per-row-only scaling doesn't have the same
+  catastrophic failure mode there was something for rank-1 to fix in
+  the first place -- adding rank-1's column correction on top just adds
+  its own fit noise.
+  **CORRECTION, direct follow-up**: this was originally written up as
+  "evidence the recurrence approximation, not quantization scheme, is
+  the larger factor" -- wrong framing, caught by direct question ("the
+  recurrence isn't an approximation, it should be exactly numerically
+  equivalent -- are the values staying float32 throughout?"). Worked
+  through the math: `state=0; for step: out=block(x+state);
+  state+=out`, WITH each step using that fold-step's own distinct real
+  weights and a real per-step attention+MLP computation (which is what
+  B6 actually built, not the crude single-shot fold-sum
+  `SiliBlock.forward_sili`/`FoldedLayer.forward` that the older
+  "first-order approximation" note was actually about) -- by induction,
+  `x+state` at step i exactly equals the true sequential model's h_i,
+  so the recurrence IS exactly equivalent to true layer-by-layer
+  composition, not an approximation of it, PROVIDED each step's own
+  block computation is implemented correctly. torch runs float32
+  throughout (confirmed: `dtype=torch.float32` explicit); sili's
+  `SparseLinearLayer` stores every weight as FP4 (4 bits, 15
+  representable levels -- far coarser than float16) via
+  `load_weights`, with no opt-out. The rank-1-vs-per-row comparison
+  only varied the FP4 scale-FITTING scheme -- both are still
+  FP4-quantized, so it could never have isolated "recurrence" from
+  "quantization" in the first place; that conclusion wasn't supported by
+  the experiment run. FP4's own coarseness is the more likely dominant
+  factor, not yet directly tested (would need either a genuine
+  unquantized (float32) sili forward path, not currently possible since
+  FP4 isn't optional in SparseLinearLayer, or a hand-rolled float32
+  reference fed the SAME post-dequantization weight values to isolate
+  "is apply_fold_step's own attention/RoPE/GQA/MLP math correct" from
+  "does FP4 hurt".
+- **Memory breakdown: model weights vs. everything else, computed from
+  exact real numbers** (total checkpoint: 1,080,632,832 params exactly,
+  4122MB dense float32; 7-suffix pruned nnz 544,477,322 confirmed
+  matching the earlier B5/compact() measurement exactly; embed_tokens
+  pruned nnz 40,427,529 of 200,540,160 dense = ~20% density; lm_head
+  pruned nnz 140,628,074 of 200,540,160 = ~70% density).
+  - **torch** (peak 11810MB): model-related memory is actually TWO full
+    copies held simultaneously -- the HF model's own live parameters
+    (4122MB) AND the separate `pruned_dense` source dict `load_state_dict`
+    copied from, which stays referenced until freed after the peak
+    measurement (another 4122MB) = ~8244MB "model", leaving ~3566MB
+    (~30%) as interpreter/torch/transformers-library/tokenizer/
+    activation-buffer "context". The double-copy is an artifact of this
+    specific test's structure (freeing `pruned_dense` right after
+    `load_state_dict` would roughly halve it), not fundamental to torch.
+  - **sili** (peak 7070MB): the 7 real transformer-suffix weights cost
+    ~1118MB in sili's actual compact FP4 format (measured earlier via
+    `compact()`) -- but embed_tokens and lm_head are currently loaded as
+    FULL DENSE numpy arrays (`sili_model.py`'s `_to_dense_numpy`, chosen
+    as "out of B3/B5's scope" without checking whether B3 actually
+    prunes them -- it does), costing 765MB each regardless of their real
+    ~20%/~70% density. "Model" ≈ 1118+765+765 ≈ 2648MB (~37% of peak),
+    "context" ≈ 4422MB (~63%) -- Python/still-imported-torch/
+    per-suffix-SparseLinearLayer-object overhead/tokenizer/etc.
+    **Concrete, not-yet-done follow-up this surfaces**: storing
+    embed_tokens/lm_head compactly at the same ~2 bytes/nnz used
+    elsewhere would cost ~81MB + ~281MB ≈ 362MB instead of the current
+    1530MB dense -- a real ~1.2GB reduction available, left on the
+    table because these two tensors were assumed out of scope rather
+    than actually checked.

@@ -21,15 +21,15 @@ Measured on this machine (archengineeringpc1), single run, RSS via
 
 | | torch (HF forward) | sili (B6/B7 path) |
 |---|---|---|
-| Perplexity | 16.1493 | 173.3712 |
+| Perplexity | 16.1493 | 173.3711 |
 | Accuracy | 0.4825 | 0.2652 |
-| Wall-clock (eval only) | 7.59s | 161.65s |
-| Peak RSS (this phase) | 11822 MB | 6836 MB |
-| RSS before phase | 7556 MB | 6848 MB |
+| Wall-clock (build+eval) | 8.21s | 147.69s (build 79.5s + eval 68.1s) |
+| Peak RSS (this phase) | 11810 MB | 7070 MB |
+| RSS before phase | 7556 MB | 6907 MB |
 
-RSS checkpoints: start 596 MB, after load+prune
-6791 MB, after freeing torch model+trim
-6848 MB.
+RSS checkpoints: start 595 MB, after load+prune
+6790 MB, after freeing torch model+trim
+6907 MB.
 
 Per-text loss (torch): [2.4744, 2.3127, 3.5558, 1.9847, 3.5818]
 Per-text loss (sili):  [4.9213, 6.1931, 5.1339, 4.764, 4.765]
@@ -39,15 +39,24 @@ Per-text accuracy (sili):  [0.2857, 0.0909, 0.32, 0.36, 0.2692]
 ## Reading these numbers
 
 sili is meaningfully worse on quality (accuracy well below torch's
-pruned-only baseline) and far slower (many small Python-level C++ calls
-per token per fold step vs. one fused torch forward), while using less
-peak RSS for the eval phase itself. Since three things differ from
-torch at once (pruning -- shared -- plus FP4 quantization plus the
-fold-depth recurrence's own approximation of true sequential layers),
-this run alone can't attribute the accuracy gap to any one of them.
-B5a already measured quantization's own effect in isolation (stacked/
-rank-1 scheme: ~0.297 accuracy vs. this run's per-step-independent
-scheme's 0.265 -- worth checking whether per-step independent
-quantization is actually worse than sharing a scale, or whether the
-recurrence approximation is the bigger factor). Not yet isolated in
-this comparison; a real next step, not a conclusion drawn here.
+pruned-only baseline) and slower, while using less peak RSS.
+
+The fold-depth recurrence itself (state=0; for step: out=block(x
++state); state+=out, each step using its own real per-layer weights
+and a real per-step attention+MLP computation) is NOT an approximation
+of true sequential layer composition -- by induction it's exactly
+equivalent, provided each step's own block math is correct. torch runs
+float32 throughout; sili's SparseLinearLayer stores every weight as
+FP4 (4 bits, 15 representable levels, no opt-out in the path used
+here) while activations stay float32 on both sides. So the gap here is
+pruning (shared) + FP4 weight quantization, not a recurrence
+approximation -- an earlier draft of this note claimed otherwise and
+was wrong (see JOURNAL.md's correction). A follow-up swapping this
+run's per-row per-step quantization for a rank-1 (row+col) per-step
+scheme found rank-1 accuracy *lower*, not higher (0.243 vs 0.265) --
+only compares two FP4 scale-fitting schemes, doesn't isolate FP4's own
+effect from anything else. See JOURNAL.md for the full investigation,
+including a real memory breakdown (model weights vs. Python/library/
+per-call overhead) and why two attempts to speed up model-building by
+reducing torch CSR call count both made it slower, not faster
+(reverted).
