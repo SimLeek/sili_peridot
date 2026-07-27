@@ -550,3 +550,35 @@ the catastrophe
   methodology) is not started. Scoped this way deliberately given the
   size of B6+B7 combined -- get the core mechanism right and tested
   first, real-checkpoint integration next.
+- **B7 (full model assembly) + a real sili-vs-torch integration test,
+  same session's direct follow-up**: `model/sili_model.py` wires
+  embed_tokens (numpy gather) -> B6's fold-depth recurrence ->
+  final RMSNorm -> lm_head (numpy matmul) and computes real next-token
+  loss/accuracy, mirroring `eval_pruning.evaluate_next_token_prediction`
+  exactly for a fair comparison. Found and fixed a real bug getting
+  this working: `embed_tokens.weight`/`lm_head.weight` are 2-D, so B3's
+  role-based pruning DOES apply to them and can store either as `{"csr":
+  ...}` or `{"raw": ...}` depending on its own density decision --
+  assumed `"raw"` always (matching the 1-D layernorm vectors, which
+  really are always `"raw"`) and hit a `KeyError` on the real
+  checkpoint immediately.
+- **Real head-to-head run (`tests/test_sili_vs_torch_integration.py`,
+  results in `sili_v_torch.md`)**: same B3-pruned weights, evaluated via
+  torch (float32, pruned only) vs. sili end-to-end (B6/B7). sili:
+  accuracy 0.265 (vs. torch's 0.483), perplexity 173 (vs. 16.1), ~161s
+  wall-clock (vs. ~7.6s -- ~21x slower, expected given many small
+  Python-level C++ calls per token per fold step vs. one fused torch
+  forward), but LOWER peak RSS for the eval phase itself (6.8GB vs.
+  11.8GB). Important correction caught before reporting this: the
+  report's first draft claimed "no quantization on either side" --
+  false. `SparseLinearLayer.load_weights` always FP4-quantizes, no
+  opt-out, so sili's column combines pruning + quantization (per fold
+  step independently, not B5a's stacked/rank-1 scheme) + the recurrence
+  approximation, against torch's pruning-ONLY float32 baseline -- three
+  things differ at once, not one. B5a's own isolated quantization
+  measurement (~0.297 accuracy for the stacked/rank-1 scheme) is
+  suggestively close to this run's 0.265, which could mean per-step
+  independent quantization is similar to or slightly worse than sharing
+  one scale across all 24 layers, OR that the recurrence approximation
+  itself is the larger factor -- genuinely not isolated by this test,
+  flagged as the real next step rather than guessed at.
