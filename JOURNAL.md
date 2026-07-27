@@ -923,3 +923,52 @@ exist yet (needs energy RL / branching factor).
   lose accuracy faster than they gain speed. Not pursued further this
   session; flagging as the natural next step for whoever picks this
   back up.
+
+## ULEB128 SIMD decode: prototyped in isolation, real speedup much smaller than hoped
+
+Per the earlier plan ("sparse activation tests first, then ULEB128 SIMD
+optimizations"), prototyped the "batch-decode groups of 8, verify all
+single-byte via SIMD, fall back to scalar on any multi-byte delta" idea
+standalone (this machine has AVX2/BMI1/BMI2, no AVX-512, matching
+sili__new's existing `-march=haswell` build flag) -- NOT wired into
+sili__new, a throwaway benchmark
+(`/home/simleek/.claude/jobs/4c378ed3/tmp/uleb128_simd_bench.cpp`, not
+committed anywhere) using synthetic delta data matching the real
+checkpoint's measured distribution (median delta=1, mostly single-byte).
+
+- **First version** (widen 8 bytes via `_mm256_cvtepu8_epi32`, then a
+  SCALAR loop for the running-sum/prefix-sum step): 1.34x speedup at
+  0% multi-byte deltas, dropping to 0.80x (SLOWER than plain scalar)
+  by 5% multi-byte.
+- **Second version** (also vectorized the prefix-sum itself -- 8x
+  uint32 prefix sum via 2 shift+add steps plus one cross-128-bit-lane
+  carry broadcast, removing the scalar loop from the fast path
+  entirely): only marginally better, 1.3-1.6x at 0% multi-byte
+  (some run-to-run variance), still ~0.86x (slower) by 5%. Vectorizing
+  the arithmetic did NOT meaningfully move the needle -- correctness
+  verified against the scalar reference in both versions (bit-for-bit
+  identical cumulative column indices).
+- **Reading**: at N=2M synapses (roughly one suffix's real scale),
+  this looks memory-bandwidth-bound rather than compute-bound --
+  each byte is read once and each output written once either way, so
+  batching the arithmetic only saves a fraction of the total time.
+  The "8x" speculated earlier assumed the decode's sequential-
+  dependency chain was the dominant cost; this prototype suggests the
+  actual ceiling is much lower, and the "one bad delta forces the
+  whole group of 8 through the scalar fallback" design pays for
+  itself less and less as the real multi-byte rate rises above a
+  couple percent (a smarter fallback that resyncs at just the bad
+  byte instead of redoing the whole group might recover some of
+  this, not attempted here).
+- **This also isn't the only real bottleneck**: this session's
+  earlier py-spy profiling of `disldo_forward` (see the b6/rank1
+  investigation further up this file) found the single hottest LINE
+  was `mo[b*n_out+col] += contrib` -- the scattered/strided
+  accumulator WRITE, not the decode loop. Even a decode step with a
+  true 8x speedup wouldn't directly fix that separate cost. Given
+  this prototype's real (not assumed) numbers are much more modest
+  than hoped, and the actual profiled hot line is elsewhere, this
+  doesn't look like a good next investment as currently scoped --
+  recommend re-profiling the CURRENT (post activation-sparsity-fix)
+  code before sinking more time into ULEB128-specific SIMD work,
+  rather than continuing on the original assumption.
