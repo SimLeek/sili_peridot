@@ -997,3 +997,108 @@ this session ("too much work for something that probably won't
 result in much of a speedup at all" / "inference-only fast paths...
 low-priority for now") -- not revisiting that call here, just noting
 it's still the same answer with fresh data behind it.
+
+## ULEB128 SIMD, round 2: six real design attempts, real numbers
+
+User correctly pushed back on the first prototype's design (see above)
+as fundamentally flawed, not just "tested and disproved" -- it had a
+branchy all-or-nothing scalar fallback for any group containing a
+multi-byte delta, and its "0% multi-byte" test case had a scalar
+baseline whose branch predictor ran at ~100% accuracy on that specific
+synthetic data, making the comparison unfair. Six substantively
+different designs tried after that correction, all in
+`/home/simleek/.claude/jobs/4c378ed3/tmp/uleb128_simd_v*.cpp`
+(prototypes only, not committed -- correctness verified against a
+scalar reference in every case before any timing was trusted):
+
+1. **v1 (the flawed one above)**: branchy group fallback. 1.3x best
+   case, negative once multi-byte rate exceeds ~2-3%.
+2. **v2**: fixed the boundary math (value boundaries are fully
+   determined by the continuation-bit pattern alone -- one SIMD
+   `movemask` gives it for a whole 32-byte window, no need to decode
+   payloads to find them) but still fell back to scalar decode for any
+   window containing a multi-byte delta. Correct, bounded, but still
+   has real scalar work in the (rare) escalation case.
+3. **v3 -- group-varint re-encoding**: per user's explicit correction
+   ("there shouldn't really be any slow or non-simd work... entire
+   group is 8 bits per or it's 16 or more"), confirmed that TRUE
+   zero-scalar-work decode requires the ENCODING itself to guarantee
+   fixed width per group, not decoder cleverness on the existing raw
+   ULEB128 stream (whose byte offsets are unknowable ahead of time
+   without either a sequential scan or an encode-time guarantee --
+   there is no way around this for the current format). New format:
+   groups of 8 values, each group stored at a fixed 1/2/4 bytes/value
+   (whichever its own max needs) behind a 1-byte tier descriptor.
+   Decode dispatches once per group of 8 to one of three fully
+   vectorized routines -- zero scalar work anywhere in the hot path.
+   **Real per-row-scale result (N=100-8000, matching actual sili
+   per-row nnz, not the earlier 2M-element stress test): ~1.6-2.5x
+   speedup**, correctness verified exactly against scalar reference
+   in every case. Costs ~12-60% more storage than raw ULEB128
+   depending on multi-byte rate (descriptor tax + fixed-width padding
+   for groups needing escalation), a real tradeoff for real hardware.
+4. **v4 -- two-pass decoupled prefix sum**: diagnosed that even v3's
+   zero-scalar design only got ~1.2-1.5x at large N, and that
+   swapping working-set size (4K to 20M elements) didn't move the
+   ratio much -- ruling out pure memory-bandwidth-bound. The actual
+   limiter: the cumulative sum's cross-GROUP carry is inherently
+   serial (each group's carry-in depends on the previous group's
+   total), so even an internally-parallel per-group prefix sum still
+   serializes group-to-group. Decoupled this into 3 passes -- (1)
+   embarrassingly-parallel per-group LOCAL prefix sums + totals, (2)
+   serial prefix-sum of the much-smaller (~N/8) totals array, (3)
+   embarrassingly-parallel broadcast-add of each group's carry-in.
+   Result: genuinely BETTER at cache-resident scale (2-3.7x at
+   N=200K) but WORSE than scalar at large N (0.7-0.9x at 2M-20M,
+   extra read/write pass over the output costs more than the latency
+   it saves once bandwidth-bound) -- and at REAL per-row scale
+   (100-8000), roughly comparable to or slightly worse than v3's
+   simpler single-pass design (~1.5-1.9x vs v3's ~1.6-2.5x). Simpler
+   v3 wins for the actual relevant scale.
+5. **v5 -- wider lanes for the dominant tier**: per user's suggestion
+   ("probably 32x instead if we're doing uint8 and clever"), kept the
+   overwhelmingly-common tier-0 (single-byte) case in uint16 lanes
+   (16-wide) instead of immediately widening to uint32 (8-wide) --
+   safe from overflow since 16 single-byte deltas summed is at most
+   4080, well inside uint16 range; only widens to uint32 for the
+   final carry-in add. **~2.0-2.5x at real per-row scale** -- a real
+   but modest improvement over v3's 8-wide version, roughly
+   proportional to the wider lane count but not linearly so (matches
+   v4's finding: cross-lane AVX2 operation latency, not raw lane
+   count, is the binding constraint).
+6. **v6 -- warp/SIMT-style decode across ROWS**: user's idea --
+   sili already tracks known per-row starting byte offsets
+   (`L.byte_start[row]`), so instead of fighting the intra-row
+   unknown-boundary problem, run 8 independent scalar decoders in
+   lockstep, one per SIMD lane, each walking a DIFFERENT row
+   (matches GPU SIMT execution for divergent-length loops). Verified
+   correct (both a scalar-lane-emulation version and a true-AVX2
+   version matched the sequential reference exactly), but **5-10x
+   SLOWER than plain sequential decode**, worse still with divergent
+   row lengths (the exact scenario SIMT masking is supposed to help
+   with). Root cause is CPU-specific, not a flaw in the idea itself:
+   AVX2 has no efficient byte-granularity gather/scatter (had to
+   gather/scatter via 8 individual scalar loads/stores per round),
+   which (a) destroys the sequential memory-access pattern the
+   hardware prefetcher relies on -- interleaving 8 independent
+   streams touches 8 different cache lines every single byte instead
+   of walking one region linearly -- and (b) for divergent lengths,
+   pays a full vector-op round for every already-finished lane with
+   no dedicated warp scheduler to hide that cost the way a real GPU
+   does. A genuinely good idea that needs different hardware
+   (AVX-512's better gather, or an actual GPU) to pay off here.
+
+**Where this leaves things**: six substantively different strategies,
+including two (v3, v5) with provably zero scalar/branchy work in the
+hot path, converge on the same real ceiling -- **~1.6-2.5x at the
+actual relevant per-row scale**, not the hoped-for 8x. This isn't
+"the hypothesis was wrong," it's a real, verified, hardware-grounded
+finding: the binding constraint is the cumulative-sum dependency
+chain's LATENCY (not throughput, not branchiness, not memory
+bandwidth -- each of those was directly tested and ruled out in turn)
+combined with AVX2 cross-lane operations being relatively expensive.
+v3 or v5 (group-varint re-encoding) would be the ones actually worth
+integrating into sili__new if this is pursued further -- v3 for
+simplicity, v5 for the extra ~20-30% on top. Neither has been wired
+into the real library; this is prototype-only, `sili__new`'s actual
+`DeltaCSRRowCursor`/encoder are untouched.
