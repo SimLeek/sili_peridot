@@ -766,3 +766,234 @@ from the estimate in an instructive way.
   building the same weights both ways (CSR vs. densified-by-hand
   reference) and checking `compute_logits_sili` gives numerically
   identical results either way.
+
+## sili_peridot: activation sparsity -- a real sili__new bug, then real results
+
+Added `_forward` (`model/sili_block.py`) so every projection in a fold
+step can route through DISLDO (`forward_dense`, current default) or
+SISLDO (`forward_sparse`, when `activation_density` is set) -- keeps
+only the top `round(density*n_features)` entries by magnitude per
+token before the sparse forward pass. `activation_density` also
+accepts a dict (per-suffix: sparsify only some of q/k/v/o/gate/up/
+down) or a list of length `num_hidden_layers` (per-fold-step) via
+`_density_for_suffix`/`run_folded_recurrence`'s `per_step` branch --
+manual stand-ins for true per-layer adaptive sparsity, which doesn't
+exist yet (needs energy RL / branching factor).
+
+- **First real-checkpoint run collapsed to ~0.0 accuracy at EVERY
+  density tested, including 0.9** -- a uniform floor, not the smooth
+  degradation genuine information loss would produce. Traced through
+  three layers of investigation, in order:
+  1. `_cpu.dense_to_top_k_csr`'s `k` is a GLOBAL budget over the whole
+     flattened `[rows, cols]` batch, not per-row (verified directly:
+     5 rows x 8 cols, k=4 gave nnz-per-row `[3,0,0,1,0]`, not
+     `[4]*5`) -- calling it once on the full multi-token `x` starved
+     most tokens of any active features at all. Fixed in
+     `_forward` by looping per row (later replaced, see below).
+  2. Row-budget fix alone didn't help -- even 90% density still
+     collapsed (0.0071 accuracy). Isolated with fresh-layer,
+     single-call synthetic tests (avoiding a real but harmless
+     `forward_sparse`/`forward_dense` return-value ALIASING gotcha:
+     the returned array is a live view into the layer's own
+     `output_buf`, silently overwritten by the layer's next
+     forward call -- copy immediately if holding onto more than one
+     result from the same layer instance) down to a genuine bug in
+     **sili__new**: `csr.hpp`'s `top_k_indices` sorted candidates by
+     raw signed value (`a.second > b.second`), not magnitude. For
+     zero-mean data (any post-RMSNorm activation) that keeps only the
+     largest POSITIVE entries and discards every negative one
+     regardless of magnitude -- even at k close to the full row
+     width, since it's the most-negative (often highest-magnitude)
+     entries that get dropped first. Fixed upstream: sili__new PR #15
+     (`fix/top-k-indices-sort-by-magnitude`, both `partial_sort`
+     comparators now compare `std::abs(...)`), 855 assertions passing,
+     merge pending user review as of this writing.
+  3. With both fixes, the real-checkpoint curve became sensible:
+     dense=0.2652 acc/173.37 ppl; 0.9=0.2591-0.2663 acc/~173 ppl
+     (matches dense); 0.5=0.15-0.17 acc/~870 ppl; 0.2=0.008-0.03
+     acc/~170k-370k ppl; 0.1 and below=0.0 acc. **Real cliff is
+     between 0.5 and 0.2 density, not near the low end** -- so the
+     5%/2%/0.5% densities from the original request are all well past
+     collapse; only ~90% (matches dense, no speed win) and marginally
+     ~50% (meaningfully degraded) preserve any real accuracy.
+- **Separately, the per-row Python loop itself (`dense_to_top_k_csr`
+  called once per token) was ~74x slower than necessary** -- measured
+  directly (T=30, F=1536, density=0.5): 57.06ms/call looped vs
+  0.77ms/call for a fully vectorized `np.argpartition`-based
+  per-row top-k (partition + per-row sort + `np.take_along_axis` to
+  gather values, then build the CSR triplet directly -- no C++ call
+  per row at all). Replaced the loop with this in `_forward`; `idx`
+  sets per row confirmed identical between the two approaches before
+  switching. `num_cpus` dropped from `_forward`'s signature (was only
+  ever used by the removed per-row `_cpu` calls).
+- **Even with vectorized top-k, global activation sparsity still has
+  no density where speed and accuracy both hold**: real-checkpoint
+  eval time was 215s at density=0.9 (vs ~65s dense -- 3.3x SLOWER),
+  101s at 0.5, ~62s at 0.2 (roughly dense speed), 40s at 0.1 and below
+  (faster, but already collapsed). `forward_sparse`'s own per-synapse
+  delta-CSR walk has real fixed overhead per active connection that a
+  batched dense matmul doesn't -- confirmed with a clean (no
+  concurrent load) isolated single-layer microbenchmark across 8
+  different layer shapes (512-4096 dims), weight densities
+  (0.3-0.9), and batch sizes (5-50 tokens): the dense/sparse
+  wall-clock crossover point landed consistently in the **0.15-0.2
+  density range** across all 8 configs, not just the one shape first
+  measured. Stable enough across shapes to be worth exposing in
+  sili__new itself as a real auto-dispatch threshold (see
+  `hoyer_sparsify.hpp`'s existing-but-unwired hoyer-score machinery
+  and TODO.md's planned "auto-dispatching version" -- this is real
+  data toward the "not obvious" threshold decision mentioned there),
+  though not yet proposed/implemented -- flagging as a candidate,
+  not treating one session's benchmark as final.
+- **Local (per-projection / per-fold-step) sparsity at density=0.2,
+  real checkpoint, dense baseline 0.2652 acc / 173.37 ppl**:
+
+  | variant | accuracy | perplexity |
+  |---|---|---|
+  | attn-only (q/k/v/o, all 24 steps) | 0.0557 | 8311.48 |
+  | mlp-only (gate/up/down, all 24 steps) | 0.0157 | 72971.38 |
+  | early-8 fold steps (all 7 suffixes) | 0.0077 | 11962.08 |
+  | **late-8 fold steps** | **0.2148** | **569.97** |
+  | middle-8 fold steps | 0.1261 | 2223.70 |
+
+  Late-8 is close to dense; early-8 is nearly as collapsed as
+  sparsifying everything globally. Matches the fold-depth recurrence's
+  own structure (`state=0; for step: out=block(x+state); state+=out`)
+  -- corrupting an EARLY step's output poisons every subsequent step's
+  input via the accumulated `state`, while corrupting only the last
+  few steps limits the damage to whatever's added at the very end.
+  MLP-only also hurts more than attn-only, consistent with B3's own
+  role-based pruning thresholds already treating MLP and attention
+  weights differently for a similar reason (different parts of the
+  network carry different amounts of irreplaceable signal).
+- **Follow-up depth sweep, density=0.2, trailing N fold steps sparsified
+  (rest dense), same 5-text eval**:
+
+  | trailing steps | accuracy | perplexity | eval time |
+  |---|---|---|---|
+  | 4 | 0.1974 | 292.76 | 65.07s |
+  | 8 | 0.2148 | 569.97 | 57.86s |
+  | 12 | 0.1512 | 1569.46 | 57.09s |
+  | 16 | 0.0622 | 8658.95 | 54.58s |
+  | 20 | 0.0080 | 64926.17 | 51.90s |
+  | 24 (=global) | 0.0319 | 167598.48 | 50.80s |
+
+  Clear boundary: 4-8 trailing steps stay close to dense accuracy,
+  12 is visibly degrading but not collapsed, 16+ falls off a cliff
+  toward the same collapse as sparsifying globally. (late-24 here
+  is the same "global 0.2" case as the earlier curve/local-sparsity
+  runs -- 0.0319 vs those runs' 0.03/0.0077 is normal run-to-run
+  noise on a 5-text eval set, not a contradiction.)
+  eval time drops MONOTONICALLY as more trailing steps are
+  sparsified (65s @ N=4 down to 51s @ N=24) even though accuracy
+  does not improve monotonically past N=8 -- consistent with
+  `forward_sparse` genuinely being cheaper per call at this density
+  once contention/measurement noise is controlled for (matches the
+  clean crossover benchmark below), but the win from sparsifying
+  only a handful of steps out of 24 is modest in absolute terms
+  (a few seconds out of ~60s total), since most of the network stays
+  dense regardless.
+- **late-8 also degrades gracefully (not catastrophically) as density
+  drops further**, unlike the sharp global cliff: 0.2->0.2148 acc,
+  0.15->0.1415, 0.1->0.0953, 0.05->0.0876 acc (172, 1193, 2024, 10682
+  ppl respectively) -- some usable signal survives even at 5% density
+  when confined to the last 8 steps, where the same density applied
+  globally gives exactly 0.0.
+- **Checked whether trading depth for density beats late-8@0.2**
+  (the best point found so far): late-12 at lower densities does
+  NOT help -- 0.15->0.0795 acc, 0.1->0.0400, 0.05->0.0077 (4603,
+  28203, 472728 ppl), all worse than late-8's own values at the same
+  densities (0.1415/0.0953/0.0876 acc). late-10@0.2->0.1438 acc,
+  sitting between late-8 (0.2148) and late-12 (0.1512) as expected.
+  **late-8@density=0.2 is the best accuracy/speed point found in
+  this whole sweep** -- pushing either axis (more steps, or the same
+  step count at lower density) past that point loses more accuracy
+  than it's worth for this checkpoint/eval set.
+- **Net read**: a uniform global density has no usable
+  accuracy/speed tradeoff point in this checkpoint. Confining
+  sparsification to the LAST ~8 fold steps does have real accuracy
+  headroom (and confirms the fold-recurrence's state-accumulation
+  structure is the actual mechanism, not a fluke of one density
+  value), but the speed win from sparsifying only 8 of 24 steps is
+  modest, not dramatic -- getting a genuinely large speedup out of
+  this direction would need a smarter (adaptive/learned, e.g. energy
+  RL) mechanism for deciding per-step/per-token density rather than
+  a fixed manual schedule; naively pushing the fixed schedule further
+  (more steps, or lower density) has already been checked and both
+  lose accuracy faster than they gain speed. Not pursued further this
+  session; flagging as the natural next step for whoever picks this
+  back up.
+
+## ULEB128 SIMD decode: prototyped in isolation, real speedup much smaller than hoped
+
+Per the earlier plan ("sparse activation tests first, then ULEB128 SIMD
+optimizations"), prototyped the "batch-decode groups of 8, verify all
+single-byte via SIMD, fall back to scalar on any multi-byte delta" idea
+standalone (this machine has AVX2/BMI1/BMI2, no AVX-512, matching
+sili__new's existing `-march=haswell` build flag) -- NOT wired into
+sili__new, a throwaway benchmark
+(`/home/simleek/.claude/jobs/4c378ed3/tmp/uleb128_simd_bench.cpp`, not
+committed anywhere) using synthetic delta data matching the real
+checkpoint's measured distribution (median delta=1, mostly single-byte).
+
+- **First version** (widen 8 bytes via `_mm256_cvtepu8_epi32`, then a
+  SCALAR loop for the running-sum/prefix-sum step): 1.34x speedup at
+  0% multi-byte deltas, dropping to 0.80x (SLOWER than plain scalar)
+  by 5% multi-byte.
+- **Second version** (also vectorized the prefix-sum itself -- 8x
+  uint32 prefix sum via 2 shift+add steps plus one cross-128-bit-lane
+  carry broadcast, removing the scalar loop from the fast path
+  entirely): only marginally better, 1.3-1.6x at 0% multi-byte
+  (some run-to-run variance), still ~0.86x (slower) by 5%. Vectorizing
+  the arithmetic did NOT meaningfully move the needle -- correctness
+  verified against the scalar reference in both versions (bit-for-bit
+  identical cumulative column indices).
+- **Reading**: at N=2M synapses (roughly one suffix's real scale),
+  this looks memory-bandwidth-bound rather than compute-bound --
+  each byte is read once and each output written once either way, so
+  batching the arithmetic only saves a fraction of the total time.
+  The "8x" speculated earlier assumed the decode's sequential-
+  dependency chain was the dominant cost; this prototype suggests the
+  actual ceiling is much lower, and the "one bad delta forces the
+  whole group of 8 through the scalar fallback" design pays for
+  itself less and less as the real multi-byte rate rises above a
+  couple percent (a smarter fallback that resyncs at just the bad
+  byte instead of redoing the whole group might recover some of
+  this, not attempted here).
+- **This also isn't the only real bottleneck**: this session's
+  earlier py-spy profiling of `disldo_forward` (see the b6/rank1
+  investigation further up this file) found the single hottest LINE
+  was `mo[b*n_out+col] += contrib` -- the scattered/strided
+  accumulator WRITE, not the decode loop. Even a decode step with a
+  true 8x speedup wouldn't directly fix that separate cost. Given
+  this prototype's real (not assumed) numbers are much more modest
+  than hoped, and the actual profiled hot line is elsewhere, this
+  doesn't look like a good next investment as currently scoped --
+  recommend re-profiling the CURRENT (post activation-sparsity-fix)
+  code before sinking more time into ULEB128-specific SIMD work,
+  rather than continuing on the original assumption.
+
+**Re-profiled current code (py-spy, dense baseline, real checkpoint,
+20500 samples) to check that recommendation before dropping it** --
+confirms the prototype's implication directly: `uleb128_decode` is
+only **0.33% of eval-phase samples**. Full eval-phase breakdown (build
+phase separated out, since `fp4_quantize`/CSR-conversion-during-load
+costs are a different question from per-token forward cost):
+`disldo_forward`'s several hot lines together (121/117/119/120/106/122
+-- the scattered accumulator write and its neighbors) are ~55% of
+eval-phase samples, and `sgemm_` (BLAS) is ~34% -- traced to
+`hidden @ lm_head.T` in `compute_logits_sili`, the full-vocabulary
+logits matmul. That's a fundamentally unavoidable cost (any
+implementation needs this exact operation to produce logits over the
+whole vocab; `lm_head` stays dense on purpose per the earlier
+embed_tokens/lm_head compaction work, since CSR would cost MORE at
+its real ~70% density), not a sili-specific inefficiency to chase.
+**Conclusion: ULEB128 SIMD decode is confirmed not worth pursuing
+further in the current (dense-forward-dominant) pipeline** -- its
+ceiling is under 1%. `disldo_forward`'s scattered-write pattern
+remains the one real, identified, sili-specific hot spot, and it was
+already flagged plus explicitly deprioritized by the user earlier
+this session ("too much work for something that probably won't
+result in much of a speedup at all" / "inference-only fast paths...
+low-priority for now") -- not revisiting that call here, just noting
+it's still the same answer with fresh data behind it.
