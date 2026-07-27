@@ -231,3 +231,209 @@ lives instead of in code docstrings/comments, so the code can stay terse.
   forward and checking `ps aux` for stray processes before starting a
   new heavy one -- worth remembering for any future multi-round
   iterative search that needs repeated real-model loads.
+
+## sili_peridot: B5 -- FoldedLayer construction memory, and a real
+FP4 quantization quality catastrophe
+
+- **First alarm on `FoldedLayer.from_descriptor()` at real scale was a
+  measurement artifact, not a real problem.** Testing v_proj -> k_proj
+  -> o_proj sequentially in one long-running process showed a "4.4GB
+  jump" landing on o_proj's construction; extrapolating that rate to
+  `gate_proj`/`up_proj` (budget ~170M vs o_proj's ~75M) suggested ~10GB
+  more, which wouldn't fit alongside the ~8GB already used loading+
+  pruning the checkpoint. Re-tested each suffix in an ISOLATED fresh
+  process instead: `from_descriptor`'s own C++ construction
+  (SparseLinearLayer alloc, load_weights, scale-setting,
+  equalize_to_capacity) added **zero** measurable peak RSS beyond what
+  `fold_suffix` itself already used -- true even for `gate_proj` at its
+  full ~170M budget (nnz~=136M, already ~80% of the dense ceiling). The
+  "4.4GB" was cumulative fragmentation from testing 3 suffixes
+  back-to-back in one process without releasing memory between them
+  (Python/glibc doesn't reliably return freed large-tensor memory to the
+  OS within a process's lifetime) -- misattributed entirely to whichever
+  suffix happened to run last.
+- **The REAL memory driver is `fold_block_group`'s own per-layer
+  dense-to-CSR conversion loop, not `from_descriptor`.** Confirmed by
+  isolated single-suffix tests: `fold_suffix(gate_proj)` alone jumped
+  from ~8GB (post load+prune) to ~11.5GB. Root cause: B3's per-role
+  thresholds deliberately leave most suffixes 80-93% dense by row
+  (`gate_proj` mean row occupancy ~80% of its dense ceiling) -- "prune
+  gently, let training-time synaptogenesis do the real sparsification
+  later" was always the intentional trade (see B3b above), but it means
+  folding, a pure reshape, has almost no headroom to work with:
+  converting 24 already-mostly-dense per-layer tensors to CSR and
+  stacking them costs real memory regardless of how the C++ layer itself
+  stores things.
+- **Fix: stream, don't accumulate.** `fold_all_suffixes` (build all 7
+  descriptors, hold them all) let dead weight from already-folded
+  suffixes pile up across the loop. `build_folded_layers_streaming`
+  (`model/fold.py`) folds ONE suffix, pops its 24 raw per-layer tensors
+  out of the caller's `sparse_state` dict immediately, THEN builds the
+  real `FoldedLayer`, before moving to the next suffix. Confirmed on the
+  real checkpoint, twice: all 7 real `FoldedLayer` objects buildable
+  simultaneously, peak ~13.5-13.9GB on this 15GB machine, ~4-5 minutes.
+  A further variant, `build_and_save_folded_layers`, additionally
+  serializes each suffix's `state_dict()` to a `.npz` and discards the
+  live C++ object right after -- didn't reduce the measured PEAK much
+  further (the peak moment is dominated by whichever single suffix is
+  largest at the time it's processed, not by how many are held
+  afterward), but does mean the CONVERSION step itself doesn't need to
+  hold all 7 simultaneously once written to disk. True per-row streaming
+  (converting each suffix's dense-to-CSR-to-C++ pipeline in row batches,
+  never materializing a whole suffix's dense form at once) would cut the
+  real peak further but requires changes inside `fold_block_group`/
+  `from_descriptor` in `sili__new` itself -- tracked as a follow-up
+  (todolist B5), not done in this pass.
+- **A real FP4 quantization catastrophe, found while building the
+  "pre-quantized vs post-quantized" comparison the user asked for.**
+  Simulated `from_descriptor`'s EXACT quantization scheme in
+  numpy/torch (`model/quantize.py`: fp4quant.hpp's real 16-level table,
+  the real per-input-column scale computed on the STACKED/folded matrix
+  -- shared across all 24 layers, not computed independently per layer)
+  and ran the same real end-to-end next-token comparison methodology
+  B3b used for pruning (`model/eval_quantization.py`, reusing
+  `eval_pruning.evaluate_next_token_prediction`). Result: accuracy
+  collapses from 0.482 (B3b's pruned baseline) to ~0.09-0.12, perplexity
+  jumps ~200x (16 -> ~3300) -- nowhere near the "small drop" expected
+  going in. Ruled out a simulation bug before treating this as real:
+  (a) unit-tested the scale computation against a hand-worked example
+  (`test_quantize.py`), (b) checked whether the shared (across-24-layers)
+  scale is dominated by a rogue outlier layer for `gate_proj` -- it
+  isn't (per-layer/global max_abs ratio: mean=0.71, median=0.71, only
+  1.1% of (layer,column) pairs below 0.3, 0% below 0.1), ruling out
+  "one weird layer wrecks everyone's resolution" as the mechanism.
+  Tried a finer, per-layer-only scale (each layer quantized against its
+  own weights, not the shared/stacked one) as the obvious first fix:
+  helps a lot (accuracy 0.094 -> 0.265) but still falls far short of
+  "small drop" -- naive round-to-nearest 4-bit weight quantization with
+  no calibration (no GPTQ-style Hessian-aware rounding, no smoothing,
+  no outlier handling) is just genuinely destructive at this model
+  scale, stacked on top of already-pruned weights. Locked in as a real
+  regression test (`tests/test_eval_quantization.py`,
+  `test_shared_scale_quantization_currently_destroys_quality`) rather
+  than hidden -- same pattern as B3b's
+  `test_global_threshold_pruning_destroys_the_model`: document the
+  current bad number so a future fix has something concrete to beat.
+  **Not yet resolved** -- needs the same kind of per-role/per-suffix
+  sensitivity search B3b built for pruning
+  (`sili.conversion.prune_sensitivity`), not yet attempted for
+  quantization; plausibly some suffixes tolerate FP4 fine and others
+  (like `v_proj` for pruning) don't, and per-suffix granularity /
+  selective full-precision retention for sensitive suffixes is the
+  natural next experiment.
+- **A second, real OOM directly caused by NOT applying the same
+  streaming discipline everywhere.** `fold_all_suffixes` alone (no real
+  `FoldedLayer` construction, just building all 7 descriptors to extract
+  their scale vectors) OOM-killed this machine (confirmed via
+  `journalctl`/kernel oom-killer log, not inferred) once a real HF model
+  was ALSO loaded at the same time for the next-token comparison --
+  holding all 7 suffixes' full stacked CSRs (hundreds of MB to ~1.8GB
+  each for the largest) simultaneously, on top of the HF model's own
+  ~4.3GB float32 footprint and the still-resident pruned `sparse_state`,
+  exceeded 15GB. Fixed the same way as the FoldedLayer construction
+  case: `compute_suffix_scales_streaming` (`model/quantize.py`) folds
+  one suffix, extracts its (small, ~1536-float) scale vector, discards
+  the descriptor, before moving to the next. **Order matters**: build
+  `pruned_dense` (needed for the whole rest of the comparison) BEFORE
+  running the streaming/destructive scale computation, since the latter
+  pops entries out of `sparse_state` -- doing it in the other order
+  would silently produce an incomplete `pruned_dense`.
+
+## sili_peridot/sili__new: B5a -- rank-1 quantization scale fixes most of
+the catastrophe
+
+- **User's diagnosis, confirmed directly before building anything**: "the
+  layers were originally trained as separate dense layers, so merging
+  them would harm things" -- i.e. `from_descriptor`'s per-row scale,
+  SHARED across all 24 folded layers, forces every layer to share ONE
+  input-side scale even though they were never trained with that
+  constraint. Their proposed fix: per-input AND per-output scale (a rank
+  -1/outer-product pair of vectors, not a full per-element matrix).
+  Their diagnostic proposal -- check whether per-OUTPUT magnitude is
+  roughly uniform WITHIN one folded layer (if so, per-layer scaling
+  alone would already be "enough" and rank-1 wouldn't help) -- was run
+  first, on the real checkpoint: within-layer coefficient of variation
+  of per-output max|.| ~0.32-0.38, within-layer min/max ratio ~0.05-0.10
+  (gate_proj/q_proj/down_proj all similar). Confirmed real structure a
+  per-row-only OR per-layer-only scale can't capture.
+- **Simulated in pure numpy before touching any C++** (per direct
+  guidance -- validate the concept cheaply first): an alternating max
+  -fit ("Sinkhorn-style, but max-based") producing a rank-1 envelope
+  `row_scale[i] * col_scale[o] >= |W[i,o]|` for every entry, using
+  O(n_in+n_out) parameters instead of O(n_in*n_out). Real end-to-end
+  next-token result: accuracy 0.482 (baseline) -> 0.094 (old per-row
+  scheme) -> **0.297 (rank-1)**, perplexity 3328 -> 91 (~36x lower).
+  Real, substantial progress -- not full recovery.
+- **Two further simulated attempts, both informative negatives**:
+  (a) percentile-based envelope fitting (letting rare outlier weights
+  clip/saturate instead of forcing the whole scale to cover them, a
+  standard clipping-based quantization technique) tested WORSE than the
+  plain max-envelope (accuracy 0.181 vs 0.297) -- rejected, not pursued
+  further. (b) Confirmed the shared-scale catastrophe wasn't caused by
+  one outlier layer dominating the scale (per-layer/global max_abs
+  ratio: mean=0.71, only 1.1% of pairs below 0.3) before spending effort
+  on a fix that wouldn't have addressed the real cause.
+- **Built the real sili__new library support** once the concept was
+  validated (sili__new PR #10): `output_scale` (per-column, mirroring
+  `value_scale`'s existing per-row design exactly) added to
+  `SparseLinearWeightsDelta`, wired through `disldo_forward`/
+  `disldo_backward`'s dequantization (`true_w = stored_w * value_scale
+  [row] * output_scale[col]`). `value_scale`'s OWN gradient (used when a
+  layer is later trained, not at conversion time) had to be corrected to
+  account for the new fixed `output_scale[col]` factor too -- easy to
+  miss since `output_scale` itself isn't gradient-updated, but
+  `value_scale`'s gradient formula still needs to know about it.
+  `output_scale` deliberately NOT gradient-updated -- a fixed, write
+  -once conversion-time constant, not a re-learned parameter (matches
+  how `value_scale` is actually USED in `from_descriptor` today, even
+  though the class also supports gradient-updating `value_scale`
+  elsewhere, e.g. Mandelbrot RL). `FoldedLayer.from_descriptor` gets an
+  opt-in `value_scale_mode="rank1"` (default stays `"per_row"` for exact
+  backward compatibility) -- now `sili_peridot`'s own default once
+  wired through `model/fold.py`'s builder functions.
+- **Real (not simulated) C++ validation, on the actual checkpoint**:
+  built a real `FoldedLayer` for `gate_proj` via both modes, compared
+  `forward()` output against the exact unquantized analytic reference
+  (`reference_fold_forward`) -- rank1's real reconstruction error was
+  ~30% lower than per_row's (mean_abs_err 0.75 vs 1.08), confirming the
+  wiring works correctly, not just the simulation.
+- **A real bug found writing sili_peridot's OWN simulation copy of the
+  fix** (`model/quantize.py`): the envelope fit needs `abs(W)`, not raw
+  signed values -- a first draft dropped the `.abs()` call (present
+  correctly in the original probe script and in sili__new's own
+  `from_descriptor`), which silently made the simulated "rank1" result
+  WORSE than per-row (error 180 vs 105 on synthetic data) rather than
+  better. Caught because the new module-level test used i.i.d. random
+  weights with no real per-output structure for rank1 to exploit in the
+  first place -- fixed the test to build data WITH genuine per-output
+  magnitude structure (matching what the real checkpoint actually has),
+  which is what surfaced the missing-`.abs()` bug clearly.
+- **A `float64` memory bug, found by a real, repeated OOM** (confirmed
+  via kernel oom-killer log each time, not inferred): `fit_rank1_scale_
+  envelope`'s `row_scale`/`col_scale` were `float64` by construction,
+  which silently upcasts every `abs_mat / scale` broadcast to float64
+  internally regardless of `abs_mat`'s own dtype -- doubling the
+  transient memory of every envelope-fit iteration for the largest
+  suffixes. Combined with a real HF model also loaded for the next
+  -token comparison, this OOM-killed the machine three times before
+  being found and fixed (switched to float32 throughout -- a max/divide
+  fit has no numerical-stability need for float64). Fixed in both
+  sili__new's copy and sili_peridot's own mirror.
+- **Even after that fix, running BOTH real-checkpoint quantization test
+  classes (per_row's and rank1's) together in one pytest invocation
+  still risks OOM on this 15GB machine** -- each passes reliably in
+  isolation. Documented directly in the test file rather than chased
+  further: a real hardware constraint on this specific machine, not a
+  code bug (the module-scoped fixtures are each individually correct
+  and necessary).
+- **Per direct instruction, this is where the search stops for now**:
+  "0.297 isn't the best but it also isn't noise" -- real, substantial,
+  validated progress (accuracy 3.2x higher, perplexity 36x lower than
+  the original scheme), locked in as the new baseline via a real
+  -checkpoint regression test, rather than continuing to chase full
+  parity with the 0.482 dense-pruned baseline right now. B5a is closed
+  as "addressed", not "solved" -- a finer-than-rank-1 group size or
+  genuine calibration (Hessian/activation-aware rounding, e.g.
+  GPTQ-style) remains a real, documented option if more quality is
+  needed later, most likely resolved via B8's post-quantization
+  training rather than further conversion-time work.

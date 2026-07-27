@@ -23,11 +23,14 @@ itself doesn't block on that decision.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from sili.conversion.rnn_fold import fold_block_group, FoldedBlockDescriptor
+from sili.sparse_rnn import FoldedLayer
 
 from .config import MiniCPM5Config
 
@@ -105,6 +108,165 @@ def fold_all_suffixes(
         suffix: fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
         for suffix in suffixes
     }
+
+
+def build_folded_layers(
+    descriptors: Dict[str, FoldedBlockDescriptor],
+    learning_rate: float = 0.01,
+    num_cpus: int = 4,
+    value_scale_mode: str = "rank1",
+) -> Dict[str, FoldedLayer]:
+    """
+    B5: turn each suffix's FoldedBlockDescriptor into a real sili
+    FoldedLayer (sili.sparse_rnn.FoldedLayer.from_descriptor). One
+    suffix at a time -- each descriptor's stacked_weights has exactly
+    one key, so from_descriptor builds exactly one internal
+    SparseLinearLayer per call, never bundling suffixes (see module
+    docstring).
+
+    value_scale_mode="rank1" (default, B5a): from_descriptor's original
+    "per_row" scheme (one value_scale per input row, shared across all
+    n_out output positions) collapsed real next-token accuracy from
+    0.482 to ~0.09-0.12 on MiniCPM5 -- per-output magnitude within one
+    folded layer varies by a min/max ratio as low as ~0.05-0.10, so a
+    single per-row scale wastes most of FP4's resolution on most
+    outputs. "rank1" adds a genuine per-output scale too (sili__new's
+    fit_rank1_scale_envelope), recovering to ~0.297 accuracy in
+    simulation before this was wired into the real C++ path. See
+    JOURNAL.md for the full investigation and eval_quantization.py for
+    the real (not simulated) confirmation.
+    """
+    return {
+        suffix: FoldedLayer.from_descriptor(
+            desc, learning_rate=learning_rate, num_cpus=num_cpus,
+            value_scale_mode=value_scale_mode)
+        for suffix, desc in descriptors.items()
+    }
+
+
+def build_folded_layers_streaming(
+    sparse_state: Dict[str, dict],
+    cfg: MiniCPM5Config,
+    suffixes: List[str] = SUFFIXES,
+    prefix: str = "model.layers.",
+    learning_rate: float = 0.01,
+    num_cpus: int = 4,
+    band_half_width_override: Optional[int] = None,
+    value_scale_mode: str = "rank1",
+) -> Dict[str, FoldedLayer]:
+    """
+    Fold and build a real sili FoldedLayer for each suffix ONE AT A
+    TIME, popping that suffix's 24 raw per-layer tensors out of
+    `sparse_state` (MUTATES it in place) immediately after folding --
+    so an already-processed suffix's memory is released before the next
+    suffix's fold+construct begins, instead of holding all 219 tensors
+    resident for the whole loop.
+
+    Why this exists (measured, not assumed, on the real checkpoint --
+    see JOURNAL.md): FoldedLayer.from_descriptor's own C++ construction
+    adds ~0 marginal peak RSS beyond fold_suffix's own CSR-stacking step
+    -- even for the largest suffix (mlp.gate_proj, budget~=170M,
+    nnz~=136M). The real memory driver is holding raw per-layer dense
+    tensors (already fully resident in RAM from B3's pruning, since most
+    suffixes are still 80-93% dense at B3's validated per-role
+    thresholds -- deeper sparsification is intentionally deferred to
+    training-time synaptogenesis, not this conversion step) for suffixes
+    that have ALREADY been folded and are no longer needed. A naive
+    "fold each suffix in a loop, keep sparse_state untouched" version
+    (fold_all_suffixes + build_folded_layers called on its output) lets
+    that dead weight accumulate across the whole loop instead. Using
+    this function is destructive to `sparse_state` by design -- pass a
+    dict you don't need afterward, or use fold_all_suffixes if you need
+    to keep sparse_state intact and can afford the extra memory.
+    """
+    layers: Dict[str, FoldedLayer] = {}
+    for suffix in suffixes:
+        desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
+        for i in range(cfg.num_hidden_layers):
+            del sparse_state[f"{prefix}{i}{suffix}"]
+        layers[suffix] = FoldedLayer.from_descriptor(
+            desc, learning_rate=learning_rate, num_cpus=num_cpus,
+            value_scale_mode=value_scale_mode)
+        del desc
+    return layers
+
+
+def _save_folded_layer_state_dict(suffix: str, layer: FoldedLayer, out_dir: str) -> str:
+    """One .npz per suffix -- FoldedLayer.state_dict() is already a plain
+    dict of numpy arrays (per-suffix weight/scale arrays plus
+    n_folds/out_dim/lr), np.savez handles it directly without any
+    torch/sili dependency to read back later."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{suffix.strip('.').replace('.', '_')}.npz")
+    sd = layer.state_dict()[suffix]
+    np.savez(path, **sd)
+    return path
+
+
+def build_and_save_folded_layers(
+    sparse_state: Dict[str, dict],
+    cfg: MiniCPM5Config,
+    out_dir: str,
+    suffixes: List[str] = SUFFIXES,
+    prefix: str = "model.layers.",
+    learning_rate: float = 0.01,
+    num_cpus: int = 4,
+    band_half_width_override: Optional[int] = None,
+    value_scale_mode: str = "rank1",
+) -> Dict[str, str]:
+    """
+    Same one-suffix-at-a-time streaming discipline as
+    build_folded_layers_streaming (MUTATES `sparse_state` in place,
+    releasing each suffix's raw tensors as soon as it's folded), but
+    additionally serializes each suffix's real FoldedLayer to disk and
+    discards the live C++ object immediately after -- so peak memory
+    never holds more than ONE suffix's built FoldedLayer at a time, on
+    top of whatever's left of sparse_state. Confirmed on the real
+    checkpoint (see JOURNAL.md): holding all 7 real FoldedLayer objects
+    simultaneously (build_folded_layers_streaming's own return value)
+    peaks at ~13.5GB on this 15GB machine -- workable but with barely
+    any headroom left for anything else. This function exists to give
+    that headroom back for the conversion step specifically; B7's real
+    runtime will still need all 7 loaded together to run a forward
+    pass, but building/verifying them doesn't.
+
+    Returns {suffix: saved .npz path}.
+    """
+    paths: Dict[str, str] = {}
+    for suffix in suffixes:
+        desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
+        for i in range(cfg.num_hidden_layers):
+            del sparse_state[f"{prefix}{i}{suffix}"]
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=learning_rate, num_cpus=num_cpus,
+            value_scale_mode=value_scale_mode)
+        del desc
+        paths[suffix] = _save_folded_layer_state_dict(suffix, layer, out_dir)
+        del layer
+    return paths
+
+
+def reference_fold_forward(
+    descriptor: FoldedBlockDescriptor, suffix: str, x: np.ndarray,
+) -> np.ndarray:
+    """
+    The UNQUANTIZED analytic fold-sum for one suffix: x @ W^T per fold
+    step, summed over the fold axis -- exactly FoldedLayer.forward's
+    own math, computed directly from the exact float32 stacked CSR
+    values with no FP4 rounding. Comparing this against the real
+    (quantized) FoldedLayer.forward(x) on the same x isolates
+    quantization's own effect, since both compute the identical fold
+    -sum given the identical input -- the fold-approximation itself
+    (same x fed to every virtual layer) contributes zero difference
+    between the two, only quantization does.
+    """
+    stacked = descriptor.stacked_weights[suffix]
+    dense = stacked.to_dense().numpy().astype(np.float32)   # [n_folds*out_dim, in_dim]
+    n_folds = descriptor.n_folds
+    out_dim = descriptor.out_dims[suffix]
+    batch = x.shape[0]
+    raw = x.astype(np.float32) @ dense.T                    # [batch, n_folds*out_dim]
+    return raw.reshape(batch, n_folds, out_dim).sum(axis=1)
 
 
 def _true_nnz(entry: dict) -> int:

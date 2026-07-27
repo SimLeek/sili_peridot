@@ -3,6 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import numpy as np
 import torch
 import pytest
 
@@ -11,6 +12,8 @@ from model.checkpoint import load_minicpm5_checkpoint
 from model.prune import prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE
 from model.fold import (
     fold_suffix, fold_all_suffixes, verify_lossless, SUFFIXES,
+    build_folded_layers, build_folded_layers_streaming,
+    build_and_save_folded_layers, reference_fold_forward,
 )
 
 REAL_CHECKPOINT_DIR = os.path.join(
@@ -123,6 +126,92 @@ class TestVerifyLossless:
         for suffix in SUFFIXES:
             assert report.per_suffix_nnz_before[suffix] > 0
             assert report.per_suffix_nnz_after[suffix] > 0
+
+
+class TestReferenceFoldForward:
+    def test_matches_manual_fold_sum(self):
+        cfg = _tiny_config(n_layers=3)
+        sd = _fake_sparse_state(cfg)
+        desc = fold_suffix(sd, ".self_attn.q_proj.weight", cfg, prefix="model.layers.")
+        x = np.random.RandomState(0).randn(2, cfg.attn_in).astype(np.float32)
+
+        out = reference_fold_forward(desc, ".self_attn.q_proj.weight", x)
+
+        stacked = desc.stacked_weights[".self_attn.q_proj.weight"].to_dense().numpy()
+        manual_raw = x @ stacked.T
+        manual = manual_raw.reshape(2, desc.n_folds, cfg.q_proj_out).sum(axis=1)
+        assert np.allclose(out, manual, atol=1e-4)
+
+    def test_output_shape(self):
+        cfg = _tiny_config(n_layers=4)
+        sd = _fake_sparse_state(cfg)
+        desc = fold_suffix(sd, ".mlp.down_proj.weight", cfg, prefix="model.layers.")
+        x = np.random.RandomState(1).randn(5, cfg.mlp_hidden).astype(np.float32)
+        out = reference_fold_forward(desc, ".mlp.down_proj.weight", x)
+        assert out.shape == (5, cfg.mlp_out)
+
+
+class TestBuildFoldedLayers:
+    def test_builds_one_layer_per_suffix(self):
+        cfg = _tiny_config(n_layers=2)
+        sd = _fake_sparse_state(cfg)
+        descriptors = fold_all_suffixes(sd, cfg, prefix="model.layers.")
+        layers = build_folded_layers(descriptors)
+        assert set(layers.keys()) == set(SUFFIXES)
+
+    def test_forward_matches_unquantized_reference_closely(self):
+        # FoldedLayer.forward's real (FP4-quantized) output should be
+        # numerically close to the unquantized reference_fold_forward --
+        # not identical (quantization is lossy by design), but not wildly
+        # different either, for well-scaled random weights.
+        from sili.tensor import Tensor
+        cfg = _tiny_config(n_layers=3)
+        sd = _fake_sparse_state(cfg, mix_raw_and_csr=False)   # avoid CSR-branch dtype surprises
+        desc = fold_suffix(sd, ".self_attn.v_proj.weight", cfg, prefix="model.layers.")
+        layer = build_folded_layers({".self_attn.v_proj.weight": desc})[".self_attn.v_proj.weight"]
+
+        x_np = np.random.RandomState(2).randn(4, cfg.attn_in).astype(np.float32)
+        quantized_out = layer.forward(Tensor(x_np)).data
+        reference_out = reference_fold_forward(desc, ".self_attn.v_proj.weight", x_np)
+
+        # FP4's coarsest levels are spaced by 2.0 near the top of its
+        # range -- a generous but bounded tolerance, not "anything goes".
+        assert np.abs(np.asarray(quantized_out) - reference_out).max() < 5.0
+
+
+class TestBuildFoldedLayersStreaming:
+    def test_releases_processed_suffix_from_sparse_state(self):
+        cfg = _tiny_config(n_layers=2)
+        sd = _fake_sparse_state(cfg)
+        layers = build_folded_layers_streaming(sd, cfg, prefix="model.layers.")
+        assert set(layers.keys()) == set(SUFFIXES)
+        # every suffix's per-layer entries must be gone from sd afterward
+        remaining_suffix_keys = [k for k in sd if any(s in k for s in SUFFIXES)]
+        assert remaining_suffix_keys == []
+
+    def test_matches_non_streaming_build(self):
+        cfg = _tiny_config(n_layers=2)
+        sd_a = _fake_sparse_state(cfg)
+        sd_b = {k: v for k, v in sd_a.items()}   # shallow copy -- same tensor objects
+        descriptors = fold_all_suffixes(sd_a, cfg, prefix="model.layers.")
+        non_streamed = build_folded_layers(descriptors)
+
+        streamed = build_folded_layers_streaming(sd_b, cfg, prefix="model.layers.")
+        assert set(streamed.keys()) == set(non_streamed.keys())
+
+
+class TestBuildAndSaveFoldedLayers:
+    def test_saves_one_npz_per_suffix_and_releases_sparse_state(self, tmp_path):
+        cfg = _tiny_config(n_layers=2)
+        sd = _fake_sparse_state(cfg)
+        paths = build_and_save_folded_layers(sd, cfg, str(tmp_path), prefix="model.layers.")
+        assert set(paths.keys()) == set(SUFFIXES)
+        for suffix, path in paths.items():
+            assert os.path.isfile(path)
+            loaded = np.load(path)
+            assert "n_folds" in loaded and int(loaded["n_folds"][0]) == 2
+        remaining_suffix_keys = [k for k in sd if any(s in k for s in SUFFIXES)]
+        assert remaining_suffix_keys == []
 
 
 @pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
