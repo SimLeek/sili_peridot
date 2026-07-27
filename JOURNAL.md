@@ -1143,11 +1143,64 @@ rate turns out higher than the sampled suffixes suggested.
 
 **This is the first attempt (of 7) that looks genuinely worth
 integrating into sili__new**, not just documenting as a negative
-result. It would need: a new encoder (replacing the current
-delta-to-ULEB128 packer) and a new decoder (replacing
-`DeltaCSRRowCursor`'s sequential `advance()`/`uleb128_decode`), plus
-handling for the size/tier tradeoff above. Not yet started --
-this is still prototype-only
-(`/home/simleek/.claude/jobs/4c378ed3/tmp/uleb128_simd_v7_for.cpp`),
-`sili__new` itself is untouched. Worth a real PR if the user wants to
-proceed, given how much stronger this result is than attempts 1-6.
+result.
+
+## sili__new: full ULEB128 -> FOR migration landed
+
+Per user decision, done as a full replacement (not dual-format
+coexistence) in `sili__new`'s `feature/delta-csr-for-encoding` branch:
+`DeltaCSRLayout` gained a per-tensor `group_size` field;
+`DeltaCSRRowCursor` now decodes FOR internally via one-group-at-a-time
+caching between `advance()` calls, keeping its external interface
+byte-for-byte identical, so every existing call site (`disldo_forward`,
+`delta_csr_forward`'s SISLDO path, `build_probes`, `row_last_col`)
+needed zero changes; `delta_csr_from_absolute`/`row_rebuild` now
+encode via FOR; `row_insert_col`/`row_remove_col` were rewritten as
+decode-whole-row -> modify -> `row_rebuild`, since FOR's fixed-width
+groups don't support ULEB128's old surgical single-delta in-place byte
+shift (inserting one element can change every later group's byte
+length, not just one delta) -- an accepted tradeoff since
+synaptogenesis is rare and touches few connections per step.
+`uleb128_encode`/`decode`/`max_bytes` removed entirely (confirmed zero
+remaining callers outside `synapse.hpp`, a separate, currently-unused
+radiation-resilience format left untouched).
+
+Found and fixed a real bug along the way: `compact()` only memcpy's a
+row's existing bytes (no re-encoding), so it needs to copy
+`group_size` into its output layout too -- missing that would leave
+the cursor decoding correctly-encoded bytes at the WRONG group width,
+silently corrupting every read for any layer using a non-default
+group size. The existing test suite (all using the default group
+size) couldn't have caught this; added two regression tests that
+explicitly use a non-default size to exercise it.
+
+**Verified two ways**: (1) 927 C++ assertions passing (up from 855
+baseline), covering encode/decode/growth/synaptogenesis/compact/
+expand, not just compile checks; (2) rebuilt the real Python
+extension and re-ran the full 1B-param MiniCPM5 checkpoint through
+sili_peridot's B6/B7 pipeline -- **accuracy=0.2652, perplexity=173.37,
+byte-identical** to every prior run this session both before and
+after the migration.
+
+**Honest result on wall-clock time: no measurable change** (eval
+61.73s post-migration vs. the ~62-67s baseline throughout this
+session). This is expected, not a letdown -- it's the DIRECT
+confirmation of the earlier profiling finding that motivated setting
+ULEB128 SIMD work aside the first time (`uleb128_decode` measured at
+only 0.33% of eval-phase samples in the dense forward path). A 4-12x
+speedup on a component that's under 1% of total time can't move
+overall wall-clock time no matter how real the speedup is -- Amdahl's
+Law, not a flaw in the migration. `disldo_forward`'s own scattered-
+write (already identified, already deprioritized by the user earlier
+this session) remains the actual dense-path bottleneck, untouched by
+this work. The real beneficiary would be the SISLDO/sparse-activation
+path, which is far more decode-heavy relative to its other costs --
+though this session's own activation-sparsity investigation found no
+practical global-density sweet spot on this checkpoint (see above),
+so the near-term practical payoff is architectural (a genuinely
+faster, provably-vectorizable column-index format, replacing one
+confirmed unvectorizable via `-fopt-info-vec-missed`) rather than an
+immediate measured win, with real upside if per-layer/local sparse-
+activation work (also explored above) gets picked back up, or for any
+future workload that's more decode-bound than this checkpoint's dense
+path is.
