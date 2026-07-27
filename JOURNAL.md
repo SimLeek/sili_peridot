@@ -972,3 +972,28 @@ checkpoint's measured distribution (median delta=1, mostly single-byte).
   recommend re-profiling the CURRENT (post activation-sparsity-fix)
   code before sinking more time into ULEB128-specific SIMD work,
   rather than continuing on the original assumption.
+
+**Re-profiled current code (py-spy, dense baseline, real checkpoint,
+20500 samples) to check that recommendation before dropping it** --
+confirms the prototype's implication directly: `uleb128_decode` is
+only **0.33% of eval-phase samples**. Full eval-phase breakdown (build
+phase separated out, since `fp4_quantize`/CSR-conversion-during-load
+costs are a different question from per-token forward cost):
+`disldo_forward`'s several hot lines together (121/117/119/120/106/122
+-- the scattered accumulator write and its neighbors) are ~55% of
+eval-phase samples, and `sgemm_` (BLAS) is ~34% -- traced to
+`hidden @ lm_head.T` in `compute_logits_sili`, the full-vocabulary
+logits matmul. That's a fundamentally unavoidable cost (any
+implementation needs this exact operation to produce logits over the
+whole vocab; `lm_head` stays dense on purpose per the earlier
+embed_tokens/lm_head compaction work, since CSR would cost MORE at
+its real ~70% density), not a sili-specific inefficiency to chase.
+**Conclusion: ULEB128 SIMD decode is confirmed not worth pursuing
+further in the current (dense-forward-dominant) pipeline** -- its
+ceiling is under 1%. `disldo_forward`'s scattered-write pattern
+remains the one real, identified, sili-specific hot spot, and it was
+already flagged plus explicitly deprioritized by the user earlier
+this session ("too much work for something that probably won't
+result in much of a speedup at all" / "inference-only fast paths...
+low-priority for now") -- not revisiting that call here, just noting
+it's still the same answer with fresh data behind it.
