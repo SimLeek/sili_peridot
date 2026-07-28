@@ -1026,6 +1026,23 @@ to flip green once it's fixed.
   that collapsed to dense-and-thresholded or to input-only propagation
   with a silently-dead recurrent pathway.
 
+- [ ] **B10. True incremental KV-cache for the fold recurrence, for
+  training data past the current small repeating corpus.** Found while
+  scoping `model/train_online.py`'s speed (see JOURNAL.md): a much
+  simpler per-text memoization cache (steps 0..-2 + last-step attention
+  are frozen and text-invariant during MLP-only training, so cache
+  their output keyed by token ids) already fixed the immediate
+  bottleneck for the current ~50-sentence training corpus, where
+  sentences repeat constantly across a real training run. That cache
+  stops helping once training moves to a large, non-repeating corpus --
+  at that point a genuine incremental cache (extend a sequence one
+  token at a time, reusing past K/V per fold step instead of
+  recomputing the whole prefix from scratch) is the real fix. Real,
+  buildable architectural work, comparable in scope/experimental-ness
+  to sili__new's `prototypes/gpu_dual_csr_csc_training/` and
+  `prototypes/synaptogenesis_subrow_interleaving/` design notes — not
+  scheduled, but needed before training can scale past a small corpus.
+
 ## Phase C — Testing, evaluation, examples
 
 - [ ] C1. Attention autograd correctness tests (finite-difference

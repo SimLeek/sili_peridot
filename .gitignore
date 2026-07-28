@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+scripts/overnight_run.log
+scripts/overnight_run_results.json
