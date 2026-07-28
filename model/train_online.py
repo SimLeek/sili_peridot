@@ -196,7 +196,26 @@ def _trainable_forward(layer, x: Tensor, learning_rate: float) -> Tensor:
     FoldedLayer.forward's proven per-layer wrapping pattern.
     forward_dense/backward_dense always return [1, cols] even for a
     bare 1-D input (see sili__new's DISLDOLayer.forward, same fix);
-    squeeze back to 1-D here for the same reason."""
+    squeeze back to 1-D here for the same reason.
+
+    lr_per_row_nnz=False: with it True (divides the already-small
+    learning_rate by the row's real nnz -- ~1,400-3,600 for these real
+    MLP layers), the effective per-synapse learning rate drops to
+    ~2.9e-7 to 7.2e-7, needing a single-step gradient (dy *
+    input_activation) on the order of 10,000+ to move even one FP4
+    grid step at this checkpoint's real per-row scales (median
+    value_scale ~0.026-0.031, needing a ~0.007-0.03 true-units delta) --
+    far past anything plausible. This was originally masking a deeper
+    bug (FP4 storage had no persistent shadow/master weight and used
+    deterministic round-to-nearest, so a too-small update was simply
+    lost every time, not accumulated -- fixed at the source in
+    sili__new via fp4_quantize_stochastic(), see its docstring in
+    fp4quant.hpp). Kept False anyway now that the real fix is in place:
+    it's still a more plausible per-step update scale for this probe's
+    small real-tier learning rate, and lr_per_row_nnz's actual design
+    intent (keep aggregate per-row update comparable despite
+    synaptogenesis-driven nnz variation) isn't relevant here since this
+    probe doesn't grow/prune connections."""
     x_np   = np.asarray(x.data, dtype=np.float32)
     out_np = layer.forward_dense(x_np, learning_rate).squeeze(0)
     out    = Tensor(out_np, (x,), "trainable_forward", x.backend)
@@ -204,7 +223,7 @@ def _trainable_forward(layer, x: Tensor, learning_rate: float) -> Tensor:
     def _bwd():
         if out.grad is not None:
             dy = np.asarray(out.grad, dtype=np.float32)
-            dx = layer.backward_dense(dy, learning_rate, lr_per_row_nnz=True).squeeze(0)
+            dx = layer.backward_dense(dy, learning_rate, lr_per_row_nnz=False).squeeze(0)
             _acc(x, dx)
 
     out._backward = _bwd
