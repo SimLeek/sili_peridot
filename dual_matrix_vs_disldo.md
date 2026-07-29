@@ -1,0 +1,77 @@
+# Dual-matrix (disldo + dense-4x4-block) vs plain disldo: real MiniCPM5-1B-Base layers
+
+Forward pass only (no backward/training in this prototype yet). `min_fill_frac=0.1`
+(this machine's measured breakeven, see `sili__new/prototypes/sili_ell/BLOCK4_NOTES.md`
+-- CPU- and data-distribution-specific, not a universal constant). `num_cpus=8`.
+One representative tensor per role (layer 0), plus `embed_tokens`/`lm_head`, from the
+real, already-pruned checkpoint (B3's `DEFAULT_TARGET_SPARSITY_BY_ROLE`).
+
+Design: `y = disldo_forward(A, x) + block4_forward(B, x)`. A holds the scattered
+remainder (existing production `SparseLinearLayer`, unchanged). B holds `sili__new`'s
+new `dense_block4.hpp`: weights are partitioned into 4x4 tiles; a tile with local fill
+>= `min_fill_frac` is stored fully dense (16 bytes, FP4 weight+importance, no
+per-synapse index at all -- position IS the column); the rest stays in A. Both paths
+use per-original-row FP4 value scaling (matching disldo's own default calibration,
+`max_abs_in_row / 6.0`) -- see below, this was a real, necessary fix, not optional.
+
+## Two real bugs found and fixed before these numbers were trustworthy
+
+1. **Missing per-row scale (the big one)**. A first pass used no scaling at all, then
+   one *global* scale for a whole tensor. Both were wrong on real weights: real
+   `gate_proj` magnitudes span 0.0095-0.629 (66x) within one tensor. No scaling
+   rounded 99.999% of real synapses to FP4 code 0 ("empty") -- 5.5M real nonzeros
+   survived as 66. A global scale calibrated to the tensor max still left the smallest
+   weights far below FP4's floor (0.5) even after scaling -- 43% still lost. Per-row
+   scaling (this file's current state) recovers **99.9%** of real nonzeros (verified
+   directly: 5,506,810 of 5,511,463 on `gate_proj`), matching disldo's own retention.
+2. **An orientation mismatch** (`block4_forward`'s internal row=output/col=input
+   convention vs. a caller passing disldo's row=input orientation) caused a real
+   heap-buffer-overflow, confirmed via AddressSanitizer, not by inspection. Fixed by
+   standardizing the dual-layer's Python-facing API on the natural PyTorch
+   `[out_features, in_features]` orientation and transposing only for disldo's own
+   leftover path internally.
+
+Both are described in more detail in `sili__new`'s commit history for
+`prototypes/sili_ell/` and `sili/lib/headers/dense_block4.hpp`.
+
+## Results
+
+| role | shape | density | nnz | disldo ms | dual ms | speedup | %nnz in block4 |
+|---|---|---|---|---|---|---|---|
+| model.layers.0.mlp.down_proj.weight | 1536x4608 | 0.8959 | 6340977 | 9.395 | 0.703 | 13.37x | 96.0% |
+| model.layers.0.mlp.gate_proj.weight | 4608x1536 | 0.7787 | 5511463 | 7.228 | 0.720 | 10.04x | 99.9% |
+| model.layers.0.mlp.up_proj.weight | 4608x1536 | 0.7455 | 5276871 | 10.029 | 1.336 | 7.51x | 100.0% |
+| model.layers.0.self_attn.k_proj.weight | 256x1536 | 0.7820 | 307497 | 0.359 | 0.051 | 7.09x | 98.5% |
+| model.layers.0.self_attn.o_proj.weight | 1536x2048 | 0.8035 | 2527665 | 3.063 | 0.314 | 9.75x | 99.9% |
+| model.layers.0.self_attn.q_proj.weight | 2048x1536 | 0.6684 | 2102481 | 2.759 | 0.311 | 8.86x | 100.0% |
+| model.layers.0.self_attn.v_proj.weight | 256x1536 | 0.7815 | 307306 | 0.365 | 0.050 | 7.30x | 100.0% |
+| lm_head.weight | 130560x1536 | 0.7012 | 140628074 | 231.031 | 27.259 | 8.48x | 99.6% |
+| model.embed_tokens.weight | 130560x1536 | 0.2016 | 40427529 | 61.780 | 29.700 | 2.08x | 96.5% |
+
+Speedup scales with density, as expected from the synthetic breakeven work: the
+sparsest real tensor here (`embed_tokens`, 20.2% density, closest to the ~10% local
+breakeven) shows the smallest win (2.08x); the densest (`down_proj`, 89.6%) shows the
+largest (13.37x). `%nnz in block4` (nearly all of it, for every role except the
+sparsest) confirms this isn't a marginal effect on these real, already-pruned layers
+-- B3's pruning targets are mild enough (5-30% sparsity on most roles, only
+`embed_tokens` at 80%) that local block fill sits well above breakeven almost
+everywhere.
+
+## What this does and doesn't establish
+
+- **Real speed win, on real weights, forward pass only**: yes, established directly,
+  not extrapolated.
+- **Quality**: NOT yet validated here. A direct check on `gate_proj` alone found
+  ~11% relative L2 error vs. the real dense reference (`W @ x`) -- consistent with
+  (not obviously worse than) this project's already-established finding that naive
+  FP4 round-to-nearest quantization is "genuinely destructive" at this model scale
+  (see `sili_v_torch.md`/JOURNAL.md's B5 investigation), not a new problem
+  introduced by the block4 design specifically -- but not yet compared side-by-side
+  against disldo's own quantization error on the identical weights, which is the
+  real test of "does this trade any additional quality for speed."
+- **Backward pass / training**: not built yet. `disldo_backward`'s inline weight
+  update has no block4 counterpart in this prototype.
+- **Synaptogenesis/pruning on the dual-matrix structure itself**: not built. The
+  earlier synthetic benchmark (`prototypes/sili_ell/bench_synaptogenesis.cpp`)
+  measured disldo/banked/packed growth cost in isolation, not this combined design's
+  own promotion/demotion between A and B during online growth.
