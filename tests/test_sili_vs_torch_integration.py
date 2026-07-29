@@ -129,11 +129,25 @@ top-1 accuracy, identical methodology on both sides
 used with `half_bandwidth={max_seq_len}` (>= every eval text's own
 length, i.e. full/unbanded causal attention -- a fair
 apples-to-apples comparison, not sili's local-attention approximation).
+Neither side uses autoregressive generation/KV-caching here -- both
+compute one single-shot teacher-forced forward pass over the whole
+known sequence, so `use_cache` is a non-issue for THIS comparison (see
+sili_v_torch.md's "KV-caching" section for when it does matter).
+
+REQUIRES numpy/scipy resolving to their PyPI wheels (bundled OpenBLAS),
+not this machine's system packages (Arch's plain `blas`/`lapack` are
+the unoptimized reference implementation) -- see requirements.txt.
+Confirmed directly: the exact GEMM shape sili's lm_head matmul uses
+was ~35x slower on system/reference BLAS than on an OpenBLAS wheel,
+for identical hardware and code (see sili_v_torch.md).
 
 Measured on this machine ({os.uname().nodename}), single run, RSS via
-`/proc/self/status`, wall-clock via `time.perf_counter()`.
+`/proc/self/status`, wall-clock via `time.perf_counter()`. Thread
+counts recorded explicitly since they materially affect both sides
+(see sili_v_torch.md's thread-count section) -- torch at its own
+library default (not pinned here), sili at `NUM_CPUS`.
 
-| | torch (HF forward) | sili (B6/B7 path) |
+| | torch (HF forward, {torch.get_num_threads()} threads) | sili (B6/B7 path, {NUM_CPUS} threads) |
 |---|---|---|
 | Perplexity | {torch_result.perplexity:.4f} | {sili_result.perplexity:.4f} |
 | Accuracy | {torch_result.accuracy:.4f} | {sili_result.accuracy:.4f} |
