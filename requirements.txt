@@ -1,0 +1,15 @@
+# numpy/scipy MUST resolve to their PyPI wheels (bundled OpenBLAS), not this
+# machine's system packages (Arch's `blas`/`lapack` are the reference Netlib
+# implementation -- unoptimized, no threading). Confirmed directly: the exact
+# [26,1536]@[1536,130560] GEMM shape sili's lm_head matmul uses took 5176ms
+# on system numpy/reference BLAS vs 147ms on this pinned numpy -- a 35x gap,
+# for identical hardware and identical code, from BLAS choice alone. This
+# venv is --system-site-packages (needed for other reasons), so without an
+# explicit pin `pip install numpy` can silently prefer/keep the slower system
+# copy already present. See sili_v_torch.md for the full investigation.
+numpy>=1.23.5,<2.5.0
+scipy>=1.11
+
+torch>=2.6.0
+transformers>=5.0.0
+datasets>=5.0.0
