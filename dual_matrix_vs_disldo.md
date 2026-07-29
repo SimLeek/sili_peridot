@@ -90,8 +90,19 @@ calibration to the leftover CSR before construction, matching
 - **Real speed win, on real weights, forward pass only**: yes, established directly.
 - **Quality: no meaningful cost vs. disldo's own baseline**: yes, established
   directly, on real weights, after fixing the leftover-calibration bug above.
-- **Backward pass / training**: not built yet. `disldo_backward`'s inline weight
-  update has no block4 counterpart in this prototype.
+- **Backward pass / training**: now built (`transpose_block4`, `block4_backward_dx`,
+  `block4_weight_update` in `dense_block4.hpp`; exposed as `DualLayer.backward()` in
+  the pybind binding). Verified correct (exact agreement with a dense reference once
+  per-row FP4 rescaling noise is isolated out) and verified to actually learn
+  end-to-end through the real Python API (a student layer fit to a fixed target's
+  output dropped loss 68.6% over 1500 steps). **Known real cost, not yet addressed**:
+  `backward()` rebuilds the block4 transpose from scratch every call (O(nnz)) --
+  fine for batch/occasional training, but a genuinely online (single-token-at-a-
+  time) loop, this project's own stated convention elsewhere, would pay this every
+  step. An incremental transpose update is the real fix, not built here. This
+  benchmark file itself only measured forward -- a real per-role speed number for
+  the trained/backward path on the actual checkpoint is a natural next step, not yet
+  run.
 - **Synaptogenesis/pruning on the dual-matrix structure itself**: not built. The
   earlier synthetic benchmark (`prototypes/sili_ell/bench_synaptogenesis.cpp`)
   measured disldo/banked/packed growth cost in isolation, not this combined design's
