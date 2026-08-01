@@ -418,6 +418,9 @@ def grow_window_layer(
     slower dequantize -> union -> refit path, since per-row's shortcut
     doesn't apply there.
     """
+    assert (existing_window_layer is None) == (existing_window_size == 0), (
+        "existing_window_layer and existing_window_size must agree: both "
+        "absent (first position) or both present (growing further)")
     total_in  = (existing_window_size + 1) * in_dim
     total_out = (existing_window_size + 1) * out_dim
     off_in  = existing_window_size * in_dim
