@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import pytest
 
+from sili import _cpu
+
 from model.config import MiniCPM5Config
 from model.sili_block import (
     build_step_layers, apply_fold_step, run_folded_recurrence,
@@ -504,3 +506,56 @@ class TestGrowWindowLayer:
         ], axis=1)
 
         np.testing.assert_allclose(out_window, expected, rtol=1e-4, atol=1e-4)
+
+    def test_growing_a_third_position_leaves_earlier_blocks_bit_identical(self):
+        # Regression for the per_row fast path (_grow_window_layer_per_row_fast):
+        # old rows must be reused VERBATIM (same stored values, same
+        # scale), not rescanned/requantized, when the window grows again.
+        suffix = ".mlp.gate_proj.weight"
+        cfg, in_dim, out_dim, L_last, L_second_last, _, w2 = self._grown_two_position_window(suffix)
+        sparse_state = _fake_sparse_state(cfg, seed=40)
+        step_layers, _, _ = build_step_layers(sparse_state, cfg)
+        L_third = step_layers[0][suffix]
+
+        w3 = grow_window_layer(L_third, in_dim, out_dim, num_cpus=2,
+                                existing_window_layer=w2, existing_window_size=2)
+
+        assert w3.n_inputs == 3 * in_dim
+        np.testing.assert_allclose(
+            _dense_block(w3, 0, in_dim, 0, out_dim),
+            _dense_block(w2, 0, in_dim, 0, out_dim),
+            atol=0.0)
+        np.testing.assert_allclose(
+            _dense_block(w3, in_dim, 2 * in_dim, out_dim, 2 * out_dim),
+            _dense_block(w2, in_dim, 2 * in_dim, out_dim, 2 * out_dim),
+            atol=0.0)
+        for r in range(2 * in_dim):
+            assert w3.get_value_scale(r) == w2.get_value_scale(r)
+
+    def test_recurrent_band_stays_sparse_at_realistic_layer_width(self):
+        # Regression for the "ton of memory at large layers" concern: an
+        # earlier version defaulted recurrent_bandwidth to
+        # 2*max(in_dim, out_dim), which at MiniCPM5's real dims
+        # (in_dim=1536, out_dim=4608) made _build_rectangular_banded_csr's
+        # "band" cover the ENTIRE row width -- fully dense, not sparse.
+        # Use realistic-scale dims here (not the tiny 8/12-dim synthetic
+        # config elsewhere in this file) so that blowup would actually
+        # show up. nnz for one position must stay close to its own
+        # diagonal content (in_dim*out_dim), not balloon past it.
+        in_dim, out_dim = 1536, 4608
+        rng = np.random.RandomState(50)
+        dense = (rng.randn(in_dim, out_dim).astype(np.float32) * 0.02)
+        ptrs = np.arange(0, (in_dim + 1) * out_dim, out_dim, dtype=np.int32)
+        idx = np.tile(np.arange(out_dim, dtype=np.int32), in_dim)
+        row_scales = np.abs(dense).max(axis=1) / 6.0
+        row_scales[row_scales == 0] = 1.0
+        layer = _cpu.SparseLinearLayer(in_dim, out_dim, int(dense.size * 1.3) + 64, 4)
+        layer.load_weights(ptrs, idx, (dense / row_scales[:, None]).ravel())
+        for r in range(in_dim):
+            layer.set_value_scale_raw(r, float(row_scales[r]))
+
+        window = grow_window_layer(layer, in_dim, out_dim, num_cpus=2)
+        diagonal_nnz = in_dim * out_dim
+        assert window.nnz < diagonal_nnz * 1.05, (
+            f"nnz={window.nnz} vs diagonal-only={diagonal_nnz} -- recurrent "
+            f"band is contributing much more than a small sparse overhead")

@@ -179,7 +179,9 @@ def _extract_true_csr(layer: "_cpu.SparseLinearLayer"):
     in TRUE units (true_w = weights_vals * value_scale[row] *
     output_scale[col], see cpu_backend.cpp) -- same pattern
     quantize.py's build_quantized_dense_state_dict_streaming already
-    uses. csr_union expects true units, not FP4-stored ones."""
+    uses. csr_union expects true units, not FP4-stored ones. Only used
+    by grow_window_layer's rank1 path now -- see _raw_stored_csr for the
+    per_row fast path, which deliberately avoids this dequantization."""
     n_in, n_out = layer.n_inputs, layer.n_outputs
     ptrs = np.asarray(layer.ptrs).astype(np.int32)
     idx  = np.asarray(layer.indices).astype(np.int32)
@@ -190,12 +192,32 @@ def _extract_true_csr(layer: "_cpu.SparseLinearLayer"):
     return ptrs, idx, vals
 
 
+def _raw_stored_csr(layer: "_cpu.SparseLinearLayer"):
+    """Read (ptrs, indices, weights_vals) EXACTLY as stored -- FP4-nominal
+    units, NOT multiplied by value_scale -- plus the per-row scale array,
+    with no dequantization arithmetic at all. Used by grow_window_layer's
+    per_row fast path (see its docstring) to reuse existing rows verbatim
+    instead of round-tripping through true units and refitting a scale
+    that, in per_row mode, provably can't have changed: a row's scale
+    only depends on THAT row's own max_abs, and appending zero-valued
+    band entries never changes a row's max_abs."""
+    n_in = layer.n_inputs
+    ptrs = np.asarray(layer.ptrs).astype(np.int64)
+    idx  = np.asarray(layer.indices).astype(np.int32)
+    stored = np.asarray(layer.weights_vals).astype(np.float32)
+    row_scale = np.array([layer.get_value_scale(r) for r in range(n_in)], dtype=np.float32)
+    return ptrs, idx, stored, row_scale
+
+
 def _quantize_and_load(u_ptrs, u_idx, u_val, total_in, total_out, num_cpus,
                         value_scale_mode, rank1_iters):
-    """Shared tail of grow_window_layer: fit a fresh quantization scale
-    over the WHOLE unioned matrix and load it into a new SparseLinearLayer.
-    Same math build_step_layers/_build_step_layer_from_arrays uses, just
-    applied to the combined window shape instead of one small matrix.
+    """Tail of grow_window_layer's rank1 fallback path only (per_row uses
+    _grow_window_layer_per_row_fast instead, which never needs a full
+    rescan -- see grow_window_layer's docstring): fit a fresh
+    quantization scale over the WHOLE unioned matrix and load it into a
+    new SparseLinearLayer. Same math build_step_layers/
+    _build_step_layer_from_arrays uses, just applied to the combined
+    window shape instead of one small matrix.
 
     KNOWN RISK, not resolved here, worth watching via Phase 4's
     reporting: a row's value_scale is fit from ITS OWN max_abs, which
@@ -242,6 +264,99 @@ def _quantize_and_load(u_ptrs, u_idx, u_val, total_in, total_out, num_cpus,
     return layer
 
 
+def _fixed_band_span(row: int, in_dim: int, out_dim: int, bw: int) -> Tuple[int, int]:
+    """This row's recurrent-band reach in absolute output-column units,
+    using its OWN position's fixed in/out ratio -- NOT recentered
+    against however large total_in/total_out have grown to since. An
+    absolute row = p*in_dim + l always maps to
+    center = p*out_dim + l*out_dim/in_dim, i.e. always INSIDE row's own
+    position's own output block (out_dim/in_dim is the same ratio for
+    every position of this suffix, so p cancels out of where the block
+    starts) -- provably invariant to how many further positions get
+    added later. That's what lets grow_window_layer only ever touch an
+    OLD row once per later stage (to extend it into whatever NEW column
+    range just opened), never recomputing/rescanning its already-placed
+    entries."""
+    center = (row * out_dim) // in_dim
+    return max(0, center - bw + 1), center + bw - 1
+
+
+def _grow_window_layer_per_row_fast(
+    new_position_layer, in_dim: int, out_dim: int, num_cpus: int, bw: int,
+    existing_window_layer, existing_window_size: int,
+    total_in: int, total_out: int, off_in: int, off_out: int,
+) -> "_cpu.SparseLinearLayer":
+    """value_scale_mode="per_row" fast path -- see grow_window_layer.
+    Every row's scale is reused verbatim (old rows from
+    existing_window_layer, new rows from new_position_layer's own
+    already-fit scale); only the STRUCTURE (which columns are nonzero)
+    changes, via plain disjoint concatenation, never a value-changing
+    union or a max_abs rescan. Old-row content and new-position content
+    live in strictly disjoint column ranges (old content < off_out <=
+    new diagonal; new backward band < off_out <= new diagonal too), so
+    no conflict-resolution is needed either -- only new rows' own two
+    pieces (backward band + diagonal) need an explicit sort."""
+    new_ptrs, new_idx, new_stored, new_row_scale = _raw_stored_csr(new_position_layer)
+    assert new_ptrs.shape[0] - 1 == in_dim
+
+    if existing_window_layer is not None:
+        old_ptrs, old_idx, old_stored, old_row_scale = _raw_stored_csr(existing_window_layer)
+        assert old_ptrs.shape[0] - 1 == off_in
+
+    ptrs = np.zeros(total_in + 1, dtype=np.int64)
+    row_scale = np.empty(total_in, dtype=np.float32)
+    idx_chunks: List[np.ndarray] = []
+    val_chunks: List[np.ndarray] = []
+
+    for r in range(off_in):
+        s, e = int(old_ptrs[r]), int(old_ptrs[r + 1])
+        idx_parts = [old_idx[s:e]]
+        val_parts = [old_stored[s:e]]
+        lo, hi = _fixed_band_span(r, in_dim, out_dim, bw)
+        lo, hi = max(lo, off_out), min(hi, total_out - 1)
+        if lo <= hi:
+            band_idx = np.arange(lo, hi + 1, dtype=np.int32)
+            idx_parts.append(band_idx)
+            val_parts.append(np.zeros(band_idx.shape[0], dtype=np.float32))
+        row_idx = idx_parts[0] if len(idx_parts) == 1 else np.concatenate(idx_parts)
+        row_val = val_parts[0] if len(val_parts) == 1 else np.concatenate(val_parts)
+        idx_chunks.append(row_idx)
+        val_chunks.append(row_val)
+        ptrs[r + 1] = ptrs[r] + row_idx.shape[0]
+        row_scale[r] = old_row_scale[r]
+
+    for l in range(in_dim):
+        r = off_in + l
+        s, e = int(new_ptrs[l]), int(new_ptrs[l + 1])
+        idx_parts = [new_idx[s:e].astype(np.int64) + off_out]
+        val_parts = [new_stored[s:e]]
+        lo, hi = _fixed_band_span(r, in_dim, out_dim, bw)
+        lo, hi = max(lo, 0), min(hi, off_out - 1)
+        if lo <= hi:
+            band_idx = np.arange(lo, hi + 1, dtype=np.int64)
+            idx_parts.append(band_idx)
+            val_parts.append(np.zeros(band_idx.shape[0], dtype=np.float32))
+        row_idx = np.concatenate(idx_parts)
+        row_val = np.concatenate(val_parts)
+        order = np.argsort(row_idx)
+        idx_chunks.append(row_idx[order].astype(np.int32))
+        val_chunks.append(row_val[order])
+        ptrs[r + 1] = ptrs[r] + row_idx.shape[0]
+        row_scale[r] = new_row_scale[l]
+
+    u_idx = np.concatenate(idx_chunks)
+    u_val = np.concatenate(val_chunks)
+    u_ptrs = ptrs.astype(np.int32)
+
+    nnz = int(u_val.shape[0])
+    layer = _cpu.SparseLinearLayer(total_in, total_out, int(nnz * 1.3) + 64, num_cpus)
+    layer.load_weights(u_ptrs, u_idx, u_val)
+    for r in range(total_in):
+        if row_scale[r] != 1.0:
+            layer.set_value_scale_raw(r, row_scale[r])
+    return layer
+
+
 def grow_window_layer(
     new_position_layer: "_cpu.SparseLinearLayer",
     in_dim: int, out_dim: int, num_cpus: int = 4,
@@ -257,30 +372,67 @@ def grow_window_layer(
     path, no `desc`/pretrained-tensor access needed here at all).
 
     existing_window_layer=None (window growing from 0->1 positions):
-    the new diagonal block IS the whole matrix -- equivalent to
-    new_position_layer itself, just re-quantized as a 1-block "combined"
-    matrix so later grow calls compose uniformly. Positions are appended
+    the new diagonal block IS the whole matrix. Positions are appended
     in window-growth order (index 0 = first position added to the
     window, i.e. the LAST fold-step under B8a's backward-growing
     curriculum) -- existing blocks' row/col offsets never shift as the
-    window grows, so union with the existing matrix is a straight
-    same-prefix-range merge, not a relabeling.
+    window grows.
 
     Returns a NEW SparseLinearLayer (old one is not mutated in place --
     caller replaces its reference). Off-diagonal (recurrent/skip) band
-    entries carry forward from `existing_window_layer` via csr_union
-    (prefer="a", the existing/already-trained side wins on overlap) --
-    training progress on in-window recurrent connections is preserved
-    across stage transitions, not discarded.
-    """
-    new_ptrs, new_idx, new_val = _extract_true_csr(new_position_layer)
-    new_rows = new_ptrs.shape[0] - 1
-    assert new_rows == in_dim, f"new position has {new_rows} rows, expected in_dim={in_dim}"
+    entries carry forward from `existing_window_layer` -- training
+    progress on in-window recurrent connections is preserved across
+    stage transitions, not discarded.
 
+    recurrent_bandwidth: None (default) picks max(1, min(in_dim,
+    out_dim) // 8) -- deliberately NOT scaled to 2*max(in_dim, out_dim)
+    (an earlier version of this function did that, matching
+    build_fold_skip_layer's own "one hop = out_dim" convention doubled).
+    Measured directly at MiniCPM5's real dims (in_dim=1536,
+    out_dim=4608): a bandwidth on that same order makes
+    _build_rectangular_banded_csr's "band" cover the ENTIRE row width,
+    i.e. fully DENSE, not sparse -- ~7M zero entries for a single
+    position's block in one suffix alone, the "ton of memory at large
+    layers" this was flagged for directly. This default keeps
+    nnz-per-row (and therefore total memory) a small, bounded fraction
+    of the layer's own width regardless of how wide the real layer is.
+    This is a genuine richness-vs-memory tradeoff, not a fully "solved"
+    number -- a small bandwidth means only neurons near a position's own
+    block boundary ever get a pre-seeded cross-position slot at all (see
+    _fixed_band_span: the proportional center always falls inside a
+    row's OWN position block, so reaching a neighbor at all requires
+    bw comparable to the distance from that row to its block's edge).
+    Phase 4's reporting is the place to check whether this is generous
+    enough for synaptogenesis to find useful cross-position connections
+    in practice; tune via this argument, not by editing the default.
+
+    value_scale_mode="per_row" (default): fast path (see
+    _grow_window_layer_per_row_fast) -- every row's scale only depends
+    on ITS OWN max_abs, so growing the window never needs to
+    dequantize+rescan already-placed rows, only construct the new
+    position's own rows (reusing ITS already-fit scale verbatim too) and
+    append zero band entries. "rank1": output_scale couples across the
+    WHOLE matrix jointly (fit_rank1_scale_envelope fits row+col envelopes
+    together), so a newly-opened column range genuinely changes the
+    right scale for every existing column too -- falls back to the
+    slower dequantize -> union -> refit path, since per-row's shortcut
+    doesn't apply there.
+    """
     total_in  = (existing_window_size + 1) * in_dim
     total_out = (existing_window_size + 1) * out_dim
     off_in  = existing_window_size * in_dim
     off_out = existing_window_size * out_dim
+    bw = recurrent_bandwidth if recurrent_bandwidth is not None else max(1, min(in_dim, out_dim) // 8)
+
+    if value_scale_mode == "per_row":
+        return _grow_window_layer_per_row_fast(
+            new_position_layer, in_dim, out_dim, num_cpus, bw,
+            existing_window_layer, existing_window_size,
+            total_in, total_out, off_in, off_out)
+
+    new_ptrs, new_idx, new_val = _extract_true_csr(new_position_layer)
+    new_rows = new_ptrs.shape[0] - 1
+    assert new_rows == in_dim, f"new position has {new_rows} rows, expected in_dim={in_dim}"
 
     diag_row_of_nnz = np.repeat(np.arange(in_dim, dtype=np.int64), np.diff(new_ptrs.astype(np.int64)))
     diag_rows = diag_row_of_nnz + off_in
@@ -293,7 +445,6 @@ def grow_window_layer(
     diag_idx  = diag_cols.astype(np.int32)
     diag_val  = diag_vals.astype(np.float32)
 
-    bw = recurrent_bandwidth if recurrent_bandwidth is not None else 2 * max(in_dim, out_dim)
     rec_ptrs, rec_idx, rec_val = _build_rectangular_banded_csr(total_in, total_out, bw)
 
     u_ptrs, u_idx, u_val = csr_union(
