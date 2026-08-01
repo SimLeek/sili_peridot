@@ -11,6 +11,7 @@ from model.config import MiniCPM5Config
 from model.sili_block import (
     build_step_layers, apply_fold_step, run_folded_recurrence,
     rmsnorm, rope_cos_sin, apply_rotary, _forward, _density_for_suffix,
+    grow_window_layer, _extract_true_csr,
 )
 
 
@@ -422,3 +423,84 @@ class TestRunFoldedRecurrence:
                                           cfg, half_bandwidth=T)
 
         np.testing.assert_allclose(out_before[:t + 1], out_after[:t + 1], rtol=1e-5, atol=1e-5)
+
+
+def _dense_block(layer, row_lo, row_hi, col_lo, col_hi):
+    """Densify one [row_lo:row_hi, col_lo:col_hi] block of `layer`'s true
+    weights (see _extract_true_csr) -- used to check a specific
+    diagonal/off-diagonal region of a grown window matrix in isolation."""
+    ptrs, idx, vals = _extract_true_csr(layer)
+    out = np.zeros((row_hi - row_lo, col_hi - col_lo), dtype=np.float32)
+    for r in range(row_lo, row_hi):
+        s, e = int(ptrs[r]), int(ptrs[r + 1])
+        cols, cvals = idx[s:e], vals[s:e]
+        mask = (cols >= col_lo) & (cols < col_hi)
+        out[r - row_lo, cols[mask] - col_lo] = cvals[mask]
+    return out
+
+
+class TestGrowWindowLayer:
+    """grow_window_layer builds/grows the B8a curriculum window's combined
+    per-suffix matrix, ONE position at a time, from that position's own
+    already-built step_layers[i][suffix] (see module docstring's "don't
+    fold before the window needs it") -- no separate desc-based
+    construction path. These checks stand in for Phase 2's real-checkpoint
+    regression test (Phase 4/plan verification): with the recurrent band
+    still all-zero (nothing trained yet), the window's combined forward
+    pass must reproduce running each position's own layer independently."""
+
+    def _grown_two_position_window(self, suffix=".mlp.gate_proj.weight"):
+        cfg = _tiny_config(n_layers=3)
+        sparse_state = _fake_sparse_state(cfg, seed=40)
+        step_layers, _, _ = build_step_layers(sparse_state, cfg)
+        in_dim, out_dim = cfg.mlp_in, cfg.mlp_hidden
+        L_last, L_second_last = step_layers[2][suffix], step_layers[1][suffix]
+
+        w1 = grow_window_layer(L_last, in_dim, out_dim, num_cpus=2)
+        w2 = grow_window_layer(L_second_last, in_dim, out_dim, num_cpus=2,
+                                existing_window_layer=w1, existing_window_size=1)
+        return cfg, in_dim, out_dim, L_last, L_second_last, w1, w2
+
+    def test_first_position_shape_matches_source_layer(self):
+        cfg, in_dim, out_dim, L_last, _, w1, _ = self._grown_two_position_window()
+        assert w1.n_inputs == in_dim
+        assert w1.n_outputs == out_dim
+        np.testing.assert_allclose(
+            _dense_block(w1, 0, in_dim, 0, out_dim),
+            _dense_block(L_last, 0, in_dim, 0, out_dim),
+            atol=1e-6)
+
+    def test_growing_widens_shape_and_preserves_both_diagonal_blocks(self):
+        cfg, in_dim, out_dim, L_last, L_second_last, _, w2 = self._grown_two_position_window()
+        assert w2.n_inputs == 2 * in_dim
+        assert w2.n_outputs == 2 * out_dim
+
+        # Position added FIRST (window index 0) keeps its own offset --
+        # growing the window must not shift already-placed blocks.
+        np.testing.assert_allclose(
+            _dense_block(w2, 0, in_dim, 0, out_dim),
+            _dense_block(L_last, 0, in_dim, 0, out_dim),
+            atol=1e-6)
+        # Position added when the window grew (index 1) lands at the new offset.
+        np.testing.assert_allclose(
+            _dense_block(w2, in_dim, 2 * in_dim, out_dim, 2 * out_dim),
+            _dense_block(L_second_last, 0, in_dim, 0, out_dim),
+            atol=1e-6)
+
+    def test_forward_matches_independent_positions_while_band_is_zero(self):
+        # Off-diagonal (recurrent/skip) entries start zero-valued and
+        # untrained -- so until synaptogenesis/training touch them, the
+        # window's combined forward pass on concatenated per-position
+        # inputs must equal each position's own independent forward_dense.
+        cfg, in_dim, out_dim, L_last, L_second_last, _, w2 = self._grown_two_position_window()
+        rng = np.random.RandomState(41)
+        x0 = rng.randn(4, in_dim).astype(np.float32)
+        x1 = rng.randn(4, in_dim).astype(np.float32)
+
+        out_window = w2.forward_dense(np.concatenate([x0, x1], axis=1), learning_rate=0.0)
+        expected = np.concatenate([
+            L_last.forward_dense(x0, learning_rate=0.0),
+            L_second_last.forward_dense(x1, learning_rate=0.0),
+        ], axis=1)
+
+        np.testing.assert_allclose(out_window, expected, rtol=1e-4, atol=1e-4)

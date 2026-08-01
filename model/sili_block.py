@@ -1,19 +1,29 @@
 """
 sili_peridot/model/sili_block.py
 ─────────────────────────────────
-B6: attention assembly. Runs MiniCPM5's 24-layer stack as a single folded
-block over a 24-step fold-depth recurrence (state=0; for step: out=block(x
-+state); state+=out -- see RNNFoldedBlock.forward's docstring in
-sili__new's rnn_fold.py), computing every projection and the attention
-itself through real sili ops -- no torch anywhere in this module.
+B6/B8-Phase2: attention assembly, PLUS the growable window-scoped
+combined matrix that column-averaging training needs.
 
-Each fold step gets its OWN small real sili SparseLinearLayer per suffix
-(q/k/v/o/gate/up/down), built by slicing that step's weights out of the
-pre-quantization stacked CSR (FoldedBlockDescriptor.fold_weight_csr) and
-FP4-quantizing them independently -- not by reusing B5/B5a's
-stacked/rank-1-quantized FoldedLayer, which shares one scale scheme across
-all 24 layers for storage efficiency. Per-step independent quantization
-matches what running each original layer separately would actually see.
+Every one of MiniCPM5's 24 fold-depth positions gets its OWN small,
+independently-quantized SparseLinearLayer per suffix (build_step_layers,
+168 matrices total) -- unchanged from B6. A position outside the current
+B8a curriculum window passes exactly one token through the whole system
+at a time, so it can never have a recurrent/cross-position connection;
+running it through anything heavier than its own small layer would be
+wasted compute. run_folded_recurrence therefore keeps every pre-window
+position on this plain per-position path, exactly as it always has
+(state=0; for step: out=block(x+state); state+=out).
+
+Only the CURRENT window (the last few positions B8a's curriculum is
+training column-averaging over) needs a combined matrix -- that's the
+only place a cross-position (recurrent/skip) synapse has anywhere to
+live. grow_window_layer() builds that combined matrix INCREMENTALLY:
+each time the window widens by one position (a curriculum stage
+transition), the newly-included position's own already-quantized
+step_layers[i][suffix] is folded in as a new diagonal block, and the
+existing (already-trained) window matrix is preserved via csr_union --
+not rebuilt from scratch. Stage 0 (window=1 position) needs no combined
+matrix at all: it's just that position's own existing small layer.
 
 RMSNorm/RoPE weights are never part of the 7 folded suffixes (B3/B5 never
 prune or quantize them), so they're read directly from sparse_state as
@@ -26,7 +36,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from sili import _cpu
-from sili.sparse_rnn import fit_rank1_scale_envelope
+from sili.sparse_rnn import fit_rank1_scale_envelope, _build_rectangular_banded_csr, csr_union
 from sili.tensor import Tensor, banded_attention
 
 from .config import MiniCPM5Config
@@ -116,6 +126,12 @@ def build_step_layers(
       input_ln_weights[i]   -- float32 [hidden_size], layer i's input_layernorm
       post_attn_ln_weights[i] -- float32 [hidden_size], layer i's post_attention_layernorm
 
+    These per-position layers are the ONLY construction needed for
+    positions outside the current B8a curriculum window (see module
+    docstring) -- they also double as the source grow_window_layer()
+    folds in when a position newly enters the window, so there is no
+    separate/duplicate build path for that case.
+
     NOTE: two different attempts to reduce build time by cutting the
     number of torch .t().to_sparse_csr() calls (transposing the whole
     suffix once instead of once per step, and separately a pure-numpy
@@ -152,6 +168,152 @@ def build_step_layers(
         post_ln.append(sparse_state.pop(f"{prefix}{i}.post_attention_layernorm.weight")["raw"]
                        .float().numpy().copy())
     return step_layers, input_ln, post_ln
+
+
+# ── Window-scoped combined matrix: grown incrementally, one position at a
+# time, as B8a's curriculum widens the window. Never built for positions
+# outside the window -- see module docstring.
+
+def _extract_true_csr(layer: "_cpu.SparseLinearLayer"):
+    """Read a SparseLinearLayer's stored (ptrs, indices, values) back out
+    in TRUE units (true_w = weights_vals * value_scale[row] *
+    output_scale[col], see cpu_backend.cpp) -- same pattern
+    quantize.py's build_quantized_dense_state_dict_streaming already
+    uses. csr_union expects true units, not FP4-stored ones."""
+    n_in, n_out = layer.n_inputs, layer.n_outputs
+    ptrs = np.asarray(layer.ptrs).astype(np.int32)
+    idx  = np.asarray(layer.indices).astype(np.int32)
+    row  = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs.astype(np.int64)))
+    row_scale = np.array([layer.get_value_scale(r) for r in range(n_in)], dtype=np.float32)
+    col_scale = np.array([layer.get_output_scale(c) for c in range(n_out)], dtype=np.float32)
+    vals = np.asarray(layer.weights_vals).astype(np.float32) * row_scale[row] * col_scale[idx]
+    return ptrs, idx, vals
+
+
+def _quantize_and_load(u_ptrs, u_idx, u_val, total_in, total_out, num_cpus,
+                        value_scale_mode, rank1_iters):
+    """Shared tail of grow_window_layer: fit a fresh quantization scale
+    over the WHOLE unioned matrix and load it into a new SparseLinearLayer.
+    Same math build_step_layers/_build_step_layer_from_arrays uses, just
+    applied to the combined window shape instead of one small matrix.
+
+    KNOWN RISK, not resolved here, worth watching via Phase 4's
+    reporting: a row's value_scale is fit from ITS OWN max_abs, which
+    (since every row belongs to exactly one position's diagonal block)
+    reflects that position's REAL pretrained weight magnitude -- likely
+    much larger than a growing recurrent connection's early gradient
+    steps. If so, a recurrent entry's small gradient could round back to
+    zero under FP4's step size before ever becoming visible, the same
+    class of "value_scale too coarse for a fresh connection to move"
+    landmine build_fold_skip_layer hit once already (see JOURNAL.md).
+    Not fixed speculatively -- Phase 4's "pre-seeded, still exactly
+    zero" count is the real signal for whether this is worth a follow-up.
+    """
+    vals = u_val.copy()
+    row_scales = np.ones(total_in, dtype=np.float32)
+    col_scales = np.ones(total_out, dtype=np.float32)
+    if value_scale_mode == "rank1":
+        row_of_nnz = np.repeat(np.arange(total_in, dtype=np.int64), np.diff(u_ptrs))
+        row_env, col_env = fit_rank1_scale_envelope(
+            row_of_nnz, u_idx.astype(np.int64), np.abs(vals), total_in, total_out, n_iters=rank1_iters)
+        row_scales = (row_env / _FP4_MAX).astype(np.float32)
+        col_scales = col_env.astype(np.float32)
+        combined = row_scales[row_of_nnz] * col_scales[u_idx]
+        nz = combined > 0
+        vals[nz] /= combined[nz]
+    else:
+        for r in range(total_in):
+            start, end = int(u_ptrs[r]), int(u_ptrs[r + 1])
+            if end > start:
+                max_abs = float(np.abs(vals[start:end]).max())
+                if max_abs > 0.0:
+                    row_scales[r] = max_abs / _FP4_MAX
+                    vals[start:end] /= row_scales[r]
+
+    nnz = int(vals.shape[0])
+    layer = _cpu.SparseLinearLayer(total_in, total_out, int(nnz * 1.3) + 64, num_cpus)
+    layer.load_weights(u_ptrs, u_idx, vals)
+    for r in range(total_in):
+        if row_scales[r] != 1.0:
+            layer.set_value_scale_raw(r, row_scales[r])
+    for c in range(total_out):
+        if col_scales[c] != 1.0:
+            layer.set_output_scale_raw(c, col_scales[c])
+    return layer
+
+
+def grow_window_layer(
+    new_position_layer: "_cpu.SparseLinearLayer",
+    in_dim: int, out_dim: int, num_cpus: int = 4,
+    recurrent_bandwidth: Optional[int] = None,
+    value_scale_mode: str = "per_row", rank1_iters: int = 6,
+    existing_window_layer: Optional["_cpu.SparseLinearLayer"] = None,
+    existing_window_size: int = 0,
+) -> "_cpu.SparseLinearLayer":
+    """
+    Add ONE position to the window's combined matrix. `new_position_layer`
+    is that position's own already-built, already-quantized small layer
+    (step_layers[i][suffix] -- see build_step_layers; no separate build
+    path, no `desc`/pretrained-tensor access needed here at all).
+
+    existing_window_layer=None (window growing from 0->1 positions):
+    the new diagonal block IS the whole matrix -- equivalent to
+    new_position_layer itself, just re-quantized as a 1-block "combined"
+    matrix so later grow calls compose uniformly. Positions are appended
+    in window-growth order (index 0 = first position added to the
+    window, i.e. the LAST fold-step under B8a's backward-growing
+    curriculum) -- existing blocks' row/col offsets never shift as the
+    window grows, so union with the existing matrix is a straight
+    same-prefix-range merge, not a relabeling.
+
+    Returns a NEW SparseLinearLayer (old one is not mutated in place --
+    caller replaces its reference). Off-diagonal (recurrent/skip) band
+    entries carry forward from `existing_window_layer` via csr_union
+    (prefer="a", the existing/already-trained side wins on overlap) --
+    training progress on in-window recurrent connections is preserved
+    across stage transitions, not discarded.
+    """
+    new_ptrs, new_idx, new_val = _extract_true_csr(new_position_layer)
+    new_rows = new_ptrs.shape[0] - 1
+    assert new_rows == in_dim, f"new position has {new_rows} rows, expected in_dim={in_dim}"
+
+    total_in  = (existing_window_size + 1) * in_dim
+    total_out = (existing_window_size + 1) * out_dim
+    off_in  = existing_window_size * in_dim
+    off_out = existing_window_size * out_dim
+
+    diag_row_of_nnz = np.repeat(np.arange(in_dim, dtype=np.int64), np.diff(new_ptrs.astype(np.int64)))
+    diag_rows = diag_row_of_nnz + off_in
+    diag_cols = new_idx.astype(np.int64) + off_out
+    diag_vals = new_val
+
+    order = np.lexsort((diag_cols, diag_rows))
+    diag_rows, diag_cols, diag_vals = diag_rows[order], diag_cols[order], diag_vals[order]
+    diag_ptrs = np.searchsorted(diag_rows, np.arange(total_in + 1)).astype(np.int32)
+    diag_idx  = diag_cols.astype(np.int32)
+    diag_val  = diag_vals.astype(np.float32)
+
+    bw = recurrent_bandwidth if recurrent_bandwidth is not None else 2 * max(in_dim, out_dim)
+    rec_ptrs, rec_idx, rec_val = _build_rectangular_banded_csr(total_in, total_out, bw)
+
+    u_ptrs, u_idx, u_val = csr_union(
+        diag_ptrs, diag_idx, diag_val, rec_ptrs, rec_idx, rec_val,
+        total_in, prefer="a", num_cpus=num_cpus)
+
+    if existing_window_layer is not None:
+        old_ptrs, old_idx, old_val = _extract_true_csr(existing_window_layer)
+        old_total_in = existing_window_size * in_dim
+        # Pad old ptrs to the new (larger) row count -- rows beyond the
+        # old window contribute nothing from the old side, so every
+        # appended ptr entry repeats the final (total) nnz count.
+        pad = np.full(total_in - old_total_in, old_ptrs[-1], dtype=np.int32)
+        old_ptrs_padded = np.concatenate([old_ptrs, pad])
+        u_ptrs, u_idx, u_val = csr_union(
+            old_ptrs_padded, old_idx, old_val, u_ptrs, u_idx, u_val,
+            total_in, prefer="a", num_cpus=num_cpus)
+
+    return _quantize_and_load(u_ptrs, u_idx, u_val, total_in, total_out, num_cpus,
+                               value_scale_mode, rank1_iters)
 
 
 # ── Elementwise math (RMSNorm / RoPE / SiLU) ─────────────────────────────────
@@ -311,6 +473,14 @@ def run_folded_recurrence(
     (not a plain 24-layer sequential replay) and why averaging/summing
     per-step outputs is not done here (skip_connection_outputs=False:
     final accumulated state is returned, RMSNorm'd, ready for lm_head).
+
+    This is the PLAIN, pre-window path -- unchanged since B6, and still
+    exactly what every position outside the current B8a curriculum
+    window uses (see module docstring). The window itself (retained
+    per-position state, the combined per-suffix matrix from
+    grow_window_layer, column-averaging over the window) is a distinct
+    code path, not yet added here -- see Phase 3 in the project plan.
+
     See _forward for activation_density; may also be a per-step list of
     length num_hidden_layers (each entry itself None/float/dict) to
     isolate which LAYERS tolerate sparsification, not just which
