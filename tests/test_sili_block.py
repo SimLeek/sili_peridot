@@ -559,3 +559,62 @@ class TestGrowWindowLayer:
         assert window.nnz < diagonal_nnz * 1.05, (
             f"nnz={window.nnz} vs diagonal-only={diagonal_nnz} -- recurrent "
             f"band is contributing much more than a small sparse overhead")
+
+
+class TestGrowWindowLayerRank1Mode:
+    """grow_window_layer's row/column-scale reuse (see _raw_stored_csr's
+    docstring) is not actually per_row-specific -- growth only ever adds
+    ZERO-valued cross-position entries, which never move EITHER kind of
+    max-based scale fit, per_row's or rank1's alternating envelope. These
+    mirror TestGrowWindowLayer's own per_row checks but build step_layers
+    with value_scale_mode="rank1", confirming the same guarantees
+    (diagonal blocks preserved, output_scale carried over, no drift)
+    hold for output_scale too, not just value_scale."""
+
+    def _grown_two_position_window_rank1(self, suffix=".mlp.gate_proj.weight"):
+        cfg = _tiny_config(n_layers=3)
+        sparse_state = _fake_sparse_state(cfg, seed=42)
+        step_layers, _, _ = build_step_layers(sparse_state, cfg, value_scale_mode="rank1")
+        in_dim, out_dim = cfg.mlp_in, cfg.mlp_hidden
+        L_last, L_second_last = step_layers[2][suffix], step_layers[1][suffix]
+
+        w1 = grow_window_layer(L_last, in_dim, out_dim, num_cpus=2)
+        w2 = grow_window_layer(L_second_last, in_dim, out_dim, num_cpus=2,
+                                existing_window_layer=w1, existing_window_size=1)
+        return in_dim, out_dim, L_last, L_second_last, w1, w2
+
+    def test_diagonal_blocks_match_source_layers_exactly(self):
+        in_dim, out_dim, L_last, L_second_last, w1, w2 = self._grown_two_position_window_rank1()
+        np.testing.assert_allclose(
+            _dense_block(w2, 0, in_dim, 0, out_dim),
+            _dense_block(L_last, 0, in_dim, 0, out_dim), atol=1e-6)
+        np.testing.assert_allclose(
+            _dense_block(w2, in_dim, 2 * in_dim, out_dim, 2 * out_dim),
+            _dense_block(L_second_last, 0, in_dim, 0, out_dim), atol=1e-6)
+
+    def test_output_scale_reused_not_refit(self):
+        # The claim this test exists to check: growing the window must
+        # NOT change output_scale for either the old position's columns
+        # (a joint row/col envelope fit could plausibly want to, if it
+        # were actually being recomputed) or the new position's own
+        # columns (which should exactly match what building it as a
+        # standalone layer already produced).
+        in_dim, out_dim, L_last, L_second_last, w1, w2 = self._grown_two_position_window_rank1()
+        for c in range(out_dim):
+            assert w2.get_output_scale(c) == w1.get_output_scale(c)
+        for c_local in range(out_dim):
+            assert w2.get_output_scale(out_dim + c_local) == L_second_last.get_output_scale(c_local)
+
+    def test_forward_matches_independent_positions_while_band_is_zero(self):
+        in_dim, out_dim, L_last, L_second_last, w1, w2 = self._grown_two_position_window_rank1()
+        rng = np.random.RandomState(43)
+        x0 = rng.randn(4, in_dim).astype(np.float32)
+        x1 = rng.randn(4, in_dim).astype(np.float32)
+
+        out_window = w2.forward_dense(np.concatenate([x0, x1], axis=1), learning_rate=0.0)
+        expected = np.concatenate([
+            L_last.forward_dense(x0, learning_rate=0.0),
+            L_second_last.forward_dense(x1, learning_rate=0.0),
+        ], axis=1)
+
+        np.testing.assert_allclose(out_window, expected, rtol=1e-4, atol=1e-4)

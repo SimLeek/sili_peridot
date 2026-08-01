@@ -62,8 +62,6 @@ def advance_window(
     n_folds: int,
     num_cpus: int = 4,
     recurrent_bandwidth: Optional[int] = None,
-    value_scale_mode: str = "per_row",
-    rank1_iters: int = 6,
 ) -> WindowState:
     """Grow the window by exactly one position -- the position
     immediately before window_state's current earliest one (or the
@@ -72,6 +70,8 @@ def advance_window(
     previous combined matrix (or None, for the very first position --
     see grow_window_layer's own None-existing_window_layer case) so
     already-trained in-window recurrent connections carry forward.
+    grow_window_layer works the same regardless of what value_scale_mode
+    built step_layers (per_row or rank1) -- no mode argument needed here.
 
     Does NOT mutate window_state -- returns a new one, matching the
     functional style grow_window_layer itself already uses (old
@@ -89,7 +89,6 @@ def advance_window(
         new_windows[suffix] = grow_window_layer(
             new_layer, in_dim, out_dim, num_cpus=num_cpus,
             recurrent_bandwidth=recurrent_bandwidth,
-            value_scale_mode=value_scale_mode, rank1_iters=rank1_iters,
             existing_window_layer=window_state.suffix_windows.get(suffix),
             existing_window_size=window_state.window_size)
 
