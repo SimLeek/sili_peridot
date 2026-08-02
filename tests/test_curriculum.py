@@ -261,6 +261,46 @@ class TestRunFoldedRecurrenceWindowed:
             "resetting carried_state to zero before the second token didn't "
             "change the output -- the mechanism isn't using carried state")
 
+    def test_no_input_still_produces_nontrivial_state_driven_output(self):
+        # "Sleep"/consolidation capability: with x_common_t all zero (no
+        # real input at all), Q and K both draw from token+state (see
+        # apply_window_step's docstring) so they degenerate to
+        # self-attention over memory alone, NOT a dead/content-blind
+        # gate. Confirms the mechanism can keep running purely off
+        # carried_state -- a non-trivial (nonzero, non-degenerate)
+        # output that actually depends on what's in memory.
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=95)
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        window_ln = [input_ln[p] for p in state.window_positions]
+        window_post_ln = [post_ln[p] for p in state.window_positions]
+        hidden = cfg.hidden_size
+        x_zero = np.zeros(hidden, dtype=np.float32)
+
+        rng = np.random.RandomState(96)
+        carried_1 = rng.randn(2, hidden).astype(np.float32)
+        carried_2 = rng.randn(2, hidden).astype(np.float32)
+
+        np.random.seed(777)
+        energy_1 = default_window_energy()
+        delta_1, new_carried_1, _ = apply_window_step(
+            x_zero, carried_1, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_1, num_cpus=2)
+
+        np.random.seed(777)
+        energy_2 = default_window_energy()
+        delta_2, new_carried_2, _ = apply_window_step(
+            x_zero, carried_2, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_2, num_cpus=2)
+
+        assert np.all(np.isfinite(delta_1)) and np.all(np.isfinite(new_carried_1))
+        assert not np.allclose(delta_1, 0.0), (
+            "zero input produced a zero (dead) output -- the mechanism "
+            "isn't running self-sustained dynamics off carried_state alone")
+        assert not np.allclose(delta_1, delta_2), (
+            "two DIFFERENT carried_state values gave the same output under "
+            "zero input -- Q/K aren't actually depending on carried_state "
+            "when there's no real input")
+
     def test_window_output_shape_and_finite_for_larger_window(self):
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=80)
         T = 3

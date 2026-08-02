@@ -538,18 +538,31 @@ def apply_window_step(
 
     Time-axis mechanism (replaces causal attention over T, which is
     meaningless once T=1): Q/K/V/O stay the PRETRAINED weights,
-    reinterpreted. `q`/`v_new` come from THIS token (as before); `k_state`/
-    `v_state` come from the CARRIED STATE instead of another token -- K
-    now means "key extracted from memory," not "key of a past token".
-    Per head: `gate = sigmoid(q[h].k_state[kv_h]/sqrt(head_dim))`,
-    `blended[h] = gate*v_new[h] + (1-gate)*v_state[kv_h]` -- a learned,
-    data-dependent blend between fresh input and carried memory, using
-    only reused pretrained weights. Fully vectorized across BOTH window
-    positions and heads (plain numpy elementwise ops, not a real
-    attention softmax over many keys) -- no Python-level per-position or
-    per-head loop, and no C++ batching needed either, since this
-    mechanism is cheap enough that plain vectorized numpy already keeps
-    every core busy without it.
+    reinterpreted. `q`/`k_state` BOTH draw from THIS token AND the
+    CARRIED STATE together (`q_proj`/`k_proj` applied to
+    `normed(token) + normed(state)` -- linear, so this is exactly
+    `q_proj(normed(token)) + q_proj(normed(state))`, just cheaper to
+    compute once) -- NOT one from the token and one from the state
+    alone, per direct correction: tying Q exclusively to the current
+    token means the gate goes dead (content-blind, `q=0`) with no fresh
+    input, which forecloses any "sleep"/consolidation-style internal
+    dynamics driven by EnergyDynamics' own exploration noise. With no
+    real input, `normed(token)` is simply zero and this degenerates
+    cleanly to self-attention over memory alone -- genuine ongoing
+    internal dynamics, not a dead mechanism. `v_new`/`v_state` stay
+    asymmetric (token-only / state-only respectively) -- that split is
+    what the gate actually blends between. Per head:
+    `gate = sigmoid(q[h].k_state[kv_h]/sqrt(head_dim))`,
+    `blended[h] = gate*v_new[h] + (1-gate)*v_state[kv_h]`. The column
+    average (see run_folded_recurrence) and EnergyDynamics' own
+    input-driven activation already favor real input over idle memory
+    when input IS present, without needing Q/K to enforce that
+    asymmetrically. Fully vectorized across BOTH window positions and
+    heads (plain numpy elementwise ops, not a real attention softmax
+    over many keys) -- no Python-level per-position or per-head loop,
+    and no C++ batching needed either, since this mechanism is cheap
+    enough that plain vectorized numpy already keeps every core busy
+    without it.
 
     `attn_out = o_proj(blended)` (pretrained, unchanged role). The
     residual `x_common_t + attn_out` is gated by `energy_dynamics`
@@ -579,10 +592,25 @@ def apply_window_step(
 
     normed_flat = normed.reshape(1, window_size * hidden)
     carried_flat = carried_normed.reshape(1, window_size * hidden)
+    # Q and K both draw from token AND carried state, not one each --
+    # per direct correction: tying Q exclusively to the current token
+    # meant the gate went dead (degenerate, content-blind) with no fresh
+    # input, which breaks any "sleep"/consolidation-style internal
+    # dynamics driven by EnergyDynamics' own exploration noise. q_proj/
+    # k_proj are linear, so proj(normed(token)) + proj(normed(state)) ==
+    # proj(normed(token) + normed(state)) exactly -- summing once and
+    # projecting through both is equivalent and cheaper. With no real
+    # input, normed(token) is just zero (RMSNorm of an all-zero vector
+    # is zero, no special-casing needed) and this degenerates cleanly to
+    # self-attention over memory alone -- genuine internal dynamics, not
+    # a dead gate. The column average (see run_folded_recurrence) and
+    # EnergyDynamics' own input-driven activation favor real input
+    # already, without needing Q/K to enforce that asymmetrically.
+    qk_source_flat = (normed + carried_normed).reshape(1, window_size * hidden)
 
-    q = _forward(window_layers[".self_attn.q_proj.weight"], normed_flat,
+    q = _forward(window_layers[".self_attn.q_proj.weight"], qk_source_flat,
                  _density_for_suffix(activation_density, ".self_attn.q_proj.weight"))[0]
-    k_state = _forward(window_layers[".self_attn.k_proj.weight"], carried_flat,
+    k_state = _forward(window_layers[".self_attn.k_proj.weight"], qk_source_flat,
                        _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))[0]
     v_new = _forward(window_layers[".self_attn.v_proj.weight"], normed_flat,
                      _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))[0]
