@@ -524,6 +524,8 @@ def apply_window_step(
     energy_dynamics: EnergyDynamics,
     num_cpus: int = 4,
     activation_density: _ActivationDensity = None,
+    cross_position_weight: float = 0.0,
+    cross_position_bandwidth: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tensor]:
     """The in-window counterpart to apply_fold_step -- per the MAJOR
     PIVOT (2026-08-02), scoped to the window ONLY and no longer a
@@ -571,6 +573,36 @@ def apply_window_step(
     step's own residual (feeds the MLP below) and as `new_carried_state`
     for the NEXT token. This is the first place `EnergyDynamics` is
     wired into `sili_peridot` at all.
+
+    Cross-position attention (Phase 2.6, window positions only): once
+    `blended` is computed, an OPTIONAL additional pass lets it mix
+    across window positions (fold-depth) for THIS token -- not a
+    different mechanism per position, one shared pass over all of them.
+    Reuses `q`/`k_state_exp` (already computed above) as Q/K and
+    `blended` as V, run through `sili.tensor.banded_attention` once per
+    head with the window_size axis as the sequence -- both `q`/`k_state`
+    and `banded_attention` are already generic over what axis they're
+    given, so this needs no new C++ and no new weights. Symmetric/
+    non-causal (`causal=False`), matching `grow_window_layer`'s own
+    off-diagonal band convention -- no assumption about which fold-depth
+    direction is "causal." `cross_position_bandwidth` defaults to
+    `window_size` (covers the whole window, since window_size is always
+    small -- up to 24 -- unlike the linear layer's own band which has a
+    real reason to stay narrow at real hidden-dim widths, see
+    grow_window_layer's own docstring).
+
+    `cross_position_weight` (default 0.0) blends the cross-position
+    result back in: `blended = (1-w)*blended + w*cross_attended`. Unlike
+    the gated blend above (which uses PRETRAINED Q/K/V, already
+    meaningful from step 0), this pass has no honest "zero-init" state
+    of its own -- real softmax attention over already-pretrained Q/K
+    would mix positions non-trivially from the very first call, unlike
+    grow_window_layer's off-diagonal band (a genuinely zero-valued
+    weight matrix that only gains content through training/
+    synaptogenesis). Defaulting the WEIGHT to 0 instead reproduces
+    Phase 2.5 exactly until this is deliberately turned on -- matches
+    the project's own "starts close to original behavior" pattern
+    without needing a fake zero-init on the attention math itself.
 
     Returns (delta [window_size, hidden] -- this step's own output, NOT
     yet added to x_common_t, same "caller accumulates it" contract
@@ -629,6 +661,18 @@ def apply_window_step(
     gate_scores = np.sum(q * k_state_exp, axis=-1) / np.sqrt(head_dim)  # [window_size, n_heads]
     gates = 1.0 / (1.0 + np.exp(-gate_scores))
     blended = gates[..., None] * v_new_exp + (1.0 - gates[..., None]) * v_state_exp  # [window_size, n_heads, head_dim]
+
+    if window_size > 1 and cross_position_weight != 0.0:
+        bw = cross_position_bandwidth if cross_position_bandwidth is not None else window_size
+        cross_attended = np.empty_like(blended)
+        for h in range(n_heads):
+            qh = Tensor(np.ascontiguousarray(q[:, h, :]))
+            kh = Tensor(np.ascontiguousarray(k_state_exp[:, h, :]))
+            vh = Tensor(np.ascontiguousarray(blended[:, h, :]))
+            out_h = banded_attention(qh, kh, vh, half_bandwidth=bw, num_cpus=num_cpus, causal=False)
+            cross_attended[:, h, :] = out_h.data
+        blended = (1.0 - cross_position_weight) * blended + cross_position_weight * cross_attended
+
     blended_flat = blended.reshape(1, window_size * q_proj_out)
 
     attn_out = _forward(window_layers[".self_attn.o_proj.weight"], blended_flat,
@@ -691,6 +735,8 @@ def run_folded_recurrence(
     window_activation_density: _ActivationDensity = None,
     window_energy: Optional[EnergyDynamics] = None,
     window_carried_state: Optional[np.ndarray] = None,
+    window_cross_position_weight: float = 0.0,
+    window_cross_position_bandwidth: Optional[int] = None,
 ) -> np.ndarray:
     """state=0; for step: out=block(x+state); state+=out -- see
     RNNFoldedBlock.forward's docstring in sili__new for why this recurrence
@@ -810,7 +856,8 @@ def run_folded_recurrence(
         for t in range(T):
             delta, carried_state, _aux_loss = apply_window_step(
                 x_common[t], carried_state, window_state.suffix_windows, window_size,
-                window_ln, window_post_ln, cfg, energy, num_cpus, window_activation_density)
+                window_ln, window_post_ln, cfg, energy, num_cpus, window_activation_density,
+                window_cross_position_weight, window_cross_position_bandwidth)
             columns_t = state[t][None, :] + delta  # [window_size, hidden]
             mean_column[t] = columns_t.mean(axis=0)
 

@@ -301,6 +301,86 @@ class TestRunFoldedRecurrenceWindowed:
             "zero input -- Q/K aren't actually depending on carried_state "
             "when there's no real input")
 
+    def test_cross_position_weight_zero_is_a_true_noop(self):
+        # Default cross_position_weight=0.0 must reproduce Phase 2.5's
+        # own output exactly -- the whole point of defaulting the WEIGHT
+        # to zero (see apply_window_step's docstring) rather than trying
+        # to fake a zero-init on the attention math itself.
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=100)
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        window_ln = [input_ln[p] for p in state.window_positions]
+        window_post_ln = [post_ln[p] for p in state.window_positions]
+        hidden = cfg.hidden_size
+        x_t = np.random.RandomState(101).randn(hidden).astype(np.float32)
+        carried = np.random.RandomState(102).randn(2, hidden).astype(np.float32)
+
+        np.random.seed(303)
+        energy_a = default_window_energy()
+        delta_default, _, _ = apply_window_step(
+            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+
+        np.random.seed(303)
+        energy_b = default_window_energy()
+        delta_explicit_zero, _, _ = apply_window_step(
+            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
+            num_cpus=2, cross_position_weight=0.0)
+
+        np.testing.assert_array_equal(delta_default, delta_explicit_zero)
+
+    def test_cross_position_weight_nonzero_changes_output(self):
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=104)
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        window_ln = [input_ln[p] for p in state.window_positions]
+        window_post_ln = [post_ln[p] for p in state.window_positions]
+        hidden = cfg.hidden_size
+        x_t = np.random.RandomState(105).randn(hidden).astype(np.float32)
+        carried = np.random.RandomState(106).randn(2, hidden).astype(np.float32)
+
+        np.random.seed(404)
+        energy_a = default_window_energy()
+        delta_off, _, _ = apply_window_step(
+            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+
+        np.random.seed(404)
+        energy_b = default_window_energy()
+        delta_on, _, _ = apply_window_step(
+            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
+            num_cpus=2, cross_position_weight=1.0)
+
+        assert np.all(np.isfinite(delta_on))
+        assert not np.allclose(delta_off, delta_on), (
+            "cross_position_weight=1.0 produced the same output as 0.0 -- "
+            "the cross-position attention pass isn't contributing anything")
+
+    def test_cross_position_weight_ignored_at_window_size_one(self):
+        # Nothing to attend ACROSS with only one position -- confirms the
+        # window_size>1 guard, not just that it happens to be harmless.
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=2, seed=107)
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        window_ln = [input_ln[p] for p in state.window_positions]
+        window_post_ln = [post_ln[p] for p in state.window_positions]
+        hidden = cfg.hidden_size
+        x_t = np.random.RandomState(108).randn(hidden).astype(np.float32)
+        carried = np.random.RandomState(109).randn(1, hidden).astype(np.float32)
+
+        np.random.seed(505)
+        energy_a = default_window_energy()
+        delta_off, _, _ = apply_window_step(
+            x_t, carried.copy(), state.suffix_windows, 1, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+
+        np.random.seed(505)
+        energy_b = default_window_energy()
+        delta_on, _, _ = apply_window_step(
+            x_t, carried.copy(), state.suffix_windows, 1, window_ln, window_post_ln, cfg, energy_b,
+            num_cpus=2, cross_position_weight=1.0)
+
+        np.testing.assert_array_equal(delta_off, delta_on)
+
     def test_window_output_shape_and_finite_for_larger_window(self):
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=80)
         T = 3
