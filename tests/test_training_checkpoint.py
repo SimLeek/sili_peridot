@@ -124,10 +124,16 @@ class TestTrainingCheckpointRoundtrip:
         assert r_window_state.window_size == 2
         assert r_window_state.window_positions == [3, 2]
 
+        # EnergyDynamics' exploration noise draws from the global,
+        # unseeded np.random (see sili__new JOURNAL.md) -- re-seed
+        # identically before each call so this compares the RESTORED
+        # WEIGHTS, not incidental noise-draw drift between two calls.
         T = 4
         x = np.random.RandomState(93).randn(T, cfg.hidden_size).astype(np.float32)
+        np.random.seed(24680)
         original_out = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
                                              cfg, half_bandwidth=T, window_state=state)
+        np.random.seed(24680)
         restored_out = run_folded_recurrence(x, r_step_layers, r_input_ln, r_post_ln, r_final_norm,
                                              cfg, half_bandwidth=T, window_state=r_window_state)
 

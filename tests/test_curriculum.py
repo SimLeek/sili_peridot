@@ -10,7 +10,8 @@ import pytest
 from model.config import MiniCPM5Config
 from model.sili_block import (
     build_step_layers, _extract_true_csr, run_folded_recurrence,
-    apply_fold_step, rope_cos_sin, rmsnorm,
+    apply_fold_step, apply_window_step, default_window_energy,
+    rope_cos_sin, rmsnorm,
 )
 from model.curriculum import CurriculumStage, build_stage_list, WindowState, advance_window
 
@@ -136,13 +137,18 @@ class TestAdvanceWindow:
 
 class TestRunFoldedRecurrenceWindowed:
     """run_folded_recurrence's window_state branch (see its own
-    docstring). Two exact-equivalence guarantees the design commits to:
-    window_size==1 must be bit-identical to the plain (window_state=None)
-    path -- B8a's stage-0 sanity check depends on this -- and, more
-    generally, an UNTRAINED window (all-zero recurrent band, fresh out of
-    grow_window_layer) must reduce to running every window position
-    independently on the SAME shared input, since window positions don't
-    chain within one call (see apply_window_step's docstring)."""
+    docstring). window_size==1 must stay bit-identical to the plain
+    (window_state=None) path -- B8a's stage-0 sanity check depends on
+    this, and window_size==1 bypasses apply_window_step entirely, so
+    this is unaffected by the MAJOR PIVOT (2026-08-02) T=1/carried-state
+    redesign. window_size>=2 now runs a genuinely different mechanism
+    (gated blend between fresh input and carried memory, reusing
+    pretrained Q/K/V/O -- see apply_window_step's docstring) -- there is
+    no simple "matches independent positions" baseline for it anymore
+    the way there was for the old T-batched causal-attention design, so
+    these tests instead check the new mechanism is wired correctly
+    (matches a manual per-token replication) and genuinely stateful
+    (carried state actually affects output across tokens)."""
 
     def _built(self, n_layers=4, seed=60):
         cfg = _tiny_config(n_layers)
@@ -166,7 +172,15 @@ class TestRunFoldedRecurrenceWindowed:
 
         np.testing.assert_allclose(windowed, plain, rtol=1e-5, atol=1e-5)
 
-    def test_window_size_two_matches_independent_positions_when_untrained(self):
+    def test_window_size_two_matches_manual_per_token_replication(self):
+        # Regression for the T=1/carried-state wiring itself: replicate
+        # run_folded_recurrence's own per-token loop by hand (same fresh
+        # zero carried_state, same fresh default_window_energy(), same
+        # pre-window state) and confirm it produces the identical output.
+        # EnergyDynamics' exploration noise draws from the global,
+        # unseeded np.random (see sili__new JOURNAL.md), so both runs
+        # re-seed identically right before their own (identical-length,
+        # identical-order) sequence of energy-gate calls.
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=70)
         T = 4
         x = np.random.RandomState(71).randn(T, cfg.hidden_size).astype(np.float32)
@@ -177,18 +191,13 @@ class TestRunFoldedRecurrenceWindowed:
         assert state.window_size == 2
         assert state.window_positions == [3, 2]
 
+        np.random.seed(12345)
         windowed = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
                                          cfg, half_bandwidth=T, window_state=state)
 
         # Manual reference: pre-window positions 0,1 run exactly the
-        # plain sequential loop; then BOTH window positions (3 and 2)
-        # independently see the SAME x_common (not each other's output,
-        # since the band is untrained/zero -- no cross-position mixing
-        # exists yet). Each column = pre_state (NOT x_common -- x is
-        # only ever added back in to build the NEXT layer's input, never
-        # into the accumulated column itself; see RNNFoldedBlock.forward's
-        # docstring in sili__new) + that position's own delta output, and
-        # the prediction is the columns' average.
+        # plain sequential loop (unaffected by the pivot); then the
+        # window's own per-token loop, replicated by hand.
         cos, sin = rope_cos_sin(T, cfg.head_dim, cfg.rope_theta)
         pre_state = np.zeros_like(x)
         for i in range(2):
@@ -197,14 +206,60 @@ class TestRunFoldedRecurrenceWindowed:
             pre_state = pre_state + out
         x_common = x + pre_state
 
-        out_pos3 = apply_fold_step(x_common, step_layers[3], input_ln[3], post_ln[3],
-                                   cfg, cos, sin, half_bandwidth=T)
-        out_pos2 = apply_fold_step(x_common, step_layers[2], input_ln[2], post_ln[2],
-                                   cfg, cos, sin, half_bandwidth=T)
-        mean_column = ((pre_state + out_pos3) + (pre_state + out_pos2)) / 2.0
+        window_ln = [input_ln[3], input_ln[2]]
+        window_post_ln = [post_ln[3], post_ln[2]]
+        hidden = cfg.hidden_size
+        carried = np.zeros((2, hidden), dtype=np.float32)
+        energy = default_window_energy()
+        mean_column = np.empty((T, hidden), dtype=np.float32)
+
+        np.random.seed(12345)
+        for t in range(T):
+            delta, carried, _aux = apply_window_step(
+                x_common[t], carried, state.suffix_windows, 2,
+                window_ln, window_post_ln, cfg, energy, num_cpus=4)
+            columns_t = pre_state[t][None, :] + delta
+            mean_column[t] = columns_t.mean(axis=0)
         expected = rmsnorm(mean_column, final_norm, cfg.rms_norm_eps)
 
-        np.testing.assert_allclose(windowed, expected, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(windowed, expected, rtol=1e-5, atol=1e-5)
+
+    def test_carried_state_actually_affects_output(self):
+        # A genuine statefulness check: feed the SAME token twice through
+        # the window's per-token loop. If carried_state actually carries
+        # information forward, the SECOND token's output must differ
+        # from a version where carried_state is reset to zero right
+        # before it (simulating "no memory") -- confirms the mechanism
+        # isn't silently degenerating to a stateless per-token function.
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=90)
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        window_ln = [input_ln[p] for p in state.window_positions]
+        window_post_ln = [post_ln[p] for p in state.window_positions]
+        hidden = cfg.hidden_size
+        x_t = np.random.RandomState(91).randn(hidden).astype(np.float32)
+
+        np.random.seed(555)
+        energy_a = default_window_energy()
+        carried_a = np.zeros((2, hidden), dtype=np.float32)
+        _delta1, carried_a, _ = apply_window_step(
+            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+        delta2_with_memory, _, _ = apply_window_step(
+            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+
+        np.random.seed(555)
+        energy_b = default_window_energy()
+        carried_b = np.zeros((2, hidden), dtype=np.float32)
+        _delta1b, _carried_b, _ = apply_window_step(
+            x_t, carried_b, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b, num_cpus=2)
+        delta2_no_memory, _, _ = apply_window_step(
+            x_t, np.zeros((2, hidden), dtype=np.float32), state.suffix_windows, 2,
+            window_ln, window_post_ln, cfg, energy_b, num_cpus=2)
+
+        assert not np.allclose(delta2_with_memory, delta2_no_memory), (
+            "resetting carried_state to zero before the second token didn't "
+            "change the output -- the mechanism isn't using carried state")
 
     def test_window_output_shape_and_finite_for_larger_window(self):
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=80)
