@@ -8,7 +8,10 @@ import torch
 import pytest
 
 from model.config import MiniCPM5Config
-from model.sili_block import build_step_layers, _extract_true_csr
+from model.sili_block import (
+    build_step_layers, _extract_true_csr, run_folded_recurrence,
+    apply_fold_step, rope_cos_sin, rmsnorm,
+)
 from model.curriculum import CurriculumStage, build_stage_list, WindowState, advance_window
 
 
@@ -129,3 +132,92 @@ class TestAdvanceWindow:
             dense_block(ptrs1, idx1, vals1, 0, in_dim, 0, out_dim),
             dense_block(ptrs3, idx3, vals3, 0, in_dim, 0, out_dim),
             atol=1e-6)
+
+
+class TestRunFoldedRecurrenceWindowed:
+    """run_folded_recurrence's window_state branch (see its own
+    docstring). Two exact-equivalence guarantees the design commits to:
+    window_size==1 must be bit-identical to the plain (window_state=None)
+    path -- B8a's stage-0 sanity check depends on this -- and, more
+    generally, an UNTRAINED window (all-zero recurrent band, fresh out of
+    grow_window_layer) must reduce to running every window position
+    independently on the SAME shared input, since window positions don't
+    chain within one call (see apply_window_step's docstring)."""
+
+    def _built(self, n_layers=4, seed=60):
+        cfg = _tiny_config(n_layers)
+        sparse_state = _fake_sparse_state(cfg, seed=seed)
+        step_layers, input_ln, post_ln = build_step_layers(sparse_state, cfg)
+        final_norm = np.random.RandomState(seed + 1).randn(cfg.hidden_size).astype(np.float32)
+        return cfg, step_layers, input_ln, post_ln, final_norm
+
+    def test_window_size_one_matches_plain_path(self):
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built()
+        T = 5
+        x = np.random.RandomState(61).randn(T, cfg.hidden_size).astype(np.float32)
+
+        plain = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
+                                      cfg, half_bandwidth=T)
+
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        windowed = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
+                                         cfg, half_bandwidth=T, window_state=state)
+
+        np.testing.assert_allclose(windowed, plain, rtol=1e-5, atol=1e-5)
+
+    def test_window_size_two_matches_independent_positions_when_untrained(self):
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=70)
+        T = 4
+        x = np.random.RandomState(71).randn(T, cfg.hidden_size).astype(np.float32)
+
+        state = WindowState()
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        assert state.window_size == 2
+        assert state.window_positions == [3, 2]
+
+        windowed = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
+                                         cfg, half_bandwidth=T, window_state=state)
+
+        # Manual reference: pre-window positions 0,1 run exactly the
+        # plain sequential loop; then BOTH window positions (3 and 2)
+        # independently see the SAME x_common (not each other's output,
+        # since the band is untrained/zero -- no cross-position mixing
+        # exists yet). Each column = pre_state (NOT x_common -- x is
+        # only ever added back in to build the NEXT layer's input, never
+        # into the accumulated column itself; see RNNFoldedBlock.forward's
+        # docstring in sili__new) + that position's own delta output, and
+        # the prediction is the columns' average.
+        cos, sin = rope_cos_sin(T, cfg.head_dim, cfg.rope_theta)
+        pre_state = np.zeros_like(x)
+        for i in range(2):
+            out = apply_fold_step(x + pre_state, step_layers[i], input_ln[i], post_ln[i],
+                                  cfg, cos, sin, half_bandwidth=T)
+            pre_state = pre_state + out
+        x_common = x + pre_state
+
+        out_pos3 = apply_fold_step(x_common, step_layers[3], input_ln[3], post_ln[3],
+                                   cfg, cos, sin, half_bandwidth=T)
+        out_pos2 = apply_fold_step(x_common, step_layers[2], input_ln[2], post_ln[2],
+                                   cfg, cos, sin, half_bandwidth=T)
+        mean_column = ((pre_state + out_pos3) + (pre_state + out_pos2)) / 2.0
+        expected = rmsnorm(mean_column, final_norm, cfg.rms_norm_eps)
+
+        np.testing.assert_allclose(windowed, expected, rtol=1e-4, atol=1e-4)
+
+    def test_window_output_shape_and_finite_for_larger_window(self):
+        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=80)
+        T = 3
+        x = np.random.RandomState(81).randn(T, cfg.hidden_size).astype(np.float32)
+
+        state = WindowState()
+        for _ in range(4):
+            state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
+        assert state.window_size == 4
+
+        out = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
+                                    cfg, half_bandwidth=T, window_state=state)
+
+        assert out.shape == (T, cfg.hidden_size)
+        assert np.all(np.isfinite(out))

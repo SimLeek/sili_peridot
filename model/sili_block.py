@@ -512,6 +512,94 @@ def apply_fold_step(
     return attn_out + mlp_out
 
 
+def apply_window_step(
+    x_common: np.ndarray,          # [T, hidden] -- SAME starting input for every window position
+    window_layers: Dict[str, object],   # {suffix: combined layer spanning window_size positions}
+    window_size: int,
+    input_ln_weights: List[np.ndarray],       # window order (index 0 = last fold-step)
+    post_attn_ln_weights: List[np.ndarray],   # window order, same indexing
+    cfg: MiniCPM5Config,
+    cos: np.ndarray, sin: np.ndarray,
+    half_bandwidth: int,
+    num_cpus: int = 4,
+    activation_density: _ActivationDensity = None,
+) -> np.ndarray:
+    """The in-window counterpart to apply_fold_step -- every window
+    position runs its OWN RMSNorm and its OWN causal attention (those
+    stay strictly per-position, unchanged in kind from apply_fold_step),
+    but the linear projections (q/k/v/o/gate/up/down) route through ONE
+    combined matrix per suffix spanning the whole window (grow_window_
+    layer's output) instead of separate small per-position layers --
+    that combined matrix is the only place a cross-position (recurrent/
+    skip) connection can live, so this is the only place they take
+    effect. Every window position receives the SAME x_common input (the
+    pre-window accumulated residual) rather than each other's output --
+    window positions do NOT sequentially chain within one call the way
+    pre-window positions do (a single matmul through the combined matrix
+    can't express within-call sequential dependency anyway); whatever
+    cross-position influence exists comes entirely from the combined
+    matrix's TRAINED off-diagonal weights, which is why an untrained
+    (all-zero) window reduces exactly to running each position
+    independently on x_common (see test_sili_block.py's
+    TestGrowWindowLayer and TestApplyWindowStep for the exact regression
+    checks this reduces to).
+
+    Returns [T, window_size*hidden] -- each window position's own delta
+    output (NOT yet added to x_common; same "caller accumulates it"
+    contract apply_fold_step already uses, see run_folded_recurrence).
+    """
+    T = x_common.shape[0]
+    hidden = cfg.hidden_size
+    n_heads, n_kv_heads, head_dim = (cfg.num_attention_heads,
+                                     cfg.num_key_value_heads, cfg.head_dim)
+    groups = n_heads // n_kv_heads
+    q_proj_out, kv_proj_out = cfg.q_proj_out, cfg.kv_proj_out
+
+    normed = np.concatenate(
+        [rmsnorm(x_common, input_ln_weights[w], cfg.rms_norm_eps) for w in range(window_size)],
+        axis=1)  # [T, window_size*hidden]
+
+    q = _forward(window_layers[".self_attn.q_proj.weight"], normed,
+                 _density_for_suffix(activation_density, ".self_attn.q_proj.weight"))
+    k = _forward(window_layers[".self_attn.k_proj.weight"], normed,
+                 _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))
+    v = _forward(window_layers[".self_attn.v_proj.weight"], normed,
+                 _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))
+
+    attn_out = np.empty((T, window_size * hidden), dtype=np.float32)
+    for w in range(window_size):
+        qw = q[:, w * q_proj_out:(w + 1) * q_proj_out].reshape(T, n_heads, head_dim)
+        kw = k[:, w * kv_proj_out:(w + 1) * kv_proj_out].reshape(T, n_kv_heads, head_dim)
+        vw = v[:, w * kv_proj_out:(w + 1) * kv_proj_out].reshape(T, n_kv_heads, head_dim)
+        attn_w = np.empty((T, n_heads, head_dim), dtype=np.float32)
+        for h in range(n_heads):
+            kv_h = h // groups
+            qh = Tensor(apply_rotary(qw[:, h, :], cos, sin))
+            kh = Tensor(apply_rotary(kw[:, kv_h, :], cos, sin))
+            vh = Tensor(np.ascontiguousarray(vw[:, kv_h, :]))
+            out_h = banded_attention(qh, kh, vh, half_bandwidth=half_bandwidth,
+                                     num_cpus=num_cpus, causal=True)
+            attn_w[:, h, :] = out_h.data
+        attn_out[:, w * hidden:(w + 1) * hidden] = attn_w.reshape(T, n_heads * head_dim)
+
+    attn_out = _forward(window_layers[".self_attn.o_proj.weight"], attn_out,
+                        _density_for_suffix(activation_density, ".self_attn.o_proj.weight"))
+
+    x_after_attn = np.tile(x_common, (1, window_size)) + attn_out
+    normed2 = np.concatenate(
+        [rmsnorm(x_after_attn[:, w * hidden:(w + 1) * hidden], post_attn_ln_weights[w], cfg.rms_norm_eps)
+         for w in range(window_size)], axis=1)
+
+    gate = _forward(window_layers[".mlp.gate_proj.weight"], normed2,
+                    _density_for_suffix(activation_density, ".mlp.gate_proj.weight"))
+    up   = _forward(window_layers[".mlp.up_proj.weight"], normed2,
+                    _density_for_suffix(activation_density, ".mlp.up_proj.weight"))
+    mlp_out = _forward(window_layers[".mlp.down_proj.weight"], silu(gate) * up,
+                       _density_for_suffix(activation_density, ".mlp.down_proj.weight"))
+
+    return attn_out + mlp_out
+
+
 def run_folded_recurrence(
     x: np.ndarray,                          # [T, hidden] embedded input
     step_layers: List[Dict[str, object]],
@@ -522,6 +610,8 @@ def run_folded_recurrence(
     half_bandwidth: int,
     num_cpus: int = 4,
     activation_density: Union[_ActivationDensity, List[_ActivationDensity]] = None,
+    window_state=None,               # curriculum.WindowState, or None -- see below
+    window_activation_density: _ActivationDensity = None,
 ) -> np.ndarray:
     """state=0; for step: out=block(x+state); state+=out -- see
     RNNFoldedBlock.forward's docstring in sili__new for why this recurrence
@@ -529,19 +619,59 @@ def run_folded_recurrence(
     per-step outputs is not done here (skip_connection_outputs=False:
     final accumulated state is returned, RMSNorm'd, ready for lm_head).
 
-    This is the PLAIN, pre-window path -- unchanged since B6, and still
-    exactly what every position outside the current B8a curriculum
-    window uses (see module docstring). The window itself (retained
-    per-position state, the combined per-suffix matrix from
-    grow_window_layer, column-averaging over the window) is a distinct
-    code path, not yet added here -- see Phase 3 in the project plan.
+    window_state=None (default): the PLAIN pre-window path, unchanged
+    since B6 -- every position runs sequentially, exactly as it always
+    has. Every existing caller/test keeps working unmodified.
+
+    window_state=<a curriculum.WindowState-shaped object> (duck-typed,
+    not imported here to avoid a curriculum<->sili_block import cycle --
+    needs .window_size, .window_positions, .suffix_windows): positions
+    BEFORE window_state.window_positions[-1] (the SMALLEST/earliest
+    absolute index currently in the window -- window_positions[0] is
+    instead the LARGEST/last-added, since curriculum.advance_window
+    appends new positions in the order they enter the window: last
+    fold-step first, then working backward) still run exactly this same
+    plain sequential loop, ending at a `state` -- this is what "positions
+    outside the window compute sequentially, unchanged" means throughout
+    the project plan. `x + state` at that point (x_common below) is then
+    the SAME starting input every window position sees -- see
+    apply_window_step's docstring for why they don't chain sequentially
+    within this one call, and why an untrained window's forward pass
+    still reduces to each position's own independent computation.
+
+    The return value generalizes from "final accumulated state (sum of
+    every position's own delta, NOT including x -- see RNNFoldedBlock.
+    forward's docstring in sili__new, x is only ever added back in to
+    build the NEXT layer's input, never into the accumulator itself),
+    RMSNorm'd" to "column-averaged prediction, RMSNorm'd", matching
+    RNNFoldedBlock.forward's own skip_connection_outputs=True mode
+    (return mean(outputs), each outputs[i] itself already excluding x):
+    each window position's own column = `state` (the PRE-WINDOW
+    accumulated delta sum, WITHOUT x) + that position's own delta output
+    -- NOT x_common (x_common includes x, and is only the correct thing
+    to feed IN to apply_fold_step/apply_window_step, never to add into
+    the accumulated column). window_size==1 (B8a's stage 0) is provably
+    identical to the plain path for this exact reason (only one column,
+    `state + that position's delta` matches exactly what the plain
+    path's own accumulator would hold after that same position, and
+    grow_window_layer's 1-position matrix is bit-identical to the
+    position's own plain layer) -- and is also handled by bypassing
+    apply_window_step entirely (window_state.window_size==1 uses
+    step_layers[window_state.window_positions[0]] directly), per
+    curriculum.WindowState's own documented recommendation, since
+    there's nothing for a combined matrix to usefully do with only one
+    column. window_size>1 averages window_size columns instead of
+    trusting only the last one.
 
     See _forward for activation_density; may also be a per-step list of
     length num_hidden_layers (each entry itself None/float/dict) to
     isolate which LAYERS tolerate sparsification, not just which
-    projections -- errors from top-k truncation compound through the
-    fold-depth recurrence's accumulated state, so a layer near the start
-    is not necessarily equivalent to the same layer near the end."""
+    projections -- applies to the PRE-WINDOW positions only when
+    window_state is given (errors from top-k truncation compound through
+    the fold-depth recurrence's accumulated state, so a layer near the
+    start is not necessarily equivalent to the same layer near the end).
+    window_activation_density is the window's own (single, not
+    per-position) density, passed to apply_window_step."""
     T = x.shape[0]
     cos, sin = rope_cos_sin(T, cfg.head_dim, cfg.rope_theta)
     per_step = isinstance(activation_density, list)
@@ -550,12 +680,38 @@ def run_folded_recurrence(
             f"activation_density list has {len(activation_density)} entries, "
             f"expected cfg.num_hidden_layers={cfg.num_hidden_layers}")
 
+    has_window = window_state is not None and window_state.window_size > 0
+    pre_window_end = window_state.window_positions[-1] if has_window else cfg.num_hidden_layers
+
     state = np.zeros_like(x)
-    for i in range(cfg.num_hidden_layers):
+    for i in range(pre_window_end):
         step_density = activation_density[i] if per_step else activation_density
         out = apply_fold_step(
             x + state, step_layers[i], input_ln_weights[i], post_attn_ln_weights[i],
             cfg, cos, sin, half_bandwidth, num_cpus, step_density)
         state = state + out
 
-    return rmsnorm(state, final_norm_weight, cfg.rms_norm_eps)
+    if not has_window:
+        return rmsnorm(state, final_norm_weight, cfg.rms_norm_eps)
+
+    x_common = x + state
+    window_size = window_state.window_size
+    positions = window_state.window_positions
+
+    if window_size == 1:
+        pos = positions[0]
+        out = apply_fold_step(
+            x_common, step_layers[pos], input_ln_weights[pos], post_attn_ln_weights[pos],
+            cfg, cos, sin, half_bandwidth, num_cpus, window_activation_density)
+        mean_column = state + out
+    else:
+        window_out = apply_window_step(
+            x_common, window_state.suffix_windows, window_size,
+            [input_ln_weights[p] for p in positions],
+            [post_attn_ln_weights[p] for p in positions],
+            cfg, cos, sin, half_bandwidth, num_cpus, window_activation_density)
+        hidden = cfg.hidden_size
+        columns = state[:, None, :] + window_out.reshape(T, window_size, hidden)
+        mean_column = columns.mean(axis=1)
+
+    return rmsnorm(mean_column, final_norm_weight, cfg.rms_norm_eps)
