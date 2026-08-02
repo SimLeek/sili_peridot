@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from sili import _cpu
+from sili.tensor import Tensor
 
 from .curriculum import WindowState
 
@@ -109,6 +110,8 @@ def save_training_checkpoint(
                 suffix: sparse_linear_layer_state_dict(layer)
                 for suffix, layer in window_state.suffix_windows.items()
             },
+            "centers": np.asarray(window_state.centers.data).copy(),
+            "log_sigmas": np.asarray(window_state.log_sigmas.data).copy(),
         }
 
     path = Path(path)
@@ -141,6 +144,8 @@ def load_training_checkpoint(
             suffix_windows={suffix: sparse_linear_layer_from_state_dict(d, num_cpus)
                             for suffix, d in wd["suffix_windows"].items()},
             window_size=wd["window_size"],
-            window_positions=list(wd["window_positions"]))
+            window_positions=list(wd["window_positions"]),
+            centers=Tensor(np.asarray(wd["centers"], dtype=np.float32)),
+            log_sigmas=Tensor(np.asarray(wd["log_sigmas"], dtype=np.float32)))
     return (step_layers, payload["input_ln_weights"], payload["post_attn_ln_weights"],
             payload["final_norm_weight"], window_state, payload["stage_index"], payload["quality"])

@@ -39,7 +39,7 @@ import numpy as np
 from sili import _cpu
 from sili.energy import EnergyDynamics
 from sili.sparse_rnn import fit_rank1_scale_envelope
-from sili.tensor import Tensor, banded_attention
+from sili.tensor import Tensor, banded_attention, gaussian_attention, exp
 
 from .config import MiniCPM5Config
 from .fold import SUFFIXES, fold_suffix
@@ -522,10 +522,10 @@ def apply_window_step(
     post_attn_ln_weights: List[np.ndarray],   # window order, same indexing
     cfg: MiniCPM5Config,
     energy_dynamics: EnergyDynamics,
+    centers: Tensor,                # [window_size] -- see WindowState.centers
+    log_sigmas: Tensor,              # [window_size] -- see WindowState.log_sigmas
     num_cpus: int = 4,
     activation_density: _ActivationDensity = None,
-    cross_position_weight: float = 0.0,
-    cross_position_bandwidth: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tensor]:
     """The in-window counterpart to apply_fold_step -- per the MAJOR
     PIVOT (2026-08-02), scoped to the window ONLY and no longer a
@@ -539,32 +539,38 @@ def apply_window_step(
     can live.
 
     Time-axis mechanism (replaces causal attention over T, which is
-    meaningless once T=1): Q/K/V/O stay the PRETRAINED weights,
-    reinterpreted. `q`/`k_state` BOTH draw from THIS token AND the
-    CARRIED STATE together (`q_proj`/`k_proj` applied to
-    `normed(token) + normed(state)` -- linear, so this is exactly
-    `q_proj(normed(token)) + q_proj(normed(state))`, just cheaper to
-    compute once) -- NOT one from the token and one from the state
-    alone, per direct correction: tying Q exclusively to the current
-    token means the gate goes dead (content-blind, `q=0`) with no fresh
-    input, which forecloses any "sleep"/consolidation-style internal
-    dynamics driven by EnergyDynamics' own exploration noise. With no
-    real input, `normed(token)` is simply zero and this degenerates
-    cleanly to self-attention over memory alone -- genuine ongoing
-    internal dynamics, not a dead mechanism. `v_new`/`v_state` stay
-    asymmetric (token-only / state-only respectively) -- that split is
-    what the gate actually blends between. Per head:
-    `gate = sigmoid(q[h].k_state[kv_h]/sqrt(head_dim))`,
-    `blended[h] = gate*v_new[h] + (1-gate)*v_state[kv_h]`. The column
-    average (see run_folded_recurrence) and EnergyDynamics' own
-    input-driven activation already favor real input over idle memory
-    when input IS present, without needing Q/K to enforce that
-    asymmetrically. Fully vectorized across BOTH window positions and
-    heads (plain numpy elementwise ops, not a real attention softmax
-    over many keys) -- no Python-level per-position or per-head loop,
-    and no C++ batching needed either, since this mechanism is cheap
-    enough that plain vectorized numpy already keeps every core busy
-    without it.
+    meaningless once T=1, AND replaces Phase 2.5/2.6's two separate,
+    only-one-of-them-trainable mechanisms -- see Phase 2.7): ONE real
+    attention op, `sili.tensor.gaussian_attention`, per head, over a
+    combined key/value space that INTERLEAVES each window position's
+    fresh-token entry and carried-state entry: index `2p` = position
+    p's fresh-token (K,V), index `2p+1` = position p's carried-state
+    (K,V) -- length `2*window_size`. `q` is the existing per-position
+    query, drawing from BOTH this token AND the carried state together
+    (`q_proj` applied to `normed(token) + normed(state)` -- linear, so
+    this is exactly `q_proj(normed(token)) + q_proj(normed(state))`,
+    just cheaper to compute once), per direct correction: tying Q
+    exclusively to the current token means it goes dead (content-blind,
+    `q=0`) with no fresh input, which forecloses any "sleep"/
+    consolidation-style internal dynamics driven by EnergyDynamics' own
+    exploration noise. With no real input, `normed(token)` is simply
+    zero and Q still carries the state contribution, so attention keeps
+    running over memory alone -- genuine ongoing internal dynamics, not
+    a dead mechanism. `k`/`v` stay asymmetric (token-only / state-only
+    per interleaved slot) -- unlike Q, there is no reason to blur K/V's
+    identity, since which slot attention lands on is exactly what
+    distinguishes "trust this token" from "trust memory."
+
+    `centers`/`log_sigmas` are per-window-position (length `window_size`)
+    trainable `Tensor` leaves, owned by the caller's `WindowState` (see
+    `curriculum.WindowState`/`advance_window`) -- NOT re-initialized
+    here. `sigmas = exp(log_sigmas)` keeps sigma strictly positive via
+    the ordinary autograd chain rule (see `sili.tensor.exp`/
+    `gaussian_attention`). Per direct decision, training these relies
+    entirely on plain backprop through the task loss plus
+    `EnergyDynamics`' own `aux_loss` (returned below) once Phase 3 wires
+    up `.backward()` -- no separate sparsity-pressure mechanism for
+    attention spread, and no actor-critic hook here.
 
     `attn_out = o_proj(blended)` (pretrained, unchanged role). The
     residual `x_common_t + attn_out` is gated by `energy_dynamics`
@@ -573,36 +579,6 @@ def apply_window_step(
     step's own residual (feeds the MLP below) and as `new_carried_state`
     for the NEXT token. This is the first place `EnergyDynamics` is
     wired into `sili_peridot` at all.
-
-    Cross-position attention (Phase 2.6, window positions only): once
-    `blended` is computed, an OPTIONAL additional pass lets it mix
-    across window positions (fold-depth) for THIS token -- not a
-    different mechanism per position, one shared pass over all of them.
-    Reuses `q`/`k_state_exp` (already computed above) as Q/K and
-    `blended` as V, run through `sili.tensor.banded_attention` once per
-    head with the window_size axis as the sequence -- both `q`/`k_state`
-    and `banded_attention` are already generic over what axis they're
-    given, so this needs no new C++ and no new weights. Symmetric/
-    non-causal (`causal=False`), matching `grow_window_layer`'s own
-    off-diagonal band convention -- no assumption about which fold-depth
-    direction is "causal." `cross_position_bandwidth` defaults to
-    `window_size` (covers the whole window, since window_size is always
-    small -- up to 24 -- unlike the linear layer's own band which has a
-    real reason to stay narrow at real hidden-dim widths, see
-    grow_window_layer's own docstring).
-
-    `cross_position_weight` (default 0.0) blends the cross-position
-    result back in: `blended = (1-w)*blended + w*cross_attended`. Unlike
-    the gated blend above (which uses PRETRAINED Q/K/V, already
-    meaningful from step 0), this pass has no honest "zero-init" state
-    of its own -- real softmax attention over already-pretrained Q/K
-    would mix positions non-trivially from the very first call, unlike
-    grow_window_layer's off-diagonal band (a genuinely zero-valued
-    weight matrix that only gains content through training/
-    synaptogenesis). Defaulting the WEIGHT to 0 instead reproduces
-    Phase 2.5 exactly until this is deliberately turned on -- matches
-    the project's own "starts close to original behavior" pattern
-    without needing a fake zero-init on the attention math itself.
 
     Returns (delta [window_size, hidden] -- this step's own output, NOT
     yet added to x_common_t, same "caller accumulates it" contract
@@ -624,25 +600,24 @@ def apply_window_step(
 
     normed_flat = normed.reshape(1, window_size * hidden)
     carried_flat = carried_normed.reshape(1, window_size * hidden)
-    # Q and K both draw from token AND carried state, not one each --
-    # per direct correction: tying Q exclusively to the current token
-    # meant the gate went dead (degenerate, content-blind) with no fresh
+    # Q draws from token AND carried state together -- per direct
+    # correction: tying Q exclusively to the current token meant the
+    # mechanism went dead (degenerate, content-blind) with no fresh
     # input, which breaks any "sleep"/consolidation-style internal
-    # dynamics driven by EnergyDynamics' own exploration noise. q_proj/
-    # k_proj are linear, so proj(normed(token)) + proj(normed(state)) ==
+    # dynamics driven by EnergyDynamics' own exploration noise. q_proj
+    # is linear, so proj(normed(token)) + proj(normed(state)) ==
     # proj(normed(token) + normed(state)) exactly -- summing once and
-    # projecting through both is equivalent and cheaper. With no real
-    # input, normed(token) is just zero (RMSNorm of an all-zero vector
-    # is zero, no special-casing needed) and this degenerates cleanly to
-    # self-attention over memory alone -- genuine internal dynamics, not
-    # a dead gate. The column average (see run_folded_recurrence) and
-    # EnergyDynamics' own input-driven activation favor real input
-    # already, without needing Q/K to enforce that asymmetrically.
+    # projecting once is equivalent and cheaper. With no real input,
+    # normed(token) is just zero (RMSNorm of an all-zero vector is
+    # zero, no special-casing needed) and Q still carries the state
+    # contribution -- genuine internal dynamics, not a dead gate.
     qk_source_flat = (normed + carried_normed).reshape(1, window_size * hidden)
 
     q = _forward(window_layers[".self_attn.q_proj.weight"], qk_source_flat,
                  _density_for_suffix(activation_density, ".self_attn.q_proj.weight"))[0]
-    k_state = _forward(window_layers[".self_attn.k_proj.weight"], qk_source_flat,
+    k_new = _forward(window_layers[".self_attn.k_proj.weight"], normed_flat,
+                     _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))[0]
+    k_state = _forward(window_layers[".self_attn.k_proj.weight"], carried_flat,
                        _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))[0]
     v_new = _forward(window_layers[".self_attn.v_proj.weight"], normed_flat,
                      _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))[0]
@@ -650,28 +625,35 @@ def apply_window_step(
                        _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))[0]
 
     q       = q.reshape(window_size, n_heads, head_dim)
+    k_new   = k_new.reshape(window_size, n_kv_heads, head_dim)
     k_state = k_state.reshape(window_size, n_kv_heads, head_dim)
     v_new   = v_new.reshape(window_size, n_kv_heads, head_dim)
     v_state = v_state.reshape(window_size, n_kv_heads, head_dim)
 
-    k_state_exp = np.repeat(k_state, groups, axis=1)  # [window_size, n_heads, head_dim]
+    k_new_exp   = np.repeat(k_new,   groups, axis=1)  # [window_size, n_heads, head_dim]
+    k_state_exp = np.repeat(k_state, groups, axis=1)
     v_new_exp   = np.repeat(v_new,   groups, axis=1)
     v_state_exp = np.repeat(v_state, groups, axis=1)
 
-    gate_scores = np.sum(q * k_state_exp, axis=-1) / np.sqrt(head_dim)  # [window_size, n_heads]
-    gates = 1.0 / (1.0 + np.exp(-gate_scores))
-    blended = gates[..., None] * v_new_exp + (1.0 - gates[..., None]) * v_state_exp  # [window_size, n_heads, head_dim]
+    # Interleave fresh-token/carried-state entries: index 2p = position
+    # p's fresh-token (K,V), 2p+1 = its carried-state (K,V) -- see
+    # docstring. centers[p] is defined in this same interleaved space
+    # (own pair's midpoint at init is 2p+0.5, see advance_window).
+    combined_k = np.empty((2 * window_size, n_heads, head_dim), dtype=np.float32)
+    combined_v = np.empty((2 * window_size, n_heads, head_dim), dtype=np.float32)
+    combined_k[0::2] = k_new_exp
+    combined_k[1::2] = k_state_exp
+    combined_v[0::2] = v_new_exp
+    combined_v[1::2] = v_state_exp
 
-    if window_size > 1 and cross_position_weight != 0.0:
-        bw = cross_position_bandwidth if cross_position_bandwidth is not None else window_size
-        cross_attended = np.empty_like(blended)
-        for h in range(n_heads):
-            qh = Tensor(np.ascontiguousarray(q[:, h, :]))
-            kh = Tensor(np.ascontiguousarray(k_state_exp[:, h, :]))
-            vh = Tensor(np.ascontiguousarray(blended[:, h, :]))
-            out_h = banded_attention(qh, kh, vh, half_bandwidth=bw, num_cpus=num_cpus, causal=False)
-            cross_attended[:, h, :] = out_h.data
-        blended = (1.0 - cross_position_weight) * blended + cross_position_weight * cross_attended
+    sigmas = exp(log_sigmas)
+    blended = np.empty((window_size, n_heads, head_dim), dtype=np.float32)
+    for h in range(n_heads):
+        qh = Tensor(np.ascontiguousarray(q[:, h, :]))
+        kh = Tensor(np.ascontiguousarray(combined_k[:, h, :]))
+        vh = Tensor(np.ascontiguousarray(combined_v[:, h, :]))
+        out_h = gaussian_attention(qh, kh, vh, centers, sigmas, num_cpus=num_cpus, causal=False)
+        blended[:, h, :] = out_h.data
 
     blended_flat = blended.reshape(1, window_size * q_proj_out)
 
@@ -721,6 +703,22 @@ def default_window_energy(percent_active: float = 0.25) -> EnergyDynamics:
     )
 
 
+def default_window_gaussian_params(window_size: int) -> Tuple[Tensor, Tensor]:
+    """Fresh, from-scratch `centers`/`log_sigmas` for a `window_size`-wide
+    window: `center[p] = 2p + 0.5` (own fresh-token/carried-state pair's
+    midpoint in apply_window_step's interleaved `2*window_size` key
+    space), `log_sigma[p] = 0.0` (`sigma=1.0`) -- concentrates ~68% of
+    attention mass on position p's own pair at init, while still
+    reachable by neighbors. Matches `advance_window`'s own incremental
+    per-position init exactly (see its docstring) -- this is for
+    callers that want a whole window's worth at once (tests, or a
+    from-scratch WindowState) rather than growing one position at a
+    time."""
+    centers = Tensor(np.array([2.0 * p + 0.5 for p in range(window_size)], dtype=np.float32))
+    log_sigmas = Tensor(np.zeros(window_size, dtype=np.float32))
+    return centers, log_sigmas
+
+
 def run_folded_recurrence(
     x: np.ndarray,                          # [T, hidden] embedded input
     step_layers: List[Dict[str, object]],
@@ -735,8 +733,6 @@ def run_folded_recurrence(
     window_activation_density: _ActivationDensity = None,
     window_energy: Optional[EnergyDynamics] = None,
     window_carried_state: Optional[np.ndarray] = None,
-    window_cross_position_weight: float = 0.0,
-    window_cross_position_bandwidth: Optional[int] = None,
 ) -> np.ndarray:
     """state=0; for step: out=block(x+state); state+=out -- see
     RNNFoldedBlock.forward's docstring in sili__new for why this recurrence
@@ -750,8 +746,9 @@ def run_folded_recurrence(
 
     window_state=<a curriculum.WindowState-shaped object> (duck-typed,
     not imported here to avoid a curriculum<->sili_block import cycle --
-    needs .window_size, .window_positions, .suffix_windows): positions
-    BEFORE window_state.window_positions[-1] (the SMALLEST/earliest
+    needs .window_size, .window_positions, .suffix_windows, .centers,
+    .log_sigmas): positions BEFORE window_state.window_positions[-1]
+    (the SMALLEST/earliest
     absolute index currently in the window -- window_positions[0] is
     instead the LARGEST/last-added, since curriculum.advance_window
     appends new positions in the order they enter the window: last
@@ -768,15 +765,18 @@ def run_folded_recurrence(
     input, per token, every window position sees) is walked token by
     token, threading each window position's own `carried_state` from one
     token to the next via `apply_window_step` -- see that function's
-    docstring for the gated-blend mechanism this now uses instead of
-    causal attention over T (meaningless once a single call only ever
-    sees one token). `window_carried_state`/`window_energy` are
-    caller-owned (matching how `window_state.suffix_windows` already is)
-    so a caller CAN persist them across separate `run_folded_recurrence`
-    calls if it wants continuity across sequences -- None (the default)
-    starts fresh state/energy every call, the simplest and current
-    choice pending Phase 3's real training loop clarifying whether
-    cross-call persistence is actually needed.
+    docstring for the unified `gaussian_attention` mechanism (Phase 2.7)
+    this now uses instead of causal attention over T (meaningless once a
+    single call only ever sees one token). `centers`/`log_sigmas` come
+    from `window_state` itself (persisted, growable trainable
+    parameters -- see `curriculum.WindowState`/`advance_window`).
+    `window_carried_state`/`window_energy` are caller-owned (matching
+    how `window_state.suffix_windows` already is) so a caller CAN
+    persist them across separate `run_folded_recurrence` calls if it
+    wants continuity across sequences -- None (the default) starts
+    fresh state/energy every call, the simplest and current choice
+    pending Phase 3's real training loop clarifying whether cross-call
+    persistence is actually needed.
 
     The return value generalizes from "final accumulated state (sum of
     every position's own delta, NOT including x -- see RNNFoldedBlock.
@@ -856,8 +856,9 @@ def run_folded_recurrence(
         for t in range(T):
             delta, carried_state, _aux_loss = apply_window_step(
                 x_common[t], carried_state, window_state.suffix_windows, window_size,
-                window_ln, window_post_ln, cfg, energy, num_cpus, window_activation_density,
-                window_cross_position_weight, window_cross_position_bandwidth)
+                window_ln, window_post_ln, cfg, energy,
+                window_state.centers, window_state.log_sigmas,
+                num_cpus, window_activation_density)
             columns_t = state[t][None, :] + delta  # [window_size, hidden]
             mean_column[t] = columns_t.mean(axis=0)
 

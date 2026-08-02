@@ -25,6 +25,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+import numpy as np
+
+from sili.tensor import Tensor
+
 from .sili_block import grow_window_layer
 
 
@@ -49,10 +53,23 @@ class WindowState:
     currently in the window, in window-growth order (index 0 = first
     position added = the LAST fold-step, matching grow_window_layer's
     own convention) -- e.g. for a 24-layer model, window_size=3 means
-    window_positions == [23, 22, 21]."""
+    window_positions == [23, 22, 21].
+
+    centers/log_sigmas (Phase 2.7): trainable `Tensor` leaves, one pair
+    per window position, in the SAME order as window_positions -- the
+    learnable Gaussian center/spread `apply_window_step`'s
+    `gaussian_attention` call uses (see its docstring). Both None only
+    when window_size==0 (nothing built yet). Grown one position at a
+    time by advance_window, exactly like suffix_windows -- an
+    already-trained position's own center/log_sigma carries forward
+    unchanged (as data, not a live autograd graph -- there's no
+    backward call spanning a curriculum stage transition) when the
+    window widens."""
     suffix_windows: Dict[str, object] = field(default_factory=dict)
     window_size: int = 0
     window_positions: List[int] = field(default_factory=list)
+    centers: Optional[Tensor] = None
+    log_sigmas: Optional[Tensor] = None
 
 
 def advance_window(
@@ -75,7 +92,20 @@ def advance_window(
 
     Does NOT mutate window_state -- returns a new one, matching the
     functional style grow_window_layer itself already uses (old
-    layers untouched, caller replaces its reference)."""
+    layers untouched, caller replaces its reference).
+
+    Also grows centers/log_sigmas by exactly one pair, matching
+    grow_window_layer's own "old rows reused verbatim" discipline: the
+    new position's index in the window is `p = window_state.window_size`
+    (0-indexed, before the increment below), so its Gaussian center is
+    initialized to `2p + 0.5` (own fresh-token/carried-state pair's
+    midpoint in apply_window_step's interleaved key space) and
+    log_sigma to `0.0` (sigma=1.0) -- see
+    sili_block.default_window_gaussian_params for the same formula
+    applied to a whole window at once. Every earlier position's own
+    center/log_sigma value is carried forward UNCHANGED (as data, not a
+    live autograd graph -- there is no backward call spanning a
+    curriculum stage transition)."""
     next_position = (window_state.window_positions[-1] - 1
                       if window_state.window_positions else n_folds - 1)
     if next_position < 0:
@@ -92,7 +122,21 @@ def advance_window(
             existing_window_layer=window_state.suffix_windows.get(suffix),
             existing_window_size=window_state.window_size)
 
+    p = window_state.window_size
+    new_center = np.float32(2.0 * p + 0.5)
+    new_log_sigma = np.float32(0.0)
+    if window_state.centers is None:
+        centers = Tensor(np.array([new_center], dtype=np.float32))
+        log_sigmas = Tensor(np.array([new_log_sigma], dtype=np.float32))
+    else:
+        centers = Tensor(np.concatenate(
+            [window_state.centers.data, [new_center]]).astype(np.float32))
+        log_sigmas = Tensor(np.concatenate(
+            [window_state.log_sigmas.data, [new_log_sigma]]).astype(np.float32))
+
     return WindowState(
         suffix_windows=new_windows,
         window_size=window_state.window_size + 1,
-        window_positions=window_state.window_positions + [next_position])
+        window_positions=window_state.window_positions + [next_position],
+        centers=centers,
+        log_sigmas=log_sigmas)

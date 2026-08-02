@@ -7,11 +7,13 @@ import numpy as np
 import torch
 import pytest
 
+from sili.tensor import Tensor, gaussian_attention, exp
+
 from model.config import MiniCPM5Config
 from model.sili_block import (
     build_step_layers, _extract_true_csr, run_folded_recurrence,
     apply_fold_step, apply_window_step, default_window_energy,
-    rope_cos_sin, rmsnorm,
+    default_window_gaussian_params, rope_cos_sin, rmsnorm,
 )
 from model.curriculum import CurriculumStage, build_stage_list, WindowState, advance_window
 
@@ -176,11 +178,12 @@ class TestRunFoldedRecurrenceWindowed:
         # Regression for the T=1/carried-state wiring itself: replicate
         # run_folded_recurrence's own per-token loop by hand (same fresh
         # zero carried_state, same fresh default_window_energy(), same
-        # pre-window state) and confirm it produces the identical output.
-        # EnergyDynamics' exploration noise draws from the global,
-        # unseeded np.random (see sili__new JOURNAL.md), so both runs
-        # re-seed identically right before their own (identical-length,
-        # identical-order) sequence of energy-gate calls.
+        # pre-window state, same window_state.centers/log_sigmas) and
+        # confirm it produces the identical output. EnergyDynamics'
+        # exploration noise draws from the global, unseeded np.random
+        # (see sili__new JOURNAL.md), so both runs re-seed identically
+        # right before their own (identical-length, identical-order)
+        # sequence of energy-gate calls.
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=70)
         T = 4
         x = np.random.RandomState(71).randn(T, cfg.hidden_size).astype(np.float32)
@@ -217,7 +220,8 @@ class TestRunFoldedRecurrenceWindowed:
         for t in range(T):
             delta, carried, _aux = apply_window_step(
                 x_common[t], carried, state.suffix_windows, 2,
-                window_ln, window_post_ln, cfg, energy, num_cpus=4)
+                window_ln, window_post_ln, cfg, energy,
+                state.centers, state.log_sigmas, num_cpus=4)
             columns_t = pre_state[t][None, :] + delta
             mean_column[t] = columns_t.mean(axis=0)
         expected = rmsnorm(mean_column, final_norm, cfg.rms_norm_eps)
@@ -244,18 +248,21 @@ class TestRunFoldedRecurrenceWindowed:
         energy_a = default_window_energy()
         carried_a = np.zeros((2, hidden), dtype=np.float32)
         _delta1, carried_a, _ = apply_window_step(
-            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a,
+            state.centers, state.log_sigmas, num_cpus=2)
         delta2_with_memory, _, _ = apply_window_step(
-            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a,
+            state.centers, state.log_sigmas, num_cpus=2)
 
         np.random.seed(555)
         energy_b = default_window_energy()
         carried_b = np.zeros((2, hidden), dtype=np.float32)
         _delta1b, _carried_b, _ = apply_window_step(
-            x_t, carried_b, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b, num_cpus=2)
+            x_t, carried_b, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
+            state.centers, state.log_sigmas, num_cpus=2)
         delta2_no_memory, _, _ = apply_window_step(
             x_t, np.zeros((2, hidden), dtype=np.float32), state.suffix_windows, 2,
-            window_ln, window_post_ln, cfg, energy_b, num_cpus=2)
+            window_ln, window_post_ln, cfg, energy_b, state.centers, state.log_sigmas, num_cpus=2)
 
         assert not np.allclose(delta2_with_memory, delta2_no_memory), (
             "resetting carried_state to zero before the second token didn't "
@@ -285,12 +292,14 @@ class TestRunFoldedRecurrenceWindowed:
         np.random.seed(777)
         energy_1 = default_window_energy()
         delta_1, new_carried_1, _ = apply_window_step(
-            x_zero, carried_1, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_1, num_cpus=2)
+            x_zero, carried_1, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_1,
+            state.centers, state.log_sigmas, num_cpus=2)
 
         np.random.seed(777)
         energy_2 = default_window_energy()
         delta_2, new_carried_2, _ = apply_window_step(
-            x_zero, carried_2, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_2, num_cpus=2)
+            x_zero, carried_2, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_2,
+            state.centers, state.log_sigmas, num_cpus=2)
 
         assert np.all(np.isfinite(delta_1)) and np.all(np.isfinite(new_carried_1))
         assert not np.allclose(delta_1, 0.0), (
@@ -301,35 +310,42 @@ class TestRunFoldedRecurrenceWindowed:
             "zero input -- Q/K aren't actually depending on carried_state "
             "when there's no real input")
 
-    def test_cross_position_weight_zero_is_a_true_noop(self):
-        # Default cross_position_weight=0.0 must reproduce Phase 2.5's
-        # own output exactly -- the whole point of defaulting the WEIGHT
-        # to zero (see apply_window_step's docstring) rather than trying
-        # to fake a zero-init on the attention math itself.
-        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=100)
-        state = WindowState()
-        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
-        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
-        window_ln = [input_ln[p] for p in state.window_positions]
-        window_post_ln = [post_ln[p] for p in state.window_positions]
-        hidden = cfg.hidden_size
-        x_t = np.random.RandomState(101).randn(hidden).astype(np.float32)
-        carried = np.random.RandomState(102).randn(2, hidden).astype(np.float32)
+    def test_gaussian_attention_concentrates_on_own_pair_at_init(self):
+        # Phase 2.7b's own init claim: center[p] = 2p+0.5, sigma[p] = 1.0
+        # should concentrate most attention mass on position p's own
+        # (fresh-token, carried-state) pair at indices (2p, 2p+1) of the
+        # interleaved key space -- checked directly at the
+        # gaussian_attention level (not through apply_window_step's
+        # linear layers) by making each key's V a one-hot indicator, so
+        # the output IS the attention distribution.
+        window_size = 4
+        centers, log_sigmas = default_window_gaussian_params(window_size)
+        sigmas = exp(log_sigmas)
+        K = 2 * window_size
+        # Q/K share V's dimensionality (the kernel assumes one shared d
+        # for all three) -- zero Q/K isolates the Gaussian bias (Q.K=0
+        # for every pair), and V=eye(K) then makes the output BE the
+        # attention distribution directly.
+        q = Tensor(np.zeros((window_size, K), dtype=np.float32))
+        k = Tensor(np.zeros((K, K), dtype=np.float32))
+        v = Tensor(np.eye(K, dtype=np.float32))
+        out = gaussian_attention(q, k, v, centers, sigmas, num_cpus=2, causal=False)
+        weights = out.data  # [window_size, K] -- weights[p] is query p's full attention distribution
+        for p in range(window_size):
+            own_pair_mass = weights[p, 2 * p] + weights[p, 2 * p + 1]
+            assert own_pair_mass > 0.5, (
+                f"position {p}: own-pair attention mass {own_pair_mass:.3f} "
+                f"did not dominate at init (expected >0.5, roughly 68%)")
+            other_pair_mass = 1.0 - own_pair_mass
+            assert own_pair_mass > other_pair_mass
 
-        np.random.seed(303)
-        energy_a = default_window_energy()
-        delta_default, _, _ = apply_window_step(
-            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
-
-        np.random.seed(303)
-        energy_b = default_window_energy()
-        delta_explicit_zero, _, _ = apply_window_step(
-            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
-            num_cpus=2, cross_position_weight=0.0)
-
-        np.testing.assert_array_equal(delta_default, delta_explicit_zero)
-
-    def test_cross_position_weight_nonzero_changes_output(self):
+    def test_other_positions_carried_state_affects_this_positions_output(self):
+        # Unlike Phase 2.5/2.6's old cross_position_weight (an on/off
+        # switch with a literal zero-init no-op default), Phase 2.7's
+        # gaussian_attention always genuinely mixes across window
+        # positions -- there is no "off" state to test for. Confirm
+        # this directly: changing ONLY position 1's carried_state (not
+        # position 0's own) still changes position 0's own delta.
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=104)
         state = WindowState()
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
@@ -338,48 +354,49 @@ class TestRunFoldedRecurrenceWindowed:
         window_post_ln = [post_ln[p] for p in state.window_positions]
         hidden = cfg.hidden_size
         x_t = np.random.RandomState(105).randn(hidden).astype(np.float32)
-        carried = np.random.RandomState(106).randn(2, hidden).astype(np.float32)
+        carried_a = np.random.RandomState(106).randn(2, hidden).astype(np.float32)
+        carried_b = carried_a.copy()
+        carried_b[1] = np.random.RandomState(107).randn(hidden).astype(np.float32)
 
         np.random.seed(404)
         energy_a = default_window_energy()
-        delta_off, _, _ = apply_window_step(
-            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
+        delta_a, _, _ = apply_window_step(
+            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a,
+            state.centers, state.log_sigmas, num_cpus=2)
 
         np.random.seed(404)
         energy_b = default_window_energy()
-        delta_on, _, _ = apply_window_step(
-            x_t, carried.copy(), state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
-            num_cpus=2, cross_position_weight=1.0)
+        delta_b, _, _ = apply_window_step(
+            x_t, carried_b, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
+            state.centers, state.log_sigmas, num_cpus=2)
 
-        assert np.all(np.isfinite(delta_on))
-        assert not np.allclose(delta_off, delta_on), (
-            "cross_position_weight=1.0 produced the same output as 0.0 -- "
-            "the cross-position attention pass isn't contributing anything")
+        assert np.all(np.isfinite(delta_a)) and np.all(np.isfinite(delta_b))
+        assert not np.allclose(delta_a[0], delta_b[0]), (
+            "changing only position 1's carried_state didn't change position "
+            "0's own delta -- gaussian_attention isn't genuinely mixing "
+            "across window positions")
 
-    def test_cross_position_weight_ignored_at_window_size_one(self):
-        # Nothing to attend ACROSS with only one position -- confirms the
-        # window_size>1 guard, not just that it happens to be harmless.
-        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=2, seed=107)
-        state = WindowState()
-        state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
-        window_ln = [input_ln[p] for p in state.window_positions]
-        window_post_ln = [post_ln[p] for p in state.window_positions]
-        hidden = cfg.hidden_size
-        x_t = np.random.RandomState(108).randn(hidden).astype(np.float32)
-        carried = np.random.RandomState(109).randn(1, hidden).astype(np.float32)
-
-        np.random.seed(505)
-        energy_a = default_window_energy()
-        delta_off, _, _ = apply_window_step(
-            x_t, carried.copy(), state.suffix_windows, 1, window_ln, window_post_ln, cfg, energy_a, num_cpus=2)
-
-        np.random.seed(505)
-        energy_b = default_window_energy()
-        delta_on, _, _ = apply_window_step(
-            x_t, carried.copy(), state.suffix_windows, 1, window_ln, window_post_ln, cfg, energy_b,
-            num_cpus=2, cross_position_weight=1.0)
-
-        np.testing.assert_array_equal(delta_off, delta_on)
+    def test_centers_and_log_sigmas_receive_gradients_from_a_toy_backward(self):
+        # Phase 2.7's whole point: centers/log_sigmas are ordinary
+        # trainable Tensor leaves, reachable by plain backprop -- not
+        # wired into a real task loss yet (Phase 3), but the gradient
+        # path itself must work end to end (through the log_sigma->exp
+        # ->sigma chain) using the SAME shapes apply_window_step builds
+        # (window_size queries, 2*window_size interleaved keys).
+        window_size = 3
+        centers, log_sigmas = default_window_gaussian_params(window_size)
+        sigmas = exp(log_sigmas)
+        K = 2 * window_size
+        rng = np.random.RandomState(42)
+        q = Tensor(rng.randn(window_size, 8).astype(np.float32))
+        k = Tensor(rng.randn(K, 8).astype(np.float32))
+        v = Tensor(rng.randn(K, 8).astype(np.float32))
+        out = gaussian_attention(q, k, v, centers, sigmas, num_cpus=2, causal=False)
+        out.grad = np.ones_like(out.data)
+        out._backward()
+        sigmas._backward()  # propagate through exp() into log_sigmas.grad
+        assert centers.grad is not None and np.all(np.isfinite(centers.grad))
+        assert log_sigmas.grad is not None and np.all(np.isfinite(log_sigmas.grad))
 
     def test_window_output_shape_and_finite_for_larger_window(self):
         cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=4, seed=80)
