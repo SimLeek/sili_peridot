@@ -1423,3 +1423,45 @@ a proper implementation needs a new parameter threaded through
 per-connection update loop, which is intertwined with FP4 quantization/
 scale/importance tracking -- real, bounded scope, not attempted this
 session pending explicit direction).
+
+## Confirmed: the toy training failure is confounded, not architectural
+
+Direct question that cut right to it: is the stuck-at-chance result
+from FP4 (the model itself), or is our own from-scratch training
+system confounded with the comparison? It's the latter, confirmed
+decisively -- `ToySmallTransformer`/`ToyTileRecurrence` were never run
+through a "premade" (established, battle-tested) training system;
+everything -- the model precision (FP4, via `DISLDOLayer`) AND the
+optimizer (hand-rolled per-node gradient clipping + plain SGD, no
+momentum, no Adam) -- was built from scratch this session.
+
+**Control experiment** (`scripts/torch_mqar_control.py`, diagnostic
+only, not part of the real model): the EXACT SAME architecture shape
+as `ToySmallTransformer` (RMSNorm -> single-head causal self-attn -> O
+-> residual -> RMSNorm -> SwiGLU MLP -> residual, no positional
+encoding -- kept identical on purpose), but full fp32 precision (plain
+`torch.nn.Linear`, no FP4/`DISLDOLayer`) and a real, established
+optimizer (`torch.optim.Adam`), on the EXACT SAME
+`generate_mqar_sequence` task (unaffected -- it was already a faithful
+port, not implicated).
+
+**Result**: `seq_len=16/num_kv_pairs=2`: eval accuracy **0.95** (vs
+chance 0.10) in **20.1 seconds** (3000 steps). `seq_len=32/
+num_kv_pairs=4`: eval accuracy **0.67** (vs chance 0.05) in **22.3
+seconds**. Loss decreased cleanly and monotonically-ish throughout,
+none of the overflow warnings seen in every FP4 attempt.
+
+**This settles it**: the architecture (the dense baseline's own
+design, and by extension the shared design principles
+`ToyTileRecurrence` builds on) is NOT the problem -- it learns MQAR
+easily and fast under a standard training setup. The bottleneck is
+somewhere in {FP4 quantization via `DISLDOLayer`, the hand-rolled
+optimizer (no momentum/Adam), or both} -- genuinely not yet isolated
+between those two. **Real next diagnostic step, not done yet**: run
+ONE more control that changes only ONE of those two variables at a
+time (e.g. plain fp32 `sili.tensor` ops with the SAME hand-rolled
+clip+SGD loop, to isolate whether the optimizer alone explains it; or
+`DISLDOLayer`/FP4 with a real momentum-based update if one can be
+retrofitted) rather than continuing to guess with tile-recurrence
+itself, which was never the thing actually being tested by this
+failure.
