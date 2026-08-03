@@ -26,7 +26,9 @@ from typing import List, Tuple
 import numpy as np
 
 from sili.sparse_rnn import DISLDOLayer
-from sili.tensor import Tensor, banded_attention, gaussian_attention, exp, log, reduce_sum, silu, gather
+from sili.tensor import (
+    Tensor, banded_attention, gaussian_attention, exp, log, reduce_sum, silu, gather, _topo_sort,
+)
 
 
 def rmsnorm_tensor(x: Tensor, weight: Tensor, eps: float) -> Tensor:
@@ -102,6 +104,56 @@ def apply_gradient_step(params: List[Tensor], lr: float) -> None:
         if p.grad is not None:
             p.data = p.data - lr * np.asarray(p.grad, dtype=np.float32)
             p.zero_grad()
+
+
+def backward_with_grad_clip(loss: Tensor, max_grad_norm: float) -> None:
+    """Gradient-clipped replacement for `loss.backward()` -- clips the
+    L2 norm of EVERY node's incoming gradient (not just the final
+    parameter gradients) to `max_grad_norm`, right before that node's
+    own `_backward()` fires.
+
+    Textbook gradient clipping computes the TOTAL norm across all
+    parameter gradients FIRST, then rescales once -- not possible here
+    in one pass: `DISLDOLayer`'s own weights self-update INLINE, during
+    the SAME `_backward()` call that computes their gradient (see
+    module docstring), so by the time a global norm could be measured,
+    the (unclipped) update has already happened. A true two-pass
+    version (a dry run at `learning_rate=0` to measure the norm, then a
+    real pass with a correctly pre-scaled seed) would double the
+    forward+backward cost of every single training step -- not worth
+    it here.
+
+    Per-NODE clipping is the single-pass-compatible alternative that
+    still directly bounds what any individual weight update can see:
+    `Tensor.backward()` (`sili/tensor.py`) is just `for node in
+    reversed(_topo_sort(self)): node._backward()` -- replicated here
+    with a clip inserted in the loop, so every node's `.grad` (already
+    fully accumulated from all its consumers by the time its own turn
+    comes, per topological order) is bounded before it can either
+    propagate further OR drive a `DISLDOLayer`'s inline update. This is
+    what actually fixed the training instability (overflow warnings,
+    divergent loss) seen during this session's own unclipped runs."""
+    if loss.grad is None:
+        loss.grad = np.ones_like(loss.data)
+    for node in reversed(_topo_sort(loss)):
+        if node.grad is not None:
+            g = np.asarray(node.grad, dtype=np.float32)
+            norm = float(np.sqrt(np.sum(g.astype(np.float64) ** 2)))
+            if norm > max_grad_norm and norm > 0:
+                node.grad = (g * (max_grad_norm / norm)).astype(np.float32)
+        node._backward()
+
+
+def lr_schedule(step: int, total_steps: int, peak_lr: float,
+                 warmup_steps: int, min_lr_ratio: float = 0.1) -> float:
+    """Linear warmup + cosine decay, matching nanoGPT's own convention
+    (widely-used, well-tested defaults for small transformer training --
+    looked up rather than guessed, per direct decision)."""
+    if step < warmup_steps:
+        return peak_lr * (step + 1) / max(1, warmup_steps)
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+    return float(peak_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

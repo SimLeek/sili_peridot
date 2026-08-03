@@ -9,7 +9,7 @@ import pytest
 from model.toy_recall_models import (
     ToySmallTransformer, ToyTileRecurrence,
     cross_entropy_sum, predicted_token, apply_gradient_step,
-    rmsnorm_tensor,
+    rmsnorm_tensor, backward_with_grad_clip, lr_schedule,
 )
 from model.toy_recall_task import generate_sequence
 from sili.tensor import Tensor
@@ -208,3 +208,66 @@ class TestApplyGradientStep:
         assert a.grad is None
         np.testing.assert_allclose(b.data, [5.0])
         assert b.grad is None
+
+
+class TestBackwardWithGradClip:
+    def test_matches_plain_backward_when_under_the_clip_norm(self):
+        # Small gradients (well under max_grad_norm) shouldn't be
+        # altered at all -- clipping only kicks in above the threshold.
+        a = Tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        b = Tensor(np.array([0.5, -0.5, 1.0], dtype=np.float32))
+        out1 = (a * b).sum()
+        out1.grad = np.array(0.01, dtype=np.float32)  # tiny seed -> tiny grads
+        backward_with_grad_clip(out1, max_grad_norm=1.0)
+        expected_a_grad = b.data * 0.01
+
+        a2 = Tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        b2 = Tensor(np.array([0.5, -0.5, 1.0], dtype=np.float32))
+        out2 = (a2 * b2).sum()
+        out2.grad = np.array(0.01, dtype=np.float32)
+        out2.backward()
+
+        np.testing.assert_allclose(a.grad, expected_a_grad, rtol=1e-4)
+        np.testing.assert_allclose(a.grad, a2.grad, rtol=1e-4)
+
+    def test_clips_a_large_gradient_down_to_the_norm(self):
+        a = Tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        b = Tensor(np.array([0.5, -0.5, 1.0], dtype=np.float32))
+        out = (a * b).sum()
+        out.grad = np.array(1000.0, dtype=np.float32)  # huge seed
+        backward_with_grad_clip(out, max_grad_norm=1.0)
+        norm = float(np.sqrt(np.sum(a.grad.astype(np.float64) ** 2)))
+        assert norm <= 1.0 + 1e-4
+
+    def test_clips_disldo_layer_update_not_just_leaf_tensors(self):
+        # The whole point: a huge loss must not blow up a DISLDOLayer's
+        # own inline weight update either, not just plain Tensor leaves.
+        model = _tile_model(num_tiles=3)
+        x_window = np.random.RandomState(9).randn(3, HIDDEN).astype(np.float32) * 0.1
+        M_prev = np.zeros((3, HIDDEN), dtype=np.float32)
+        probe = np.random.RandomState(10).randn(3, HIDDEN).astype(np.float32) * 0.1
+        before = model.step(probe, np.zeros((3, HIDDEN), dtype=np.float32), learning_rate=0.0)[1].data.copy()
+
+        _M, logits = model.step(x_window, M_prev, learning_rate=1.0)
+        loss = cross_entropy_sum(logits, [(0, 1), (1, 2), (2, 3)])
+        loss.grad = np.array(1e6, dtype=np.float32)  # deliberately huge seed
+        backward_with_grad_clip(loss, max_grad_norm=1.0)
+        apply_gradient_step(model.parameters(), lr=1.0)
+
+        after = model.step(probe, np.zeros((3, HIDDEN), dtype=np.float32), learning_rate=0.0)[1].data
+        assert np.all(np.isfinite(after)), "clipped update still produced non-finite output"
+        # Some change is expected (real training happened); just not NaN/inf.
+        assert not np.allclose(before, after)
+
+
+class TestLrSchedule:
+    def test_linear_warmup_then_cosine_decay(self):
+        peak, warmup, total = 0.02, 10, 100
+        assert lr_schedule(0, total, peak, warmup) == pytest.approx(peak / warmup)
+        assert lr_schedule(warmup - 1, total, peak, warmup) == pytest.approx(peak, rel=0.15)
+        assert lr_schedule(warmup, total, peak, warmup) == pytest.approx(peak, rel=1e-6)
+        # decays monotonically after warmup
+        lrs = [lr_schedule(s, total, peak, warmup) for s in range(warmup, total)]
+        assert all(lrs[i] >= lrs[i + 1] - 1e-9 for i in range(len(lrs) - 1))
+        # never drops below min_lr_ratio * peak
+        assert lr_schedule(total - 1, total, peak, warmup, min_lr_ratio=0.1) >= peak * 0.1 - 1e-6
