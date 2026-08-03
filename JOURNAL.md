@@ -1151,3 +1151,106 @@ this is still prototype-only
 (`/home/simleek/.claude/jobs/4c378ed3/tmp/uleb128_simd_v7_for.cpp`),
 `sili__new` itself is untouched. Worth a real PR if the user wants to
 proceed, given how much stronger this result is than attempts 1-6.
+
+## B8 paused: tile-recurrence architecture (Kimi K3 collaboration)
+
+Phase 2.7 (unifying B8's window mechanism onto one real trainable
+`gaussian_attention` call, see the two entries above this) shipped
+cleanly, but it didn't fix the real underlying problem: the window
+caps at 24 fold-depth positions, each holding a SINGLE 1536-dim
+carried-state vector -- nowhere near a real transformer's KV cache
+(thousands of distinct token vectors). Confirmed by direct benchmark:
+the attention math itself is cheap at that scale (<1.5% of
+`apply_window_step`'s cost even at window_size=24); representational
+*capacity*, not compute, was the actual bottleneck.
+
+The user worked out an alternative architecture with Kimi K3 (an
+external model, no knowledge of this repo) and pasted the full spec:
+one persistent recurrent state `M[num_tiles, tile_dim]`, decoupled
+entirely from fold depth -- `num_tiles` is a free axis. Per direct
+decision: **B8's fold-depth-window curriculum is PAUSED** (not
+abandoned -- `feature/b8-suffix-unification` stays as-is) in favor of
+prototyping this. Backed by real prior art (reservoir computing/ESN,
+RTRL, e-prop, Clockwork RNN) claiming an emergent internal "clock"
+gives content-addressable memory without hand-coded NTM read/write
+heads -- a real, unproven architectural bet, not something this
+prototype validates (see below).
+
+**Went through several rounds of correction against the generic
+Kimi-generated spec** (full detail in the approved plan,
+`feature/tile-recurrence-prototype` branch,
+`model/tile_recurrence.py`'s own docstrings):
+- Weight reuse: bootstrap the SHARED tile network from ONE already-
+  folded fold position (`step_layers[i]`), not train from scratch --
+  confirmed mechanically feasible (batched `forward_dense` over
+  `[num_tiles, hidden]` works fine, shapes match exactly).
+- Positional encoding: first drafted "drop RoPE, `gaussian_attention`'s
+  center/sigma replaces it" -- wrong, center/sigma are fixed constants
+  tied to tile INDEX, not a true relative-offset encoding. Then
+  over-corrected to "no positional encoding at all." Final, correct
+  answer (direct user correction): **just use RoPE** -- tiles have
+  real, known sequence positions once injection is the full sliding
+  window, so RoPE applies exactly like `apply_fold_step` already does.
+  `gaussian_attention`'s center/sigma stays as an independent,
+  complementary, learnable locality prior on top of RoPE, not a
+  substitute for it.
+- Input injection: first drafted "inject only into the last tile" --
+  wrong, corrected to full sliding-window injection into EVERY tile
+  each tick (`tile[j] = x[i-(num_tiles-1)+j]` when that index exists).
+  Naturally reduces to "only the last tile gets real input" at the
+  very first tick, not a special case.
+- State update: additive/gated (`M_new = M_prev + energy_dynamics(
+  attn_out)`), matching Kimi's own residual formula literally -- this
+  is what makes "inject raw content into every tile every tick" still
+  compatible with genuine memory persistence (the injection only feeds
+  this tick's computation, it doesn't overwrite `M_prev`).
+- No new training mechanism needed: `SparseLinearLayer`'s existing
+  inline/local training (self-updates during `forward_dense`, no
+  backprop from a downstream loss) already satisfies Kimi's own
+  "no BPTT, `M_t-1` fully detached" requirement. Only `centers`/
+  `log_sigmas` need real `Tensor` backprop -- a single non-recurrent
+  op per tick, same as Phase 2.7 already validated.
+
+**Sizing/speed, measured not assumed -- and a real error caught and
+fixed along the way**: initial benchmarks (including the FLOP-parity
+ceiling estimate) used 10% density, picked without checking. Real B3
+-achieved density is 80-93% (this file, "B3 pruning" entry above,
+`gate_proj` mean row occupancy ~80%) -- redid the comparison at 85%,
+same sili/FP4 engine on both sides for a fair test:
+
+  ORIGINAL, 24 real distinct layers, one real token, sili/FP4, 85%:
+  **1460 ms/token**
+  TILE, num_tiles=8,  same engine/density: 104.8 ms/tick -> **13.9x faster**
+  TILE, num_tiles=32, same engine/density: 344.5 ms/tick -> **4.2x faster**
+
+Notably, num_tiles=32 does slightly MORE raw FLOPs than the original
+24-layer pass (32 tiles x one shared matrix ~= 1.54B FLOPs vs the
+original's ~1.16B) yet is still ~4x faster in wall time -- consistent
+with the cache-locality hypothesis raised mid-design: one small shared
+weight matrix reused across many tile-rows stays cache-resident, vs
+the original's 24 DISTINCT matrices that can't share residency at
+all. Caveats: single-run timing, randomly-initialized fake CSR layers
+(not real trained weights), no KV-cache-style reuse modeled on the
+original's side -- real, but not a rigorous benchmark yet.
+
+**Given these real speedups already, batch-parallelism (a genuinely
+new C++ kernel task -- confirmed `sili__new` has no real batch-parallel
+op today, passing a bigger array into `forward_dense` does NOT get
+real batch parallelism, only whatever row/thread parallelism it
+already does) was explicitly deferred per direct decision** -- noted
+as future optimization work in `todolist.md`, not pursued now.
+
+**Not tested at all, and there's no basis to expect it yet**: the
+"emergent clock" hypothesis, or any other emergent property from the
+cited literature. Phase T1 only built and sanity-tested the
+architecture (shapes, gradient plumbing, injection-formula
+correctness, statefulness under a FIXED untrained weight set) --
+nothing has been trained, so nothing could have emerged. Real
+validation needs an actual training loop (not built) plus new
+instrumentation designed to detect it (not designed) -- both real
+future work, not close to done.
+
+See `/home/simleek/.claude/plans/fuzzy-plotting-starlight.md` for the
+full approved plan and design rationale; `model/tile_recurrence.py`
+and `tests/test_tile_recurrence.py` on `feature/tile-recurrence
+-prototype` (11/11 tests passing) for the actual implementation.

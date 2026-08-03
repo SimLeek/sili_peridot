@@ -946,6 +946,35 @@ to flip green once it's fixed.
   sparse backprop conversion) — that's the scheduled trigger point A5
   itself names ("execute A5 after Phase B7"), not a maybe. Don't move on
   to B8 training without at least checking A5 first.
+**PAUSED (2026-08-02), not abandoned.** B8/B8a below (the fold-depth
+-window column-averaging curriculum) shipped through Phase 2.7
+(unified onto a real trainable `gaussian_attention` mechanism -- see
+`feature/b8-suffix-unification`, left as-is), but the underlying
+24-fold-depth-position capacity cap is a real problem a window
+mechanism alone can't fix. Now prototyping an alternative "tile
+-recurrence" architecture instead (`feature/tile-recurrence-prototype`,
+`model/tile_recurrence.py`) -- decouples state capacity from fold
+depth entirely, bootstraps its shared tile network from the same
+already-folded weights, and measured 4-14x FASTER than the original
+24-layer model per real token at the same (realistic, 85%) density,
+same sili/FP4 engine both sides. See JOURNAL.md's "B8 paused:
+tile-recurrence architecture" entry for the full story (design
+corrections, real numbers, what's still unvalidated). B8/B8a's own
+text below is kept for reference, not deleted -- may be revisited.
+
+**Future optimizations, noted not scheduled** (deferred per direct
+decision -- the real speedups already measured above don't need these
+yet):
+- **Batch parallelism** (processing multiple independent sequences at
+  once, distinct from tile parallelism): `sili__new` has no genuine
+  batch-parallel op today -- passing a bigger array into `forward_dense`
+  does NOT get real batch parallelism, only whatever row/thread
+  parallelism it already does. Would need real new C++ (two separate
+  code paths, row-parallel vs batch-parallel, with an empirically
+  -determined dispatch threshold -- see the approved plan for the full
+  scoping). Worth it once tile-recurrence needs to scale past what
+  single-sequence throughput can deliver, not before.
+
 - [ ] **B8. Column-averaging training loop**: for each input index `i`,
   the column of 24 fold-depth neurons should average toward `input[i]`
   **at every fold step, from step 1 onward** — not only after the full
