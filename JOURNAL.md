@@ -1320,3 +1320,58 @@ gradient clipping (the overflow warnings are a real signal, not
 noise), a proper LR schedule, possibly batched (not pure per-step
 online) training over multiple sequences at once, and/or substantially
 more steps. Tracked in `todolist.md`.
+
+## Toy validation follow-up: standard MQAR + gradient clipping + LR schedule
+
+Per direct feedback on the first (inconclusive) toy training result:
+implemented gradient clipping (the user's own long-standing standard),
+a warmup+cosine LR schedule (nanoGPT's convention, looked up via
+websearch rather than guessed), explicitly skipped batched training
+(single CPU here, no parallelism to gain -- the user's own correct
+call), and -- most substantively -- **replaced the hand-rolled
+induction-head task with the standard MQAR benchmark** (Arora,
+Eyuboglu et al., "Zoology: Measuring and Improving Recall in Efficient
+Language Models", 2023) rather than continuing to extend a bespoke
+one, per direct instruction that a sufficiently standard test shouldn't
+be reimplemented from scratch. Ported directly from HazyResearch/
+zoology's own reference implementation
+(`zoology/data/multiquery_ar.py`, fetched from the repo) to plain
+single-example numpy -- this is the established benchmark for exactly
+what's being tested here (can an efficient/recurrent architecture
+recall associations as well as full attention), used throughout the
+linear-attention/SSM/efficient-architecture literature specifically
+for this comparison.
+
+**Gradient clipping implementation note**: textbook global-norm
+clipping (measure the total gradient norm across all parameters, THEN
+rescale once) isn't directly compatible with `DISLDOLayer`'s own
+design -- its weights self-update INLINE during the very
+`_backward()` call that computes their gradient, so knowing the "total
+norm" before any update happens would need a full dry-run pass first
+(learning_rate=0 everywhere), doubling every training step's cost.
+Implemented PER-NODE clipping instead (`backward_with_grad_clip` in
+`model/toy_recall_models.py`): replicates `Tensor.backward()`'s own
+topological-order traversal, clipping each node's `.grad` to
+`max_grad_norm` right before that node's own `_backward()` fires --
+single-pass, and still directly bounds what any individual weight
+update (including `DISLDOLayer`'s inline ones) can see.
+
+**Real result, reported honestly**: better than the pre-clipping run
+(no more NaN divergence), but still not a clean signal for either
+model. `seq_len=16/num_kv_pairs=2`: dense=0.15, tile=0.04.
+`seq_len=32/num_kv_pairs=4`: dense=0.03, tile=0.01. A residual overflow
+warning appeared during the run even WITH clipping, suggesting some
+instability remains (plausibly: clipped GRADIENTS bound each step's
+update, but nothing yet bounds cumulative WEIGHT magnitude directly --
+weight decay, another standard stabilization technique, wasn't added
+this round).
+
+**Not resolved -- genuinely open, real next steps** (not attempted
+further this session, given how much back-and-forth this specific
+sub-task has already consumed): weight decay; more training steps;
+possibly the toy dims (hidden=16) are simply too small for MQAR's
+real vocab requirements (MQAR needs vocab_size > seq_len strictly,
+forcing vocab up as seq_len grows, unlike the old hand-rolled task);
+worth checking against zoology's own reported results for their
+SMALLEST model configs to see what scale they needed for real
+learning to emerge, rather than continuing to guess.
