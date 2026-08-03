@@ -46,11 +46,17 @@ from model.toy_recall_models import (
 )
 
 NUM_TILES = 4              # deliberately small and FIXED across the whole sweep
-TRAIN_STEPS = 1500
-WARMUP_STEPS = 100
-PEAK_LR = 0.02
-MAX_GRAD_NORM = 1.0
-EVAL_SEQUENCES = 40
+TRAIN_STEPS = 15000        # per direct decision, scaled up substantially -- looked up
+WARMUP_STEPS = 300         # zoology's own real MQAR configs: 100k examples, up to 32
+PEAK_LR = 0.02             # epochs (millions of steps for the largest configs). Not
+MAX_GRAD_NORM = 1.0        # matching that scale (single CPU, from-scratch inline
+EVAL_SEQUENCES = 60        # training), but "these just take a while" (direct
+                           # feedback, echoing the Mandelbrot attention system's own
+                           # minutes-to-an-hour convergence time) -- calibrated
+                           # directly: hidden=32 costs ~6.7ms/step (dense) / ~43ms/step
+                           # (tile) at seq_len=16, landing this run around 30-40 min
+                           # total for both configs, not the ~3 min the first attempt
+                           # used.
 
 # (seq_len, num_kv_pairs, vocab_size) -- MQAR requires vocab_size > seq_len
 # and seq_len >= 4*num_kv_pairs. Two difficulty levels: config 1 mostly
@@ -146,7 +152,11 @@ def train_and_eval_tile(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed):
 
 
 def main():
-    hidden, mlp_hidden = 16, 24
+    hidden, mlp_hidden = 32, 48   # zoology's own smallest real attention-baseline
+                                   # d_model for MQAR is 32 (models_repo.py's
+                                   # add_attention sweeps d_model in [32, 64, 128],
+                                   # n_layers=2) -- looked up, not guessed; doubled
+                                   # from this session's earlier hidden=16 attempts.
     print(f"num_tiles={NUM_TILES} hidden={hidden} mlp_hidden={mlp_hidden} "
           f"train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} peak_lr={PEAK_LR} "
           f"max_grad_norm={MAX_GRAD_NORM} eval_sequences={EVAL_SEQUENCES}\n")

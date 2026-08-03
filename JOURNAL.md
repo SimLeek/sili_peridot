@@ -1375,3 +1375,51 @@ forcing vocab up as seq_len grows, unlike the old hand-rolled task);
 worth checking against zoology's own reported results for their
 SMALLEST model configs to see what scale they needed for real
 learning to emerge, rather than continuing to guess.
+
+## Toy validation: longer run at zoology-matched scale still stuck at chance
+
+Per direct feedback: checked zoology's own real MQAR configs
+(`zoology/experiments/models_repo.py`'s `add_attention` -- their
+smallest attention baseline sweeps `d_model` in `[32, 64, 128]`,
+`n_layers=2`, hybrid with a BaseConv mixer; real training configs use
+100k examples per config, up to 32 epochs -- far more data/steps than
+anything tried here so far, confirming "these just take a while").
+Scaled `hidden` 16 -> 32 (matching their smallest `d_model`) and
+`TRAIN_STEPS` 1500 -> 15000 (calibrated directly: ~6.7ms/step dense,
+~43ms/step tile at these dims -- landed the real run at ~30.7 minutes
+total for both configs, in the "minutes to an hour" range the user
+described from their own Mandelbrot-attention precedent).
+
+**Real result, still honestly reported, not dressed up**:
+`seq_len=16/kv_pairs=2`: dense=0.07 (chance=0.10), tile=0.00.
+`seq_len=32/kv_pairs=4`: dense=0.05 (chance=0.05), tile=0.00. Even the
+DENSE baseline -- full attention over the whole sequence, the
+condition under which MQAR should be EASIEST to solve, at a model
+scale directly matching zoology's own real smallest reference config
+-- is still stuck at chance after ~30 minutes of training. Overflow
+warnings (`RuntimeWarning: overflow in exp`, `invalid value in
+multiply/reduce`) are STILL present, unchanged by adding gradient
+clipping.
+
+**This is a real, useful negative result, not just "still
+inconclusive"**: scale-appropriate model + the standard benchmark +
+substantially longer training + gradient clipping STILL doesn't
+produce learning, even for the reference architecture (dense
+attention) that should have the easiest time. This points at the
+TRAINING METHODOLOGY itself, not model capacity and not something
+specific to tile-recurrence -- most likely weight MAGNITUDE drifting
+into an unstable regime over many steps, unopposed by anything (
+gradient clipping bounds each STEP's update, but 15,000 consistently
+-directed steps at `lr=0.02` can still walk weights into a bad regime
+even with every individual step bounded). Weight decay -- explicitly
+scoped but not implemented last round as a "maybe" -- now looks more
+likely NECESSARY than optional, not resolved this session (see the
+previous JOURNAL entry for why it needs real C++ work: `DISLDOLayer`'s
+`weights_vals` accessor returns a DECODED COPY of the compressed
+storage, not a live view, so decay-by-direct-mutation doesn't work --
+confirmed directly, `w *= 0.5` on the returned array didn't persist;
+a proper implementation needs a new parameter threaded through
+`disldo_backward` in `sili/lib/headers/linear_disldo.hpp`, inside its
+per-connection update loop, which is intertwined with FP4 quantization/
+scale/importance tracking -- real, bounded scope, not attempted this
+session pending explicit direction).
