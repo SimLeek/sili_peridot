@@ -31,6 +31,38 @@ from sili.tensor import (
 )
 
 
+class DenseTensorLinear:
+    """Plain fp32 Tensor-graph linear layer (matmul-based, NO
+    quantization, NO DISLDOLayer) -- trainable via apply_gradient_step,
+    the SAME hand-rolled SGD+clip convention as every other leaf in
+    this module (RMSNorm weights, centers, log_sigmas), NOT Adam.
+
+    Exists specifically to isolate FP4-quantization-via-DISLDOLayer
+    from this session's own hand-rolled optimizer as the cause of the
+    toy training experiments' stuck-at-chance result: a full-precision
+    + Adam control (scripts/torch_mqar_control.py) converged easily and
+    fast on the identical architecture/task, proving the ARCHITECTURE
+    wasn't the problem -- but that control changed BOTH precision and
+    optimizer at once. This class changes ONLY precision (still uses
+    this module's own optimizer), so a model built from it isolates
+    the remaining variable directly."""
+
+    def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
+        self.weight = Tensor(
+            (np.random.randn(in_features, out_features) * scale).astype(np.float32))
+
+    def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
+        """learning_rate accepted (unused) only so this drops into the
+        SAME call signature DISLDOLayer.forward uses -- this class's
+        own weight trains via apply_gradient_step(self.parameters(),
+        lr), called by the caller's training loop like any other leaf,
+        not via an inline per-call update."""
+        return x @ self.weight
+
+    def parameters(self) -> List[Tensor]:
+        return [self.weight]
+
+
 def rmsnorm_tensor(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     """x: [T, hidden] Tensor. Same formula as sili_block.rmsnorm, but
     built from Tensor ops so gradient flows through it (needed here,

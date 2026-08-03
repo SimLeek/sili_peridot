@@ -1465,3 +1465,46 @@ clip+SGD loop, to isolate whether the optimizer alone explains it; or
 retrofitted) rather than continuing to guess with tile-recurrence
 itself, which was never the thing actually being tested by this
 failure.
+
+## Second control: fp32 + same hand-rolled loop isolates the optimizer, not FP4
+
+Per direct decision (importance/row-scale mechanisms already validated
+elsewhere, so FP4 itself was doubted as the cause): built
+`scripts/fp32_handrolled_control.py` -- identical architecture and
+task to the first control, but changes ONLY precision (plain fp32
+`sili.tensor` matmul via a new `DenseTensorLinear` primitive in
+`model/toy_recall_models.py`, no `DISLDOLayer`/FP4), keeping the SAME
+hand-rolled optimizer (`backward_with_grad_clip` + `apply_gradient_step`
++ `lr_schedule`) as every real toy model this session.
+
+**Result, decisive**: `seq_len=16/kv_pairs=2`: loss improved initially
+(5.881 -> 4.746 by step 300) then diverged catastrophically (5834 ->
+182843 -> 3,088,712 by step 2100) -- eval accuracy 0.10 (chance).
+`seq_len=32/kv_pairs=4`: same pattern, eval accuracy 0.06 (chance).
+The same `RuntimeWarning: overflow in exp` seen in every FP4 attempt
+reappeared here too, at FULL PRECISION.
+
+**This isolates the cause cleanly: the hand-rolled optimizer (per-node
+gradient-norm clipping + plain SGD, no momentum) is the actual
+bottleneck, NOT FP4 quantization.** Per-node clipping bounds each
+individual step's gradient, but nothing prevents weights from walking
+into instability over many CONSISTENTLY-DIRECTED steps -- exactly what
+momentum/Adam-style per-parameter adaptive scaling exists to prevent,
+and exactly what this session's own from-scratch optimizer never had.
+
+**Real, scoped next step -- NOT symmetric across the two training
+paths this project has**: fixing this for plain `Tensor` LEAVES
+(RMSNorm weights, `centers`/`log_sigmas`, `DenseTensorLinear`'s own
+weight) is pure Python -- a real Adam implementation is directly
+addable to `apply_gradient_step`'s call site, no `sili__new` changes
+needed. But the REAL toy models (`ToySmallTransformer`/
+`ToyTileRecurrence`) route their big linear layers through
+`DISLDOLayer`, whose inline C++ weight update (inside
+`backward_dense`) has the identical no-momentum problem and isn't
+reachable from the Python side the same way -- giving DISLDOLayer's
+own training real momentum would need genuine new C++ work in
+`disldo_backward` (`sili/lib/headers/linear_disldo.hpp`), similar in
+scope to the weight-decay idea scoped (not built) earlier. Not
+resolved this session -- a real decision point on how much further to
+invest, given how much of this session has already gone into training
+-loop diagnostics rather than the tile-recurrence architecture itself.
