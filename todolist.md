@@ -975,6 +975,26 @@ yet):
   scoping). Worth it once tile-recurrence needs to scale past what
   single-sequence throughput can deliver, not before.
 
+**Toy-scale learning validation (before wiring the real conversion
+pipeline onto tile-recurrence)**: built (`model/toy_recall_models.py`,
+`model/toy_recall_task.py`, `scripts/train_toy_recall_comparison.py`)
+per direct decision -- prove the architecture can actually LEARN before
+committing to the expensive real-checkpoint route. Surfaced 3 real
+`sili__new` bugs along the way (all fixed, PR #30 -- the serious one:
+`forward_dense`/`forward_sparse` returning an ALIASED array, silently
+corrupting any previously-held result once the same layer is called
+again). **The actual learning-signal result is inconclusive, reported
+honestly, not resolved**: even the dense baseline (expected near-
+ceiling, full attention over the whole sequence) only reliably beat
+chance at the shortest lag tested; tile-recurrence's own numbers show
+no clear signal either way. See JOURNAL.md's "Tile-recurrence toy
+validation" entry for the full numbers and what's needed to get a real
+answer (gradient clipping -- overflow warnings seen during the longer
+run are a real signal, not noise -- a proper LR schedule, possibly
+batched training, more steps). **Not yet done, real next step**: fix
+the training-loop instability and re-run before deciding whether to
+proceed with the real conversion pipeline.
+
 - [ ] **B8. Column-averaging training loop**: for each input index `i`,
   the column of 24 fold-depth neurons should average toward `input[i]`
   **at every fold step, from step 1 onward** — not only after the full

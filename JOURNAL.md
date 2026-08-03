@@ -1254,3 +1254,69 @@ See `/home/simleek/.claude/plans/fuzzy-plotting-starlight.md` for the
 full approved plan and design rationale; `model/tile_recurrence.py`
 and `tests/test_tile_recurrence.py` on `feature/tile-recurrence
 -prototype` (11/11 tests passing) for the actual implementation.
+
+## Tile-recurrence toy validation: real bugs found, learning signal inconclusive
+
+Before wiring the real B1-B7 conversion pipeline onto tile-recurrence
+(dropping the paused fold-depth-window design), built a toy-scale
+validation harness to prove the architecture can actually LEARN, not
+just run a forward pass without crashing (all Phase T1 verified).
+
+**Two toy models** (`model/toy_recall_models.py`): `ToySmallTransformer`
+(real stacked causal dense transformer, own weights per layer) and
+`ToyTileRecurrence` (one shared tile network + `gaussian_attention`
+across tiles, Q/K/V from `normed(x_window)+normed(M_prev)` so memory is
+genuinely attend-able, not just added in afterward). Both route every
+linear projection through `sili.sparse_rnn.DISLDOLayer` (Tensor-graph
+-integrated, self-updates inline via `backward_dense`) rather than
+`sili_block.py`'s frozen-inference convention. Kept Kimi's staggered
+per-tile "column" prediction (tile j predicts what tile j+1 currently
+holds) per direct decision -- the tile-shaped descendant of this
+project's own A3/A4 column-averaging work.
+
+**Task**: synthetic associative recall / "induction head"
+(`model/toy_recall_task.py`) -- a cue-response bigram planted early,
+repeated `lag` positions later, correct prediction at that point
+requires genuine retrieval. Standard synthetic test for exactly the
+property tile-recurrence exists to have more of.
+
+**Building this surfaced THREE real upstream `sili__new` bugs** (all
+fixed, PR #30):
+1. `reduce_sum`'s backward broken for any axis other than 0 (needed
+   for a batched RMSNorm).
+2. `add()`/`mul()`'s backward didn't reduce broadcasted gradients
+   (only matched when both operands already shared the same shape).
+3. **The serious one**: `SparseLinearLayer.forward_dense`/
+   `forward_sparse` and `DISLDOLayerV.forward` returned a numpy array
+   ALIASED to the layer's own reused internal `output_buf` -- any
+   caller holding a PREVIOUS call's result alive across a subsequent
+   call to the same layer silently saw it change to the new call's
+   answer. Not a crash -- wrong answers that looked like a design bug
+   (a "tile-recurrence ignores M_prev" test failure turned out to be
+   this, not the architecture). Root-caused via
+   `np.shares_memory()` confirming two genuinely different inputs'
+   returned arrays shared the same backing memory. This affects
+   `DISLDOLayer` broadly, not just this toy work -- worth being aware
+   of for any other code in this project using it.
+
+**Real training result (`scripts/train_toy_recall_comparison.py`),
+reported plainly, not dressed up**: inconclusive at the calibrated
+settings. First pass (vocab=16, lr=0.005, 400 steps/lag) left even the
+DENSE baseline -- which should be a near-ceiling reference, given full
+attention over the whole sequence -- stuck exactly at chance (0.05).
+Recalibrated (vocab=8, lr=0.02, 2000 steps/lag): dense only reliably
+beat chance (12.5%) at lag=2 (0.45); lag=4/8/16 hovered at/barely above
+chance (0.10/0.17/0.23), with visible numerical instability (overflow
+warnings) during the longer run. Tile-recurrence's numbers
+(0.10/0.12/0.15/0.05) show no clear signal relative to dense either
+way. This is a genuinely hard task from FRESH sequences every step (no
+memorization shortcut) -- matches real induction-head literature (these
+take real training to emerge, not instant convergence) -- not evidence
+the architecture can't learn it, but also not evidence it can, yet.
+
+**Not resolved, real follow-up work**: getting a confident answer needs
+actual training-loop engineering this session didn't have room for --
+gradient clipping (the overflow warnings are a real signal, not
+noise), a proper LR schedule, possibly batched (not pure per-step
+online) training over multiple sequences at once, and/or substantially
+more steps. Tracked in `todolist.md`.
