@@ -14,22 +14,28 @@ here, in seconds, before touching the full tile system.
 
 Result as of the LATEST run (50 seeds x 40 eval sequences,
 STATE_WIDTH=16, TRAIN_STEPS=6000, GENTLE_ENERGY_CONFIG, eval-mode
-energy bug fixed -- see below):
+energy bug fixed -- see below), with REAL hypothesis tests (paired --
+plain[s]/peak[s] share the same eval-sequence seed at each s, so a
+paired test uses that shared variance rather than discarding it;
+Wilcoxon signed-rank as a non-parametric check against the t-test's
+normality assumption):
 
-  n_bits  in_ctx  plain (mean+-std)  peak-synapse (mean+-std)
-       2     yes     0.526 +- 0.223          0.539 +- 0.205
-       3      NO     0.514 +- 0.168          0.542 +- 0.133
-       4      NO     0.493 +- 0.187          0.502 +- 0.197
-       6      NO     0.410 +- 0.197          0.452 +- 0.180
+  n_bits  plain mean  peak mean   diff  paired-t     p(t)   p(Wilcoxon)
+       2      0.5262     0.5386  0.0124    0.318    0.752       0.746
+       3      0.5132     0.5410  0.0278    0.953    0.345       0.653
+       4      0.4930     0.5010  0.0080    0.200    0.842       0.766
+       6      0.4092     0.4514  0.0422    1.220    0.229       0.356
 
-No single point clears its own noise (largest gap, n=6, is only
-~1.1 combined SEM at N=50) -- NOT a proven effect. But peak-synapse is
-nominally ahead at ALL FOUR points, including every out-of-context
-one -- a consistent direction, unlike earlier (pre-fix) runs where the
-sign flipped between reruns. Worth continued tracking, not yet worth
-calling settled. Both arms remain at/below chance at n=6 specifically
--- the hardest, most out-of-context case is still the weak point for
-both, independent of mechanism.
+NOT statistically significant at any point (best case, n=6, p~=0.23)
+-- both tests agree, so this isn't a normality-assumption artifact.
+Honest verdict: no statistically significant evidence that
+peak-synapse outperforms plain DISLDO at this scale/task/sample size.
+peak-synapse IS nominally ahead at all four points (a real, consistent
+direction, unlike earlier pre-fix runs where the sign flipped between
+reruns) -- worth continued tracking with more seeds, not something to
+lean on as evidence yet. Both arms remain at/below chance at n=6
+specifically -- the hardest, most out-of-context case is still the
+weak point for both, independent of mechanism.
 
 Multiple real bugs found and fixed along the way to get a run worth
 trusting at all -- see JOURNAL.md for the full narrative: sili__new's
@@ -96,6 +102,7 @@ Run: python -m scripts.prototype_peak_synapse_learning_comparison
 """
 import time
 import numpy as np
+from scipy import stats as scipy_stats
 
 from sili.sparse_rnn import DISLDOLayer
 from sili import _cpu
@@ -419,13 +426,31 @@ def main():
         print(f"seed {s}: plain={ {n: round(pr[n],2) for n in EVAL_N_VALUES} }  "
               f"peak={ {n: round(kr[n],2) for n in EVAL_N_VALUES} }")
 
-    print(f"\n{'n_bits':>8}  {'in_ctx':>7}  {'plain (mean+-std)':>20}  {'peak-synapse (mean+-std)':>26}")
+    # Paired tests: plain[s] and peak[s] share the same eval-sequence
+    # seed (5000+s) at each s, so a paired test uses that shared
+    # per-seed variance rather than discarding it -- more sensitive
+    # than treating the two arms as independent samples, and matches
+    # how the data was actually generated. Wilcoxon signed-rank as a
+    # non-parametric cross-check against the t-test's normality
+    # assumption (accuracy is itself a mean over EVAL_SEQUENCES binary
+    # trials, not obviously normal at N=50).
+    print(f"\n{'n_bits':>8}  {'in_ctx':>7}  {'plain mean+-std':>17}  {'peak mean+-std':>17}  "
+          f"{'diff':>7}  {'paired-t':>9}  {'p(t)':>7}  {'p(Wilcoxon)':>11}")
     for n_bits in EVAL_N_VALUES:
         in_ctx = "yes" if n_bits <= W else "NO"
-        pm, ps = np.mean(plain_agg[n_bits]), np.std(plain_agg[n_bits])
-        km, ks = np.mean(peak_agg[n_bits]), np.std(peak_agg[n_bits])
-        print(f"{n_bits:>8}  {in_ctx:>7}  {pm:>8.3f} +- {ps:.3f}       {km:>8.3f} +- {ks:.3f}")
-    print(f"\n(chance = 0.5, {N_SEEDS} seeds x {EVAL_SEQUENCES} eval sequences each)")
+        p_arr = np.array(plain_agg[n_bits])
+        k_arr = np.array(peak_agg[n_bits])
+        pm, ps = p_arr.mean(), p_arr.std()
+        km, ks = k_arr.mean(), k_arr.std()
+        t_stat, t_p = scipy_stats.ttest_rel(k_arr, p_arr)
+        try:
+            _w_stat, w_p = scipy_stats.wilcoxon(k_arr, p_arr)
+        except ValueError:
+            w_p = float("nan")  # all-zero differences -- degenerate, not an error
+        print(f"{n_bits:>8}  {in_ctx:>7}  {pm:>8.3f} +- {ps:<5.3f}  {km:>8.3f} +- {ks:<5.3f}  "
+              f"{km - pm:>+7.4f}  {t_stat:>9.3f}  {t_p:>7.4f}  {w_p:>11.4f}")
+    print(f"\n(chance = 0.5, {N_SEEDS} seeds x {EVAL_SEQUENCES} eval sequences each; "
+          f"p-values are two-sided, NOT corrected for testing {len(EVAL_N_VALUES)} points)")
     print(f"total time: {time.time()-t0:.1f}s")
 
 
