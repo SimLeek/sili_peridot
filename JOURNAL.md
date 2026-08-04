@@ -2335,3 +2335,43 @@ deliberate fixed-memory/no-unrolled-graph design choice
 trying to approximate, in fixed memory, what real BPTT gets for free
 here in under 7 seconds -- a genuinely harder problem than the task
 itself, not an easy win blocked by a bug.
+
+**Direct follow-up: does BPTT itself actually explain the 100%, or is
+it something else about the PyTorch control?** Added a NO-BPTT variant
+to the same script (`train_and_eval_no_bptt`): identical model/
+optimizer/task, but the sequence is processed one tick at a time with
+the hidden state DETACHED after every step -- exactly matching how
+`M_prev` is a fresh detached leaf every tick in the from-scratch
+system -- and `loss.backward()` fires once, at the query tick only.
+
+**Result: no-BPTT nn.RNN still hit 100% at every n_bits (2/3/4/6);
+no-BPTT nn.LSTM hit 100%/100%/91%/90% -- NOT a drop to chance.** Per
+direct correction from the user (confirmed against their own prior
+hands-on experience: "I tried BPTT a lot and it does practically
+nothing... it's not a chance vs 100% thing ever"), the hypothesis this
+session had been building toward -- that BPTT-per-se explains the
+from-scratch system's out-of-context struggle -- is WRONG. Why no-BPTT
+still works: the recurrent weight matrix is SHARED across every tick
+AND across every training sequence (varying `query_pos`, varying
+`n_bits`), so even though any single training example only
+differentiates through its own last tick, the same weights get pushed
+toward the correct one-step transition rule from many different
+"positions in the recursion" across the training set -- enough to
+learn a stateless, composable update rule (accumulate-deviation is
+exactly such a rule) without ever needing multi-tick BPTT. This is
+architecturally the SAME regime `prototype_peak_synapse_learning_
+comparison.py`'s own `train()` already uses -- it calls `cell.step()`
+with a real, nonzero `lr` at EVERY tick, not just the query tick -- so
+"add BPTT" was never actually the missing ingredient to chase there
+either; [[project_sili_bptt_or_chance]]'s diagnosis needs revisiting.
+
+**Reframed next step, per direct instruction**: not more BPTT-vs-not
+comparisons -- an ABLATION study. Start from this working no-BPTT
+PyTorch control (proven to reach 100%/near-100% without BPTT) and
+incrementally swap in real components of the from-scratch system --
+DISLDO's sparse/quantized FP4 weights, EnergyDynamics gating, the
+residual state-update structure, FP4's stochastic rounding noise --
+one at a time, watching for whichever specific addition is the one
+that actually drags accuracy down toward chance. That component, once
+found, is the real thing to investigate -- not BPTT, not the task,
+possibly not even the peak-eligibility mechanism itself.
