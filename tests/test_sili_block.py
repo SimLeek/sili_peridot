@@ -320,7 +320,7 @@ class TestForwardActivationDensity:
         x = np.random.RandomState(20).randn(5, cfg.attn_in).astype(np.float32)
 
         out = _forward(layer, x, activation_density=None)
-        expected = layer.forward_dense(x, learning_rate=0.0)
+        expected = layer.forward_dense(x)
 
         np.testing.assert_allclose(out, expected, rtol=1e-6, atol=1e-6)
 
@@ -345,7 +345,7 @@ class TestForwardActivationDensity:
         for row in range(x.shape[0]):
             top_idx = np.argsort(-np.abs(x[row]))[:k]
             masked[row, top_idx] = x[row, top_idx]
-        expected = layer.forward_dense(masked, learning_rate=0.0)
+        expected = layer.forward_dense(masked)
 
         np.testing.assert_allclose(out, expected, rtol=1e-4, atol=1e-4)
 
@@ -499,10 +499,10 @@ class TestGrowWindowLayer:
         x0 = rng.randn(4, in_dim).astype(np.float32)
         x1 = rng.randn(4, in_dim).astype(np.float32)
 
-        out_window = w2.forward_dense(np.concatenate([x0, x1], axis=1), learning_rate=0.0)
+        out_window = w2.forward_dense(np.concatenate([x0, x1], axis=1))
         expected = np.concatenate([
-            L_last.forward_dense(x0, learning_rate=0.0),
-            L_second_last.forward_dense(x1, learning_rate=0.0),
+            L_last.forward_dense(x0),
+            L_second_last.forward_dense(x1),
         ], axis=1)
 
         np.testing.assert_allclose(out_window, expected, rtol=1e-4, atol=1e-4)
@@ -611,10 +611,10 @@ class TestGrowWindowLayerRank1Mode:
         x0 = rng.randn(4, in_dim).astype(np.float32)
         x1 = rng.randn(4, in_dim).astype(np.float32)
 
-        out_window = w2.forward_dense(np.concatenate([x0, x1], axis=1), learning_rate=0.0)
+        out_window = w2.forward_dense(np.concatenate([x0, x1], axis=1))
         expected = np.concatenate([
-            L_last.forward_dense(x0, learning_rate=0.0),
-            L_second_last.forward_dense(x1, learning_rate=0.0),
+            L_last.forward_dense(x0),
+            L_second_last.forward_dense(x1),
         ], axis=1)
 
         np.testing.assert_allclose(out_window, expected, rtol=1e-4, atol=1e-4)

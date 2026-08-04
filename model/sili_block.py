@@ -423,7 +423,7 @@ def _forward(layer, x: np.ndarray, activation_density: Optional[float]) -> np.nd
     is naturally per-row, sidestepping that mismatch entirely.
     """
     if activation_density is None:
-        return layer.forward_dense(x, learning_rate=0.0)
+        return layer.forward_dense(x)
     T, n_features = x.shape
     k = max(1, round(activation_density * n_features))
     abs_x = np.abs(x)
@@ -433,7 +433,7 @@ def _forward(layer, x: np.ndarray, activation_density: Optional[float]) -> np.nd
     idx = top_idx.ravel().astype(np.int32)
     vals = top_vals.ravel().astype(np.float32)
     ptrs = np.arange(0, (T + 1) * k, k, dtype=np.int32)
-    return layer.forward_sparse(ptrs, idx, vals, T, learning_rate=0.0)
+    return layer.forward_sparse(ptrs, idx, vals, T)
 
 
 _ActivationDensity = Union[None, float, Dict[str, Optional[float]]]

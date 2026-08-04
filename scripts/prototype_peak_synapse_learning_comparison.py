@@ -268,7 +268,6 @@ class PlainCell:
         loss = cross_entropy_sum(logits, [(0, answer)])
         if aux_loss is not None:
             loss = loss + aux_loss
-        loss.grad = np.array(1.0, dtype=np.float32)
         loss.backward()
         return M_new.data[0], logits
 
@@ -347,7 +346,6 @@ class PeakSynapseCell:
         loss = cross_entropy_sum(logits, [(0, answer)])
         if aux_loss is not None:
             loss = loss + aux_loss
-        loss.grad = np.array(1.0, dtype=np.float32)
         loss.backward()
 
         # extra per-synapse correction, using the REAL error that just

@@ -2375,3 +2375,136 @@ one at a time, watching for whichever specific addition is the one
 that actually drags accuracy down toward chance. That component, once
 found, is the real thing to investigate -- not BPTT, not the task,
 possibly not even the peak-eligibility mechanism itself.
+
+## The ablation ladder: what's actually breaking DISLDO, traced step by step
+
+Direct follow-up to the plan above. Per direct instruction, first built
+`scripts/disldo_no_bptt_ablation.py`: literally swap the no-BPTT torch
+control's `nn.RNN` cell for a parameter-matched DISLDOLayer (full
+density, `max_weights = (hidden*2)*hidden` to match nn.RNN's Whx+Whh
+count), everything else identical (tanh nowhere yet -- residual
+accumulate, matching PlainCell's own `h_new = h_prev + delta`
+convention). Result: catastrophic, not subtle -- loss exploded to
+1e22-1e26, accuracy near/below chance. Traced directly, not guessed
+at, through four real, separable causes, each isolated and fixed
+before moving to the next:
+
+1. **Unbounded residual accumulate -- pure forward-pass instability,
+   nothing to do with training.** Traced with FROZEN (lr=0,
+   untrained) weights: h_norm roughly doubles every tick regardless of
+   training (0.85 -> 1.4 -> 2.6 -> ... -> 1.97e12 by tick 50) --
+   `h_new = h_prev + delta` has no squashing nonlinearity anywhere,
+   unlike nn.RNN's actual formula `h_new = tanh(Whx@x + Whh@h)` (full
+   OVERWRITE, not accumulate, tanh-bounded every tick). Fix: made the
+   DISLDO cell structurally identical to nn.RNN --
+   `h_new = tanh(cell([x, h_prev]))`, no residual add
+   (`scripts/disldo_tanh_no_bptt_ablation.py`). Confirmed directly:
+   frozen-weight h_norm now stays ~1.2-1.4 indefinitely, same regime
+   as the working torch control. Loss stopped exploding (0.66-1.17
+   range) -- but accuracy stayed near chance. Fixed a real problem,
+   not the only one.
+
+2. **Effective learning rate crushed by density, independent of the
+   nominal lr chosen.** Traced weight/value_scale movement directly
+   (`weights_vals`/`get_value_scale` introspection): only 66/16384
+   cell weights moved after 300 steps (0.6%), each by exactly one FP4
+   quantization level (0.5) then permanently stuck; `value_scale`
+   (the continuous, non-quantized per-row multiplier) moved too, but
+   by <1% deviation from 1.0 after 300 steps -- real gradient signal,
+   just far too slow. Root cause: `lr_per_row_nnz=True` (hardcoded in
+   `DISLDOLayer.forward`'s backward closure, no way to override)
+   divides `learning_rate` by the row's own connection count
+   (nnz_this_row=128 at full density) for EVERY trainable quantity.
+   At uniform density this normalization (meant to keep updates
+   comparable across rows with varying degree under synaptogenesis)
+   does nothing useful and just silently shrinks the effective rate
+   ~128x. Confirmed via a direct lr sweep (`lr_per_row_nnz=False`,
+   `sili__new` threaded the override through): n=2 (in-context) climbs
+   from 0.673 (lr=1e-4) to a clean 1.000 (lr=0.03), matching the
+   dense-Tensor/torch controls exactly at the top of the range -- but
+   n=3/4/6 plateaued around 0.5-0.73 across every lr tested, a
+   separate, still-unresolved gap at the time.
+
+3. **A second, structurally distinct footgun: forward-time Hebbian
+   importance update, uncoupled from any real gradient.** Direct user
+   suspicion ("doesn't make sense without backward there too") led to
+   reading `disldo_forward`'s C++ source directly: it mutates
+   per-synapse importance (`imp += contrib * learning_rate /
+   (1+|imp|)`, `contrib = w*iv`, no gradient/label involved)
+   whenever `learning_rate != 0` -- INCLUDING on every non-query tick
+   of an online RNN, which never has a backward() call at all. This
+   fires far more often than backward's own real gradient-based
+   importance update. Tested by forcing `lr=0.0` on non-query
+   `step()` calls (forward-only, no backward -- so the Hebbian update
+   never fires without a matching gradient): at lr=1e-3 specifically,
+   in-context accuracy jumped from 0.33 (erratic, barely above
+   chance) to 0.843 at the SAME nominal lr -- a dramatic stabilization
+   confirming the mechanism was real. Out-of-context still didn't
+   close (stayed 0.5-0.73), narrowing the remaining gap further but
+   not yet explaining it.
+
+4. **Root-caused as a genuine sili__new architectural flaw, not a
+   tuning knob -- removed upstream, not just routed around.** Per
+   direct instruction ("we don't need this footgun... break the API
+   if you must"): deleted the unconditional forward-time Hebbian
+   importance update entirely from `disldo_forward`
+   (`linear_disldo.hpp` -- covered THREE separate sites: per-synapse
+   importance, `value_scale_importance`, `output_scale_importance`),
+   `sisldo_forward` (`sisldo_ops.hpp`), and the older
+   `sisldo_forward_trivalues` (`linear_sisldo.hpp`, actually reachable
+   from Python via `SparseLinearLayer::forward_sparse`, a DIFFERENT
+   function than `sisldo_forward` despite the similar name -- both
+   needed the fix). `learning_rate` removed from all three functions'
+   signatures entirely (not left as a dead unused parameter), cascading
+   through `forward_dense`/`forward_sparse`/`DISLDOLayerV::forward`'s
+   C++ methods and pybind bindings, and every real Python call site in
+   `sparse_rnn.py` (`DISLDOLayer.forward`, `SISLDOLayer.forward`,
+   `FoldedLayer.forward`, `FoldedColumnLayer.in_proj`, `apply_fold_skip`)
+   and `sili_peridot/model/sili_block.py`. Forward is now a pure,
+   side-effect-free computation across the board -- weight/importance
+   updates only ever happen in backward, coupled to a real gradient,
+   same principle weight updates always followed. C++ unit tests still
+   calling the old signature (test_disldo_block4_forward.cpp,
+   test_scale_handling.cpp, and others) deliberately left broken --
+   fix at merge time, not now, per direct instruction. Verified: fresh
+   build compiles clean, DISLDOLayer/SISLDOLayer forward+backward work
+   correctly, repeated forward-only calls with nonzero lr now leave
+   weights provably unchanged (previously would have mutated
+   importance every call), and the full non-real-checkpoint
+   sili_peridot test suite (155 tests) passes.
+
+Also confirmed, via a clean isolation control built alongside the
+DISLDO ablation: swapping DISLDOLayer for sili's own dense
+`DenseTensorLinear` + `AdamOptimizer` (same tanh/full-overwrite
+formula, same fixed embedding, same task, same seeds, same lr=1e-3,
+zero FP4 anywhere) reaches 0.918-1.000 across every n_bits tested
+(`scripts/dense_tanh_no_bptt_control.py`) -- matching the torch
+control almost exactly. This rules out the architecture, the task,
+the no-BPTT training regime, and sili's core Tensor/autograd machinery
+as explanations for DISLDO's remaining gap: the problem is confined
+specifically to DISLDOLayer's own FP4/importance-update machinery.
+
+Real, load-bearing methodology lesson from this whole ladder, twice
+over: (a) an accuracy-only comparison at N=4 seeds is not evidence of
+anything by itself -- confirmed directly by rerunning the EXACT SAME
+code/seeds twice and getting wildly different results (e.g. 0.8 vs 0.2
+at the same seed) purely from `EnergyDynamics`' own already-documented
+unseeded exploration noise, chaotically amplified through thousands of
+discrete top-p/FP4-rounding decisions -- and (b) "the manual
+`loss.grad = np.array(1.0, ...)` line before `.backward()` broke
+learning" (an earlier hypothesis this session) does NOT hold up: for a
+genuinely scalar loss, this is provably numerically identical to
+`Tensor.backward()`'s own default (verified directly in the
+interpreter: `ones_like(loss.data) == np.array(1.0, dtype=np.float32)`
+bit-for-bit) -- removed anyway since it's dead weight, but it was never
+the actual bug.
+
+Status at end of this pass: DISLDO reaches in-context parity with the
+torch/dense-Adam controls (1.000 at high lr) once both real bugs above
+are fixed; out-of-context (n=3/4/6) still lags (0.5-0.73 vs 0.92-0.96)
+-- an open question, not yet root-caused, and not explained by the
+no-BPTT regime itself (the dense+Adam control uses the identical
+no-BPTT regime and does NOT show this gap). Next planned step (not yet
+started): re-run the lr sweep and the in_proj-vs-recurrent gradient
+question with the now-fixed sili__new build, since every measurement
+above the C++ fix was taken against the buggy library.
