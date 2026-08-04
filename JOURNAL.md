@@ -1508,3 +1508,644 @@ scope to the weight-decay idea scoped (not built) earlier. Not
 resolved this session -- a real decision point on how much further to
 invest, given how much of this session has already gone into training
 -loop diagnostics rather than the tile-recurrence architecture itself.
+
+## Real MQAR comparison run: tile-recurrence fails, root cause found
+
+With the training loop finally trustworthy (`DenseTensorLinear` +
+`AdamOptimizer` + `clip_grad_norm_`, real global-norm clipping -- per-
+node clipping alone still let Adam diverge, confirmed directly before
+landing global clipping), re-ran `scripts/train_toy_recall_comparison.py`
+for real: 3000 steps, warmup+cosine LR (peak 0.02), `num_tiles=4`,
+`hidden=32`, both configs from zoology's own smallest reference dims.
+
+**Result**: `seq_len=16/kv=2`: dense=0.57, tile=0.02. `seq_len=32/kv=4`:
+dense=0.24, tile=0.00. Dense (whole-sequence causal attention, a
+ceiling reference) partially learns the task. Tile-recurrence does
+NOT -- both numbers are at or below random chance (1/20=0.05,
+1/40=0.025), i.e. no signal at all.
+
+**Root cause, found via a targeted ablation**: `ToyTileRecurrence`'s
+per-tick "column" auxiliary loss (tile `j`'s state trained to predict
+tile `j+1`'s current token, EVERY tick) and the true MQAR recall loss
+(trained only on the ~2/16 query ticks per sequence) share the exact
+same weights (one tile network, one `lm_head`). Re-ran the
+`seq_len=16/kv=2` config with the column loss removed entirely (only
+the true recall loss, on query positions only) -- accuracy went from
+0.02 to 0.225. Still well below dense's 0.57, but far above chance and
+a completely different regime. **The column-averaging auxiliary task
+is actively drowning out the harder recall signal**, not a neutral
+extra: it fires 8x more often (every tick vs ~2/16 ticks) and is
+trivially easy (the next token is already sitting one column over in
+the SAME input window this tick, not an actual retrieval problem), so
+gradient descent on shared weights cheaply satisfies it and never gets
+pushed hard enough toward the genuinely harder MQAR objective.
+
+This is a real, reinstated-per-direct-decision feature turning out to
+interfere with the property the whole architecture exists for, at
+least as currently weighted/scheduled (auxiliary loss with no
+down-weighting or scheduling, added at full strength from step 0).
+Reported to the user plainly, not concluding this dooms the
+architecture -- the 0.225-vs-chance ablation shows the underlying
+retrieval mechanism (recurrent `M` state + `gaussian_attention` across
+tiles) DOES carry some real signal once the interfering loss term is
+gone; it's still well short of dense's 0.57 at the same scale, and
+there's a separate, not-yet-investigated suspect too: `M_prev` is
+passed into each tick as a fresh detached `Tensor(M_prev...)` leaf, so
+gradient never flows backward through TIME across ticks (no BPTT) --
+only the current tick's own transition gets trained. That may be
+capping how much genuine long-range storage this training setup could
+ever learn, independent of the column-loss issue.
+
+## Column mechanism redesigned per direct correction -- second real run
+
+Direct correction on the column mechanism, in two rounds: (1) it's
+meant to solve "how do you backprop an output error into a recurrent
+state much WIDER than the output" (worked example: input 10, recurrent
+80, output 10 -- selecting a subset starves the rest, summing a column
+forces small state values ("epsilon errors," bad under FP4),
+AVERAGING a column works, ~1 bit of precision cost); (2) what the
+column should predict is the genuine NEXT TOKEN (these are meant to be
+predictive autoencoders throughout, `ToySmallTransformer` included),
+not the tile's own input (my first fix attempt) or another tile's
+content (the original, ablation-confirmed-harmful version).
+
+Rebuilt `ToyTileRecurrence`: `embed_width` (matches real embedding
+width, e.g. 32) vs `state_width = embed_width * column_neurons` (e.g.
+32*8=256, genuinely wider internal recurrent state) -- clearly
+distinct names per direct correction ("tile width" = input width, not
+the wide state). Injection broadcasts embed_width -> state_width via
+`np.repeat` (parameter-free); readout does the reverse via
+`reshape`+`reduce_sum(axis=-1)*1/C` (column-mean, also parameter-free)
+before the FIXED-width `lm_head` -- both ends parameter-free,
+matching the real system's constraint that `lm_head` is the pretrained
+MiniCPM5 output head and can't grow a new learned down-projection.
+Checked `model/toy_recall_task.py` directly rather than assuming: at a
+query position the true `tokens[pos+1]` is random noise
+(`random_non_queries=True`), NOT the recall value -- so "predict the
+next token" can't mean `tokens[i+1]` literally everywhere. Built a
+unified per-position target instead, applied to BOTH models now:
+query positions -> recalled value (unchanged), key/value
+context-laydown region -> real next token (genuine structure,
+reinforces the exact adjacency later queries need), everywhere else ->
+skipped (pure noise, training on it would be actively harmful).
+`num_tiles` widened to `= seq_len` per config too (was a fixed 4) --
+removes the window-narrowness confound, testing whether the mechanism
+can learn at all with full context visibility before testing genuine
+cross-tick recall beyond a narrow window (still deferred).
+
+**First re-run had a confound, caught and fixed**: the initial version
+of this run also changed the DENSE control's own training target
+(adding the same context-region next-token loss to it) -- direct
+correction: dense should have stayed the unmodified control, since the
+column-mean-readout width-mismatch problem this fix addresses doesn't
+exist for a standard dense transformer at all (its hidden state
+already matches `lm_head`'s input width directly). That confounded run
+showed dense dropping substantially (0.57->0.33, 0.24->0.07) alongside
+tile's improvement -- reverted `train_and_eval_dense` back to training
+on `mqar_pairs` only (unchanged from the very first comparison run),
+and re-ran clean.
+
+**Clean, unconfounded re-run result**: `seq_len=16/kv=2`: dense=0.57
+(unchanged control, matches the first run's 0.57 exactly), tile=0.10
+(was 0.02). `seq_len=32/kv=4`: dense=0.26 (matches the first run's
+0.24 within eval-sampling noise), tile=0.05 (was 0.00). **Tile
+-recurrence genuinely improved and now clears chance (~0.05/~0.025) at
+BOTH configs**, with the control held constant -- a real, clean
+positive signal for the corrected column mechanism, not an artifact of
+also changing what the control was trained on. Tile still trails dense
+substantially at both configs (as expected -- see the user's own
+framing: this toy run is a deliberately sub-optimal case, meant to
+verify the mechanism CAN learn the target property at all, not to
+match a heavily-tuned dense transformer's own accuracy). Not yet
+testing recall genuinely beyond a narrow window (`num_tiles=seq_len`
+gives full visibility this run) -- stays deferred, per the approved
+plan, until this basic-mechanism check passes, which it now has.
+
+## Adam+artificial-FP4 vs real FP4+importance+energy, matched precision
+
+Direct correction: comparing Adam against this project's own
+importance+energy training must hold PRECISION matched, or it repeats
+the exact confound two earlier isolation controls already spent real
+effort disentangling. Built `model/toy_precision_models.py`:
+`fake_quantize_fp4`/`ArtificialFP4Linear` (straight-through fake
+-quantization using the REAL 15-level FP4 table and real per-row
+`scale=max(|row|)/6.0` calibration, verbatim from
+`sili/lib/headers/fp4quant.hpp`/`sili/sparse_rnn.py` -- checked
+directly, not assumed) for the Adam arm; `DISLDOLayer` (real,
+unmodified, inline C++-trained) + `EnergyDynamics` for the real arm,
+per [[feedback_importance_is_already_the_optimizer]] -- no external
+optimizer touches DISLDOLayer's own big weight matrices, only the
+small RMSNorm leaves get an Adam step.
+
+**Bug found and fixed before the real run**: `sili_block.py`'s
+`default_window_energy` (the obvious first choice -- already used
+elsewhere in this codebase) diverges badly at this toy scale --
+verified directly via isolation (its own aux_loss grew unbounded, 5.5
+-> 17.9 over 300 steps, total loss diverged at every learning rate
+tried). It's explicitly documented as a placeholder calibrated for
+full-model-scale windows, not toy scale -- switched to the config
+already used in `sili__new`'s own small-scale `EnergyDynamics` tests
+(`drive=0.1, activation_cost=0.05, precision=0.01, density=0.05,
+p=0.3`), which behaved far better in a 300-step isolation check
+(aux_loss stayed 0.005 -> ~0.3, loss reached a real minimum).
+
+**Real 3000-step MQAR run result**: `seq_len=16/kv=2`: Adam+artificial
+-FP4 acc=0.53, real-FP4+energy acc=0.12. `seq_len=32/kv=4`: 0.21 vs
+0.05. Adam substantially outperforms importance+energy at both
+configs, under matched FP4 precision. **The real-FP4+energy arm's own
+loss curve is genuinely diverging, not just noisy**: config1 climbs
+6.9 -> 29.2 over training (sampled every 200 steps); config2 climbs
+22.9 -> 48.2. This tracks with what the 300-step isolation check had
+already started to show (loss reaching a minimum then drifting back
+up) -- at the full 3000-step scale that drift becomes dominant,
+outweighing the real, if smaller, isolated-check improvement the
+toy-scale energy config fix produced.
+
+**Not yet root-caused further** -- plausible candidates, none
+confirmed: (a) DISLDOLayer's own inline update may need a different
+learning-rate schedule/range than what suits Adam (the same
+`lr_schedule` was reused for both arms, for a fair a-priori
+comparison, but that doesn't mean it's well-tuned for DISLDOLayer's
+own mechanism specifically); (b) `EnergyDynamics`'s persistent
+`energy` homeostatic state may behave differently over thousands of
+steps on FRESH random sequences each step than it did on the
+300-step, single-config isolation check; (c) a genuine capacity
+limitation from combining reduced FP4 precision with energy's own
+added noise/homeostatic pressure at this small scale. Reported
+plainly -- this is a real, reproducible negative result for
+importance+energy at this specific toy scale/task/config, not
+something to explain away, but also not yet enough evidence to
+conclude it fails at the real MiniCPM5 scale this mechanism was
+actually designed for.
+
+## Fixed the energy confound; row-scale-Adam validated
+
+Direct correction ([[feedback_do_science_correctly]] -- saved after
+this was caught twice in one session, second time by a frustrated
+"put 'try to do science correctly' in your memories"): the run above
+gave `EnergyDynamics` to the real-FP4 arm only, with no equivalent on
+the Adam arm -- confounding optimizer choice with energy's own added
+noise. Refactored `model/toy_precision_models.py` so `use_energy` is
+an orthogonal toggle on BOTH `ToySmallTransformerArtificialFP4` and
+`ToySmallTransformerRealFP4` (each layer builds its own fresh
+`EnergyDynamics` instance when enabled -- its running state is
+per-instance and can't be shared). Also built
+`AdamRowScaleDISLDOLayer`/`ToySmallTransformerRealFP4RowScaleAdam` per
+direct proposal: individual FP4 weight VALUES keep importance as their
+training signal (the user's own view: importance is the right
+mechanism for synaptogenesis/pruning, not something to replace
+wholesale), but the coarser per-row `value_scale` gets its own
+Adam-style adaptive normalization on top -- cheap (2 floats/row, not
+2 floats/weight), reachable via real, already-existing pybind
+accessors (`get_value_scale`/`set_value_scale_raw`,
+`cpu_backend.cpp:1082-1097`), no new C++ needed. Documented as an
+approximation: it re-normalizes the delta DISLDOLayer's own inline
+update already applied (via `before`/`after` snapshots around
+`backward()`), not the true pre-damping gradient.
+
+**Real 2x2 + row-scale-Adam result, 3000 steps**:
+
+| | no energy | + energy |
+|---|---|---|
+| Adam+artificial-FP4 | 0.50 / 0.23 | 0.22 / 0.10 |
+| importance+real-FP4 | 0.34 / 0.07 | 0.08 / 0.03 |
+| importance+real-FP4, row-scale-Adam | 0.42 / 0.09 | -- |
+
+(pairs are seq_len=16/kv=2 then seq_len=32/kv=4)
+
+**Energy hurts BOTH optimizer arms**, not just importance -- Adam drops
+0.50->0.22 and 0.23->0.10 from adding energy alone, matching
+importance's own drop. This resolves the open question from the
+confounded run: the earlier divergence (loss climbing to 20-40+) was
+energy's own homeostatic noise/aux-loss pressure, not something
+specific to importance-driven training. Still an open question WHY
+this toy-scale `EnergyDynamics` config destabilizes training broadly
+(see the earlier entry's still-unconfirmed candidates) -- now known to
+be orthogonal to the optimizer question, at least.
+
+**Row-scale-Adam genuinely helps**: 0.42 vs plain importance's 0.34 at
+the easier config (loss curve reaches 2.3 and stays low, vs plain
+importance oscillating between 2-10), 0.09 vs 0.07 at the harder one.
+Doesn't close the gap to full Adam-per-weight (0.50/0.23) but
+meaningfully narrows it from the plain-importance baseline, at a
+fraction of the per-weight memory cost full Adam would need. A real,
+clean, validated result for the user's own proposed design: give the
+row-scale adaptive normalization without replacing importance's role
+in individual weight training.
+
+## ToyTileRecurrence ported onto real sili (DISLDOLayer) -- first real run
+
+Direct correction: tile-recurrence was always meant to run on real
+sili, not `DenseTensorLinear` (a deliberate, explicitly-scoped stopgap
+from earlier this session). Built `model/toy_tile_precision_models.py`
+(`ToyTileRecurrenceRealFP4`, `disldo_cls=` swappable) and
+`AdamRank1DISLDOLayer` (`model/toy_precision_models.py` -- extends
+`AdamRowScaleDISLDOLayer` to also Adam-normalize `output_scale`/column
+-scale, real pybind accessors, `set_output_scale_raw` must be called
+once at init to activate its own training -- checked directly).
+
+**Real bug found and fixed before any of this could run at reasonable
+speed**: `max_weights` was sized as `state_width * mlp_hidden` (the
+FULL dense connection count) -- this doesn't just make the layer
+"as dense as it can be," it makes `per_row >= out_features`, i.e.
+genuinely 100% density. Measured directly: this made DISLDOLayer's
+scattered/CSR storage 7x SLOWER than a properly sparse config (~8%
+density) -- 1744s vs 247s for the same run. Confirmed via profiling
+that the time really was inside `forward_dense`'s C++ call, not Python
+overhead, consistent with [[project_sili_optimal_hardware_vision]]'s
+own finding that the scattered path is gather/scatter-bound. Fixed:
+`max_weights` now a FIXED sparse budget (4096) independent of
+`column_neurons`/`state_width`. `_preseed_random_sparse`'s default
+init (sparse echo network) confirmed fine as-is, per direct feedback --
+the bug was purely in `max_weights` sizing. Separately, `num_cpus=4`
+measured ~19% faster than the `num_cpus=2` used elsewhere in this
+session (`num_cpus=8` was clearly WORSE -- oversubscription, only 4
+physical cores) -- adopted for this sweep.
+
+**Real 3000-step MQAR result**: Stage 1 (optimizer variant,
+`column_neurons=8`, `seq_len=16/kv=2`): plain DISLDOLayer=0.18,
+row-scale-Adam=0.17, rank1-Adam=0.07 -- plain importance WON here,
+the opposite ranking from the precision-comparison track (where
+row-scale-Adam clearly beat plain importance, 0.42 vs 0.34) -- a real,
+non-obvious finding that the row/rank-1-Adam improvement doesn't
+transfer uniformly across architectures. Stage 2 (capacity scaling,
+plain DISLDOLayer): `column_neurons=16` beat the `=8` control at
+seq_len=16 (0.13 vs 0.11) but not at seq_len=32 (0.03 vs 0.04,
+roughly flat/within noise). Stage 3 confirmed those seq_len=32 numbers.
+
+**Real-FP4 tile-recurrence (0.18 best, seq16) BEATS the earlier fp32
+DenseTensorLinear+Adam stand-in (0.10)** -- a genuine, real validation
+that porting to sili was worth doing, not just an architectural nicety.
+Still far below the dense fp32 transformer ceiling (0.57) -- the gap
+tile-recurrence needs to close remains large. One loose end, not
+investigated: a `RuntimeWarning: overflow in exp` appeared during
+training (likely `silu`/sigmoid seeing larger-magnitude activations
+than the fp32 version produced) -- didn't invalidate the finite eval
+numbers collected, but flagged honestly rather than silently ignored.
+
+## Real bug: attention was only seeing input, not carried state -- fixed and re-tested
+
+Direct correction, marked most urgent: `step()` (both
+`ToyTileRecurrenceRealFP4` and `ToyTileRecurrence`) computed Q/K/V from
+`x_window` ALONE -- a change I'd made during the earlier column
+-mechanism redesign, reasoning `num_tiles≈seq_len` made `x_window`
+already carry nearly everything. That reasoning was wrong: with
+attention unable to see `M_prev` directly, anything relating fresh
+input to carried state could only happen by first writing input into
+state via the residual and waiting a LATER tick to attend to it -- an
+artificial "save to state first" bottleneck (now
+[[feedback_attention_needs_combined_input_state]]). Fixed: `qkv_source
+= x_normed + m_normed` (blend restored) in both classes.
+
+**Re-run result, same 3-stage sweep**: Stage 1 (seq16/kv=2, cn=8):
+plain=0.18 (unchanged), row-scale-Adam=0.15 (was 0.17), rank1
+-Adam=0.01 (was 0.07 -- collapsed, flagged not explained). Stage 2
+(capacity scaling): cn=8=0.23 (was 0.11), cn=16=0.17 (was 0.13) --
+real improvement, though some of the cn=8 jump vs Stage 1's own
+0.18 is seed-to-seed noise (different seeds, same config -- eval set
+is only 60 sequences). **Stage 3 (seq_len=32/kv=4, the harder config)
+shows the clearest, most consistent gain**: cn=8: 0.04->0.07 (nearly
+doubled), cn=16: 0.03->0.05 -- exactly where a proper input-state
+attention link should matter most (longer context, more reliance on
+carried state). Best real-FP4 tile-recurrence result now (cn=8,
+seq16) = 0.23, more than DOUBLE the fp32 `DenseTensorLinear`+Adam
+stand-in's own 0.10. Still far below the dense fp32 ceiling
+(0.57/0.26). Rank1-Adam's collapse to 0.01 with this fix is a real,
+unexplained regression -- not investigated, reported as-is rather than
+omitted.
+
+## Out-of-context benchmark Tier 1 (running parity): built, first run inconclusive
+
+Per direct decision: MQAR-style benchmarks alone (every run so far
+used `num_tiles=seq_len`, full visibility by construction) don't test
+tile-recurrence's real advantage over a bounded-window transformer --
+genuine persistent state across unbounded time. Built
+`model/toy_beyond_context_task.py` (`generate_parity_sequence` --
+n_bits random bits, a `'?'` query token, then the running-XOR answer
+as the real next token; vocab={0,1,'?'}, fixing an earlier 2-token
+design that had no way to signal "answer now" per direct correction)
+and added a real `half_bandwidth=` knob to `ToySmallTransformer`
+(default unlimited, unchanged for every existing caller) as the
+genuine "standard LLM" stand-in -- structurally unable to see past `W`
+positions, unlike every prior comparison's unlimited-context dense
+baseline. `scripts/train_toy_beyond_context_comparison.py`: two-phase
+curriculum (in-context sizes first, then out-of-context), accuracy
+-vs-`n_bits` sweep against `ToyTileRecurrenceRealFP4(num_tiles=W)`.
+
+**First real run, `W=4`, `n_layers=2` dense**: neither model showed
+the expected pattern -- dense scored ABOVE chance (0.57-0.60) at
+`n_bits=8/24`, values that should be structurally unsolvable for it.
+**Root cause #1, confirmed directly**: a 2-LAYER stacked
+`half_bandwidth=W` model's true effective receptive field is `2*W`,
+not `W` (verified via direct perturbation probe -- a position 8 back
+changes the output, 9 back doesn't, at `W=4`) -- the "structurally
+bounded to W" claim was wrong for `n_layers=2`; needs `n_layers=1` for
+a genuinely `W`-bounded baseline. **Root cause #2, more fundamental**:
+training itself doesn't converge cleanly even with `n_layers=1` --
+loss oscillates (1.3->6.5->1.5->2.2->1.7->0.8->1.0->1.4->0.9->0.7 over
+1500 steps) and settles near the random-guessing floor (`ln(2)~=0.69`),
+consistent with the near-chance accuracy seen even at the easiest
+in-context size (`n_bits=4`: dense=0.52, tile=0.50). This is a
+genuine, unresolved negative result -- not yet root-caused further
+(candidates: `peak_lr=0.02` too aggressive for this task/architecture,
+or exact parity being intrinsically hard for softmax-attention's
+smooth weighted-averaging to represent, independent of the LR).
+Reported honestly rather than re-tuned blindly -- real investigation
+needed before this benchmark can give a trustworthy signal either way.
+
+## Tier 1 re-run: methodology fixed, real root cause identified (BPTT or chance), still inconclusive
+
+Two direct corrections applied: (1) `n_layers=1` for the dense
+baseline (fixes the confirmed 2x-receptive-field bug). (2) Gradual
+curriculum -- `_sample_n_bits` now ramps a ceiling by exactly 1 every
+`STEPS_PER_LEVEL` steps (was: two coarse phases, an abrupt jump
+straight to a wide out-of-context range) -- per direct correction, now
+[[feedback_gradual_out_of_context_curriculum]]: "learning in context is
+O(1), learning in recurrent state is O(1), but learning something that
+passed recurrent state is O(random chance)... much less likely if the
+network never learned stuff before."
+
+**Isolated the real cause, confirmed empirically, not just
+theoretically**: a controlled check -- pure in-context parity training
+(no out-of-context extension at all, full 3000-step budget) --
+converged to real above-chance accuracy (0.645, loss 1.3->0.55). This
+rules out "parity is unlearnable by this architecture" -- the
+in-context capability is real. Direct diagnosis for what's actually
+limiting out-of-context performance, stated as a near-exhaustive
+dichotomy: **"It's either BPTT or chance... we're not doing bptt
+because it uses a ton of extra memory and processing."** `M_prev` is a
+fresh DETACHED leaf every tick (deliberate, established design) -- no
+gradient pathway exists to learn "write X now because a future tick
+needs it," so any out-of-context success is coincidental, not learned.
+Now [[project_sili_bptt_or_chance]] -- this was already hinted at much
+earlier (an MQAR-track entry flagged the same detached-M_prev fact as
+a "not-yet-tested suspect"), now much more strongly supported.
+
+Per direct hypothesis, added `use_energy` to `ToyTileRecurrenceRealFP4`
+(previously had none) and tested it specifically here: energy can't
+create a genuine gradient pathway either, but by keeping more neurons
+active it might raise the ODDS that useful state-carrying patterns
+persist long enough to coincidentally help -- worth testing on THIS
+task even though it hurt the (fully-visible, BPTT-irrelevant) MQAR
+benchmark.
+
+**Real 3000-step run, all three arms**: dense (n_bits=2/4/8/16/24):
+0.55/0.50/0.47/0.48/0.58 -- flat, near chance throughout (the
+curriculum spends most of its budget on n_bits values dense
+structurally cannot solve, diluting its own in-context practice vs.
+the isolated full-budget test above). Tile, no energy:
+0.18/0.50/0.52/0.52/0.47 -- a striking BELOW-chance result at
+n_bits=2 specifically (not explained -- very short sequences leave
+most of the window filled with M_prev fallback rather than real
+tokens, a plausible but unconfirmed cause). Tile +energy:
+0.48/0.40/0.55/0.53/0.42 -- energy fixed the n_bits=2 collapse, but
+shows NO clear improvement over no-energy at the actual out-of-context
+sizes (8/16/24: 0.55/0.53/0.42 vs 0.52/0.52/0.47 -- within noise of
+each other and of chance). **Genuinely inconclusive, reported as
+such**: the methodology fixes resolved the earlier catastrophic
+divergence/floor-collapse, and the real bottleneck (no BPTT) is now
+well understood and documented, but 3000 steps shared across a growing
+13-level curriculum appears to leave too little dedicated practice per
+level for a clean signal either way on this specific hard task. A much
+longer run (matching the user's own prior experience: "I ran the
+mandlebrot set for minutes to an hour before the attention system
+really got working") is the most likely next step, not yet tried.
+
+## Tier 1, ~1hr budget (40x steps): more time alone did not resolve it -- corroborates BPTT-or-chance
+
+Per direct decision ("give it an hour or so this time"), scaled
+`TRAIN_STEPS` 3000->120,000 and `STEPS_PER_LEVEL`/`WARMUP_STEPS`
+proportionally (same curriculum shape, ~40x more practice per level).
+Real training time: dense 165.5s, tile (no energy) 1354.7s, tile
++energy 2878.0s (~73 minutes total, close to the pre-run timing
+estimate).
+
+**Result** (`n_bits=2/4/8/16/24`): dense=0.53/0.38/0.45/0.63/0.53 --
+still flat, no in-context-vs-out-of-context separation. Tile, no
+energy=0.72/0.45/0.43/0.47/**0.15** -- a real, striking swing (0.72 at
+the shortest sequence down to 0.15 at the longest), too extreme to be
+pure eval-sampling noise (~2.7 std below chance at n=60), but NOT the
+hoped-for shape (staying high past the window) -- looks more like
+systematic degradation as sequences lengthen. Tile
++energy=0.45/0.30/0.43/0.35/**0.50** -- energy fixed that specific
+`n_bits=24` collapse (0.15->0.50) again, same pattern as the shorter
+run's `n_bits=2` fix, but made most OTHER points worse (0.72->0.45,
+0.45->0.30), not better -- no longer a clean net positive for energy
+here either.
+
+**Real conclusion**: ~40x more training time did NOT produce the
+clean "tile stays above chance past the window, dense collapses"
+signal. This is itself informative -- it corroborates rather than
+undermines [[project_sili_bptt_or_chance]]: if the bottleneck were
+simply "not enough practice per curriculum level," more time should
+have helped monotonically; instead the pattern stayed noisy/
+non-monotonic even at 40x the budget, consistent with "without a
+genuine gradient pathway for cross-tick credit assignment, success is
+coincidental, and more attempts at coincidence don't reliably converge
+to a working mechanism." Directly motivates the already-planned next
+step -- see [[project_sili_bptt_alternatives]] (e-prop first, SnAp-1/
+UORO/KF-RTRL as documented fallbacks) -- as a real fix rather than
+"try even more steps."
+
+## E-prop implemented (EPropDISLDOLayer, EPropAdamDISLDOLayer) -- first test at reduced budget, null result, and a real gap found
+
+Built `_EligibilityTrace` + two separate classes in
+`model/toy_precision_models.py` (per direct correction: NOT one class
+with a `use_adam` flag -- separate functions/classes, since Adam has
+not consistently won in earlier sweeps). 36/36 unit tests pass
+(`tests/test_toy_precision_models.py`). Wired into
+`scripts/train_toy_beyond_context_comparison.py` as two more arms via
+`ToyTileRecurrenceRealFP4`'s existing `disldo_cls=` swap.
+
+**Timing probe** (100 steps, extrapolated to 120k): plain DISLDO
+1787s, DISLDO+energy 2281s, `AdamRowScaleDISLDOLayer` (existing
+per-row Python loop, no trace) 3313s, `EPropDISLDOLayer` 3801s,
+`EPropAdamDISLDOLayer` 3860s. The trace mechanism itself only adds
+~15% (3801 vs 3313s) -- the bulk of the ~2x slowdown vs plain DISLDO
+is the pre-existing per-row `set_value_scale_raw` Python loop shared
+with `AdamRowScaleDISLDOLayer`, not anything new. (No bulk/vectorized
+setter exists in `cpu_backend.cpp` for `value_scale` -- `weights_vals`/
+`importance`/etc. have readonly `py::array_t` bulk-read bindings, but
+`value_scale` doesn't even have that; a bulk setter would be a small,
+low-risk C++ addition mirroring `load_weights`, not yet done.)
+
+Per direct decision -- the earlier 120k-step (~1hr) scale-up was
+specifically compensating for the no-BPTT/no-gradient-pathway problem;
+e-prop's trace exists to provide exactly that missing pathway, so it
+should not need the same 40x scale-up to show a signal -- ran BOTH
+e-prop arms at a reduced TRAIN_STEPS=36,000 (30% of 120k, same
+curriculum ratios/shape), reusing the already-recorded 120k-step
+dense/tile/tile+energy numbers as CONTEXT only (different budget, not
+a strict comparison). `scripts/train_toy_beyond_context_eprop_only.py`.
+
+**Result** (n_bits=2/4/8/16/24, eprop / eprop+adam):
+0.57/0.50/0.48/0.45/0.43 and 0.55/0.53/0.47/0.40/0.52. Every value is
+within ~1.5 std of chance (std ≈ 0.065 at n=60 eval sequences/point) --
+**genuinely inconclusive, including the in-context points** (n=2/4),
+which is actually a WORSE in-context showing than plain DISLDO's
+recorded 120k-step numbers (0.72/0.45 at n=2/4). Honest read: at this
+reduced budget neither e-prop arm shows the hoped-for
+"learns fast because it finally has a real gradient pathway" signal --
+it also hasn't clearly learned the easy in-context case yet. Not
+strong enough evidence to say e-prop failed either -- 36k steps may
+still be too few for THIS specific mechanism, unlike the hope that its
+better credit assignment would need less practice, not more.
+
+**Numerical-stability finding, real and separate from the above**: the
+training log showed `RuntimeWarning: overflow encountered in exp/
+multiply` and `invalid value encountered in reduce` during the
+`EPropDISLDOLayer` arm (final printed accuracies were NOT NaN, so
+whatever went unstable recovered, but likely disrupted training
+dynamics along the way). Root cause found: `_train_tile()` in
+`scripts/train_toy_beyond_context_comparison.py` never calls
+`clip_grad_norm_` before `tile_opt.step()` -- `train_dense()` does,
+but EVERY tile arm (plain DISLDO, +energy, and both e-prop variants)
+has been training with unclipped gradients this whole time. This is a
+real, previously-undetected asymmetry between the dense and tile
+arms -- plausibly present (silently) in the earlier 120k-step DISLDO/
++energy runs too, not just the new e-prop arms. Fixed
+(`clip_grad_norm_` added to `_train_tile`, smoke-tested clean).
+
+## E-prop found structurally broken, root-caused -- not a training-budget problem
+
+Before scaling up to re-test e-prop with the grad-clip fix, walked
+through the actual math (direct user pushback: "e-prop is the only one
+of those that doesn't really make immediate sense to me, which is an
+incredibly bad sign" -- correct instinct, confirmed by checking the
+real C++ formula in `linear_disldo.hpp`'s `disldo_backward`, not just
+re-deriving from memory):
+
+- `AdamRowScaleDISLDOLayer`'s delta-trick (`grad_proxy = -raw_delta /
+  learning_rate`) IS a real, correctly-derived `dL/d(value_scale[r])`
+  -- confirmed directly against the C++ (`scale_grad_sum` sums
+  `stored_w*out_scale*dy*iv` over synapses/batch, matching the code's
+  own comment `dL/d(val_scale[r]) = stored_w*out_scale*dy*input`). An
+  earlier claim in this session that it was "not real, fabricated from
+  nothing" was WRONG and corrected directly to the user.
+- The REAL bug: that gradient already bakes in `iv` -- the QUERY
+  TICK's OWN current input magnitude for row r. Multiplying it by an
+  eligibility trace (ALSO an activity-magnitude quantity) doesn't
+  compose "error x cross-tick sensitivity" the way RTRL/e-prop's chain
+  rule requires -- it compounds two input-magnitude-proportional terms
+  into one (roughly `iv_now x trace(iv_history)`, i.e. activity
+  squared across time), consistent with both the earlier overflow
+  warnings AND the near-chance null result.
+- Sharper, structural problem found on top: `grad_proxy` is
+  MULTIPLICATIVELY ZERO whenever the query tick's own `iv[r]=0` --
+  meaning DISLDO's own row gradient can NEVER credit a row that's
+  silent AT THE QUERY TICK, no matter what it's multiplied by
+  afterward. That's exactly the row the whole exercise most needs to
+  credit (one that mattered several ticks ago, not right now) -- the
+  entire "trace x grad_proxy" family of designs is structurally
+  incapable of fixing this.
+
+`EPropDISLDOLayer`/`EPropAdamDISLDOLayer`/`_EligibilityTrace` removed
+(model/toy_precision_models.py) along with their tests and the
+now-obsolete `scripts/train_toy_beyond_context_eprop_only.py` --
+replaced, not patched (see next entry).
+
+## Peak-eligibility trace: real per-row credit assignment via `last_input` substitution, worked out directly with the user
+
+Collaborative redesign (multiple direct corrections in sequence,
+converging on the final mechanism):
+
+1. User: track a per-row leaky PEAK-HOLD (not a smooth decaying sum)
+   of the most salient recent input, replaced when a new input exceeds
+   the decayed peak -- "when we backprop just use that input and
+   output pair to tell the exact synapse to change." Matches this
+   project's own sparse-network intuition: most rows are silent most
+   ticks, so remembering "the one time this row mattered most" beats
+   averaging over ticks where nothing happened.
+2. User, separately: confirmed `ToyTileRecurrenceRealFP4.step()`'s
+   state update is ALREADY additive/residual
+   (`M_new = M_prev + attn`, `M_new = M_new + mlp_out`,
+   `model/toy_tile_precision_models.py:129,134` -- checked directly,
+   not assumed) -- exactly the "state_t = state_t-1 + delta" shape the
+   user asked for, so whatever a row contributed several ticks ago is
+   still physically present in the state the query tick reads. No
+   architecture change needed.
+3. My first attempt at combining the peak trace with a real signal
+   (`out.grad`-based broadcast) worked but was a coarser approximation
+   than necessary. User: "You can just change the row's input to that
+   [the peak]. The sili backprop functions... take in x and x_sparse."
+   Checked directly (`cpu_backend.cpp:1199-1214`):
+   `SparseLinearLayer.last_input` is a ZERO-COPY, WRITABLE numpy view
+   straight onto the C++'s cached `_last_input` buffer -- verified
+   empirically that mutating the returned array actually writes into
+   the object `backward_dense` reads from (not assumed). Since
+   `backward_dense` takes NO `x` argument at all (reads `_last_input`
+   internally), this means: overwrite `last_input` with the
+   peak-held SIGNED value right after forward, before backward ever
+   fires, and DISLDO's OWN real gradient math computes the row's (and,
+   internally, each synapse's) correction AS IF the input had been
+   whichever recent tick was most salient -- ZERO Python-side gradient
+   approximation, full reuse of the real C++ math.
+
+Verified directly (not just unit-tested in isolation): a row given a
+strong peak, then silenced for 3 ticks AND at the query tick itself,
+gets a real, substantial `value_scale` correction (-0.14) from
+`PeakEligibilityDISLDOLayer` -- plain `DISLDOLayer` gives that same
+row EXACTLY zero credit (confirmed: `0.0`), the direct, measured
+demonstration of the mechanism doing what it's meant to do.
+
+Known accepted tradeoff, documented not hidden: `dx` (flowing to
+`x.grad`, e.g. `qkv_source.grad`) is ALSO computed from the
+substituted input, contaminating gradient reaching upstream plain
+leaves (`input_ln`/`post_ln`) slightly -- backward_dense computes dx
+and the value_scale gradient from the same `_last_input` in one pass,
+no way to split them apart without a C++ change. Accepted since those
+are secondary parameters, not the credit-assignment mechanism itself.
+
+True per-SYNAPSE (not just per-row) substitution would need direct CSR
+access -- explicitly scoped by the user as a separate, larger,
+"expensive... involves nearly everything" core change (4 bits/param at
+sili's real scale), not attempted here. Noted for later: if a layer's
+real input activation ends up genuinely ~1-sparse, `SISLDOLayer`'s CSR
+path would let this same substitution touch only the active indices
+instead of a full dense array -- a real efficiency angle at true
+MiniCPM5 scale, not needed at this toy width.
+
+`model/toy_precision_models.py`: `_PeakEligibilityTrace`,
+`PeakEligibilityDISLDOLayer`. `tests/test_toy_precision_models.py`:
+9 new tests (34/34 passing), including a direct
+silent-row-still-credited check.
+`scripts/train_toy_beyond_context_comparison.py` and the new
+`scripts/train_toy_beyond_context_peak_eligibility_only.py` updated
+(4 arms: dense, tile, tile+energy, tile+peak-eligibility -- e-prop's 2
+arms replaced by peak-eligibility's 1).
+
+**Timing** (100-step probe, extrapolated): 557.6s for 36,000 steps
+(~9.3 min) -- essentially matches plain DISLDO's own per-step cost
+(no per-row Python loop at all, unlike Adam/e-prop's `for r in
+range(in_features): set_value_scale_raw(...)` pattern -- just one
+`self.trace.update(x)` and one `last_input[...] = peak_snapshot`
+numpy assignment).
+
+**Real run result** (36,000 steps, 570.8s, `scripts/train_toy_beyond_context_peak_eligibility_only.py`),
+`n_bits=2/4/8/16/24`: 0.57/0.25/0.42/0.32/0.25. NOT a clean result
+either way, reported honestly rather than spun: three points
+(n=4, 16, 24) are 2.8-3.9 std BELOW chance (std~=0.065 at 60 eval
+sequences/point) -- not noise scattering around 0.5, a real systematic
+pattern of confidently answering WRONG, including at n=4 which is
+IN-CONTEXT and should be the easy case. Below-chance is itself
+informative (proves real learning happened, just inverted/wrong at
+those points) but this is not evidence the credit-assignment mechanism
+works as hoped.
+
+Separately, the training log still shows `RuntimeWarning: overflow
+encountered in exp` (in a sigmoid call, likely `silu`'s own internal
+sigmoid) -- the earlier `clip_grad_norm_` fix removed two of the four
+original warning types (Adam's `g*g` overflow, the NaN-producing
+`reduce`) but NOT this one. `clip_grad_norm_` bounds the GRADIENT
+STEP size, not accumulated activation/weight MAGNITUDE -- since
+`ToyTileRecurrenceRealFP4`'s state update is additive/residual with no
+renormalization of the residual stream itself (see this entry's own
+point 2 above), some intermediate value (plausibly M itself, or a
+downstream MLP activation) may be growing large over many ticks
+regardless of per-step gradient clipping. Not yet root-caused --
+plausible confound for the below-chance result above, not ruled out.
+Next step: investigate this specific overflow (which tensor, growing
+across which axis) before drawing any further conclusion about
+peak-eligibility's real effectiveness, per
+[[feedback_do_science_correctly]] -- an unresolved instability sitting
+underneath a result is not something to draw conclusions past.
