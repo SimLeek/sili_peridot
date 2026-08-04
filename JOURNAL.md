@@ -2290,3 +2290,48 @@ reruns. Recorded honestly as promising-but-not-yet-settled, not spun
 either way -- see `scripts/prototype_peak_synapse_learning_comparison.py`
 for the full mechanism, `scripts/prototype_synapse_peak_credit.py` for
 the isolated (and still-holding) per-synapse credit verification.
+
+Added real paired hypothesis tests (`scipy.stats.ttest_rel` +
+`wilcoxon`, computed directly in `main()` so every future run reports
+them automatically, not just a post-hoc analysis) -- paired because
+`plain[s]`/`peak[s]` share the same eval-sequence seed at each s, using
+that shared per-seed variance rather than discarding it. Applied to
+the 50-seed run above: none of the four `n_bits` points are
+statistically significant (best case n=6, p~=0.23 on both tests, which
+agree with each other -- not a normality-assumption artifact). Honest
+verdict: no significant evidence peak-synapse beats plain DISLDO at
+this sample size, despite the consistent nominal direction.
+
+## Ceiling check: does a proven, standard PyTorch RNN even need any of this?
+
+Per direct instruction ("look online for working proven recurrent
+tests... bring in one of their example small pytorch RNNs that they
+definitely have to compare against") -- built
+`scripts/torch_rnn_control.py`, matching the existing
+`torch_mqar_control.py` pattern: `nn.RNN` AND `nn.LSTM` (both), real
+full BPTT (whole sequence fed to torch's fused RNN module in one
+call), Adam lr=1e-3, hidden=128, num_layers=1, on the EXACT SAME
+`generate_deviation_sequence` task, no curriculum (real BPTT doesn't
+need one). Hyperparameters and task classification checked directly,
+not assumed: this is a detection/latch task (1 bit of carried state,
+"did any deviation occur"), closer to Hochreiter & Schmidhuber's
+original 1997 long-lag/latch problems than the harder standard copy
+task (Le/Jaitly/Hinton 2015; reference implementation with LSTM/GRU
+baselines: Bai/Kolter/Koltun 2018, `github.com/locuslab/TCN`) -- and
+at `n_bits<=6`, nowhere near the several-dozen-step regime where
+vanilla RNNs' vanishing gradients become a real barrier, so `nn.RNN`
+(no gating at all) is included deliberately as the strongest possible
+sanity check, not just `nn.LSTM`.
+
+**Result**: both arms hit 100% accuracy at EVERY n_bits value (2, 3,
+4, 6), loss dropping to ~0.0003-0.0009, in under 7 seconds each. Even
+the plainest vanilla RNN solves this trivially. This recalibrates the
+whole effort honestly: the task was never hard in any absolute sense
+-- the struggle this session's from-scratch, no-BPTT system has had
+(hovering 0.41-0.55 out-of-context even after four real bugs fixed)
+isn't about task difficulty, it's specifically the cost of the
+deliberate fixed-memory/no-unrolled-graph design choice
+([[project_sili_bptt_or_chance]]). The peak-eligibility mechanism is
+trying to approximate, in fixed memory, what real BPTT gets for free
+here in under 7 seconds -- a genuinely harder problem than the task
+itself, not an easy win blocked by a bug.
