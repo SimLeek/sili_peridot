@@ -1174,6 +1174,32 @@ this same benchmark, rather than just training even longer. Tier 2
 (bracket balancing) and Tier 3 (integer arithmetic) stay blocked until
 then.
 
+**Update -- e-prop tried, found structurally broken, replaced with a
+per-synapse peak-eligibility/tagging mechanism grounded in real
+Jacobian algebra** (full narrative in JOURNAL.md's "Per-synapse
+peak-eligibility via `backward_sparse`..." entry).
+`EPropDISLDOLayer`/`EPropAdamDISLDOLayer` removed -- root-caused: its
+delta-trick gradient proxy is provably zero for a row silent at the
+query tick, exactly the row it most needed to credit. Replacement
+(`prototype_synapse_peak_credit.py`,
+`prototype_peak_synapse_learning_comparison.py`): capture = exact
+leading-order BPTT term given the residual state update (confirmed via
+direct Jacobian derivation, not assumed); selection score =
+`|x_r(t)| * |state_change(t)|`, derived the same way, weight
+deliberately excluded (confirmed against SnAp-1/e-prop/UORO/KF-RTRL --
+none track the synapse's own weight, and SnAp explicitly considered
+and rejected the weighted-top-k idea). Along the way found and fixed
+FOUR real bugs that had been silently corrupting every prior toy-scale
+result using DISLDOLayer/SISLDOLayer or EnergyDynamics at small scale:
+unseeded sparse-wiring RNG (fixed upstream in sili__new), unseeded FP4
+stochastic rounding, a `max_weights` floor-clamp bug, and
+`EnergyDynamics` being both badly miscalibrated for small state widths
+AND applied during eval (no train/eval mode of its own). Final result
+(50 seeds, all four bugs fixed): peak-synapse nominally ahead at every
+n_bits tested but no single point statistically significant --
+promising, not yet settled. Tier 2/3 still blocked pending a clearer
+signal or a decision to proceed anyway.
+
 - [ ] **B8. Column-averaging training loop**: for each input index `i`,
   the column of 24 fold-depth neurons should average toward `input[i]`
   **at every fold step, from step 1 onward** — not only after the full

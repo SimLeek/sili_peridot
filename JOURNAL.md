@@ -2149,3 +2149,144 @@ across which axis) before drawing any further conclusion about
 peak-eligibility's real effectiveness, per
 [[feedback_do_science_correctly]] -- an unresolved instability sitting
 underneath a result is not something to draw conclusions past.
+
+## Per-synapse peak-eligibility via `backward_sparse`: a real, math-grounded mechanism, and the bugs it took to test honestly
+
+Per direct correction: `PeakEligibilityDISLDOLayer` (value_scale-only)
+doesn't hold causal if-then structure -- value_scale is a homeostatic
+scaling knob, not where a synapse's actual weighted contribution lives.
+Superseded by a genuinely per-SYNAPSE mechanism, worked out directly
+with the user and grounded in real Jacobian algebra rather than
+guessed:
+
+**The math.** True BPTT sums `dL/dW[r,c] = Sum_t [dL/dh_T . dh_T/dh_t]
+. x_r(t) . phi'(delta_c(t))` over every tick row r fired. Because the
+state update is residual (`h_t = h_{t-1} + phi(delta_t)`), `dh_T/dh_t`
+is dominated by an identity term regardless of how far t is from T --
+the thing BPTT would normally need the full unrolled graph to compute
+is already sitting there for free, precisely because of the residual
+architecture (confirmed as the actual reason it matters, not just "it
+helps information linger"). This means: **capture** -- substituting a
+remembered tagged `x_r(t)` into a 1-hot dense array and calling
+`SparseLinearLayer.backward_sparse` directly against the REAL error at
+query time -- computes exactly the leading-order term of the true sum.
+Checked directly against `cpu_backend.cpp`: `backward_sparse` takes
+the dense input as an EXPLICIT argument (not cached), so no
+`last_input`-mutation trick is even needed here, unlike the earlier
+row-level attempt.
+
+**Selection**, by the same derivation: comparing DIFFERENT rows
+competing for the same output c at a fixed tick has `phi'(delta_c(t))`
+cancel out (shared by every row feeding c) -- weight never belongs in
+either comparison, despite an initial (wrong) instinct that
+`w*x` ("forward contribution") was the right criterion. Confirmed via
+two rounds of literature research: SnAp-1/e-prop/UORO/KF-RTRL all
+track presynaptic-activity-based Jacobian approximations, NEVER the
+synapse's own weight -- and SnAp's own paper explicitly considered and
+REJECTED a top-k-of-full-multiplication approach on cost grounds (a
+declined path, not an unknown one). `w*x` is really the
+Taylor/attribution/pruning-saliency criterion, a different
+mathematical object. The correct stand-in for the missing
+`phi'(delta_c(t))` term is `state_change(t)` (= `delta_gated` for that
+tick exactly, since the residual update makes it literally equal to
+Δh, no separate subtraction needed) -- giving `score_r(t) = |x_r(t)| *
+|state_change(t)|`.
+
+**Decay derived, not tuned**: `decay_from_horizon(n, retain_fraction)
+= retain_fraction**(1/n)` -- the minimum decay that keeps a tag's
+score above a target fraction after a target number of ticks.
+Confirmed a real, structural limitation this exposes: one-hot token
+rows have CONSTANT magnitude every time they fire, so any later
+occurrence of the same token always beats a decayed peak regardless of
+decay rate -- only the continuously-valued STATE-portion rows can
+genuinely bridge long horizons via this mechanism, not the raw token
+inputs.
+
+**On checking "does it work" against actual BPTT/RNN capability, not
+just against itself** -- direct pushback ("something is extremely
+wrong here, since RNNs should absolutely be able to handle this"; "is
+anything in this test ever predicting out of context above chance?")
+caught something the plain-vs-peak comparison alone never would have:
+at 20 and 50 seeds, EVERY out-of-context number for BOTH arms sat at
+or below 0.5 -- the whole comparison had been happening between two
+things neither of which had demonstrated real out-of-context learning
+at all. Root-caused to THREE real, previously-undetected bugs, not a
+BPTT-alternative failure:
+
+1. **`_preseed_random_sparse` ignored `np.random.seed()` entirely**
+   (`np.random.default_rng()`, unaffected by any seed) -- every
+   layer's sparse wiring has never been reproducible in this or any
+   prior session's experiment. Fixed upstream in sili__new: optional
+   `rng` parameter on `_preseed_random_sparse`/`DISLDOLayer`/
+   `SISLDOLayer`, true randomness stays the DEFAULT (direct
+   instruction: "I actually do want a closer to true RNG"), only made
+   overridable. 6 new regression tests, full existing suite re-run
+   clean (3 pre-existing unrelated flaky tests confirmed flaky on
+   unmodified code too, not caused by this change).
+2. **FP4's own stochastic weight rounding was ALSO unseeded** --
+   `_cpu.seed_fp4_stochastic_rng(seed)` exists but reseeds only the
+   CALLING thread; true reproducibility needs `NUM_CPUS=1` too (an
+   OpenMP-parallel run keeps independent unseeded worker-thread state
+   regardless). Confirmed via direct bit-identical reproduction across
+   fresh processes once both fixes were in place.
+3. **`MAX_WEIGHTS` was landing on the `_preseed_random_sparse` bare
+   floor** (`k=1`, literally one random connection per input row, zero
+   redundancy) -- derived a properly-sized value
+   (`IN_FEATURES * STATE_WIDTH`, full column coverage) instead.
+
+Even with all three fixed, a fixed-n_bits=2 (easiest possible) sanity
+check still failed to learn (loss stuck above chance-level,
+`ln(3)~=1.099`) until a FOURTH bug was found: **`EnergyDynamics` --
+calibrated at h sizes 20-64 -- was gating out ~69% of every tick's
+state-write at this much smaller width by default** (measured
+directly: 5/16 neurons pass at init, `actual_p=0.3125`, since `p` is a
+hard ceiling the gate starts AT, not the `density` target it only
+grows toward via training) **and had no train/eval mode of its own,
+so it was being applied during EVAL calls too**, corrupting every
+accuracy number measured up to that point. `use_energy=False`
+recovered 100% accuracy on the trivial case immediately, confirming
+the diagnosis. But energy wasn't superfluous either -- removing it
+brought back the original random-collapse instability (one seed hit
+0.75/0.90/0.90/0.55, proving the task IS learnable, while others
+collapsed to exact 0.0). Direct instruction: "even small energy...
+should still save the neural network eventually, just not as
+quickly" -- confirmed directly (loss kept dropping over 9000 steps
+under a gentle config rather than plateauing) once the eval-mode bug
+was ALSO fixed (fixed-n_bits=2 check: 0.220 aggressive-config-with-bug
+-> 0.750 gentle-config-with-eval-fix).
+
+Traced WHY gentle energy still leaves an occasional collapse: a single
+still-failing seed's own `energy.energy` array, over its full training
+run, trends NEGATIVE (settles ~-1.2 to -1.6 mean, only 0-3/16 neurons
+near the firing threshold at any snapshot, down from all 16 at init)
+-- `activation_cost*|h|` drains energy proportional to a neuron's OWN
+real magnitude while `drive` accumulates it flat, so genuinely-useful,
+large-output neurons get pushed toward the shutoff floor (near-zero
+constant output) rather than toward the rescue-firing mechanism.
+Raising `drive` DID flip that one seed's energy positive as predicted
+-- but made the real 8-seed stability check WORSE overall (means
+dropped, MORE seeds collapsed, not fewer) -- a clean demonstration
+that a fix validated on one seed's own diagnostic doesn't necessarily
+generalize; reverted to the smaller `drive` that performed better
+across the full seed set. Per direct decision, the residual collapse
+rate is being set aside for now (accepted as mathematically
+non-permanent given energy + eventual dense/synaptogenesis fallbacks,
+not yet re-litigated here).
+
+**Final result** (50 seeds x 40 eval sequences, STATE_WIDTH=16,
+TRAIN_STEPS=6000, all four bugs above fixed):
+
+    n_bits  in_ctx  plain (mean+-std)  peak-synapse (mean+-std)
+         2     yes     0.526 +- 0.223          0.539 +- 0.205
+         3      NO     0.514 +- 0.168          0.542 +- 0.133
+         4      NO     0.493 +- 0.187          0.502 +- 0.197
+         6      NO     0.410 +- 0.197          0.452 +- 0.180
+
+No single point clears its own noise (largest gap, n=6, ~1.1 combined
+SEM) -- not a proven effect. But peak-synapse is nominally ahead at
+ALL FOUR points, including every out-of-context one -- a consistent
+direction, unlike earlier pre-fix runs where the sign flipped between
+reruns. Recorded honestly as promising-but-not-yet-settled, not spun
+either way -- see `scripts/prototype_peak_synapse_learning_comparison.py`
+for the full mechanism, `scripts/prototype_synapse_peak_credit.py` for
+the isolated (and still-holding) per-synapse credit verification.
