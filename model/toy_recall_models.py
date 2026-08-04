@@ -8,55 +8,45 @@ the tile-recurrence architecture on the synthetic induction-recall task
 toy-track-only simplifications (fixed embeddings, no positional
 encoding, single head) this module deliberately makes.
 
-Unlike model/sili_block.py's apply_fold_step / model/tile_recurrence.py's
-apply_tile_step (built around FROZEN pretrained weights -- `_forward`
-calls SparseLinearLayer.forward_dense(x, learning_rate=0.0) directly on
-raw numpy, discarding the Tensor graph), everything here routes through
-sili.sparse_rnn.DISLDOLayer -- a Tensor-graph-integrated wrapper whose
-forward() returns a real Tensor node and whose backward calls
-backward_dense(dy, learning_rate), which both computes dx (keeps
-backprop flowing) AND applies DISLDOLayer's own inline weight update
-using the real downstream gradient. A single loss.backward() call at
-the end of a forward pass drives every weight's own local update.
+Built from DenseTensorLinear (plain fp32 sili.tensor matmul) trained
+via a real AdamOptimizer, NOT sili.sparse_rnn.DISLDOLayer -- per direct
+decision, after two isolation controls (scripts/torch_mqar_control.py,
+scripts/fp32_handrolled_control.py) confirmed the earlier stuck-at
+-chance training result was caused by this session's own hand-rolled
+optimizer (plain per-node-clipped SGD, no momentum) diverging, NOT by
+FP4 quantization -- fp32 with that SAME hand-rolled optimizer diverged
+identically. Fixing this for DISLDOLayer's own inline C++ weight
+update would need real new work in sili__new (disldo_backward); fixing
+it for plain Tensor leaves is pure Python (this file's own
+AdamOptimizer) and directly answers this track's actual question (does
+tile-recurrence learn genuine recall), so per direct decision that's
+the path taken here. DISLDOLayer/FP4's own training dynamics remain a
+distinct, not-revisited-here concern (already partially validated
+elsewhere per direct feedback -- importance-driven training behaves
+similarly to other optimizers).
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from sili.sparse_rnn import DISLDOLayer
 from sili.tensor import (
     Tensor, banded_attention, gaussian_attention, exp, log, reduce_sum, silu, gather, _topo_sort,
 )
 
 
 class DenseTensorLinear:
-    """Plain fp32 Tensor-graph linear layer (matmul-based, NO
-    quantization, NO DISLDOLayer) -- trainable via apply_gradient_step,
-    the SAME hand-rolled SGD+clip convention as every other leaf in
-    this module (RMSNorm weights, centers, log_sigmas), NOT Adam.
-
-    Exists specifically to isolate FP4-quantization-via-DISLDOLayer
-    from this session's own hand-rolled optimizer as the cause of the
-    toy training experiments' stuck-at-chance result: a full-precision
-    + Adam control (scripts/torch_mqar_control.py) converged easily and
-    fast on the identical architecture/task, proving the ARCHITECTURE
-    wasn't the problem -- but that control changed BOTH precision and
-    optimizer at once. This class changes ONLY precision (still uses
-    this module's own optimizer), so a model built from it isolates
-    the remaining variable directly."""
+    """Plain fp32 Tensor-graph linear layer (matmul-based, no
+    quantization) -- trains via AdamOptimizer.step(), an ordinary
+    Tensor leaf like RMSNorm weights/centers/log_sigmas, not an
+    inline-self-updating primitive."""
 
     def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
         self.weight = Tensor(
             (np.random.randn(in_features, out_features) * scale).astype(np.float32))
 
-    def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
-        """learning_rate accepted (unused) only so this drops into the
-        SAME call signature DISLDOLayer.forward uses -- this class's
-        own weight trains via apply_gradient_step(self.parameters(),
-        lr), called by the caller's training loop like any other leaf,
-        not via an inline per-call update."""
+    def forward(self, x: Tensor) -> Tensor:
         return x @ self.weight
 
     def parameters(self) -> List[Tensor]:
@@ -118,23 +108,64 @@ def predicted_token(logits: Tensor, row: int) -> int:
 
 
 def apply_gradient_step(params: List[Tensor], lr: float) -> None:
-    """Plain SGD step + zero_grad for ordinary Tensor LEAVES (RMSNorm
-    weights, centers, log_sigmas) -- NOT for DISLDOLayer's own internal
-    weights, which already self-update inline during backward_dense
-    (see module docstring). Call once per training step, after
-    .backward(). Leaves whose .grad is still None (e.g. a tile whose
-    column target didn't apply this specific tick) are skipped, not
-    zeroed against a nonexistent gradient.
+    """Plain SGD step + zero_grad for ordinary Tensor leaves. Kept for
+    tests/comparison -- superseded by AdamOptimizer for real training
+    (see module docstring: plain per-node-clipped SGD, no momentum, was
+    confirmed via two isolation controls to diverge on this task,
+    independent of precision).
 
-    Forgetting this (an actual bug hit while smoke-testing this module)
-    is silent and severe, not just "doesn't learn": these leaves are
-    reused across every training step, so _acc's plain accumulation
-    keeps ADDING each step's gradient onto whatever was already there
-    forever -- unbounded grad growth, then a divergent loss within a
-    few dozen steps, not a slow-to-converge one."""
+    Leaves whose .grad is still None (e.g. a tile whose column target
+    didn't apply this specific tick) are skipped, not zeroed against a
+    nonexistent gradient."""
     for p in params:
         if p.grad is not None:
             p.data = p.data - lr * np.asarray(p.grad, dtype=np.float32)
+            p.zero_grad()
+
+
+class AdamOptimizer:
+    """Standard Adam (Kingma & Ba, 2014) for plain Tensor leaves --
+    per-parameter first/second moment estimates with bias correction.
+    Added per direct decision after two isolation controls
+    (scripts/torch_mqar_control.py, scripts/fp32_handrolled_control.py)
+    confirmed this session's earlier hand-rolled plain-SGD-with-clipping
+    optimizer (apply_gradient_step) was the actual cause of every
+    stuck-at-chance/diverging toy training result -- NOT FP4
+    quantization, NOT the architecture. A full-precision + Adam control
+    converged easily and fast on the identical task; full precision
+    with the OLD plain-SGD optimizer diverged identically to the FP4
+    version. Momentum/adaptive per-parameter scaling was the missing
+    piece, not precision.
+
+    Keyed by `id(param)` (Tensor doesn't define __hash__/__eq__, so
+    default object-identity hashing is exactly what's wanted here --
+    each distinct Tensor leaf gets its own independent moment state)."""
+
+    def __init__(self, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8):
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m: Dict[int, np.ndarray] = {}
+        self.v: Dict[int, np.ndarray] = {}
+        self.t = 0
+
+    def step(self, params: List[Tensor], lr: float) -> None:
+        self.t += 1
+        bc1 = 1.0 - self.beta1 ** self.t
+        bc2 = 1.0 - self.beta2 ** self.t
+        for p in params:
+            if p.grad is None:
+                continue
+            g = np.asarray(p.grad, dtype=np.float32)
+            key = id(p)
+            if key not in self.m:
+                self.m[key] = np.zeros_like(p.data)
+                self.v[key] = np.zeros_like(p.data)
+            self.m[key] = self.beta1 * self.m[key] + (1.0 - self.beta1) * g
+            self.v[key] = self.beta2 * self.v[key] + (1.0 - self.beta2) * (g * g)
+            m_hat = self.m[key] / bc1
+            v_hat = self.v[key] / bc2
+            p.data = p.data - lr * m_hat / (np.sqrt(v_hat) + self.eps)
             p.zero_grad()
 
 
@@ -142,29 +173,18 @@ def backward_with_grad_clip(loss: Tensor, max_grad_norm: float) -> None:
     """Gradient-clipped replacement for `loss.backward()` -- clips the
     L2 norm of EVERY node's incoming gradient (not just the final
     parameter gradients) to `max_grad_norm`, right before that node's
-    own `_backward()` fires.
+    own `_backward()` fires. Still used alongside AdamOptimizer
+    (clip+Adam together is standard practice, e.g. nanoGPT's own
+    convention) -- clipping alone was never sufficient (see
+    AdamOptimizer's own docstring), but it's still good practice
+    combined with real momentum.
 
-    Textbook gradient clipping computes the TOTAL norm across all
-    parameter gradients FIRST, then rescales once -- not possible here
-    in one pass: `DISLDOLayer`'s own weights self-update INLINE, during
-    the SAME `_backward()` call that computes their gradient (see
-    module docstring), so by the time a global norm could be measured,
-    the (unclipped) update has already happened. A true two-pass
-    version (a dry run at `learning_rate=0` to measure the norm, then a
-    real pass with a correctly pre-scaled seed) would double the
-    forward+backward cost of every single training step -- not worth
-    it here.
-
-    Per-NODE clipping is the single-pass-compatible alternative that
-    still directly bounds what any individual weight update can see:
     `Tensor.backward()` (`sili/tensor.py`) is just `for node in
     reversed(_topo_sort(self)): node._backward()` -- replicated here
     with a clip inserted in the loop, so every node's `.grad` (already
     fully accumulated from all its consumers by the time its own turn
-    comes, per topological order) is bounded before it can either
-    propagate further OR drive a `DISLDOLayer`'s inline update. This is
-    what actually fixed the training instability (overflow warnings,
-    divergent loss) seen during this session's own unclipped runs."""
+    comes, per topological order) is bounded before it propagates
+    further."""
     if loss.grad is None:
         loss.grad = np.ones_like(loss.data)
     for node in reversed(_topo_sort(loss)):
@@ -188,68 +208,119 @@ def lr_schedule(step: int, total_steps: int, peak_lr: float,
     return float(peak_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine))
 
 
+def clip_grad_norm_(params: List[Tensor], max_norm: float) -> float:
+    """Textbook GLOBAL gradient-norm clipping -- the total L2 norm
+    ACROSS ALL of `params`' gradients combined is capped to `max_norm`
+    (matching torch.nn.utils.clip_grad_norm_ exactly, including the
+    control script that used it: scripts/torch_mqar_control.py).
+
+    `backward_with_grad_clip`'s per-NODE clipping exists specifically
+    because `DISLDOLayer`'s own weights self-update INLINE during
+    `backward()`, so a true global-norm measurement isn't available
+    before an update already happened (see its own docstring). That
+    constraint doesn't apply to this module's models anymore (per
+    direct decision -- they're built from `DenseTensorLinear` now, see
+    module docstring): NOTHING updates until `optimizer.step()` is
+    called explicitly, so the real global norm can be measured first,
+    same as any standard training loop. Confirmed this distinction
+    actually matters, not just theoretically: per-node clipping still
+    let AdamOptimizer diverge on the real MQAR task (every one of many
+    parameter tensors independently allowed up to norm `max_norm` is a
+    much LARGER aggregate step than one norm-`max_norm` budget shared
+    across all of them) -- this is the correct, stronger clip to use
+    for models built from DenseTensorLinear; call after `loss.backward()`
+    (plain, ordinary -- not `backward_with_grad_clip`) and before
+    `optimizer.step()`."""
+    total_sq = 0.0
+    for p in params:
+        if p.grad is not None:
+            total_sq += float(np.sum(np.asarray(p.grad, dtype=np.float64) ** 2))
+    total_norm = total_sq ** 0.5
+    if total_norm > max_norm and total_norm > 0:
+        scale = max_norm / (total_norm + 1e-6)
+        for p in params:
+            if p.grad is not None:
+                p.grad = (np.asarray(p.grad, dtype=np.float32) * scale).astype(np.float32)
+    return total_norm
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  ToySmallTransformer -- the "pre-converted transformer" baseline
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _ToyTransformerLayer:
-    def __init__(self, hidden: int, mlp_hidden: int, max_weights: int, num_cpus: int):
-        self.q_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.k_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.v_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.o_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.gate_proj = DISLDOLayer(hidden, mlp_hidden, max_weights, num_cpus)
-        self.up_proj = DISLDOLayer(hidden, mlp_hidden, max_weights, num_cpus)
-        self.down_proj = DISLDOLayer(mlp_hidden, hidden, max_weights, num_cpus)
+    def __init__(self, hidden: int, mlp_hidden: int):
+        self.q_proj = DenseTensorLinear(hidden, hidden)
+        self.k_proj = DenseTensorLinear(hidden, hidden)
+        self.v_proj = DenseTensorLinear(hidden, hidden)
+        self.o_proj = DenseTensorLinear(hidden, hidden)
+        self.gate_proj = DenseTensorLinear(hidden, mlp_hidden)
+        self.up_proj = DenseTensorLinear(hidden, mlp_hidden)
+        self.down_proj = DenseTensorLinear(mlp_hidden, hidden)
         self.input_ln = Tensor(np.ones(hidden, dtype=np.float32))
         self.post_ln = Tensor(np.ones(hidden, dtype=np.float32))
+
+    def parameters(self) -> List[Tensor]:
+        params = [self.input_ln, self.post_ln]
+        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+                      self.gate_proj, self.up_proj, self.down_proj):
+            params += layer.parameters()
+        return params
 
 
 class ToySmallTransformer:
     """Stacked causal dense transformer -- each layer has its OWN
     distinct weights (real depth-stacking, unlike tile-recurrence's
     single shared tile network). Single-head attention (see module
-    docstring's simplifications), no positional encoding."""
+    docstring's simplifications), no positional encoding.
+
+    `half_bandwidth`: defaults to unlimited (full causal visibility --
+    the default matches every existing call site's behavior). Set to
+    an int `W` to give this model a GENUINELY bounded context window
+    -- structurally unable to see more than `W` positions back,
+    regardless of training. Used as the real "standard LLM" stand-in
+    for the out-of-context benchmark suite (see
+    scripts/train_toy_beyond_context_comparison.py) -- tile-recurrence's
+    own `num_tiles` already plays this same role, no equivalent knob
+    needed there."""
 
     def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int,
-                 n_layers: int, max_weights: int, num_cpus: int = 2,
-                 rms_eps: float = 1e-6):
+                 n_layers: int, num_cpus: int = 2, rms_eps: float = 1e-6,
+                 half_bandwidth: Optional[int] = None):
         self.hidden = hidden
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
-        self.layers = [_ToyTransformerLayer(hidden, mlp_hidden, max_weights, num_cpus)
-                        for _ in range(n_layers)]
-        self.lm_head = DISLDOLayer(hidden, vocab_size, max_weights, num_cpus)
+        self.half_bandwidth = half_bandwidth
+        self.layers = [_ToyTransformerLayer(hidden, mlp_hidden) for _ in range(n_layers)]
+        self.lm_head = DenseTensorLinear(hidden, vocab_size)
 
     def parameters(self) -> List[Tensor]:
-        """Plain Tensor leaves needing apply_gradient_step -- every
-        layer's own RMSNorm weight. DISLDOLayer weights aren't included
-        (self-update inline, see module docstring)."""
         params = []
         for layer in self.layers:
-            params += [layer.input_ln, layer.post_ln]
-        return params
+            params += layer.parameters()
+        return params + self.lm_head.parameters()
 
-    def forward(self, embedded: np.ndarray, learning_rate: float) -> Tensor:
+    def forward(self, embedded: np.ndarray) -> Tensor:
         """embedded: [T, hidden] numpy (fixed embedding lookups).
         Returns logits [T, vocab_size] Tensor."""
         T = embedded.shape[0]
+        half_bandwidth = self.half_bandwidth if self.half_bandwidth is not None else T
         x = Tensor(embedded.astype(np.float32))
         for layer in self.layers:
             normed = rmsnorm_tensor(x, layer.input_ln, self.rms_eps)
-            q = layer.q_proj.forward(normed, learning_rate)
-            k = layer.k_proj.forward(normed, learning_rate)
-            v = layer.v_proj.forward(normed, learning_rate)
-            attn = banded_attention(q, k, v, half_bandwidth=T,
+            q = layer.q_proj.forward(normed)
+            k = layer.k_proj.forward(normed)
+            v = layer.v_proj.forward(normed)
+            attn = banded_attention(q, k, v, half_bandwidth=half_bandwidth,
                                     num_cpus=self.num_cpus, causal=True)
-            attn = layer.o_proj.forward(attn, learning_rate)
+            attn = layer.o_proj.forward(attn)
             x = x + attn
             normed2 = rmsnorm_tensor(x, layer.post_ln, self.rms_eps)
-            gate = layer.gate_proj.forward(normed2, learning_rate)
-            up = layer.up_proj.forward(normed2, learning_rate)
-            mlp_out = layer.down_proj.forward(silu(gate) * up, learning_rate)
+            gate = layer.gate_proj.forward(normed2)
+            up = layer.up_proj.forward(normed2)
+            mlp_out = layer.down_proj.forward(silu(gate) * up)
             x = x + mlp_out
-        return self.lm_head.forward(x, learning_rate)
+        return self.lm_head.forward(x)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -257,85 +328,92 @@ class ToySmallTransformer:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ToyTileRecurrence:
-    """One shared tile network (DISLDOLayer q/k/v/o/gate/up/down),
+    """One shared tile network (DenseTensorLinear q/k/v/o/gate/up/down),
     gaussian_attention across tiles, additive energy-free gated residual
     (toy scale -- see module docstring; no EnergyDynamics here, plain
     residual add is enough to test the core retrieval mechanism without
     pulling in another moving part). Single head, no positional
     encoding (see module docstring's simplifications).
 
-    Keeps Kimi's staggered per-tile "column" prediction (the direct
-    tile-shaped descendant of this project's own A3/A4 column-averaging
-    work): tile j's own state, projected through the SAME shared
-    lm_head, is trained to predict the token tile j+1 currently holds
-    this same tick; the last tile predicts the genuinely novel next
-    token."""
+    `embed_width` (E) matches the real token-embedding width. The
+    internal recurrent `state_width` = E * `column_neurons` (C) is
+    deliberately WIDER -- solves "how do you backprop a prediction
+    error into a state much wider than the output" (see the approved
+    plan, fuzzy-plotting-starlight.md, for the full worked example:
+    selecting a fixed subset starves the rest of gradient, summing a
+    column forces the state's own values small to avoid blowup,
+    AVERAGING a column works and stays in the same natural magnitude
+    range). `lm_head` stays fixed at `embed_width` -- standing in for
+    the real system's pretrained, fixed-width output head, which is
+    exactly why the width-reduction has to be the parameter-free
+    column-mean, not a new learned down-projection."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int,
-                 num_tiles: int, max_weights: int, num_cpus: int = 2,
-                 rms_eps: float = 1e-6):
-        self.hidden = hidden
+    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
+                 mlp_hidden: int, num_tiles: int, num_cpus: int = 2, rms_eps: float = 1e-6):
+        self.embed_width = embed_width
+        self.column_neurons = column_neurons
+        self.state_width = embed_width * column_neurons
         self.num_tiles = num_tiles
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
-        self.q_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.k_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.v_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.o_proj = DISLDOLayer(hidden, hidden, max_weights, num_cpus)
-        self.gate_proj = DISLDOLayer(hidden, mlp_hidden, max_weights, num_cpus)
-        self.up_proj = DISLDOLayer(hidden, mlp_hidden, max_weights, num_cpus)
-        self.down_proj = DISLDOLayer(mlp_hidden, hidden, max_weights, num_cpus)
-        self.input_ln = Tensor(np.ones(hidden, dtype=np.float32))
-        self.post_ln = Tensor(np.ones(hidden, dtype=np.float32))
-        self.lm_head = DISLDOLayer(hidden, vocab_size, max_weights, num_cpus)
+        state_width = self.state_width
+        self.q_proj = DenseTensorLinear(state_width, state_width)
+        self.k_proj = DenseTensorLinear(state_width, state_width)
+        self.v_proj = DenseTensorLinear(state_width, state_width)
+        self.o_proj = DenseTensorLinear(state_width, state_width)
+        self.gate_proj = DenseTensorLinear(state_width, mlp_hidden)
+        self.up_proj = DenseTensorLinear(state_width, mlp_hidden)
+        self.down_proj = DenseTensorLinear(mlp_hidden, state_width)
+        self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.post_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.lm_head = DenseTensorLinear(embed_width, vocab_size)
         self.centers = Tensor(np.array([i + 0.5 for i in range(num_tiles)], dtype=np.float32))
         self.log_sigmas = Tensor(np.zeros(num_tiles, dtype=np.float32))
 
     def parameters(self) -> List[Tensor]:
-        """Plain Tensor leaves needing apply_gradient_step -- RMSNorm
-        weights plus centers/log_sigmas. DISLDOLayer weights aren't
-        included (self-update inline, see module docstring)."""
-        return [self.input_ln, self.post_ln, self.centers, self.log_sigmas]
+        params = [self.input_ln, self.post_ln, self.centers, self.log_sigmas]
+        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+                      self.gate_proj, self.up_proj, self.down_proj, self.lm_head):
+            params += layer.parameters()
+        return params
 
-    def step(self, x_window: np.ndarray, M_prev: np.ndarray,
-             learning_rate: float) -> Tuple[np.ndarray, Tensor]:
-        """One recurrence tick. x_window: [num_tiles, hidden] numpy
-        (see toy_recall_task/build_tile_window-style sliding-window
-        injection -- built by the caller). M_prev: [num_tiles, hidden]
-        numpy, DETACHED (no BPTT, matching tile_recurrence.py's own
-        design). Returns (M_new numpy, logits Tensor [num_tiles,
-        vocab_size] -- one row per tile's own "column" prediction,
-        last row is the genuinely novel next-token prediction).
+    def step(self, x_window: np.ndarray, M_prev: np.ndarray) -> Tuple[np.ndarray, Tensor]:
+        """One recurrence tick. x_window, M_prev: [num_tiles,
+        state_width] numpy, DETACHED (no BPTT, matching
+        tile_recurrence.py's own design) -- both already widened to
+        state_width by the caller (see _build_tile_window in
+        scripts/train_toy_recall_comparison.py), so nothing here needs
+        to handle mixed widths. Returns (M_new numpy [num_tiles,
+        state_width], logits Tensor [num_tiles, vocab_size] -- one row
+        per tile's own column-mean-pooled next-token prediction; only
+        the LAST row, the real current tick position, is ever actually
+        trained by the caller).
 
-        Q/K/V all draw from normed(x_window) + normed(M_prev) (summed,
-        matching apply_tile_step's own established convention) -- NOT
-        x_window alone. Without M_prev's own contribution here,
-        attention could only look across the current tick's fresh
-        window, never genuinely retrieve older content carried in
-        M_prev -- exactly the capability this whole architecture
-        exists to test, so it can't be simplified away even in this
-        toy version (unlike the interleaved-key-space / asymmetric-V
-        detail from Phase 2.7b's production design, which IS
-        simplified away here -- a single blended source for Q/K/V is
-        enough to keep memory genuinely attend-able without that
-        extra machinery)."""
+        Q/K/V draw from x_window BLENDED with M_prev (per direct
+        correction -- see [[feedback_attention_needs_combined_input_state]]:
+        input-only attention forces anything relating fresh input to
+        carried state through an artificial "write to state, wait a
+        tick, then attend" detour; attention must be able to relate
+        input and state directly, in one step)."""
         x_normed = rmsnorm_tensor(Tensor(x_window.astype(np.float32)), self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         qkv_source = x_normed + m_normed
-        q = self.q_proj.forward(qkv_source, learning_rate)
-        k = self.k_proj.forward(qkv_source, learning_rate)
-        v = self.v_proj.forward(qkv_source, learning_rate)
+        q = self.q_proj.forward(qkv_source)
+        k = self.k_proj.forward(qkv_source)
+        v = self.v_proj.forward(qkv_source)
         sigmas = exp(self.log_sigmas)
         attn = gaussian_attention(q, k, v, self.centers, sigmas,
                                   num_cpus=self.num_cpus, causal=False)
-        attn = self.o_proj.forward(attn, learning_rate)
+        attn = self.o_proj.forward(attn)
 
         M_new_t = Tensor(M_prev.astype(np.float32)) + attn
         normed2 = rmsnorm_tensor(M_new_t, self.post_ln, self.rms_eps)
-        gate = self.gate_proj.forward(normed2, learning_rate)
-        up = self.up_proj.forward(normed2, learning_rate)
-        mlp_out = self.down_proj.forward(silu(gate) * up, learning_rate)
+        gate = self.gate_proj.forward(normed2)
+        up = self.up_proj.forward(normed2)
+        mlp_out = self.down_proj.forward(silu(gate) * up)
         M_new_t = M_new_t + mlp_out
 
-        logits = self.lm_head.forward(M_new_t, learning_rate)  # [num_tiles, vocab_size]
+        pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))
+        pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)  # [num_tiles, embed_width]
+        logits = self.lm_head.forward(pooled)  # [num_tiles, vocab_size]
         return M_new_t.data, logits
