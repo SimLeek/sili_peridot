@@ -2821,3 +2821,53 @@ is ALSO FP4-hardcoded and not yet dispatched for FP8 -- calling
 (FP4-nibble-decoded) bytes into what should be E4M3 tile data. Tiles
 must be seeded manually (as the test does) until this lands. Tracked
 as its own follow-up, not started.
+
+## sili__new: FP8 synaptogenesis-triggered promotion/demotion landed -- block4 feature parity with FP4 now complete
+
+Third push to `feature/fp8-disldo` (commits `191f32d`, `3010d18`),
+closing the gap flagged in the previous entry. Growth
+(`delta_csr_synap_row_step`) can now correctly promote scattered FP8
+synapses into a block4 tile once `BLOCK4_PROMOTE_MIN_LIVE` land inside
+it, and pruning correctly demotes back -- same behavior as FP4, tested
+through the identical grow/prune/demote/re-grow/re-promote cycle.
+
+Two more real bugs found and fixed here, both via the same disciplined
+approach (write the test, hit a crash, root-cause with ASan/targeted
+debug output rather than guessing):
+
+1. **A genuine cross-row memory-corruption bug**, not hypothetical --
+   `block4_row_insert_tile`/`block4_row_remove_tile` looked like pure,
+   generic byte-buffer plumbing (confirmed by reading them once), but
+   they ALSO call `block4_stored_tile_len` (FP4's 1-byte/entry formula)
+   internally while walking a row to find insert/remove positions --
+   silently wrong for FP8's 2-byte/entry tiles, corrupting a row's own
+   byte bookkeeping. Missed on the first read because the function
+   signatures gave no hint they depended on value width at all. Root
+   -caused by writing a step-by-step debug harness that dumped
+   `tbyte_start`/`tbyte_end` after every synaptogenesis call until the
+   exact divergent step was visible, then confirmed with ASan. Fixed
+   with a defaulted function-pointer parameter -- every existing FP4
+   call site is completely unaffected (same default), FP8's call sites
+   pass the right function explicitly.
+2. **`Block4View8` was never registered with pybind** -- compiled fine,
+   worked fine in direct C++ tests, but raised "Unregistered type"
+   the moment Python code touched `.block4` on an `FP8`-backed layer.
+   Found by deliberately testing the REAL Python/pybind path end-to-end
+   (not just the C++ template instantiation directly), which is
+   exactly the layer this bug lived in and every earlier C++-only test
+   couldn't have caught.
+
+Both fixes are covered by new tests (`test_disldo_block4_promotion_fp8.cpp`,
+clean under ASan/UBSan; `TestDISLDOLayer8Synaptogenesis` in Python,
+exercising the actual pybind path). FP4's own promotion/demotion cycle
+was independently re-verified via a standalone C++ regression test
+after the shared-function signature change -- passes cleanly under
+ASan, zero behavior change (all new parameters are defaulted).
+
+**This completes FP8 block4 feature parity with FP4** -- scattered
+path, dense-tile SIMD promotion, and now synaptogenesis-triggered
+growth/pruning, matching what was asked for from the start ("the same
+sparse-block4 split" FP4 has). Remaining work is SIMD optimization of
+the FP8 block4 kernels (currently scalar/correctness-first) and real
+-checkpoint validation at production scale -- not started, no known
+blockers.
