@@ -3134,3 +3134,80 @@ configuration prevents the model from learning the task at all --
 the comparison is moot until (if ever) a usable energy config is
 found for this per-tick online regime. Not pursued further this pass,
 recorded as a real negative result rather than left unreported.
+
+## Root-caused the energy collapse further, then definitively ruled out "just needs more training time" -- it's a real runaway, not slow convergence
+
+Direct follow-up, per request: "try to get aux loss down, it shouldn't be that large, needs better parameters for energy."
+
+**Isolated aux_loss's own formula** (`_apply_energy_dynamics` in sili__new's `energy.py`):
+`energy_loss = (reactivity/2) * sum((new_energy_t - setpoint)^2)`, summed (not
+averaged) over every neuron in `h`. `_toy_scale_energy()`'s config (including
+its unmodified default `reactivity=0.01`) was tuned against `test_sparse_rnn_cell.py`'s
+own reference h sizes of 20-64 -- this task's HIDDEN=128 is already 2-6x
+larger, so the SAME reactivity produces a proportionally larger summed
+aux_loss purely from array size, independent of anything being "wrong."
+Confirmed directly: sweeping reactivity from 0.01 down to 0.0001 in isolation
+scaled aux_loss down cleanly and close to linearly (0.67 -> 0.07 -> 0.01).
+
+**But that alone doesn't fix anything -- confirmed by measuring cross-entropy
+and aux_loss SEPARATELY**, not just watching the combined total:
+
+    reactivity   cross-entropy (last100)   aux_loss (last100)
+    0.01               3.15                      0.67
+    0.001              4.02                      0.07
+    0.0001             3.62                      0.01
+
+Cross-entropy stays bad (3-4, vs the ~0.69 ceiling a clean binary decision
+should have) and does NOT improve as aux_loss shrinks toward zero -- ruling
+out "aux_loss dominates the gradient" as the actual cause. The real
+mechanism, found by reading `_apply_energy_dynamics` directly: fired neurons
+get `h_out` set to a flat CONSTANT `2.0`, completely independent of the
+neuron's actual computed value -- and 2.0 is well outside tanh's `[-1,1]`
+range. Every tick, some fraction of the carried recurrent state gets
+overwritten with this out-of-distribution spike constant before being
+threaded forward as `h_prev` into the next tick -- corrupting exactly the
+state this deterministic-latch task needs to carry precisely. This is a
+structural property of the gate, not a magnitude/tuning issue.
+
+**Direct test of the remaining real hypothesis: does the fire-together
+-wire-together mechanism just need many more actual gradient-update steps
+to learn to interpret the spike representation?** (Only the query tick ever
+calls `.backward()`, so 3000 training steps = only 3000 real weight updates
+-- genuinely few.) Kept the tuned-down `reactivity=0.001`, launched two
+1,500,000-step runs (rank1 and rank2, HIDDEN=128, in parallel, checkpointed
+every 50,000 steps) to give this a fair, well-resourced test rather than
+assuming the short run was conclusive.
+
+**Result: definitively refuted, not just unconfirmed.** Cross-entropy did
+not plateau near where the short runs left off -- it climbed monotonically
+and without bound the entire time it ran:
+
+    step       rank1 ce    rank2 ce    accuracy (both arms, all steps)
+     50,000        16          10      ~0.4-0.6 (chance), no trend
+    100,000        86         239      ~0.4-0.6 (chance), no trend
+    300,000       440         787      ~0.4-0.6 (chance), no trend
+    500,000       558         878      ~0.4-0.6 (chance), no trend
+    700,000       602          --      ~0.4-0.6 (chance), no trend
+    (rank2 reached 550,000 before being stopped, ce=831 there)
+
+Accuracy never once trended above chance at ANY checkpoint on either arm,
+across the entire run. Also checked and ruled out "the learning rate just
+hasn't decayed yet": with `total_steps=1,500,000` in the cosine schedule,
+lr had already dropped from peak 1e-3 to ~1.8e-4 by step 700,000 (47%
+through) -- yet cross-entropy was still accelerating upward at that point,
+not slowing. This is a genuine runaway (most likely unbounded weight growth
+from the "fire together, wire together" gradient rule repeatedly reinforcing
+the same connections over enough steps, with nothing in this toy setup to
+damp it), not a system that's slowly finding its footing. Both runs killed
+early once the trend was unambiguous -- no reason to burn the remaining
+~800,000+ steps of confirmed divergence.
+
+**Conclusion, closing this out:** EnergyDynamics' toy-scale config, and
+likely its whole per-tick "hard spike constant" gating design as currently
+implemented, is not usable for this online recurrent-latch task at any
+training budget tried (short OR 500x longer) -- not a tuning problem
+solvable by reactivity alone, a real architectural mismatch between the
+gate's discrete spike representation and a task that needs exact values
+threaded through state. Consistent with the user's own decision to table
+FP4 (and by extension, this energy angle) for now and proceed with FP8,
+which needed none of this.
