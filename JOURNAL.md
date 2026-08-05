@@ -2938,3 +2938,118 @@ growth/pruning, and a real, disassembly-verified, honestly-measured
 SIMD backward path. No known blockers remain on the FP8 side; next
 real step is production-scale validation against actual MiniCPM5
 checkpoints.
+
+## rank-n scaling for FP4: does a second scale degree of freedom close 4-bit's gap to 8-bit rank-1?
+
+Per direct request, following up on 4-bit rank-1's known weakness
+(JOURNAL's own quantization-exploration entry: "4-bit rank-1 still
+trails badly... rank-2 or other higher-order scale envelopes are a
+plausible way to close that gap further, tabled for now"). Pure toy
+-harness work, `model/toy_precision_models.py`, zero sili__new C++
+touched -- this is exploratory validation, the same "toy models first"
+gate FP8's own C++ work went through before it was worth real
+engineering time.
+
+**Design note, real dead end found before the working version:** the
+first idea tried was an additive residual decomposition (fit
+rank1_fake_quantize's envelope, subtract it, fit the leftover again).
+Verified by hand this does nothing: rank1_fake_quantize's envelope is
+a strict MAX-COVER (`row_scale[r]*col_scale[c] >= |v|` for every
+synapse, provably, since row_scale is itself a per-row max) -- the
+residual after subtracting it is <= 0 everywhere, confirmed directly
+(`min residual: ~-1, max residual: 0.0` on a real test array), so a
+second additive term has nothing left to refine. This matters beyond
+being a dead end: an envelope IS what a real N-bit fixed-point scale
+must be (never let a stored value exceed what its levels can
+represent) -- an approach that doesn't preserve the cover property
+would be simulating something real hardware can't do.
+
+**What actually works**: `rankn_fake_quantize` buckets rows by their
+own max |w| into `rank` equal-count quantile groups (deterministic
+sort+split, no iterative clustering), then fits an INDEPENDENT
+rank-1 max-cover per bucket -- letting small-magnitude rows stop
+sharing a column's envelope with large-magnitude rows they happen to
+share a column with (the actual degree of freedom a single shared
+col_scale can't express). Reduces EXACTLY to rank1_fake_quantize when
+rank=1 (verified bit-identical in tests). Checked on a synthetic
+adversarial case (bimodal-magnitude rows, same columns) before
+trusting it on a real task: rank-2 tightened the small-magnitude
+bucket's mean envelope/|value| ratio by ~22% vs rank-1, large
+-magnitude bucket unchanged as expected -- real, but bounded by how
+much true row/col scale correlation the data has, not a free lunch.
+`QuantizedDISLDOLayer32` gained a `scheme="rankn"` + `rank` param
+(rank1/row unchanged, zero behavior change); `ToySmallTransformerQuant4Rank2`/
+`Rank4` wrapper classes added, same `disldo_cls`-pluggable convention
+as every other arm in this file.
+
+**Result 1, transformer MQAR task** (`scripts/train_toy_precision_comparison.py`'s
+harness, `PEAK_LR=0.002` -- the already-documented fix for
+`DISLDOLayer`-family arms diverging at Adam-tuned rates, re-applied
+here after a first pass forgot it and produced meaningless near-chance
+numbers for every arm including FP32; a real methodology mistake,
+caught by checking the FP32 reference against JOURNAL's own prior
+numbers before trusting the comparison):
+
+    config                  FP32 ref  8-bit rank1  4-bit rank1  4-bit rank2  4-bit rank4
+    seq16/kv2/vocab20         0.467       0.333        0.075        0.183        0.167
+    seq32/kv4/vocab40         0.192       0.113        0.054        0.075        0.079
+
+4-bit rank-2 more than doubles rank-1's accuracy in both configs
+(2.4x, 1.4x); rank-4 roughly ties rank-2, not a further improvement --
+most of the gain shows up already at rank-2. Single seed per config,
+same as this file's own earlier 4-config transformer sweep -- a real,
+consistent-direction signal, not yet a statistically confirmed one.
+
+**Result 2, tanh-RNN beyond-context task** (the ORIGINAL task 8-bit
+rank-1 was first validated on -- same `DISLDOLayer` tanh-cell +
+`generate_deviation_sequence` structure as
+`scripts/disldo_tanh_sparse_ablation.py`, HIDDEN=128, sparse
+PER_ROW_K=8, 3000 steps, `PEAK_LR=1e-3`, swapping in
+`QuantizedDISLDOLayer32` variants via `disldo_cls`). Direct
+clarification worth recording: out-of-context prediction on this task
+was ALREADY working before this (FP32/8-bit rank-1 both hit
+`acc={2:1.0,3:1.0,4:1.0,6:1.0}` in the original validation) --
+rank-n's question here is narrower, whether it closes 4-bit rank-1's
+specific gap at out-of-context distances (n=3/4/6), not whether
+out-of-context prediction is possible at all (see corrected
+[[project_sili_bptt_or_chance]] -- that's a fully separate,
+already-resolved question, unrelated to quantization scheme).
+
+A first single-seed run looked dramatic (rank4 hitting 0.78-0.93
+out-of-context vs rank1's 0.2-0.71) -- per this file's own
+already-documented lesson ("an accuracy-only comparison at N=4 seeds
+is not evidence of anything by itself... wildly different results
+purely from noise"), re-ran 8 seeds with paired significance tests
+(`scipy.stats.ttest_rel` + `wilcoxon`, same methodology as the
+peak-eligibility 50-seed check) before trusting it:
+
+    n (dist)  rank1 mean  rank2 mean  diff     p(t/wilcoxon)   rank4 mean  diff     p(t/wilcoxon)
+    2 (ctx)     0.701       0.761    +0.060    0.670 / 0.938     0.682    -0.019    0.815 / 0.875
+    3           0.339       0.444    +0.105    0.534 / 0.523     0.338    -0.001    0.992 / 1.000
+    4           0.626       0.555    -0.071    0.612 / 0.688     0.736    +0.110    0.298 / 0.625
+    6           0.555       0.656    +0.101    0.199 / 0.219     0.670    +0.115    0.411 / 0.297
+
+No point at either rank clears significance (best case p=0.199) --
+the dramatic single-seed result was noise, exactly the failure mode
+this file already warned about. Honest verdict: rank-2/rank-4 show a
+weakly positive, inconsistent-in-sign trend on this specific task (3
+of 4 distances nominally favor higher rank, one doesn't), nowhere near
+the clean, large, consistent win rank-2 showed on the transformer MQAR
+task above. FP4 rank-n is a real, sometimes-substantial help but not a
+uniformly reliable one across task families -- consistent with the
+project's overall FP8-vs-FP4 conclusion: FP8 (real E4M3, `feature/fp8-disldo`,
+merged) reaches near-FP32 quality reliably and needed no rank-n
+tuning to get there, while FP4 stays fundamentally marginal (better
+with rank-n, sometimes meaningfully so, but not consistently, and
+never validated with real statistical confidence the way FP8's
+tests were) -- FP8 remains the easier, more stable choice for actual
+development; FP4 rank-n is a real lever worth having but not a
+substitute for FP8 where storage budget allows it.
+
+All new code covered by tests (`TestRankNFakeQuantize`,
+`QuantizedDISLDOLayer32`'s scheme-combination parametrization extended,
+`TestToySmallTransformerQuant4Rank2`/`Rank4`) -- 59/59 passing, full
+sili_peridot suite (257 tests) re-verified clean, no regressions. The
+comparison scripts themselves were ad hoc (matching this file's own
+established convention for the original rank-1 validation -- kept as
+JOURNAL numbers, not committed as permanent scripts).

@@ -539,8 +539,87 @@ def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
     return out.astype(np.float32)
 
 
+def rankn_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
+                        n_out: int, bits: int, rank: int = 2) -> np.ndarray:
+    """Generalizes rank1_fake_quantize's single shared row_scale/col_scale
+    pair to `rank` independently-fit column-scale profiles, one per
+    row-magnitude bucket (rows bucketed by their own max |w| into `rank`
+    equal-count quantile groups -- deterministic sort+split, no
+    iterative clustering).
+
+    An additive residual decomposition (fit rank-1, subtract, re-fit the
+    leftover, matching e.g. matching-pursuit/greedy-SVD) was the first
+    thing tried and does NOT work here, verified by hand before writing
+    this: rank1_fake_quantize's envelope is a strict MAX-COVER (its
+    alternating-max-fit guarantees row_scale[r]*col_scale[c] >= |v| for
+    every synapse in the row/col, by construction of row_scale itself
+    being a row max) -- the residual after subtracting it is <= 0
+    everywhere, so a second additive term has nothing left to refine.
+    This matters beyond being a dead end: an envelope is exactly what a
+    real N-bit fixed-point scale must be (never let a stored value
+    exceed what `levels` codes can represent) -- an approach that
+    doesn't preserve the cover property would be simulating something
+    real hardware couldn't actually do.
+
+    Bucketing rows by magnitude is the degree of freedom rank-1 alone
+    can't express: a single shared col_scale must cover the worst row
+    sharing that column even when most rows sharing it are far smaller
+    -- every small-magnitude row wastes precision matching a big
+    outlier row it happens to share a column with. Splitting rows into
+    magnitude buckets lets each bucket fit its own column envelope
+    against only its own peers. Measured effect is real but modest
+    (checked on a synthetic bimodal-magnitude case: rank-2 tightened
+    the small-magnitude bucket's mean envelope/|value| ratio by ~22%,
+    the large-magnitude bucket unchanged, as expected) -- it is bounded
+    by how much true row/col scale correlation the data has, not a
+    free lunch, and higher rank than the number of genuinely distinct
+    magnitude regimes in the data won't keep helping.
+
+    Reduces EXACTLY to rank1_fake_quantize when rank=1 (single bucket
+    containing every row = the identical 3-pass alternating fit)."""
+    if rank < 1:
+        raise ValueError(f"rank must be >= 1, got {rank}")
+    levels = 2 ** (bits - 1) - 1
+    n_in = len(ptrs) - 1
+    abs_vals = np.abs(vals.astype(np.float64))
+    row_of = np.repeat(np.arange(n_in), np.diff(ptrs).astype(np.int64))
+    col_of = indices.astype(np.int64)
+
+    row_max = np.zeros(n_in, dtype=np.float64)
+    np.maximum.at(row_max, row_of, abs_vals)
+    order = np.argsort(row_max, kind="stable")
+    bucket_of_sorted_row = np.minimum((np.arange(n_in) * rank) // max(n_in, 1), rank - 1)
+    row_bucket = np.zeros(n_in, dtype=np.int64)
+    row_bucket[order] = bucket_of_sorted_row
+    entry_bucket = row_bucket[row_of]
+
+    envelope = np.empty_like(abs_vals)
+    for b in range(rank):
+        mask = entry_bucket == b
+        if not np.any(mask):
+            continue
+        r_sub, c_sub, v_sub = row_of[mask], col_of[mask], abs_vals[mask]
+
+        row_scale = np.ones(n_in, dtype=np.float64)
+        col_scale = np.ones(n_out, dtype=np.float64)
+        for _ in range(3):
+            col_max = np.zeros(n_out, dtype=np.float64)
+            np.maximum.at(col_max, c_sub, v_sub / np.maximum(row_scale[r_sub], 1e-12))
+            col_scale = np.maximum(col_max, 1e-12)
+
+            row_max_pass = np.zeros(n_in, dtype=np.float64)
+            np.maximum.at(row_max_pass, r_sub, v_sub / np.maximum(col_scale[c_sub], 1e-12))
+            row_scale = np.maximum(row_max_pass, 1e-12)
+
+        envelope[mask] = row_scale[r_sub] * col_scale[c_sub]
+
+    step = np.maximum(envelope / levels, 1e-12)
+    out = np.round(vals.astype(np.float64) / step) * step
+    return out.astype(np.float32)
+
+
 def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
-                               quantize_importance: bool) -> None:
+                               quantize_importance: bool, rank: int = 1) -> None:
     c = inner._c
     ptrs = np.array(c.ptrs, copy=True)
     indices = np.array(c.indices, copy=True)
@@ -553,6 +632,9 @@ def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
     elif scheme == "rank1":
         w_q = rank1_fake_quantize(w, ptrs, indices, n_out, bits)
         imp_q = rank1_fake_quantize(imp, ptrs, indices, n_out, bits) if quantize_importance else imp
+    elif scheme == "rankn":
+        w_q = rankn_fake_quantize(w, ptrs, indices, n_out, bits, rank)
+        imp_q = rankn_fake_quantize(imp, ptrs, indices, n_out, bits, rank) if quantize_importance else imp
     else:
         raise ValueError(scheme)
     c.load_weights(ptrs, indices, w_q.astype(np.float32), imp_q.astype(np.float32))
@@ -584,6 +666,11 @@ class QuantizedDISLDOLayer32:
     OTHER toy models/tasks before being worth a real sili__new C++
     variant.
 
+    `scheme="rankn"` (with `rank` >= 2) is a follow-up being tested to
+    see whether it helps 4-bit specifically -- see rankn_fake_quantize's
+    own docstring for the mechanism and its honest, modest measured
+    effect. `rank` is only consulted when scheme=="rankn".
+
     Same disldo_cls-pluggable call convention as DISLDOLayer/
     DISLDOLayer32/AdamRowScaleDISLDOLayer -- drops directly into
     ToySmallTransformerRealFP4/ToyTileRecurrenceRealFP4 with no
@@ -591,12 +678,13 @@ class QuantizedDISLDOLayer32:
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, bits: int = 8, scheme: str = "rank1",
-                quantize_importance: bool = True,
+                quantize_importance: bool = True, rank: int = 1,
                 rng: Optional[np.random.Generator] = None):
         self._inner = DISLDOLayer32(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.bits = bits
         self.scheme = scheme
         self.quantize_importance = quantize_importance
+        self.rank = rank  # only consulted when scheme == "rankn"
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                damp_by_importance: bool = True) -> Tensor:
@@ -608,7 +696,7 @@ class QuantizedDISLDOLayer32:
             inner_bwd()  # real fp32 RMSprop update happens here first
             if learning_rate != 0.0:
                 _quantize_disldo32_inplace(self._inner, self.bits, self.scheme,
-                                           self.quantize_importance)
+                                           self.quantize_importance, self.rank)
 
         out._backward = _bwd
         return out
@@ -657,6 +745,34 @@ class ToySmallTransformerQuant4Rank1(ToySmallTransformerRealFP4):
                  max_weights: int, use_energy: bool = False,
                  num_cpus: int = 2, rms_eps: float = 1e-6):
         cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rank1",
+                                quantize_importance=True)
+        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
+                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+
+
+class ToySmallTransformerQuant4Rank2(ToySmallTransformerRealFP4):
+    """Same as ToySmallTransformerQuant4Rank1 but with rankn_fake_quantize
+    (rank=2, magnitude-bucketed column scale) in place of plain rank1
+    scaling -- tests whether the extra scale degree of freedom recovers
+    some of 4-bit's real quality cost vs rank-1."""
+
+    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
+                 max_weights: int, use_energy: bool = False,
+                 num_cpus: int = 2, rms_eps: float = 1e-6):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2,
+                                quantize_importance=True)
+        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
+                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+
+
+class ToySmallTransformerQuant4Rank4(ToySmallTransformerRealFP4):
+    """Same as ToySmallTransformerQuant4Rank2 but rank=4 -- checks
+    whether the trend (if any) continues past rank=2 or plateaus."""
+
+    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
+                 max_weights: int, use_energy: bool = False,
+                 num_cpus: int = 2, rms_eps: float = 1e-6):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=4,
                                 quantize_importance=True)
         super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
                          use_energy, num_cpus, rms_eps, disldo_cls=cls)
