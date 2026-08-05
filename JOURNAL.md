@@ -3053,3 +3053,84 @@ sili_peridot suite (257 tests) re-verified clean, no regressions. The
 comparison scripts themselves were ad hoc (matching this file's own
 established convention for the original rank-1 validation -- kept as
 JOURNAL numbers, not committed as permanent scripts).
+
+## Two more rank1-vs-rank2 follow-ups on the tanh-RNN beyond-context task: 2x recurrent state (no change), + energy (made it much worse)
+
+Two direct follow-up requests on the rank-n result above, same task/
+harness (HIDDEN=128 tanh-cell + `generate_deviation_sequence`, 8-seed
+paired significance tests).
+
+**2x recurrent state** (`HIDDEN=256`, cell params 2048->4096 at fixed
+`PER_ROW_K=8`): same story as HIDDEN=128, if anything slightly weaker.
+Rank-2 nominally wins 3 of 4 distances (n=2/3/4), loses at n=6, no
+point clears significance (best p=0.320, vs 0.199 at HIDDEN=128) --
+loss curves also noisier for rank-2 (a few seeds spiked to 0.82-0.99
+vs rank-1's tighter 0.56-0.81). Doubling state size doesn't change the
+conclusion: rank-2's benefit stays real-but-unconfirmed on this task
+regardless of scale.
+
+    n (dist)  rank1 mean  rank2 mean  diff     p (t / wilcoxon)
+    2 (ctx)     0.600       0.652    +0.052    0.787 / 0.945
+    3           0.300       0.481    +0.181    0.320 / 0.383
+    4           0.510       0.609    +0.099    0.321 / 0.219
+    6           0.719       0.634    -0.085    0.344 / 0.469
+
+**Does EnergyDynamics (forcing more of the recurrent state to fire,
+rather than let it collapse to the shutoff floor) change this?**
+Direct hypothesis: rank-n's bucketing needs real per-row magnitude
+diversity to have anything to exploit; if most of the state sits idle
+without energy, maybe there's nothing for rank-n to bucket usefully.
+Wired `EnergyDynamics` (`_toy_scale_energy()`'s existing drive=0.1
+toy-scale default, not a new value) into a per-tick gate on `h_new`
+(REPLACING it, not adding a residual -- an additive gate on top of the
+tanh output would reintroduce the exact forward-pass instability the
+ablation ladder already fixed by switching to full-overwrite tanh),
+applied every tick, aux_loss added to the query tick's loss before its
+one `.backward()` call (matches the no-BPTT design: earlier ticks'
+aux_loss can never carry gradient regardless, since backward only
+fires once per training example -- but the gating still matters
+through the values it threads forward as h_prev, and through
+EnergyDynamics' own running homeostatic state).
+
+**Result: energy did not help -- it collapsed BOTH rank1 and rank2 to
+pure chance at every distance, in-context included:**
+
+    arm          energy      n=2         n=3         n=4         n=6
+    4-bit rank1  off      0.70+-0.27  0.34+-0.22  0.63+-0.22  0.55+-0.26
+    4-bit rank2  off      0.76+-0.25  0.44+-0.33  0.55+-0.29  0.66+-0.22
+    4-bit rank1  on       0.49+-0.05  0.48+-0.05  0.49+-0.06  0.49+-0.03
+    4-bit rank2  on       0.50+-0.04  0.53+-0.04  0.52+-0.05  0.50+-0.04
+
+With energy on, accuracy sits within a few points of 0.5 for every
+arm/distance with a MUCH tighter std (0.03-0.06 vs 0.22-0.33 without)
+-- not "no improvement," an active regression that erased even the
+in-context (n=2) capability that worked fine before. Final training
+loss with energy stayed 2.5-3.7 across all 16 runs, vs 0.5-0.8 without
+-- cross-entropy alone caps out well under 1.0 for this binary-answer
+task, so a loss that high means the aux_loss term is dominating the
+gradient the whole way through training, not settling the way
+`_toy_scale_energy()`'s own docstring describes for the transformer
+arms it was tuned against. Plausible, not yet confirmed root cause
+(time-boxed, not chased further this pass): that config was tuned for
+a very different usage pattern (one call per T-length flattened
+sequence, transformer attention output) -- applying it per-TICK to an
+online recurrent state, with its own running energy state persisting
+continuously across the entire 3000-step training loop rather than
+being freshly seeded per sequence, may simply need different
+(likely much lower) drive/precision/density values, or aux_loss
+downweighting, to be usable in this regime at all. Matches an earlier,
+independent finding already in this file's own "Out-of-context
+benchmark" entries that energy showed no clear improvement over
+no-energy at out-of-context distances on a different architecture --
+here it's a stronger, worse result (active collapse, not just no
+gain), but the same general lesson: this project's toy-scale
+EnergyDynamics config does not obviously transfer between usage
+patterns and needs its own re-tuning per architecture, not assumed
+constant.
+
+**Honest bottom line**: cannot conclude anything about whether energy
+would help rank-n's story specifically, because energy in this
+configuration prevents the model from learning the task at all --
+the comparison is moot until (if ever) a usable energy config is
+found for this per-tick online regime. Not pursued further this pass,
+recorded as a real negative result rather than left unreported.
