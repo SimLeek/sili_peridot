@@ -2771,3 +2771,53 @@ pre-existing flaky energy-competition test differed between the two
 runs (present in one, absent in the other) -- matches this project's
 own already-documented order-dependent flakiness in that area, not a
 regression from this change.
+
+## sili__new: FP8 block4 dense-tile SIMD promotion landed (core), synaptogenesis wiring scoped as follow-up
+
+Second push to `feature/fp8-disldo` (commit `dbb4ebe`), per direct
+instruction to keep going on the block4 promotion piece.
+
+`Block4Tile8`/`Block4TileHandle8`/`Block4Store8` (block4.hpp): E4M3's
+tile format needs 2 bytes/slot (weight half + importance half, 32
+bytes/tile) instead of FP4's 1-byte nibble-packed 16-byte tile --
+fully separate types, zero modification to FP4's own `Block4Tile`/
+`Block4TileHandle`/`Block4Store`. Real, useful discovery while scoping
+this: `block4_row_shift`/`block4_grow_last_row`/
+`block4_ensure_row_headroom`/`block4_row_insert_tile`/
+`block4_row_remove_tile`/`block4_resize_tile_in_row` (the row-growth/
+compaction machinery) turned out to already be pure byte-buffer
+plumbing with zero assumption about slot width -- confirmed by reading
+each one directly, then reused completely unchanged, cutting the real
+new code needed roughly in half versus a full duplicate.
+
+`disldo_forward`/`disldo_backward`'s block4 sections (linear_disldo.hpp)
+now dispatch via `if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>)`
+-- FP4's branch is byte-for-byte the pre-existing code, untouched. The
+FP8 branch is deliberately scalar/correctness-first for now (matches
+this file's own established "first working version" precedent) --
+SIMD optimization for the block4 FP8 path is real, scoped follow-up
+work, not attempted yet.
+
+**Found and fixed a real stack buffer overflow while testing** (not
+hypothetical -- caught via GCC's stringop-overflow warning, confirmed
+with AddressSanitizer): a scratch buffer in the row-workspace write
+path was sized for FP4's 16 bytes/tile unconditionally, but the FP8
+tile-unpack call was writing 32 bytes into it. This is exactly the
+kind of thing extensive, ASan-checked testing exists to catch before
+it reaches real training -- worth remembering as a data point for how
+much verification this kind of low-level storage-format work needs.
+
+New `test_disldo_block4_fp8.cpp`: hand-promotes a block4 tile, checks
+forward output against a manual reference, checks backward moves the
+weight/importance and dx sanity -- clean under ASan/UBSan. Full test
+suite (existing FP4 + new FP8, Python + C++) diffed before/after
+again: zero new failures.
+
+**Real, explicitly scoped gap, not silently deferred:** synaptogenesis
+-triggered automatic block4 promotion/demotion
+(`delta_csr_memory.hpp`'s `block4_maybe_promote`/`block4_demote_tile`)
+is ALSO FP4-hardcoded and not yet dispatched for FP8 -- calling
+`synap_row_step` on a growing FP8 layer would currently write wrong
+(FP4-nibble-decoded) bytes into what should be E4M3 tile data. Tiles
+must be seeded manually (as the test does) until this lands. Tracked
+as its own follow-up, not started.
