@@ -45,12 +45,13 @@ its one real approximation.
 """
 from __future__ import annotations
 
+import functools
 from typing import List, Optional, Tuple
 
 import numpy as np
 
 from sili.tensor import Tensor, banded_attention, silu, _acc
-from sili.sparse_rnn import DISLDOLayer
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
 from sili.energy import EnergyDynamics
 
 from .toy_recall_models import rmsnorm_tensor, AdamOptimizer
@@ -485,6 +486,180 @@ class ToySmallTransformerRealFP4Rank1Adam(ToySmallTransformerRealFP4):
         super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
                          use_energy, num_cpus, rms_eps,
                          disldo_cls=AdamRank1DISLDOLayer)
+
+
+def row_scale_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, bits: int) -> np.ndarray:
+    """Per-row max-abs scale, symmetric signed N-bit levels -- matches
+    sili's own existing value_scale convention. Deterministic
+    round-to-nearest (NOT stochastic -- keeps this isolated from FP4's
+    own stochastic-rounding noise, a separate, already-characterized
+    variable)."""
+    levels = 2 ** (bits - 1) - 1  # e.g. 7 for 4-bit, 127 for 8-bit
+    out = vals.copy()
+    for r in range(len(ptrs) - 1):
+        s, e = int(ptrs[r]), int(ptrs[r + 1])
+        if e <= s:
+            continue
+        seg = vals[s:e]
+        max_abs = float(np.max(np.abs(seg)))
+        if max_abs < 1e-12:
+            continue
+        scale = max_abs / levels
+        out[s:e] = np.round(seg / scale) * scale
+    return out
+
+
+def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
+                        n_out: int, bits: int) -> np.ndarray:
+    """Row scale * col scale (rank-1 envelope, matching sili_peridot's
+    own B5a fix for the shared-scale FP4 catastrophe): alternating
+    max-fit, 3 passes. Fully vectorized (np.maximum.at scatter-max, no
+    per-synapse Python loop) -- must stay cheap enough to run every
+    training step at full density."""
+    levels = 2 ** (bits - 1) - 1
+    n_in = len(ptrs) - 1
+    abs_vals = np.abs(vals.astype(np.float64))
+    row_of = np.repeat(np.arange(n_in), np.diff(ptrs).astype(np.int64))
+    col_of = indices.astype(np.int64)
+
+    row_scale = np.ones(n_in, dtype=np.float64)
+    col_scale = np.ones(n_out, dtype=np.float64)
+    for _ in range(3):
+        col_max = np.zeros(n_out, dtype=np.float64)
+        np.maximum.at(col_max, col_of, abs_vals / np.maximum(row_scale[row_of], 1e-12))
+        col_scale = np.maximum(col_max, 1e-12)
+
+        row_max = np.zeros(n_in, dtype=np.float64)
+        np.maximum.at(row_max, row_of, abs_vals / np.maximum(col_scale[col_of], 1e-12))
+        row_scale = np.maximum(row_max, 1e-12)
+
+    envelope = row_scale[row_of] * col_scale[col_of]
+    step = np.maximum(envelope / levels, 1e-12)
+    out = np.round(vals.astype(np.float64) / step) * step
+    return out.astype(np.float32)
+
+
+def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
+                               quantize_importance: bool) -> None:
+    c = inner._c
+    ptrs = np.array(c.ptrs, copy=True)
+    indices = np.array(c.indices, copy=True)
+    w = np.array(c.weights_vals, copy=True)
+    imp = np.array(c.importance, copy=True)
+    n_out = c.n_outputs
+    if scheme == "row":
+        w_q = row_scale_fake_quantize(w, ptrs, bits)
+        imp_q = row_scale_fake_quantize(imp, ptrs, bits) if quantize_importance else imp
+    elif scheme == "rank1":
+        w_q = rank1_fake_quantize(w, ptrs, indices, n_out, bits)
+        imp_q = rank1_fake_quantize(imp, ptrs, indices, n_out, bits) if quantize_importance else imp
+    else:
+        raise ValueError(scheme)
+    c.load_weights(ptrs, indices, w_q.astype(np.float32), imp_q.astype(np.float32))
+
+
+class QuantizedDISLDOLayer32:
+    """A real DISLDOLayer32 (fp32 DeltaCSRBiValues backend, same
+    RMSprop-style importance formula as production DISLDOLayer) whose
+    weight AND importance arrays get fake-quantized to `bits` right
+    after every backward() call that actually trains (learning_rate !=
+    0.0). Simulates "this layer's real storage is N-bit" while keeping
+    the forward/backward ARITHMETIC itself exact fp32 -- isolates
+    "does training survive N-bit storage" from "is the update-rule
+    math itself precise", matching real quantization-aware-training
+    simulators.
+
+    Found empirically (see sili_peridot JOURNAL.md, the original
+    single-RNN-task sweep in the quantization-exploration script):
+    8-bit + rank-1 scale (row*col envelope), quantizing BOTH weight
+    and importance, reaches near-FP32 convergence quality; plain
+    per-row scale needs to leave importance in FP32 to do nearly as
+    well; 4-bit (either scale scheme) converges but at a real quality
+    cost even with rank-1 -- importance's dynamic range is shaped by
+    BOTH forward and backward signal, unlike a weight, which is why it
+    needs the extra rank-1 degree of freedom more. Defaults here
+    (bits=8, scheme=rank1, quantize_importance=True) are that
+    empirically-validated winner, not an arbitrary default -- this
+    class is the vehicle for testing whether it generalizes across
+    OTHER toy models/tasks before being worth a real sili__new C++
+    variant.
+
+    Same disldo_cls-pluggable call convention as DISLDOLayer/
+    DISLDOLayer32/AdamRowScaleDISLDOLayer -- drops directly into
+    ToySmallTransformerRealFP4/ToyTileRecurrenceRealFP4 with no
+    changes needed there."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                num_cpus: int = 4, bits: int = 8, scheme: str = "rank1",
+                quantize_importance: bool = True,
+                rng: Optional[np.random.Generator] = None):
+        self._inner = DISLDOLayer32(in_features, out_features, max_weights, num_cpus, rng=rng)
+        self.bits = bits
+        self.scheme = scheme
+        self.quantize_importance = quantize_importance
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+               damp_by_importance: bool = True) -> Tensor:
+        out = self._inner.forward(x, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                  damp_by_importance=damp_by_importance)
+        inner_bwd = out._backward
+
+        def _bwd():
+            inner_bwd()  # real fp32 RMSprop update happens here first
+            if learning_rate != 0.0:
+                _quantize_disldo32_inplace(self._inner, self.bits, self.scheme,
+                                           self.quantize_importance)
+
+        out._backward = _bwd
+        return out
+
+    def parameters(self) -> List[Tensor]:
+        return []  # nothing here is an external-optimizer-trainable Tensor leaf
+
+
+class ToySmallTransformerFP32Ref(ToySmallTransformerRealFP4):
+    """ToySmallTransformerRealFP4 built from plain DISLDOLayer32 (fp32
+    DeltaCSRBiValues, RMSprop importance, NO quantization) -- the
+    reference ceiling this class's own quantized siblings below are
+    measured against, on the SAME architecture/task (not the separate
+    single-RNN-task reference the quantization scheme was originally
+    validated on)."""
+
+    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
+                 max_weights: int, use_energy: bool = False,
+                 num_cpus: int = 2, rms_eps: float = 1e-6):
+        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
+                         use_energy, num_cpus, rms_eps,
+                         disldo_cls=DISLDOLayer32)
+
+
+class ToySmallTransformerQuant8Rank1(ToySmallTransformerRealFP4):
+    """ToySmallTransformerRealFP4 with QuantizedDISLDOLayer32 (8-bit,
+    rank-1 scale, weight+importance both quantized -- the validated
+    winner config) in place of plain DISLDOLayer. See
+    QuantizedDISLDOLayer32's own docstring."""
+
+    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
+                 max_weights: int, use_energy: bool = False,
+                 num_cpus: int = 2, rms_eps: float = 1e-6):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=8, scheme="rank1",
+                                quantize_importance=True)
+        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
+                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+
+
+class ToySmallTransformerQuant4Rank1(ToySmallTransformerRealFP4):
+    """Same as ToySmallTransformerQuant8Rank1 but 4-bit -- the
+    known-worse (but not broken) config, kept as a comparison point,
+    not the recommended default."""
+
+    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
+                 max_weights: int, use_energy: bool = False,
+                 num_cpus: int = 2, rms_eps: float = 1e-6):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rank1",
+                                quantize_importance=True)
+        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
+                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
 
 
 class _PeakEligibilityTrace:

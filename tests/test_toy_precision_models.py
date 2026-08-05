@@ -11,6 +11,9 @@ from model.toy_precision_models import (
     ToySmallTransformerArtificialFP4, ToySmallTransformerRealFP4,
     AdamRowScaleDISLDOLayer, ToySmallTransformerRealFP4RowScaleAdam,
     AdamRank1DISLDOLayer, ToySmallTransformerRealFP4Rank1Adam,
+    row_scale_fake_quantize, rank1_fake_quantize, QuantizedDISLDOLayer32,
+    ToySmallTransformerFP32Ref, ToySmallTransformerQuant8Rank1,
+    ToySmallTransformerQuant4Rank1,
     _PeakEligibilityTrace, PeakEligibilityDISLDOLayer,
 )
 from model.toy_recall_models import cross_entropy_sum, AdamOptimizer
@@ -303,6 +306,135 @@ class TestToySmallTransformerRealFP4Rank1Adam:
         after = model.forward(probe, learning_rate=0.0)[0].data
         assert np.all(np.isfinite(after))
         assert not np.allclose(before, after)
+
+
+class TestRowScaleFakeQuantize:
+    def test_reproduces_input_exactly_at_16_bits(self):
+        # 16 signed levels' worth of headroom is plenty to round-trip
+        # small random values without a visible quantization error.
+        rng = np.random.RandomState(0)
+        ptrs = np.array([0, 3, 3, 6], dtype=np.int32)
+        vals = (rng.randn(6) * 0.1).astype(np.float32)
+        out = row_scale_fake_quantize(vals, ptrs, bits=16)
+        np.testing.assert_allclose(out, vals, atol=1e-3)
+
+    def test_empty_row_is_a_no_op(self):
+        ptrs = np.array([0, 0, 2], dtype=np.int32)
+        vals = np.array([1.0, -1.0], dtype=np.float32)
+        out = row_scale_fake_quantize(vals, ptrs, bits=8)
+        assert np.all(np.isfinite(out))
+
+
+class TestRank1FakeQuantize:
+    def test_output_is_finite_and_bounded_by_input_envelope(self):
+        rng = np.random.RandomState(0)
+        n_in, n_out, k = 5, 6, 3
+        ptrs = np.arange(0, (n_in + 1) * k, k).astype(np.int32)
+        indices = np.concatenate([rng.choice(n_out, size=k, replace=False)
+                                  for _ in range(n_in)]).astype(np.int32)
+        vals = (rng.randn(n_in * k) * 0.5).astype(np.float32)
+        out = rank1_fake_quantize(vals, ptrs, indices, n_out, bits=8)
+        assert np.all(np.isfinite(out))
+        assert np.max(np.abs(out)) <= np.max(np.abs(vals)) * 1.5
+
+
+class TestQuantizedDISLDOLayer32:
+    def test_forward_shape_and_finite(self):
+        layer = QuantizedDISLDOLayer32(HIDDEN, VOCAB, MAX_WEIGHTS, num_cpus=2)
+        x = np.random.RandomState(0).randn(4, HIDDEN).astype(np.float32)
+        out = layer.forward(x, learning_rate=0.01)
+        assert out.data.shape == (4, VOCAB)
+        assert np.all(np.isfinite(out.data))
+
+    def test_weights_and_importance_stay_finite_after_training_and_quantization(self):
+        layer = QuantizedDISLDOLayer32(HIDDEN, VOCAB, MAX_WEIGHTS, num_cpus=2,
+                                       bits=8, scheme="rank1", quantize_importance=True)
+        x = np.random.RandomState(1).randn(4, HIDDEN).astype(np.float32)
+        out = layer.forward(x, learning_rate=0.05)
+        out.grad = np.ones_like(out.data)
+        out.backward()
+        c = layer._inner._c
+        assert np.all(np.isfinite(c.weights_vals))
+        assert np.all(np.isfinite(c.importance))
+
+    def test_eval_call_with_zero_learning_rate_does_not_quantize(self):
+        layer = QuantizedDISLDOLayer32(HIDDEN, VOCAB, MAX_WEIGHTS, num_cpus=2)
+        before = np.array(layer._inner._c.weights_vals, copy=True)
+        x = np.random.RandomState(2).randn(4, HIDDEN).astype(np.float32)
+        out = layer.forward(x, learning_rate=0.0)
+        out.grad = np.ones_like(out.data)
+        out.backward()
+        after = layer._inner._c.weights_vals
+        np.testing.assert_allclose(before, after)
+
+    def test_no_external_optimizer_parameters(self):
+        layer = QuantizedDISLDOLayer32(HIDDEN, VOCAB, MAX_WEIGHTS, num_cpus=2)
+        assert layer.parameters() == []
+
+    @pytest.mark.parametrize("bits,scheme", [(8, "row"), (4, "row"), (8, "rank1"), (4, "rank1")])
+    def test_all_bit_width_and_scheme_combinations_stay_finite(self, bits, scheme):
+        layer = QuantizedDISLDOLayer32(HIDDEN, VOCAB, MAX_WEIGHTS, num_cpus=2,
+                                       bits=bits, scheme=scheme, quantize_importance=True)
+        rng = np.random.RandomState(bits + (0 if scheme == "row" else 100))
+        for _ in range(5):
+            x = rng.randn(4, HIDDEN).astype(np.float32)
+            out = layer.forward(x, learning_rate=0.05)
+            out.grad = np.ones_like(out.data)
+            out.backward()
+        assert np.all(np.isfinite(layer._inner._c.weights_vals))
+        assert np.all(np.isfinite(layer._inner._c.importance))
+
+
+class TestToySmallTransformerQuant8Rank1:
+    def test_shapes_and_finite(self):
+        model = ToySmallTransformerQuant8Rank1(VOCAB, HIDDEN, MLP_HIDDEN, 2,
+                                               MAX_WEIGHTS, use_energy=False, num_cpus=2)
+        T = 6
+        embedded = np.random.RandomState(1).randn(T, HIDDEN).astype(np.float32) * 0.1
+        logits, aux_loss = model.forward(embedded, learning_rate=0.01)
+        assert logits.data.shape == (T, VOCAB)
+        assert np.all(np.isfinite(logits.data))
+        assert aux_loss is None
+
+    def test_big_weights_change_after_a_step_with_no_external_optimizer(self):
+        model = ToySmallTransformerQuant8Rank1(VOCAB, HIDDEN, MLP_HIDDEN, 2,
+                                               MAX_WEIGHTS, use_energy=False, num_cpus=2)
+        probe = np.random.RandomState(3).randn(4, HIDDEN).astype(np.float32) * 0.1
+        before = model.forward(probe, learning_rate=0.0)[0].data.copy()
+
+        train_x = np.random.RandomState(4).randn(4, HIDDEN).astype(np.float32) * 0.1
+        logits, _aux = model.forward(train_x, learning_rate=0.01)
+        loss = cross_entropy_sum(logits, [(0, 1), (1, 2), (2, 3), (3, 4)])
+        loss.grad = np.array(1.0, dtype=np.float32)
+        loss.backward()
+
+        after = model.forward(probe, learning_rate=0.0)[0].data
+        assert np.all(np.isfinite(after))
+        assert not np.allclose(before, after)
+
+
+class TestToySmallTransformerFP32Ref:
+    def test_shapes_and_finite(self):
+        model = ToySmallTransformerFP32Ref(VOCAB, HIDDEN, MLP_HIDDEN, 2,
+                                           MAX_WEIGHTS, use_energy=False, num_cpus=2)
+        T = 6
+        embedded = np.random.RandomState(1).randn(T, HIDDEN).astype(np.float32) * 0.1
+        logits, aux_loss = model.forward(embedded, learning_rate=0.01)
+        assert logits.data.shape == (T, VOCAB)
+        assert np.all(np.isfinite(logits.data))
+        assert aux_loss is None
+
+
+class TestToySmallTransformerQuant4Rank1:
+    def test_shapes_and_finite(self):
+        model = ToySmallTransformerQuant4Rank1(VOCAB, HIDDEN, MLP_HIDDEN, 2,
+                                               MAX_WEIGHTS, use_energy=False, num_cpus=2)
+        T = 6
+        embedded = np.random.RandomState(1).randn(T, HIDDEN).astype(np.float32) * 0.1
+        logits, aux_loss = model.forward(embedded, learning_rate=0.01)
+        assert logits.data.shape == (T, VOCAB)
+        assert np.all(np.isfinite(logits.data))
+        assert aux_loss is None
 
 
 class TestPeakEligibilityTrace:
