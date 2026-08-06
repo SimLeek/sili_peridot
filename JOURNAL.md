@@ -3282,3 +3282,99 @@ catastrophically (genuine numerical blowup) -- a real, useful robustness
 difference worth knowing, and one more concrete reason FP8 is the safer
 default -- but getting energy to actually IMPROVE this task (vs. just
 not break it) remains unsolved with either storage format.
+
+## CORRECTION: energy's own drive/p defaults were miscalibrated, not FP4 -- once fixed, both FP4 and FP8 show real above-chance learning
+
+**This supersedes the "FP4 diverges, FP8 doesn't" framing directly above.**
+Per direct pushback ("this doesn't make any sense mathematically -- if
+drive is low enough the fire events rarely happen, and if aux_loss is low
+enough it can't compete... something in energy has to be making things
+fail"): correct instinct, and it led to the actual root cause, which
+neither the reactivity sweep nor the fired-value sweep above ever tested
+-- `drive` and `p` themselves.
+
+**Measured directly** (not assumed) what the DEFAULT toy config
+(`drive=0.1`, `p=0.3`, unchanged in every experiment run so far) was
+actually doing to a 128-wide state, every tick: ~30% of neurons fired
+(pinned to the flat constant) on 99.5% of ticks, ~70% got hard-zeroed.
+Tried the user's exact hypothesis next -- lower `drive` to make fire
+events rare -- and it does (0% fired at `drive<=0.01`), but the zeroed
+fraction climbed to 99%+, WORSE than the firing case, not better. Traced
+why directly: `new_energy = energy + drive + noise - activation_cost*|h|`
+every tick, unconditionally; at low drive this term is net NEGATIVE
+(`activation_cost*E[|h|] ~= 0.05*0.32 ~= 0.016` easily exceeds a small
+drive), so instead of firing, the whole population drifts into
+PERMANENT SHUTOFF and gets pinned there (confirmed: mean energy converges
+to exactly -2.0 within ~500 ticks) -- and a shutoff-pinned neuron's own
+output formula (`energy_flat + 2.0`, with energy_flat clamped at -2.0)
+evaluates to ~0.0 too, indistinguishable from being suppressed. There is
+no "does nothing" regime reachable by lowering drive alone -- it's
+bimodal: too-high drive saturates on firing, too-low drive saturates on
+shutoff, and BOTH destroy most of the carried state, just via different
+absorbing thresholds.
+
+**The actual fix**: calibrate drive to the POPULATION's own typical |h|,
+not treat it as an independent knob: `drive ~= activation_cost * E[|h|]`.
+Measured `E[|h|]~=0.32` for this cell's tanh output, giving
+`drive~=0.016`. Also raised `p` (the independent hard active-fraction
+ceiling) from 0.3 to 0.95, since even a perfectly-calibrated drive still
+leaves `1-p` of the population zeroed via the top-p competition,
+unrelated to drive/activation_cost at all. Verified directly: this
+config cuts firing to 0% and zeroing to ~5% (vs 70-99%+ in both failure
+regimes) -- a genuinely quiet operating point, found and confirmed BEFORE
+spending another training run on it.
+
+**Documented in sili__new itself, not just here** (per direct request:
+"the energy function should have the equation... describing how often
+neurons will fire or be driven to zero") -- `sili/energy.py`'s
+`_apply_energy_dynamics` docstring now has a full derivation of this
+balance point and both failure regimes, with the real measured numbers
+above as worked examples. Pure docstring addition (zero behavior
+change, confirmed via the existing `TestEnergyDynamicsKeptIndices`
+suite passing unmodified). Branch `docs/energy-fire-shutoff-balance`,
+commit `c7206e5`, pushed for review (not yet merged) -- this branch was
+made from a fresh `origin/main` checkout since `feature/fp8-disldo`
+(where `DISLDOLayer32`/`DISLDOLayer8` live) hasn't been merged to main
+yet either; testing below still runs on `feature/fp8-disldo` for that
+reason.
+
+**Real training result, 100,000 steps each, calibrated config
+(`drive=0.016, p=0.95, reactivity=0.001`), same tanh-RNN beyond-context
+task, checkpoints every 10,000 steps -- genuine above-chance accuracy
+across every distance, for every arm, not just bounded loss:**
+
+    FP8    ce: 1.04 0.69 0.72 0.71 0.70 0.72 0.66 0.68 0.66 0.65  (clean, ~monotonic)
+    rank2  ce: 1.07 0.68 0.74 0.75 0.79 1.91 1.67 1.42 0.95 0.97  (one bump, recovers)
+    rank1  ce: 1.06 0.80 1.24 0.91 4.98 4.43 1.56 1.29 1.02 0.80  (real spike, recovers)
+
+    Mean accuracy across all 10 checkpoints, by distance (chance = 0.5):
+    arm     n=2(ctx)  n=3    n=4    n=6    overall mean
+    FP8      0.725   0.585  0.573  0.534    0.604
+    rank2    0.737   0.606  0.611  0.518    0.618
+    rank1    0.603   0.552  0.518  0.547    0.555
+
+Every arm, every distance, beats chance on average -- including every
+OUT-OF-CONTEXT distance (n=3/4/6), the thing this whole task exists to
+test. This is a complete reversal from every energy result earlier in
+this file: the miscalibrated default didn't just fail to help, it
+actively prevented the model from learning at all regardless of storage
+format; the calibrated config lets the SAME architecture, SAME task,
+SAME quantization schemes actually learn, FP4 included.
+
+**One real nuance, not smoothed over**: rank2 edges out FP8 on average
+accuracy (0.618 vs 0.604) but has a real, if recovered, CE spike;
+rank1 is both the noisiest (real 4-5x CE spike at steps 50-60k) and the
+lowest-average of the three (0.555, still above chance at every distance
+but by less). This matches this file's own earlier, independent finding
+(rank-1 alone is FP4's weaker configuration) -- now shown to hold even
+under a correctly-calibrated energy setup, not just as an artifact of
+the earlier broken one. FP8's own curve is the smoothest/most stable of
+the three even though it isn't the top scorer -- still the safer default
+pick when stability matters more than squeezing out the last bit of
+accuracy.
+
+Single seed per arm -- a real, honest result worth taking seriously
+given the magnitude of the reversal, but not yet a statistically
+confirmed one (this file's own established standard, per the
+peak-eligibility 50-seed check). Multi-seed confirmation is the natural
+next step if this line of work continues.
