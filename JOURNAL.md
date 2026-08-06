@@ -3378,3 +3378,103 @@ given the magnitude of the reversal, but not yet a statistically
 confirmed one (this file's own established standard, per the
 peak-eligibility 50-seed check). Multi-seed confirmation is the natural
 next step if this line of work continues.
+
+## Multi-seed confirmation: n=20, 50,000 steps -- statistically significant above-chance learning at every distance, for every arm
+
+Direct follow-up (n=8/30,000-step run above was underpowered -- best
+vs-chance p was 0.066). Two real methodological corrections came out of
+getting here, both from direct pushback, worth recording:
+
+1. **The right null-hypothesis test is a one-sample test of each
+   independently-trained seed's own accuracy against chance (0.5)**,
+   not a pooled binomial test over all raw eval trials. Within one
+   seed, all `EVAL_SEQUENCES` trials are scored by the SAME frozen
+   trained network -- they share whatever fixed bias that one network
+   has, so they are not independent draws for the question "does this
+   PROCEDURE reliably beat chance." Confirmed this matters in practice,
+   not just in theory: per-seed accuracy at a fixed distance varies by
+   as much as ~0.2 across seeds in this data -- real between-seed
+   heterogeneity that a naive pooled test would misattribute to sampling
+   noise, inflating significance. Seed count, not eval-trial count, is
+   what buys real power here.
+2. **The z-test proposed as an alternative (`(mean-null)/SE`) is the
+   same computation as `ttest_1samp`** -- the only difference is
+   reference distribution (normal vs Student's t), and t is the more
+   correct (more conservative) choice at small n, not a different or
+   weaker measure.
+
+Given that, the fix for the n=8 result being underpowered is genuinely
+more independently-trained seeds (not more eval trials per seed, which
+barely moves wall-clock time since training dominates it) -- scaled up
+to n=20 seeds, and separately increased steps 30,000 -> 50,000 per seed
+(the original single-seed check that motivated this whole line of
+investigation used 30,000-100,000 steps; 30,000 may have been cutting
+some seeds off before they'd settled). ~50-67 min per arm, 3 arms run
+in parallel.
+
+**Result -- every arm, every distance, now clears p<0.05, most by a
+wide margin** (`scipy.stats.ttest_1samp` against 0.5, n=20):
+
+    arm     n=2 (ctx)         n=3               n=4               n=6
+    rank1   p<0.0001 (0.713)  p=0.0001 (0.584)  p=0.0058 (0.557)  p=0.0235 (0.534)
+    rank2   p<0.0001 (0.800)  p<0.0001 (0.682)  p=0.0019 (0.571)  p=0.0068 (0.560)
+    fp8     p<0.0001 (0.716)  p=0.0029 (0.581)  p=0.0111 (0.555)  p=0.0020 (0.550)
+
+This is now a real, statistically confirmed result, not just a
+suggestive average: genuine above-chance learning, INCLUDING every
+out-of-context distance, for all three storage formats, once energy is
+correctly calibrated. The n=8 result wasn't wrong, it was underpowered
+-- exactly the outcome that combination of more seeds and more training
+steps predicts if the true effect is real (which it is).
+
+**Pairwise, also now much clearer** (`ttest_rel`/`wilcoxon`, n=20):
+
+    rank2 vs rank1:  n=2 p=0.001  n=3 p=0.001  n=4 p=0.645  n=6 p=0.323
+    fp8   vs rank1:  n=2 p=0.926  n=3 p=0.918  n=4 p=0.930  n=6 p=0.376
+
+Rank-2's benefit over rank-1 is now real and significant, but
+DISTANCE-DEPENDENT -- clearly ahead at the two easier distances (n=2,
+n=3), not distinguishable from rank-1 at the two harder ones (n=4, n=6).
+FP8 is statistically indistinguishable from rank-1 throughout -- not
+ahead of it, contradicting this file's own earlier (single-seed,
+miscalibrated-energy) framing that FP8 was the stronger performer.
+
+**Two claims worth being precise about, not overclaiming:**
+
+- **"Only with energy"** -- plausible given the earlier miscalibrated
+  -energy divergence, but NOT directly verified: no matched no-energy
+  control has been run at this same n=20/50,000-step scale (the
+  session's earlier no-energy rank1-vs-rank2 comparisons were at
+  n=8/3,000 steps, a much weaker test, and never included a vs-chance
+  test at all). This is a real, cheap, natural next check if pursued
+  further -- not yet done.
+- **"Genuinely new in machine learning"** -- an earlier draft of this
+  entry claimed low-bit QAT is generally established and left it at
+  that; corrected via a literature search, since the claim shouldn't
+  have been asserted without one. Findings: Optimizing LLM Training
+  Using FP4 Quantization (arXiv:2501.17116) and FP4 All the Way
+  (arXiv:2505.19115) quantize weights/activations/gradients to FP4 but
+  don't put optimizer state there. Memory Efficient Optimizers with
+  4-bit States (arXiv:2309.01507) quantizes Adam's moments to 4-bit but
+  keeps the weights themselves at standard precision -- the reverse
+  split. Full-Stack FP4 (arXiv:2607.04422) states directly that prior
+  FP4 pretraining work left "optimizer states, optimizer arithmetic and
+  attention... underexplored in 4-bit pipelines," and identifies why:
+  AdamW's second moment is heavy-tailed and fragile at low precision.
+  That paper is the first attempt at combining both, and still needs a
+  specific AdamW-second-moment transform plus BF16 fallbacks on some
+  paths -- not a plain quantize-and-go.
+
+  DISLDOLayer's own mechanism doesn't use Adam's moments -- the
+  per-synapse "importance" term is a single RMSprop-style decayed
+  scalar, not the `m`/`v` pair the above papers are quantizing. The
+  only higher-precision state is the rank-1 (or rank-2) `value_scale`/
+  `output_scale` floats, one set per row/column rather than per weight.
+  So this isn't a result on the same question those papers are working
+  on; it's a different update rule that doesn't have that particular
+  state to quantize. The claim this JOURNAL entry can actually stand
+  behind: on this specific no-BPTT, per-tick online recurrent latch
+  task, FP4 (rank-1 or rank-2 helpers, no Adam-style optimizer state)
+  was diverging under the library's default energy config and became
+  reliably, significantly trainable once energy was correctly
+  calibrated.
