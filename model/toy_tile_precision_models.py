@@ -48,6 +48,7 @@ import numpy as np
 
 from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu
 from sili.sparse_rnn import DISLDOLayer
+from sili.energy import EnergyDynamics
 
 from .toy_recall_models import rmsnorm_tensor
 from .toy_precision_models import _toy_scale_energy, _apply_energy
@@ -70,14 +71,28 @@ class ToyTileRecurrenceRealFP4:
     def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
                  mlp_hidden: int, num_tiles: int, max_weights: int,
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
-                 use_energy: bool = False):
+                 use_energy: bool = False, energy_kwargs: Optional[dict] = None):
+        """energy_kwargs: overrides _toy_scale_energy()'s defaults when
+        given (passed straight to EnergyDynamics(**energy_kwargs)) --
+        needed because the drive/activation_cost balance point depends
+        on this call site's own attn-output magnitude (gaussian_attention's
+        raw output here, pre-o_proj -- a different distribution than
+        the tanh-cell recurrence _toy_scale_energy()'s defaults were
+        ever checked against), not a fixed constant that transfers.
+        See sili__new's energy.py docstring ("Choosing drive relative
+        to activation_cost") for the derivation."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
         self.num_tiles = num_tiles
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
-        self.energy = _toy_scale_energy() if use_energy else None
+        if not use_energy:
+            self.energy = None
+        elif energy_kwargs is not None:
+            self.energy = EnergyDynamics(**energy_kwargs)
+        else:
+            self.energy = _toy_scale_energy()
         state_width = self.state_width
         self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
         self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
