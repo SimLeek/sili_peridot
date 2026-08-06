@@ -3211,3 +3211,74 @@ gate's discrete spike representation and a task that needs exact values
 threaded through state. Consistent with the user's own decision to table
 FP4 (and by extension, this energy angle) for now and proceed with FP8,
 which needed none of this.
+
+## Two direct follow-ups: does energy break FP8 the same way? Does fixing the fired-neuron constant fix FP4?
+
+Per direct request. Six 100,000-step runs (HIDDEN=128, `reactivity=0.001`,
+checkpointed every 10,000 steps): {FP4-rank1, FP8 (`DISLDOLayer8`)} x
+{fired_value = 2.0 (real/unmodified), 1.0, tanh(2)~0.964}. `fired_value` is a
+LOCAL, exploratory modification (not yet landed in sili__new) -- a copy of
+`_apply_energy_dynamics` with only the fired-neuron output constant
+parameterized; the fire/shutoff energy THRESHOLD stays the real 2.0
+(that's tied to the accumulator's own integrate-and-fire dynamics, a
+separate concern from what value gets written into h_out when a neuron
+fires).
+
+**Cross-entropy trajectories, all six runs, checkpoints at steps
+10k/20k/.../100k:**
+
+    FP8,  fired=2.0 (default): 1.93 0.77 1.29 1.53 1.72 1.58 1.39 1.18 0.98 0.87
+    FP8,  fired=1.0:           1.16 0.72 0.81 0.87 0.94 0.94 0.87 0.82 0.79 0.76
+    FP8,  fired=tanh(2):       1.12 0.74 0.77 0.86 0.95 0.90 0.88 0.81 0.77 0.75
+    FP4,  fired=2.0 (default): 1.80 0.72 1.21 5.79 5.81 4.96 7.42 6.06 4.76 5.26
+    FP4,  fired=1.0:           1.15 0.72 0.74 3.14 19.07 15.28 11.35 8.46 5.21 5.00
+    FP4,  fired=tanh(2):       1.12 0.71 0.70 2.68 3.71 6.85 6.21 4.45 3.03 2.08
+
+**A) Does energy break FP8 the way it broke FP4? No -- a real, clean
+asymmetry, independent of fired_value.** All three FP8 variants stay
+bounded (roughly 0.7-1.9 the whole run) and every one trends DOWNWARD by
+the end (0.87, 0.76, 0.75 final) -- no runaway. All three FP4 variants
+show the same divergence-onset signature regardless of fired_value:
+healthy through ~step 30,000 (ce~0.7-1.2, matching FP8's own range
+exactly at that point), then a sharp jump starting around step 40,000
+-50,000 into the 3-19 range, staying elevated the rest of the run. FP4's
+own coarser quantization (or its inline weight-update dynamics) appears
+to be what interacts badly with energy's feedback loop -- not something
+present in FP8 at the same HIDDEN size, same task, same energy config.
+Caveat carried over honestly from the earlier 1.5M-step FP4 test: 100,000
+steps is a much shorter horizon than the 1.5M that made FP4's divergence
+undeniable, so this doesn't prove FP8 would stay bounded forever -- only
+that it clearly doesn't show FP4's SAME divergence onset within a much
+longer window (30x) than FP4 needed to start clearly diverging.
+
+**B) Does changing the fired-neuron constant to something inside tanh's
+range fix FP4? No -- refutes the original hypothesis about WHY it
+diverges.** All three FP4 variants diverge with the same onset timing
+regardless of fired_value (2.0, 1.0, or tanh(2)) -- changing the constant
+did not prevent, delay, or meaningfully alter the ONSET of divergence.
+There is a real, smaller, honestly-reportable difference in SEVERITY
+among the three FP4 variants -- tanh(2) is the mildest (peaks at 6.85,
+declining to 2.08 by the end, the only FP4 variant with a clear late
+-downward trend) vs 1.0 (peaks at 19.07, stays elevated ~5.0 at the end)
+vs 2.0 (peaks at 7.42, stays elevated ~5.3 at the end) -- so the exact
+fired value is NOT irrelevant, but none of the three variants come close
+to recovering FP8's stable ~0.75-0.87 range or the healthy ~0.7 level FP4
+itself showed in its own first 30,000 steps before diverging. This means
+the original root-cause hypothesis (the constant being numerically
+out-of-range for tanh is THE cause) was too narrow -- the real
+interaction is more likely between FP4's own coarse discrete weight
+storage / inline C++ update rule and energy's fire-together-wire
+-together gradient pathway specifically, with the fired constant's exact
+value only a secondary, severity-modulating factor, not the root cause.
+
+**One more honest point neither result should obscure: NONE of the six
+configs actually learned the task.** Accuracy sat at chance (roughly
+0.34-0.63, no consistent trend above 0.5) across every checkpoint of
+every run, FP8 included. FP8's stability here means "bounded, well
+-behaved loss that doesn't diverge" -- not "energy works with FP8 on
+this task." The real, precise conclusion: FP8 fails at this task
+gracefully under energy (no risk of NaN/runaway loss), FP4 fails
+catastrophically (genuine numerical blowup) -- a real, useful robustness
+difference worth knowing, and one more concrete reason FP8 is the safer
+default -- but getting energy to actually IMPROVE this task (vs. just
+not break it) remains unsolved with either storage format.
