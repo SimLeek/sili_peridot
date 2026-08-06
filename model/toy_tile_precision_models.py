@@ -104,6 +104,7 @@ class ToyTileRecurrenceRealFP4:
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus)
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.post_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.state_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.centers = Tensor(np.array([i + 0.5 for i in range(num_tiles)], dtype=np.float32))
         self.log_sigmas = Tensor(np.zeros(num_tiles, dtype=np.float32))
 
@@ -112,7 +113,7 @@ class ToyTileRecurrenceRealFP4:
         centers/log_sigmas) -- DISLDOLayer-family layers' own big
         weight matrices train inline during backward(), never via an
         external optimizer step."""
-        return [self.input_ln, self.post_ln, self.centers, self.log_sigmas]
+        return [self.input_ln, self.post_ln, self.state_ln, self.centers, self.log_sigmas]
 
     def step(self, x_window: np.ndarray, M_prev: np.ndarray,
             learning_rate: float) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
@@ -128,7 +129,20 @@ class ToyTileRecurrenceRealFP4:
         input-only attention forces anything relating fresh input to
         carried state through an artificial "write to state, wait a
         tick, then attend" detour; attention must be able to relate
-        input and state directly, in one step)."""
+        input and state directly, in one step).
+
+        `state_ln` bounds M ITSELF (not just a derived copy fed into a
+        sublayer, which is what input_ln/post_ln already did) after
+        EVERY residual addition -- confirmed necessary via the same
+        frozen-weight diagnostic that found the earlier tanh-cell
+        instability: without this, mean|M| grew from 0.05 to 53 (max
+        from 3.3 to 472) over just 55 ticks with lr=0 (zero training),
+        pure forward-pass structure. Unlike a fixed-depth transformer's
+        residual stream (where this same unbounded-growth pattern is a
+        known, tolerated property because depth is finite), this
+        architecture's "depth" is recurrence ticks -- unbounded over a
+        long sequence -- so leaving M itself unbounded is not safe here
+        the way it can be for a transformer."""
         x_normed = rmsnorm_tensor(Tensor(x_window.astype(np.float32)), self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         qkv_source = x_normed + m_normed
@@ -142,11 +156,13 @@ class ToyTileRecurrenceRealFP4:
         attn = self.o_proj.forward(attn, learning_rate)
 
         M_new_t = Tensor(M_prev.astype(np.float32)) + attn
+        M_new_t = rmsnorm_tensor(M_new_t, self.state_ln, self.rms_eps)
         normed2 = rmsnorm_tensor(M_new_t, self.post_ln, self.rms_eps)
         gate = self.gate_proj.forward(normed2, learning_rate)
         up = self.up_proj.forward(normed2, learning_rate)
         mlp_out = self.down_proj.forward(silu(gate) * up, learning_rate)
         M_new_t = M_new_t + mlp_out
+        M_new_t = rmsnorm_tensor(M_new_t, self.state_ln, self.rms_eps)
 
         pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)  # [num_tiles, embed_width]

@@ -55,7 +55,14 @@ MAX_WEIGHTS_PER_LAYER = 16384             # per_row=16 at state_width=1024, matc
                                            # width-independent constant that would make this
                                            # scale needlessly sparse for no capacity reason.
 NUM_CPUS = 1
-PEAK_LR = 0.02
+PEAK_LR = 0.002  # NOT 0.02 -- matches the already-documented DISLDOLayer-family
+                 # fix (JOURNAL.md ~line 2637): raw, unclipped per-synapse update
+                 # diverges at Adam-tuned rates regardless of quantization.
+                 # Re-verified directly at this scale, with the state_ln fix
+                 # already applied: peak_lr=0.02 still gives 65 overflow warnings
+                 # in exp() over 100 steps (max|M|=78); peak_lr=0.002 gives zero.
+                 # The two bugs (unbounded M, LR too high) are separate and both
+                 # real -- state_ln alone does not make 0.02 safe.
 WARMUP_STEPS = 100
 EVAL_SEQUENCES = 60
 
