@@ -3994,3 +3994,53 @@ decays); whether a much higher/lower `scale_eff_lr` specifically for
 value_scale/output_scale (separate from the weight's own learning
 rate) closes more of the gap; real DISLDOLayer4 (plain `rank1` arm)
 was NOT re-seeded/re-tested this round, only `fp8`.
+
+**Follow-up, same session: confirmed real `importance` IS stored at
+the SAME low bit-width as the weight** (per direct question) --
+checked `delta_csr_types.hpp` directly: `connections` (holding both
+`vals` and `importance`) is `DeltaCSRWeights<..., VALUES_TYPE, ...>`,
+the same packed 4-bit/8-bit codec as the weight itself; the
+simulation's `quantize_importance=True` already replicates this
+faithfully (quantizes importance to the same `bits` as weight), so
+this specific mechanism does NOT explain the remaining real-vs
+-simulation gap. `value_scale`/`output_scale`/`importance_scale`
+themselves ARE genuine float32 in both real and simulated code
+(`ValueAccessor<FP4BiPacked>::value_type` and
+`ValueAccessor<FP8BiValues>::value_type` both resolve to `float`,
+confirmed directly) -- so scale PRECISION isn't the gap either. The
+real, confirmed difference stays what the previous entry found: real
+`value_scale` is trained via its own separate, nested, RMSprop-style
+optimizer with `scale_eff_lr = learning_rate / nnz_row` (tied to the
+SAME `learning_rate` knob as the weight update, no independent scale
+-LR control currently exposed), vs the simulation's closed-form
+refit-from-scratch every step.
+
+**Tried a cheap Python-level test of "does repeated correction
+substitute for the every-step refit": `PeriodicSeedRank1DISLDOLayer8`**
+(`model/toy_precision_models.py`) -- re-seeds value_scale/output_scale
+from a fresh closed-form fit every 250 training backward() calls
+(vs `SeededRank1DISLDOLayer8`'s one-time seed at init). **Result was
+WORSE than doing nothing** (out-of-context mean noticeably below even
+the plain unseeded `fp8` baseline). **This is NOT valid evidence
+against periodic correction** -- diagnosed the reason directly: each
+reseed changes value_scale/output_scale WITHOUT re-deriving the
+already-quantized 8-bit weight codes to stay consistent with the new
+scale, so every reseed silently reinterprets old stored codes under a
+different scale -- a real, injected discontinuity every 250 steps, not
+a clean correction. A valid version would need to dequantize under the
+OLD scale and re-quantize under the NEW one together, at every reseed
+-- real additional work, not attempted this round. Recorded honestly
+as a broken diagnostic, not a genuine negative result on the
+underlying "does periodic correction help" question.
+
+**Direct conclusion, per user redirect**: further chasing this via
+more Python-level approximations/hacks risks exactly the kind of
+subtle bug just found. The better investment is a genuinely swappable
+in-place optimizer at the C++ level (template parameter or policy
+struct, matching the existing `VALUES_TYPE` generic-programming
+convention already used throughout `linear_disldo.hpp`/
+`sisldo_ops.hpp`) so different update rules (current RMSprop
+-importance, a closed-form periodic refit, Adam, etc.) can be compiled
+and tested directly against the REAL engine -- not approximated in
+Python. Scoping this as a proper plan is the deferred next step, not
+yet started.

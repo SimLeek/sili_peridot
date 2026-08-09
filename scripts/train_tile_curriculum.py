@@ -31,7 +31,8 @@ sys.path.insert(0, ".")
 
 from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import QuantizedDISLDOLayer32, SeededRank1DISLDOLayer8
+from model.toy_precision_models import (QuantizedDISLDOLayer32, SeededRank1DISLDOLayer8,
+                                        PeriodicSeedRank1DISLDOLayer8)
 from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
 
 
@@ -103,6 +104,12 @@ ARMS = {
                             # whether real fp8's out-of-context collapse is a
                             # cold-start/undertrained-scale problem, not the
                             # representation itself
+    "fp8_reseeded": functools.partial(PeriodicSeedRank1DISLDOLayer8, reseed_every=250),
+                            # real DISLDOLayer8, scale re-seeded from a fresh closed
+                            # -form fit every 250 training backward() calls -- tests
+                            # whether REPEATED correction (no change to the real
+                            # weight-update math) substitutes for the simulation's
+                            # every-step refit
 }
 
 
@@ -145,7 +152,7 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # approximation, not a byte-exact accounting).
 ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4, "multi_fp4": 8,
-                  "fp8_seeded": 8}
+                  "fp8_seeded": 8, "fp8_reseeded": 8}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,

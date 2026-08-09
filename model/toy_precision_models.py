@@ -799,6 +799,45 @@ class SeededRank1DISLDOLayer8(DISLDOLayer8):
         _seed_rank1_scale(self._c, in_features, out_features)
 
 
+class PeriodicSeedRank1DISLDOLayer8(DISLDOLayer8):
+    """Like SeededRank1DISLDOLayer8, but re-seeds value_scale/output_scale
+    from a fresh closed-form rank-1 fit every `reseed_every` training
+    backward() calls, not just once at construction -- direct test of
+    whether REPEATEDLY correcting the envelope (touching NOTHING about
+    the real RMSprop weight-update math) can substitute for the
+    simulation's every-step refit, or whether real DISLDOLayer8's own
+    separate, nested value_scale/output_scale optimizer (see
+    linear_disldo.hpp's `scale_eff_lr = learning_rate / nnz_row`,
+    itself RMSprop-style via value_scale_importance) genuinely can't
+    hold a good fit between corrections even when repeatedly given one."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                num_cpus: int = 4, reseed_every: int = 200,
+                rng: Optional[np.random.Generator] = None):
+        super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
+        self._reseed_in_features = in_features
+        self._reseed_out_features = out_features
+        self.reseed_every = reseed_every
+        self._step_count = 0
+        _seed_rank1_scale(self._c, in_features, out_features)
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+               damp_by_importance: bool = True) -> Tensor:
+        out = super().forward(x, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                              damp_by_importance=damp_by_importance)
+        inner_bwd = out._backward
+
+        def _bwd():
+            inner_bwd()
+            if learning_rate != 0.0:
+                self._step_count += 1
+                if self._step_count % self.reseed_every == 0:
+                    _seed_rank1_scale(self._c, self._reseed_in_features, self._reseed_out_features)
+
+        out._backward = _bwd
+        return out
+
+
 class ToySmallTransformerFP32Ref(ToySmallTransformerRealFP4):
     """ToySmallTransformerRealFP4 built from plain DISLDOLayer32 (fp32
     DeltaCSRBiValues, RMSprop importance, NO quantization) -- the
