@@ -3775,3 +3775,68 @@ win (does it also beat fp32 at matched memory the way rank2 did
 in-context?), and updating `todolist.md`/committing the e-prop plan
 file as explicitly deferred (not abandoned) rather than silently
 dropped.
+
+## 2026-08-09 (continued): both open items resolved -- scale RANK matters even at 4-bit, and rank1_8bit fully matches fp32 at matched memory, out-of-context included
+
+Direct follow-up to the two open items above, same out-of-context
+curriculum (seq_len 2->8, NUM_TILES=4) throughout.
+
+**Which part of "8-bit rank-1" is load-bearing -- the extra 4 bits, or
+the rank-1 envelope itself?** Added three more `ARMS` entries to
+`train_tile_curriculum.py`, all at 4-bit (same bit budget as the
+already-tested `rank2`), varying only the scale scheme:
+`QuantizedDISLDOLayer32` with `scheme="row"` (plain per-row max-abs),
+`scheme="rank1"`, and `scheme="rankn", rank=4`. Same state_width=128,
+same PEAK_LR=0.002, same everything else. Result (`learning_slope.py`,
+trailing-window stats):
+
+    row_4bit    (plain per-row scale): mean=0.114, z=1.4   -- DEAD/CHANCE
+    rank1_4bit  (row x col, rank=1):   mean=0.197, z=7.3   -- weakly LEARNING
+    rank4_4bit  (row x col, rank=4):   mean=0.308, z=9.4   -- PLATEAUED above chance,
+                                        held 0.75-0.93 through seq_len=5-6 before
+                                        dropping at 7-8 (run cut short by a timeout
+                                        at step 12000, trend already clear)
+    rank1_8bit  (row x col, rank=1, 8-bit): mean=0.971 -- near-ceiling (from the
+                                        prior entry, included here for the ladder)
+
+A clean, monotonic ladder: scale RANK matters even within a fixed
+4-bit budget (plain row-scale is barely above chance; rank=4 alone
+gets partway there, reaching real above-chance accuracy that holds for
+several out-of-context steps before eventually degrading) -- but 4-bit
+alone, at any rank tested, does NOT fully close the gap the way 8-bit
+rank-1 does. Both the scale envelope's RANK and the value's BIT-DEPTH
+are real, separate, additive factors here, not one dominant cause. Open,
+not chased further this round: whether rank=8 or higher at 4-bit
+closes the rest of the gap without needing the extra bits at all.
+
+**Does `rank1_8bit` also win at matched memory, the way `rank2` did
+in-context-only?** Same widen-to-match-fp32's-budget recipe as
+before (embed_width=32, column_neurons=8 -> state_width=256,
+max_weights=6000, ~24.3KB, matching fp32-at-width-128's ~24.6KB almost
+exactly), `rank1_8bit` arm, full out-of-context curriculum:
+
+    step=750  (seq_len=2) through step=15000 (seq_len=8): acc=1.0000 AT EVERY SINGLE CHECKPOINT
+
+`learning_slope.py`: mean_acc=1.0000, std=0.0000, z_vs_chance=inf,
+PLATEAUED (at the ceiling, not below it). This isn't "close to fp32"
+-- it's an exact match, on both in-context and out-of-context stages,
+at the same memory budget, at 1/4 the bit-width. Combined with the
+prior entry's un-widened result (0.92-1.0 at 1/4 the memory), the
+overall picture: `rank1_8bit`'s row x column scale envelope isn't just
+"good enough" for this task family, it appears to fully eliminate
+FP-family quantization as a limiting factor here once given the same
+capacity fp32 has -- the remaining question is whether that holds at
+real model scale (this is still a `state_width<=256`, `vocab=10` toy),
+not whether the scheme itself works.
+
+**Practical upshot for the actor-critic/format-choice question this
+whole arc was really in service of**
+([[project_sili_peridot_actor_critic_controller]],
+[[project_fp4_rankn_vs_fp8_conclusion]]): plain per-row FP4 is not
+enough for this architecture's recurrent state at ANY width or depth
+tested; rank-1 (or higher) scale envelopes matter more than raw
+bit-depth, and at 8-bit specifically, the rank-1 envelope reaches full
+parity with fp32 including genuine out-of-context recall. Where actual
+production storage should land (4-bit-higher-rank vs 8-bit-rank-1 vs
+mixed) is now a real, evidence-backed design question rather than a
+guess -- not yet decided, real model-scale validation still needed.

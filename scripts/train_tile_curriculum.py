@@ -81,6 +81,16 @@ ARMS = {
                                     quantize_importance=True),  # the exact scheme that
                             # reached 1.0 at every out-of-context distance on the
                             # earlier tanh-cell task (JOURNAL.md) -- direct retest here
+    # Alternative 4-bit scale representations -- same bit budget as "rank2"
+    # (bits=4, scheme=rankn, rank=2 above), different envelope shape, to see
+    # which specific scale scheme (not bit-depth) recovers out-of-context
+    # accuracy at 4-bit.
+    "row_4bit":   functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="row",
+                                    quantize_importance=True),   # plain per-row max-abs
+    "rank1_4bit": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rank1",
+                                    quantize_importance=True),   # row x col envelope, rank1
+    "rank4_4bit": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=4,
+                                    quantize_importance=True),   # higher-rank envelope
 }
 
 
@@ -121,7 +131,8 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # for reporting an approximate memory footprint (index/overhead bits are the
 # same across arms so they wash out of a *relative* comparison; this is an
 # approximation, not a byte-exact accounting).
-ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8}
+ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
+                  "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
