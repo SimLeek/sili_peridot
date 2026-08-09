@@ -3589,4 +3589,71 @@ scale, `use_energy=True` at this scale, curriculum progression past
 seq_len=2 with the clip fix, fp8 in the memory-matched comparison,
 longer rank2 runs to see if it keeps climbing toward 1.0 or plateaus
 below it, and the stale `parameters_for_optimizer()`-length test.
-  calibrated.
+
+## 2026-08-09 (same session, continued): near-1.0 reached with attention; out-of-context confirmed still broken
+
+Direct follow-up to the four open items above.
+
+**`use_attention=True` at the same memory-matched-wide config
+(embed_width=16, column_neurons=8, max_weights=1500, rank2, no
+energy)**: clean, stable **1.0000 accuracy** on the seq_len=2
+copy-recall task, holding exactly at 1.0 from step 1500 through step
+6000 with zero variance (`learning_slope.py`: std=0.0, z_vs_chance=inf).
+This is the first config in this whole debugging arc to hit the
+"near 1.0" bar directly, and answers the standing ablation question:
+gaussian_attention is NOT the hard-to-learn component here -- without
+it, rank2 plateaus noisily around 0.85-0.95 (see above); with it, the
+same weight budget converges to a clean, noise-free ceiling. (Note:
+adding q/k/v pushes the real memory footprint to ~3080 bytes,
+no longer matched to the fp32 baseline's ~832 bytes -- this result is
+about the attention ablation, not a repeat of the memory-matched
+claim above.)
+
+**Longer rank2 no-attention run (12,000 steps, same wide config)**:
+oscillates 0.82-0.97 with no further climb (`learning_slope.py`:
+mean_acc=0.885, slope status=PLATEAUED, consistent with eval-sample
+noise at n=60 around a real ~0.85-0.95 ceiling) -- confirms rank2
+without attention plateaus below 1.0 rather than eventually reaching
+it with more steps; attention is what closes that last gap, not more
+training time.
+
+**Out-of-context test** (`train_tile_curriculum.py` gained an 11th
+optional CLI arg, `seq_len_max`, so the curriculum can grow past
+`NUM_TILES` -- previously hardcoded in-context-only): same winning
+config (rank2, attention on), curriculum seq_len 2->8 against
+NUM_TILES=4, so seq_len 5-8 requires recalling token[0] after it's
+left the tile window entirely, i.e. purely through whatever survived
+in `M_prev`. Result:
+
+    seq_len=2 (in-context):  acc=1.0000
+    seq_len=3 (in-context):  acc=0.68-0.90
+    seq_len=4 (in-context):  acc=0.63-0.82
+    seq_len=5 (OUT of context): acc=0.42-0.47
+    seq_len=6 (OUT of context): acc=0.28-0.42
+    seq_len=7 (OUT of context): acc=0.22-0.33
+    seq_len=8 (OUT of context): acc=0.13-0.25, mean(last 8 ckpts)=0.1875
+
+`learning_slope.py` on the seq_len=8 tail: PLATEAUED, not LEARNING,
+right near chance=0.1 (a small persistent bias above pure chance, not
+a real trend). This is the exact same failure mode already documented
+for the tanh-cell recurrence in [[project_sili_bptt_or_chance]],
+now directly reproduced in the tile-recurrence/attention architecture:
+`M_prev` is a fresh detached numpy array every tick (no BPTT), so
+there's no gradient pathway to learn "write token[0]'s value into the
+state now because a much-later tick will need it" -- in-context
+recall (task fits inside the tile window) works essentially perfectly,
+out-of-context recall (task requires carrying state past the window)
+is indistinguishable from chance. The near-1.0 in-context result above
+is real and a genuine milestone, but it does NOT by itself demonstrate
+the recurrence is doing anything a plain windowed (non-recurrent)
+attention model couldn't already do -- the actually novel claim this
+architecture is FOR (carrying state across ticks the window can't see)
+remains unverified and, on this direct test, currently false.
+
+This is exactly the premise the standing e-prop plan
+([[project_sili_bptt_alternatives]], plan file
+`fuzzy-plotting-starlight.md`) was written to address -- a per-neuron
+eligibility trace as a fixed-memory substitute for BPTT, tested on
+this same style of out-of-context benchmark. Given this direct
+reproduction, that plan is now the next thing being worked, not a
+deferred nice-to-have.

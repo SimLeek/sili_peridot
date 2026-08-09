@@ -150,10 +150,14 @@ def main():
         COLUMN_NEURONS = int(sys.argv[9])
     if len(sys.argv) > 10:
         MAX_WEIGHTS_PER_LAYER = int(sys.argv[10])
+    # seq_len_max > NUM_TILES is a real out-of-context test: once i exceeds
+    # NUM_TILES-1, _build_tile_window's window no longer reaches back to
+    # position 0, so recalling token[0] requires the info to have survived
+    # in M_prev across ticks the window itself can no longer see.
+    SEQ_LEN_MAX = int(sys.argv[11]) if len(sys.argv) > 11 else NUM_TILES
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
-    SEQ_LEN_MAX = NUM_TILES
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
