@@ -3657,3 +3657,121 @@ eligibility trace as a fixed-memory substitute for BPTT, tested on
 this same style of out-of-context benchmark. Given this direct
 reproduction, that plan is now the next thing being worked, not a
 deferred nice-to-have.
+
+## 2026-08-09 (continued): direct correction -- out-of-context WAS already solved without BPTT/e-prop earlier this project; root-caused the tile-recurrence gap to FP4 coarseness, not architecture
+
+Direct pushback, and correctly so: this project already showed, much
+earlier in this same session (the tanh-cell "ceiling check" and
+ablation-ladder entries above), that plain PyTorch `nn.RNN`/`nn.LSTM`
+AND sili's own dense-Tensor+Adam control BOTH reach 0.92-1.0 accuracy
+at every out-of-context distance tested, running the exact same
+no-BPTT regime (hidden state detached every tick, single `backward()`
+at the query tick) as this system's own `M_prev`. The mechanism: the
+recurrent weight matrix is shared across every tick AND across every
+training sequence with varying query position, so the same weights get
+pushed toward a correct one-step transition rule from many different
+"positions in the recursion" without ever needing multi-tick BPTT.
+**BPTT was never the missing ingredient -- confirmed, not re-litigated.**
+Jumping to the e-prop plan on this session's fresh (mis-remembered)
+out-of-context failure, without first checking whether this exact gap
+had already been root-caused earlier in the SAME project, was a real
+mistake -- caught by direct user correction, not by re-reading the
+journal first. e-prop is still the right longer-term investment for
+large sparse recurrent nets, but wasn't and isn't the applicable next
+step for closing today's gap.
+
+**What the earlier ablation ladder actually found**: dense/Adam (no
+FP4 anywhere) also succeeds out-of-context; DISLDOLayer (FP4)
+specifically lagged (0.5-0.73 vs 0.92-0.96) even after fixing the two
+real bugs found there (unbounded residual accumulate, `lr_per_row_nnz`
+crushing effective rate) -- confined specifically to FP4's own
+storage/update machinery. The fix that closed it there wasn't more
+training or BPTT -- it was switching from plain per-row max-abs FP4
+scale to **8-bit, rank-1 (row x column envelope) scale, on both
+weight AND importance**: `loss=0.1693, acc={2:1.0,3:1.0,4:1.0,6:1.0}`,
+matching the fp32 reference almost exactly.
+
+**Direct re-test on THIS tile-recurrence architecture, same
+out-of-context curriculum (seq_len 2->8, NUM_TILES=4) that just failed
+for rank1/rank2 FP4:**
+
+1. **fp32 + attention, same width as the failing FP4 runs
+   (state_width=128)**: clean 1.0000 across EVERY stage, seq_len 2
+   through 8, zero variance (`learning_slope.py`: std=0.0, z=inf).
+   Confirms the architecture itself -- gaussian_attention, the tile
+   window, the no-BPTT M_prev design -- fully supports genuine
+   out-of-context recall; nothing structural is broken. This directly
+   matches the earlier dense/torch result, now reproduced on the real
+   tile-recurrence architecture too.
+
+2. **"Just widen FP4" (per a direct hypothesis: does out-of-context
+   simply need more capacity, matching the earlier memory-matched
+   in-context win?)** -- rank2 widened to state_width=256 (~12KB,
+   4x the previous rank2 test): made things WORSE, not better
+   (seq_len=4 in-context dropped to 0.67-0.68, out-of-context near/
+   below chance throughout). Widening alone doesn't help and can hurt,
+   since `lr_per_row_nnz`'s crush scales with row degree -- a wider
+   sparse layer at fixed density has MORE nnz/row, so the same nominal
+   PEAK_LR gets crushed harder, not less.
+
+3. **LR override to compensate `lr_per_row_nnz`'s crush** (added a
+   12th CLI arg to `train_tile_curriculum.py`): tried 3x and 10x the
+   baseline 0.002 -- both WORSE, collapsing even the previously-clean
+   in-context accuracy. This is the separately-documented PEAK_LR
+   -mismatch bug (0.02 diverges, JOURNAL.md ~line 2637) reasserting
+   itself, not a row-nnz compensation win. Naive LR scaling doesn't
+   work here.
+
+4. **Cascaded/residual-style o_proj depth** (per a direct hypothesis,
+   analogous to residual vector quantization in neural audio codecs --
+   N sequential coarse FP4 layers might compose into something closer
+   to a single finer-precision layer than one wide layer can): added
+   `o_proj_depth` to `ToyTileRecurrenceRealFP4` (N `disldo_cls`
+   sublayers applied in sequence, each given `max_weights/depth` so
+   total budget stays comparable) and `train_tile_curriculum.py`'s
+   13th CLI arg. Tested depth=2 at the same width/LR as the failing
+   baseline: also didn't close the gap (in-context still reasonable,
+   0.75-0.98, but out-of-context still collapsed toward chance,
+   0.02-0.38). Real negative result, kept in the code as a tested,
+   reusable ablation knob (harmless at the default depth=1), not
+   pursued further at this depth.
+
+5. **`rank1_8bit` -- the exact scheme that already worked, retested
+   here**: added to `ARMS`
+   (`QuantizedDISLDOLayer32(bits=8, scheme="rank1", quantize_importance=True)`),
+   same state_width=128, same out-of-context curriculum, baseline
+   PEAK_LR=0.002, no width/depth tricks. **Result: 0.92-1.0 accuracy
+   across every stage, seq_len 2 through 8**
+   (`learning_slope.py`: mean_acc=0.9708 over the trailing window,
+   std=0.023, z_vs_chance=106.16, PLATEAUED at ceiling not degrading)
+   -- matching fp32's win almost exactly, at 1/4 the memory (8-bit vs
+   32-bit values) and roughly half of rank2's earlier in-context-only
+   win's footprint at this width. This is the first FP4-family
+   (well, FP8-with-rank-1-scale-family) config in this whole arc to
+   solve BOTH in-context AND out-of-context on the same run.
+
+**Honest summary of what actually mattered, in order**: (1) the
+architecture was never broken -- fp32 proves it; (2) plain per-row FP4
+(rank1, rank2, even wider or deeper) hits a real, reproducible ceiling
+specifically at out-of-context distances, independent of width or
+depth; (3) the fix isn't more capacity or a bigger update, it's a
+better SCALE REPRESENTATION for the quantized values -- rank-1
+(row x column) envelope quantization at 8-bit closes the entire gap.
+Direct connection to the user's own biological framing: real synapses
+run at roughly ~24 discrete strength levels (~4.5 bits, in FP4's own
+ballpark) and clearly support recurrent computation fine, so raw
+bit-depth was never the likely bottleneck -- the SHAPE of the
+quantization error (a single global/per-row scale badly misfitting the
+true dynamic range, vs. a rank-1 envelope that adapts to it) is what
+this whole arc converged on as the real explanation, consistent with
+the earlier tanh-cell finding that plain per-row 8-bit costs 7x the
+fp32 loss on IMPORTANCE specifically, while rank-1 scale fixes almost
+all of that gap.
+
+**Not yet done:** `rank1_8bit` at 4-bit (does the rank-1 envelope
+alone rescue 4-bit too, or is 8-bit's extra headroom also required?),
+`rank1_8bit` combined with the earlier memory-matched-wide in-context
+win (does it also beat fp32 at matched memory the way rank2 did
+in-context?), and updating `todolist.md`/committing the e-prop plan
+file as explicitly deferred (not abandoned) rather than silently
+dropped.

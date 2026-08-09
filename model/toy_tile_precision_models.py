@@ -29,7 +29,7 @@ class ToyTileRecurrenceRealFP4:
                  mlp_hidden: int, num_tiles: int, max_weights: int,
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  use_energy: bool = False, energy_kwargs: Optional[dict] = None,
-                 use_attention: bool = True):
+                 use_attention: bool = True, o_proj_depth: int = 1):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
 
@@ -38,7 +38,16 @@ class ToyTileRecurrenceRealFP4:
         collapses this into a plain RNN cell,
         state = clip(rmsnorm(state + o_proj(rmsnorm(x)+rmsnorm(state)))).
         Ablation to isolate whether gaussian_attention itself is what's
-        hard to learn, before assuming the whole architecture is broken."""
+        hard to learn, before assuming the whole architecture is broken.
+
+        o_proj_depth>1: replaces the single o_proj with `o_proj_depth`
+        disldo_cls sublayers applied in sequence (each state_width ->
+        state_width, no nonlinearity between them), each given
+        max_weights // o_proj_depth so the total weight budget stays
+        roughly comparable to depth=1 -- a residual/cascaded
+        -quantization-style test of whether N sequential coarse (e.g.
+        FP4) layers can compose into something closer to a single
+        higher-precision layer, rather than needing more WIDTH."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -46,6 +55,7 @@ class ToyTileRecurrenceRealFP4:
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
         self.use_attention = use_attention
+        self.o_proj_depth = o_proj_depth
 
         if not use_attention:
             self.energy = None
@@ -63,7 +73,12 @@ class ToyTileRecurrenceRealFP4:
             self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
             self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
             self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
-        self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
+        if o_proj_depth > 1:
+            per_layer_weights = max(max_weights // o_proj_depth, state_width)
+            self.o_proj = [disldo_cls(state_width, state_width, per_layer_weights, num_cpus)
+                          for _ in range(o_proj_depth)]
+        else:
+            self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus)
         
         # 2. Norms & Gaussian Attention Params
@@ -101,6 +116,13 @@ class ToyTileRecurrenceRealFP4:
                 print(f"{name:12s} | Data Active: {data_active} (mean: {data_mean:.4f}) | Grad: NONE (Not computed yet)")
         print("==================================\n")
 
+    def _apply_o_proj(self, x: Tensor, learning_rate: float) -> Tensor:
+        if self.o_proj_depth > 1:
+            for layer in self.o_proj:
+                x = layer.forward(x, learning_rate)
+            return x
+        return self.o_proj.forward(x, learning_rate)
+
     def step(self, x_window: np.ndarray, M_prev: np.ndarray,
              learning_rate: float, debug: bool = True) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
         """One recurrence tick. x_window, M_prev: [num_tiles,
@@ -123,9 +145,9 @@ class ToyTileRecurrenceRealFP4:
             attn = gaussian_attention(q, k, v, self.centers, sigmas,
                                       num_cpus=self.num_cpus, causal=False)
             attn, aux_loss = _apply_energy(self.energy, attn, self.num_tiles, self.state_width)
-            attn = self.o_proj.forward(attn, learning_rate)
+            attn = self._apply_o_proj(attn, learning_rate)
         else:
-            attn = self.o_proj.forward(qkv_source, learning_rate)
+            attn = self._apply_o_proj(qkv_source, learning_rate)
             aux_loss = None
 
         # 3. Residual & Hard Bounding

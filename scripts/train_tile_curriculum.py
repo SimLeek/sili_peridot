@@ -77,6 +77,10 @@ ARMS = {
     "fp8":   DISLDOLayer8,
     "fp32":  DISLDOLayer32,  # precision ceiling reference -- isolates FP4 quantization
                             # coarseness from architecture/training-dynamics limits
+    "rank1_8bit": functools.partial(QuantizedDISLDOLayer32, bits=8, scheme="rank1",
+                                    quantize_importance=True),  # the exact scheme that
+                            # reached 1.0 at every out-of-context distance on the
+                            # earlier tanh-cell task (JOURNAL.md) -- direct retest here
 }
 
 
@@ -117,7 +121,7 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # for reporting an approximate memory footprint (index/overhead bits are the
 # same across arms so they wash out of a *relative* comparison; this is an
 # approximation, not a byte-exact accounting).
-ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32}
+ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
@@ -132,7 +136,7 @@ def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int
 
 
 def main():
-    global EMBED_WIDTH, COLUMN_NEURONS, MAX_WEIGHTS_PER_LAYER, SEQ_LEN_MAX
+    global EMBED_WIDTH, COLUMN_NEURONS, MAX_WEIGHTS_PER_LAYER, SEQ_LEN_MAX, PEAK_LR
 
     arm = sys.argv[1]
     use_energy = bool(int(sys.argv[2]))
@@ -155,6 +159,20 @@ def main():
     # position 0, so recalling token[0] requires the info to have survived
     # in M_prev across ticks the window itself can no longer see.
     SEQ_LEN_MAX = int(sys.argv[11]) if len(sys.argv) > 11 else NUM_TILES
+    # DISLDOLayer.forward's default lr_per_row_nnz=True divides the effective
+    # rate by each row's connection count (nnz_this_row) -- real and
+    # necessary when synaptogenesis makes degree vary, a silent crush at
+    # fixed density. fp32 tolerates the crushed rate fine (continuous
+    # updates); FP4 needs a large-enough step to move a value even one
+    # quantization level, so this override compensates directly instead of
+    # touching lr_per_row_nnz itself (which is buried inside disldo_cls's
+    # own forward() call, not exposed through ToyTileRecurrenceRealFP4).
+    if len(sys.argv) > 12:
+        PEAK_LR = float(sys.argv[12])
+    # o_proj_depth>1: N sequential FP4 sublayers instead of one wider layer --
+    # a cascaded/residual-quantization-style test of whether composing coarse
+    # stages recovers precision that widening alone doesn't, per direct idea.
+    o_proj_depth = int(sys.argv[13]) if len(sys.argv) > 13 else 1
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -165,7 +183,7 @@ def main():
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
-        use_attention=use_attention)
+        use_attention=use_attention, o_proj_depth=o_proj_depth)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -175,7 +193,8 @@ def main():
           f"train_steps={train_steps} checkpoint_every={checkpoint_every} seed={seed} "
           f"vocab={VOCAB} num_tiles={NUM_TILES} embed_width={EMBED_WIDTH} "
           f"column_neurons={COLUMN_NEURONS} state_width={state_width} "
-          f"max_weights={MAX_WEIGHTS_PER_LAYER} est_value_bits={value_bits} "
+          f"max_weights={MAX_WEIGHTS_PER_LAYER} o_proj_depth={o_proj_depth} "
+          f"peak_lr={PEAK_LR} est_value_bits={value_bits} "
           f"(~{value_bits/8:.0f} bytes) "
           f"seq_len={SEQ_LEN_START}->{SEQ_LEN_MAX} (+1/{steps_per_stage} steps)",
           flush=True)
