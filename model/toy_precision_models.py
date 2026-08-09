@@ -55,7 +55,7 @@ from sili.sparse_rnn import (DISLDOLayer, DISLDOLayer32, DISLDOLayer8,
                              DISLDOLayer8Resync, DISLDOLayer8AdaMax)
 from sili.energy import EnergyDynamics
 
-from .toy_recall_models import rmsnorm_tensor, AdamOptimizer
+from .toy_recall_models import rmsnorm_tensor, AdamOptimizer, DenseTensorLinear
 
 
 def _toy_scale_energy() -> EnergyDynamics:
@@ -696,6 +696,180 @@ def fixed_digit_residual_quantize(vals: np.ndarray, bits_per_stage: int, n_stage
         residual = residual - stage_q
         step /= base
     return reconstructed.astype(np.float32)
+
+
+def _quantize_raw_digit_inplace(inner: DISLDOLayer32, bits: int, step: float) -> None:
+    """Quantize a single digit's OWN stored weight (and importance) to a
+    plain, fixed, symmetric grid at `step` -- no row/col fit, no base/
+    e_shared multiplication (that scaling is applied OUTSIDE the digit,
+    as a multiplicative factor at combination time in
+    TrueMultiDigitDISLDOLayer, matching fixed_digit_residual_quantize's
+    own factoring of `step = e_shared/levels` as digit 1's shared raw
+    grid). Same grid for every digit -- the geometric base**-i shrink
+    happens entirely via the external factor, not via a finer grid
+    here."""
+    c = inner._c
+    ptrs = np.array(c.ptrs, copy=True)
+    indices = np.array(c.indices, copy=True)
+    w = np.array(c.weights_vals, copy=True).astype(np.float64)
+    imp = np.array(c.importance, copy=True).astype(np.float64)
+    w_q = (np.round(w / step) * step).astype(np.float32)
+    imp_q = (np.round(imp / step) * step).astype(np.float32)
+    c.load_weights(ptrs, indices, w_q, imp_q)
+
+
+class TrueMultiDigitLayer:
+    """Genuinely SEPARATE, independently-trained residual digit layers
+    -- NO hidden fp32 shadow across digits (contrast
+    QuantizedDISLDOLayer32(scheme="fixed_digit_residual"), which trains
+    ONE fp32 accumulator and only discretizes it for STORAGE after the
+    fact -- a real hardware implementation has no room for a hidden
+    full-precision shadow of every weight). Each digit is its OWN real
+    `digit_cls` instance, contributing `base**-i` of the final combined
+    output (i=0 is the coarsest/first digit) -- the Tensor class's own
+    `*`/`+` autograd ops chain the gradient back into each digit's own
+    real backward() automatically, no manual backward-wiring needed.
+
+    `digit_cls` -- per direct correction, DISLDO's real FP4 codec
+    should be the PRIMARY test here (quantization is the whole point),
+    not a fp32-backed simulation: default `DISLDOLayer` (real 4-bit
+    E2M1, matching sili's actual production codec) needs NO extra
+    Python-side quantization step at all -- real disldo_backward
+    already stores FP4 natively every update, so `simulate_quantize`
+    stays False for it. `DISLDOLayer32` (fp32 backend) is kept as an
+    optional REFERENCE/ceiling arm -- same digit-residual architecture
+    and training dynamics, but exact storage, isolating "does the
+    residual-DIGIT architecture itself work" from "does it survive
+    real FP4 storage" (this project's own long-standing
+    precision-isolation-control convention) -- for that arm only, pass
+    `simulate_quantize=True` to fake-quantize to a fixed grid after
+    each step (matching `fixed_digit_residual_quantize`'s own grid);
+    passing it True for an already-real-FP4 `digit_cls` would just
+    double-round for no reason.
+
+    Direct test of whether LATER (finer) digits need their OWN,
+    separately-scaled-down effective learning rate to stay stable, per
+    direct discussion (found first empirically: `fixed_digit_residual`
+    at 3+ stages needed roughly HALF the overall PEAK_LR to stop
+    degrading -- more digits remove the implicit noise-filtering coarse
+    rounding was providing, letting per-step gradient noise accumulate
+    unchecked). IMPORTANT, corrects an earlier mislabeling: the
+    combination `out_i * factors[i]` ALREADY multiplies the gradient
+    reaching digit i by `base**-i` via the ordinary chain rule (Tensor
+    `mul`'s own backward, verified directly) -- BEFORE `eff_lr` is even
+    applied. So `lr_power=0` (uniform nominal `learning_rate` passed to
+    every digit) is already naturally chain-rule-scaled, not an
+    unscaled "naive" baseline. `lr_power` sets an EXTRA multiplicative
+    reduction on top of that natural scaling:
+    `eff_lr = learning_rate / base**(lr_power*i)` -- lr_power=1/2 test
+    damping LATER digits MORE than the chain rule alone already gives,
+    not "chain-rule-matched" as an earlier draft of this docstring
+    incorrectly claimed."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                num_cpus: int = 4, digit_cls=DISLDOLayer, bits_per_stage: int = 4,
+                n_stages: int = 2, base: float = 4.0, e_shared: Optional[float] = None,
+                lr_power: float = 0.0, simulate_quantize: bool = False,
+                rng: Optional[np.random.Generator] = None):
+        self.digits = [digit_cls(in_features, out_features, max_weights, num_cpus, rng=rng)
+                      for _ in range(n_stages)]
+        self.bits_per_stage = bits_per_stage
+        self.n_stages = n_stages
+        self.base = base
+        self.lr_power = lr_power
+        self.simulate_quantize = simulate_quantize
+        levels = 2 ** (bits_per_stage - 1) - 1
+        if e_shared is None:
+            init_vals = np.abs(np.asarray(self.digits[0]._c.weights_vals, dtype=np.float64))
+            e_shared = float(np.max(init_vals)) if init_vals.size and init_vals.max() > 1e-12 else 1.0
+        self.e_shared = e_shared
+        self._digit_step = e_shared / levels  # only used if simulate_quantize
+        self._factors = [self.base ** (-i) for i in range(n_stages)]
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+               damp_by_importance: bool = True) -> Tensor:
+        outs = []
+        for i, digit in enumerate(self.digits):
+            eff_lr = learning_rate / (self.base ** (self.lr_power * i))
+            out_i = digit.forward(x, eff_lr, lr_per_row_nnz=lr_per_row_nnz,
+                                  damp_by_importance=damp_by_importance)
+            if learning_rate != 0.0 and self.simulate_quantize:
+                inner_bwd = out_i._backward
+                digit_i = digit
+
+                def _make_bwd(inner_bwd=inner_bwd, digit_i=digit_i):
+                    def _bwd():
+                        inner_bwd()  # real RMSprop update for THIS digit only
+                        _quantize_raw_digit_inplace(digit_i, self.bits_per_stage, self._digit_step)
+                    return _bwd
+                out_i._backward = _make_bwd()
+            outs.append(out_i)
+        total = outs[0] * self._factors[0]
+        for i in range(1, self.n_stages):
+            total = total + outs[i] * self._factors[i]
+        return total
+
+    def parameters(self) -> List[Tensor]:
+        return []
+
+
+class TrueMultiDigitDenseLayer:
+    """DENSE, ordinary-Adam-trained control for TrueMultiDigitLayer --
+    per direct request: same digit-residual architecture (n separate
+    plain `DenseTensorLinear` layers, each contributing `base**-i`,
+    combined via the same Tensor `*`/`+` autograd chain), but trained
+    via a STANDARD external AdamOptimizer instead of DISLDO's own
+    inline importance-based update. If this dense+Adam version behaves
+    very differently from the real-FP4 `TrueMultiDigitLayer` at the
+    same n_stages/base/lr_power, that's evidence something about
+    DISLDO's OWN update mechanism specifically (not the residual-digit
+    ARCHITECTURE itself) explains the difference -- matching this
+    project's own long-standing precision/optimizer-isolation
+    convention (`ToySmallTransformerFP32Ref`,
+    `dense_tanh_no_bptt_control.py`). No quantization anywhere (fp32
+    dense weights throughout) -- this isolates the ARCHITECTURE +
+    UPDATE-RULE question specifically, separate from "does it survive
+    low-bit storage" (already covered by `TrueMultiDigitLayer`'s own
+    `digit_cls=DISLDOLayer` vs `DISLDOLayer32` comparison).
+
+    `max_weights`/`num_cpus` accepted but unused -- kept only so this
+    drops into the SAME `disldo_cls(in_features, out_features,
+    max_weights, num_cpus)` call convention `ToyTileRecurrenceRealFP4`
+    already uses for every other arm, no changes needed there."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: Optional[int] = None,
+                num_cpus: Optional[int] = None, bits_per_stage: int = 4, n_stages: int = 2,
+                base: float = 4.0, e_shared: Optional[float] = None, lr_power: float = 0.0,
+                rng: Optional[np.random.Generator] = None):
+        levels = 2 ** (bits_per_stage - 1) - 1
+        init_scale = (e_shared / levels) if e_shared is not None else 0.1
+        self.digits = [DenseTensorLinear(in_features, out_features, scale=init_scale)
+                      for _ in range(n_stages)]
+        self.opt = AdamOptimizer()
+        self.n_stages = n_stages
+        self.base = base
+        self.lr_power = lr_power
+        self._factors = [self.base ** (-i) for i in range(n_stages)]
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+               damp_by_importance: bool = True) -> Tensor:
+        outs = [d.forward(x) for d in self.digits]
+        total = outs[0] * self._factors[0]
+        for i in range(1, self.n_stages):
+            total = total + outs[i] * self._factors[i]
+        if learning_rate != 0.0:
+            inner_bwd = total._backward
+
+            def _bwd():
+                inner_bwd()
+                for i, d in enumerate(self.digits):
+                    eff_lr = learning_rate / (self.base ** (self.lr_power * i))
+                    self.opt.step(d.parameters(), lr=eff_lr)
+            total._backward = _bwd
+        return total
+
+    def parameters(self) -> List[Tensor]:
+        return []  # trained internally via self.opt.step(), not an external optimizer
 
 
 def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,

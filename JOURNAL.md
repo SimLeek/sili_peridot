@@ -4427,3 +4427,250 @@ the real `DeferredScaleWrite`-style fix for `e_shared` itself if a
 future version makes `e_shared` adaptive/trained after all (currently
 fixed-once, per direct design choice, deliberately not explored this
 round).
+
+---
+
+## 2026-08-09 (cont.) — per-digit learning-rate sweep, TrueMultiDigitLayer (real FP4 vs fp32-shadow), and the actual root cause: stochastic rounding, not value_scale
+
+**Per-digit LR scaling, direct test (`div B` vs `div B^n`)**: `fixed_digit_3`/`_4`
+(more digits, finer implicit precision) were less stable at the same
+`PEAK_LR=0.002` used for `fixed_digit_2`. Root cause, confirmed directly:
+coarse quantization was accidentally acting as an implicit noise filter
+(small per-step gradient noise gets rounded away before it can
+accumulate); finer quantization removes that filtering, so the SAME
+nominal learning rate is effectively noisier. Fix is proportional LR
+reduction, not per-digit LR *shape* (`lr_power=0` already gets the
+correct chain-rule reduction automatically through `Tensor.mul`'s own
+backward, see below):
+
+    arm                      LR      bits  mean_acc  status
+    fixed_digit_3, full LR   0.002   12    0.2334    DEGRADING
+    fixed_digit_3, half LR   0.001   12    0.3312    PLATEAUED (best 12-bit result)
+    fixed_digit_4, 1/4 LR    0.0005  16    0.2562    PLATEAUED
+
+Halving LR fully fixes `fixed_digit_3`'s instability and edges out
+`fixed_digit_2`'s 0.3125. Quartering LR stabilizes `fixed_digit_4` but
+it still lands below both -- diminishing returns per added digit even
+once LR is compensated, not yet understood why.
+
+**Locked in and committed**: `fixed_digit_2`/`fixed_digit_residual_quantize`
+(commit `fda6430`) is confirmed as a real, working, best-of-session
+result at the 8-bit budget -- this section explores WHY the LR
+sensitivity happens and whether genuinely-separate real-FP4 per-digit
+training (not just decomposing one already-trained fp32 value) can do
+even better, without touching that locked-in code path.
+
+**Corrected a real math error while investigating "does the larger or
+smaller digit learn faster?"**: verified by reading `sili.tensor.mul`'s
+actual backward (`da = b.data * out.grad`) that `out_i * factor_i`
+ALREADY reduces the gradient reaching digit `i` by `factor_i` via
+ordinary autograd, before any extra scaling. So `lr_power=0` (uniform
+nominal rate per digit) is already naturally chain-rule-scaled -- NOT
+an "unscaled naive baseline" as first (wrongly) documented in code
+comments. `lr_power=1` applies ADDITIONAL damping on top of that
+natural reduction, not the natural reduction itself. Fixed in
+`TrueMultiDigitLayer`'s docstring.
+
+**`TrueMultiDigitLayer` built**: per direct correction ("No I mean
+disldo fp4 since quantization is the main goal"), each digit is a
+genuinely separate, independently-trained instance of a REAL backend
+class (`digit_cls`, defaults to `DISLDOLayer` -- true FP4, no manual
+Python-side quantization step, `disldo_backward` already quantizes
+natively) -- NOT one shared fp32 value split into digits after the
+fact the way `fixed_digit_residual_quantize` does. Combined via
+ordinary `Tensor` `*`/`+` autograd, no manual backward wiring.
+`TrueMultiDigitDenseLayer` built alongside it: same digit-residual
+architecture, plain dense fp32 weights trained by a real, external
+`AdamOptimizer` instead of DISLDO's own inline importance-based
+update -- a DISLDO-vs-trusted-optimizer control, per direct request
+("disldo vs normal tensor comparison... tell if there was something
+hidden odd in disldo").
+
+**Real result, same out-of-context curriculum, n_stages=3, base=4.0**:
+
+    arm                          digit backend         scale        rounding      mean_acc  status
+    true_multi_digit_lr0         DISLDOLayer (FP4)      RMSprop      stochastic    0.1000    DEAD/CHANCE
+    true_multi_digit_lr1         DISLDOLayer (FP4)      RMSprop      stochastic    0.0854    DEAD/CHANCE (below chance)
+    true_multi_digit_lr2         DISLDOLayer (FP4)      RMSprop      stochastic    0.0958    DEAD/CHANCE
+    true_multi_digit_dense       dense fp32 + Adam       n/a          n/a           0.3667    PLATEAUED, z=9.4
+    true_multi_digit_fp32_ref    DISLDOLayer32 (fp32)   RMSprop      deterministic 0.7167    PLATEAUED, z=40.3 (BEST of session so far)
+
+Striking and initially confusing result, flagged directly by the user:
+**real FP4 (the "more accurate," genuine floating-point E2M1 codec)
+collapses to pure chance, while `fp32_ref` -- architecturally
+IDENTICAL, same DISLDO importance-based update mechanism, same
+(unfixed, still-stale) RMSprop `value_scale` -- reaches 0.72, more
+than double `fixed_digit_2`'s already-best-of-session 0.31.**
+`lr_power` (0 vs 1 vs 2, i.e. how much EXTRA damping beyond the
+natural chain-rule reduction) makes no real difference among the
+three real-FP4 arms -- all three collapse equally, ruling out
+per-digit LR shape as the explanation. `true_multi_digit_dense`
+(plain Adam, no DISLDO mechanism at all) beats real FP4 (0.37 vs
+0.10) but underperforms `fp32_ref` (0.37 vs 0.72) -- confirms DISLDO's
+own importance-based update is not the bottleneck (it beats Adam when
+not fighting real FP4 storage), consistent with
+[[feedback_importance_is_already_the_optimizer]].
+
+**Root-cause investigation, attempt 1 (value_scale staleness) --
+FALSIFIED**: grepped `linear_disldo.hpp`/`cpu_backend.cpp` directly and
+found plain `DISLDOLayer`/`SparseLinearLayer` (FP4) was STILL calling
+`disldo_backward` with the DEFAULT `RMSpropScalePolicy`,
+`DeferredScaleWrite=false` template args -- the exact stale-code bug
+`SparseLinearLayer8Resync` was built to fix for FP8 in the session
+before this one, never mechanically ported to FP4 even though the
+underlying `disldo_backward` template already supported it for free.
+Built the FP4 equivalents, reusing the existing, already-tested
+`ScalePolicy`/`DeferredScaleWrite` machinery with zero new design:
+
+- `SparseLinearLayerImpl<ScalePolicy, DeferredScaleWrite>` -- templatized
+  the FP4 class the same way `SparseLinearLayer8Impl` already was.
+- `SparseLinearLayerResync` -- FP4 counterpart of `fp8_resync`.
+- `NoScalePolicy` (new, `delta_csr_types.hpp`) + `SparseLinearLayerNoScale`
+  -- per direct request ("Can we just add an option to remove the
+  scaling too?"): `value_scale`/`output_scale` permanently forced to
+  their init value (1.0), update() is a total no-op. Direct
+  real-hardware test of the "zero trained scale" design philosophy,
+  not just a staleness patch.
+- Python wrappers `DISLDOLayerResync`/`DISLDOLayerNoScale`
+  (`sili/sparse_rnn.py`), four new curriculum arms.
+
+Real result -- **both hypotheses falsified**, neither closes any of
+the gap:
+
+    arm (n_stages=3, real FP4)        scale          mean_acc  status
+    true_multi_digit_lr0 (baseline)   RMSprop, stale 0.1000    DEAD/CHANCE
+    true_multi_digit_resync           RMSprop, fixed 0.1187    DEAD/CHANCE
+    true_multi_digit_noscale          forced off     0.1083    DEAD/CHANCE
+    row_4bit_resync (single digit)    RMSprop, fixed 0.1271    PLATEAUED (barely above chance, z=2.6)
+    row_4bit_noscale (single digit)   forced off     0.0958    DEAD/CHANCE
+
+Timing note (per direct request, since a prior session's `fp8_resync`
+work was recalled as "costing a lot"): matched real-FP4-vs-real-FP4
+comparison from the `true_multi_digit` arms -- `DISLDOLayer` (plain)
+109s, `DISLDOLayerResync` 98s, `DISLDOLayerNoScale` 98s. Resync/NoScale
+are actually ~10% FASTER, not slower (`NoScalePolicy::update()` skips
+the RMSprop math entirely; `DeferredScaleWrite` just reorders existing
+work, no new pass) -- the earlier apparent "247s" cost was a mismatched
+comparison against an unrelated, deliberately-expensive Python
+`QuantizedDISLDOLayer32` simulation arm (`row_4bit`, full closed-form
+envelope refit every step), not a fair resync-vs-plain measurement;
+corrected once caught. Valid follow-up flagged but not yet done,
+per direct feedback: a truly optimized `NoScalePolicy` should also
+skip the per-element `value_scale`/`output_scale` MULTIPLY in
+`disldo_forward`/`disldo_backward`'s hot loop when scale is known to
+be permanently 1.0, not just skip the update -- "doing less should not
+cost more, and if it does that means the implementation just isn't
+optimizing." Currently only the update is skipped; the identity
+multiply still runs every touched element. Not urgent since NoScale
+alone isn't winning on accuracy (see below), but real, valid, and
+should be done before NoScale is considered for any production path.
+
+**Root-cause investigation, attempt 2 (stochastic vs deterministic
+rounding) -- CONFIRMED, this is the actual answer.** Both things that
+DID succeed (`fixed_digit_residual_quantize`, `fp32_ref`'s
+`_quantize_raw_digit_inplace`) use DETERMINISTIC round-to-nearest
+quantization. Real `DISLDOLayer` uses STOCHASTIC dithered rounding on
+every write (`fp4_quantize_stochastic`, real per-step noise, unbiased
+in expectation but never zero-variance) -- the one variable not yet
+isolated. `fp4quant.hpp` already had a deterministic `fp4_quantize()`
+sitting right next to the stochastic one, and `ValueAccessor::set()`
+(deterministic) already existed alongside `set_stochastic()` -- nothing
+new to build at the codec level, just needed to be reachable from
+`disldo_backward`. Added `bool StochasticRounding = true` as a 6th
+template parameter on `disldo_backward` (scattered path only, matching
+`ScalePolicy`/`DeferredScaleWrite`'s existing scope -- block4's SIMD
+stochastic-quantize calls untouched), threaded through
+`SparseLinearLayerImpl`, and added `SparseLinearLayerDeterministic`
+plus the full 2x2 (`SparseLinearLayerResyncDeterministic`,
+`SparseLinearLayerNoScaleDeterministic`) since the machinery already
+existed and made the extra arms nearly free. One real bug caught and
+fixed immediately during this edit: a stray `-` landed outside a `//`
+comment marker and broke compilation (`expected external declaration`)
+-- caught from the diagnostics before ever attempting a build.
+
+**Real result -- deterministic rounding alone closes the entire gap,
+on genuine real FP4 hardware storage, no fp32 shadow anywhere:**
+
+    arm                                scale           rounding       mean_acc  status
+    true_multi_digit_lr0 (baseline)    RMSprop, stale  stochastic     0.1000    DEAD/CHANCE
+    true_multi_digit_deterministic     RMSprop, stale  deterministic  0.7854    PLATEAUED, z=125.5
+    true_multi_digit_noscale_det.      forced off      deterministic  0.4000    PLATEAUED (worse than keeping scale)
+    true_multi_digit_fp32_ref (ref)    RMSprop, stale  det., fp32     0.7167    PLATEAUED, z=40.3
+    row_4bit_resync (single digit)     RMSprop, fixed  stochastic     0.1271    PLATEAUED
+    row_4bit_resync_deterministic      RMSprop, fixed  deterministic  0.5333    LEARNING (still trending up at step 15000)
+    row_4bit_noscale                   forced off      stochastic     0.0958    DEAD/CHANCE
+    row_4bit_noscale_deterministic     forced off      deterministic  0.5646    PLATEAUED
+
+`true_multi_digit_deterministic` -- REAL FP4 storage, the DEFAULT
+never-fixed RMSprop scale policy (not even the resync fix) -- reaches
+0.7854, matching and slightly EXCEEDING `fp32_ref`'s 0.7167. The
+stochastic-vs-deterministic axis was the entire explanation; the
+`value_scale` staleness investigation, while a real and independently
+worthwhile fix (still lands in `sili__new` as reusable
+`ScalePolicy`/`DeferredScaleWrite` infrastructure for FP4, matching
+FP8's), was chasing the wrong variable for THIS specific collapse.
+Confirms directly: forcing scale OFF actively HURTS once rounding is
+fixed (0.40 vs 0.79) -- scale was never the problem, it was quietly
+helping the whole time, just masked by the much larger stochastic-
+rounding noise floor. Single-digit (`row_4bit_*_deterministic`)
+arms land around 0.45-0.56, real and far above chance but clearly
+below the 3-digit residual architecture's 0.79 -- the digit-composition
+idea itself is pulling real additional weight on top of the rounding
+fix, not merely riding on it.
+
+**New classes/parameters landed in `sili__new`** (all additive,
+default-argument-preserving, zero regressions -- verified by stashing
+this session's `sili__new` diff and re-running the full test suite
+against the untouched baseline, confirming the 4 failures seen
+[`test_forward_output_not_aliased.py` x3, `test_rank1_scale.py`'s
+`test_forward_alone_moves_importance_before_any_backward`] plus
+`test_sili.py`'s wholesale stale-5-arg-constructor breakage and the
+already-`xfail`-adjacent `test_low_density_gating_...` energy test are
+ALL pre-existing, unrelated to this session's work):
+
+- `linear_disldo.hpp`: `StochasticRounding` template param on
+  `disldo_backward` (scattered path, both the immediate-write and
+  `DeferredScaleWrite` flush call sites).
+- `delta_csr_types.hpp`: `NoScalePolicy`.
+- `cpu_backend.cpp`: `SparseLinearLayerImpl<ScalePolicy,
+  DeferredScaleWrite, StochasticRounding>`, concrete aliases
+  `SparseLinearLayer`/`Resync`/`NoScale`/`Deterministic`/
+  `ResyncDeterministic`/`NoScaleDeterministic`, full pybind bindings.
+- `sparse_rnn.py`: matching `DISLDOLayerResync`/`NoScale`/
+  `Deterministic`/`ResyncDeterministic`/`NoScaleDeterministic` Python
+  wrappers.
+- `sili_peridot/scripts/train_tile_curriculum.py`: all corresponding
+  curriculum arms.
+
+**Direction update, per direct user request**: the goal for this whole
+line of work is now explicitly to MATCH fp8/fp16/fp32 accuracy with
+real quantized/sparse storage, not just "beat other quantization
+schemes" -- today's `true_multi_digit_deterministic` result (0.79,
+beating the fp32-shadow `fp32_ref` control) is the first real evidence
+that target is reachable, not just aspirational. If a future,
+larger-scale test can't close a remaining gap, the literature already
+gathered (SGDT, Q-S5, Loihi, BitNet b1.58, LSQ, MPQ-DMv2, VBQ,
+LLM.int8() -- see the earlier literature-search entry) is the fallback
+reference for what's practically achievable elsewhere. Also flagged:
+sparse ECHO-network connectivity (i.e. relying on synaptogenesis/
+pruning to find a good sparse structure) could underperform for
+reasons unrelated to precision if the random/adaptive connectivity
+search itself gets unlucky -- fully DENSE DISLDO layers (still using
+real FP4/FP8 storage, just no sparsity) remain an available fallback
+if that turns out to matter at real model scale, independent of
+whatever precision scheme wins.
+
+**Not yet done**: real C++ test coverage for `StochasticRounding`
+(currently validated only via the Python curriculum harness, not a
+dedicated `test_scale_policies.cpp`-style unit test); sweeping
+`n_stages`/`base` again now that deterministic rounding is the
+confirmed right foundation (today's numbers all still use the
+`fixed_digit_2`-era `n_stages=3, base=4.0` defaults, chosen before this
+finding); the `NoScalePolicy` hot-loop multiply-skip optimization
+flagged above; FP8 equivalent of `StochasticRounding` (real FP8 also
+uses `fp8_quantize_stochastic` at its 5 call sites, never tested here
+-- given how decisive this was for FP4, worth checking whether FP8's
+earlier `fp8_resync`/`fp8_adamax` "modest, close-to-noise-floor" result
+was ALSO partly a stochastic-rounding artifact); real-model-scale
+validation (everything above is still the small toy tile-recurrence
+harness, state_width<=128, vocab=10).
