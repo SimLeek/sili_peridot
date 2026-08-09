@@ -3477,4 +3477,116 @@ miscalibrated-energy) framing that FP8 was the stronger performer.
   task, FP4 (rank-1 or rank-2 helpers, no Adam-style optimizer state)
   was diverging under the library's default energy config and became
   reliably, significantly trainable once energy was correctly
+  calibrated (see the next entry -- this specific overnight run was
+  later found to not actually have been learning at all; the entry
+  below is the correction).
+
+## 2026-08-09: The overnight run wasn't learning -- root-caused, fixed, and FP4 now beats fp32 at matched memory
+
+The overnight n=20/50,000-step run above never actually learned
+anything. Direct catch: VOCAB=40, EVAL_SEQUENCES=60, so chance=0.025;
+readings around 0.03-0.1 after 20,000+ steps are indistinguishable
+from a collapsed model biased toward one output token -- the earlier
+z-vs-chance framing throughout this file was measuring "above naive
+chance," which a dead/collapsed model can satisfy by pure sampling
+bias, not "is the accuracy trending up." This was the direct, explicit
+correction that started this debugging arc; every rank1-vs-rank2-vs-fp8
+comparison earlier in this file needs re-reading with that caveat --
+NOT retracted (the numbers are real), but the differences may reflect
+which arm collapsed less often rather than which arm learned better.
+The separate tanh-cell (non-tile) recurrence's earlier statistical
+results are a different architecture and are NOT called into question.
+
+**Root causes found and fixed, in order:**
+
+1. **RMSNorm alone doesn't bound the state.** `state_ln` reduces but
+   does not eliminate unbounded growth of the raw recurrent state `M`
+   under repeated additive residual updates. Fix (found by direct
+   experimentation while this session was underway): a hard
+   `np.clip(M.data, -2.0, 2.0)` applied directly to the state's raw
+   `.data` after the RMSNorm, bypassing autograd entirely (there's no
+   gradient through a clip that matters here -- the norm already
+   handles differentiable scaling). Zero overflow warnings since, with
+   `warnings.filterwarnings("error", category=RuntimeWarning)` left on
+   as a tripwire.
+2. **`_build_tile_window` bug**: out-of-bound tokens (`src < 0`, before
+   the sequence start) were incorrectly filled with `M_prev`, silently
+   double-counting the recurrent state inside `qkv_source` on top of
+   the separate `M_prev` term already being added. Fixed to leave
+   those positions as zero.
+3. **SwiGLU MLP block removed.** Not proven necessary, and one less
+   thing that can be a source of instability while root-causing the
+   above two bugs. `post_ln` removed with it (RMSNorm is now only
+   `input_ln`/`state_ln`). `parameters_for_optimizer()` is now 4
+   entries, not 5 -- `tests/test_toy_tile_precision_models.py` still
+   asserts 5 and is now stale, not yet fixed.
+4. Model shrunk drastically for fast iteration (state_width 1024->32,
+   num_tiles 32->4, vocab 40->10) and a new self-contained
+   `generate_copy_sequence` task (`scripts/train_tile_curriculum.py`)
+   replaced `generate_mqar_sequence`, which can't express seq_len<4.
+
+**Tooling built:** `scripts/learning_slope.py` -- Theil-Sen slope
+(robust to single-checkpoint noise) plus a z-vs-chance test, over a
+trailing window of checkpoints, classifying any `step=N ... acc=X` log
+as LEARNING / PLATEAUED / DEGRADING / DEAD-CHANCE / AMBIGUOUS. Directly
+validated it distinguishes "z_vs_chance=10+ but flat" from real
+learning against the old overnight logs (`fp8_energy0.log`: z=10.40,
+correctly PLATEAUED, not LEARNING) -- concretely confirms the
+methodology problem this whole arc started from.
+
+**Ablation results, all on the trivial seq_len=2 copy-recall task
+(token[0] must be reproduced at the final tick), use_energy=False,
+use_attention=False (plain RNN cell, gaussian_attention bypassed) so
+the attention component itself isn't yet a confound:**
+
+- `fp4-rank1` at state_width=32 (matching fp32's width): plateaus
+  around 0.30-0.45, never above -- real learning (slope positive
+  early, `learning_slope.py`: mean_acc=0.35, z=10.25 in the trailing
+  window) but capped well below 1.0.
+- `fp32` at the same state_width=32: climbs steadily to 0.72-0.83,
+  clearly still trending at step 6000 (not yet plateaued in the
+  Theil-Sen sense despite `learning_slope.py` calling it PLATEAUED at
+  a stricter threshold -- mean_acc=0.73, z=26.0). This is the key
+  finding that rules out "the whole architecture/pipeline is broken":
+  the identical recurrence, identical task, identical training loop
+  learns close to the target ceiling at fp32.
+
+  So FP4 quantization coarseness -- not the architecture or the no-BPTT
+  training dynamics -- is the dominant ceiling at *equal width*.
+
+**Then the memory-matched question** (direct prompt: since FP4 packs
+~8x more value-bits per byte than fp32, what happens with a wider FP4
+net at *comparable memory footprint* to the narrow fp32 net, rather
+than comparing at equal width?). `train_tile_curriculum.py` gained
+optional CLI overrides (`embed_width column_neurons max_weights`) plus
+an `estimate_value_bits()` helper (value-bits only, index/overhead
+bits assumed to roughly cancel in a relative comparison -- an
+approximation, stated as such, not a byte-exact accounting). Built a
+config at embed_width=16, column_neurons=8 (state_width=128, 4x wider)
+with max_weights=1500, landing at ~830 bytes of estimated value memory
+-- matching the fp32-at-width-32 baseline's ~832 bytes almost exactly:
+
+    fp4-rank1 wide (~830B): step 3300 acc=0.983 (peak), step 6000 acc=0.80,
+                            mean_acc(last10)=0.885, slope status=DEGRADING
+    fp4-rank2 wide (~830B): step 6000 acc=0.95, mean_acc(last10)=0.917,
+                            slope status=LEARNING (still climbing, least noisy)
+    fp32 narrow (~832B):    step 6000 acc=0.75, mean_acc(last10)=0.73
+
+At matched memory, both FP4 configs beat the fp32 baseline's ceiling,
+with rank1 peaking highest (0.983) but degrading after its early peak,
+and rank2 more stable and still trending up at the same step count --
+both real signal, not noise (z_vs_chance 33-53 either way). This is a
+genuinely new, useful result for the project: **FP4's real advantage
+isn't matching fp32 at equal width, it's using the freed-up memory
+budget for more capacity, which more than compensates for the coarser
+per-weight precision -- and rank-2 looks like the steadier of the two
+FP4 variants at this scale**, consistent with the standing suspicion
+that rank-2 (or at least *some* multi-component FP4 helper) may be
+load-bearing rather than a nice-to-have.
+
+**Not yet done / open:** `use_attention=True` re-enabled at this
+scale, `use_energy=True` at this scale, curriculum progression past
+seq_len=2 with the clip fix, fp8 in the memory-matched comparison,
+longer rank2 runs to see if it keeps climbing toward 1.0 or plateaus
+below it, and the stale `parameters_for_optimizer()`-length test.
   calibrated.

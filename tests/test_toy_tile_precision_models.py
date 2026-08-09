@@ -57,12 +57,11 @@ class TestToyTileRecurrenceRealFP4:
     def test_leaf_parameters_for_optimizer(self):
         model = _model()
         params = model.parameters_for_optimizer()
-        assert len(params) == 5  # input_ln, post_ln, state_ln, centers, log_sigmas
+        assert len(params) == 4  # input_ln, state_ln, centers, log_sigmas
         assert params[0].data.shape == (STATE_WIDTH,)
         assert params[1].data.shape == (STATE_WIDTH,)
-        assert params[2].data.shape == (STATE_WIDTH,)
+        assert params[2].data.shape == (NUM_TILES,)
         assert params[3].data.shape == (NUM_TILES,)
-        assert params[4].data.shape == (NUM_TILES,)
 
     def test_resetting_M_prev_changes_logits(self):
         model = _model()

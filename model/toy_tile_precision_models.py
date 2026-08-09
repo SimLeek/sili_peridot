@@ -28,29 +28,41 @@ class ToyTileRecurrenceRealFP4:
     def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
                  mlp_hidden: int, num_tiles: int, max_weights: int,
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
-                 use_energy: bool = False, energy_kwargs: Optional[dict] = None):
-        """mlp_hidden is retained in the signature for API compatibility 
-        but is no longer used since the MLP block was removed."""
+                 use_energy: bool = False, energy_kwargs: Optional[dict] = None,
+                 use_attention: bool = True):
+        """mlp_hidden is retained in the signature for API compatibility
+        but is no longer used since the MLP block was removed.
+
+        use_attention=False: bypasses q/k/v/gaussian_attention (and
+        energy, which only ever gated the attention output) entirely --
+        collapses this into a plain RNN cell,
+        state = clip(rmsnorm(state + o_proj(rmsnorm(x)+rmsnorm(state)))).
+        Ablation to isolate whether gaussian_attention itself is what's
+        hard to learn, before assuming the whole architecture is broken."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
         self.num_tiles = num_tiles
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
-        
-        if not use_energy:
+        self.use_attention = use_attention
+
+        if not use_attention:
+            self.energy = None
+        elif not use_energy:
             self.energy = None
         elif energy_kwargs is not None:
             self.energy = EnergyDynamics(**energy_kwargs)
         else:
             self.energy = _toy_scale_energy()
-            
+
         state_width = self.state_width
-        
+
         # 1. Core Attention & Output Projections
-        self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
-        self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
-        self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
+        if use_attention:
+            self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
+            self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
+            self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
         self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus)
         
@@ -101,16 +113,20 @@ class ToyTileRecurrenceRealFP4:
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         qkv_source = x_normed + m_normed
         
-        # 2. Gaussian Attention
-        q = self.q_proj.forward(qkv_source, learning_rate)
-        k = self.k_proj.forward(qkv_source, learning_rate)
-        v = self.v_proj.forward(qkv_source, learning_rate)
-        sigmas = exp(self.log_sigmas)
-        
-        attn = gaussian_attention(q, k, v, self.centers, sigmas,
-                                  num_cpus=self.num_cpus, causal=False)
-        attn, aux_loss = _apply_energy(self.energy, attn, self.num_tiles, self.state_width)
-        attn = self.o_proj.forward(attn, learning_rate)
+        # 2. Gaussian Attention (or bypass -- see use_attention docstring)
+        if self.use_attention:
+            q = self.q_proj.forward(qkv_source, learning_rate)
+            k = self.k_proj.forward(qkv_source, learning_rate)
+            v = self.v_proj.forward(qkv_source, learning_rate)
+            sigmas = exp(self.log_sigmas)
+
+            attn = gaussian_attention(q, k, v, self.centers, sigmas,
+                                      num_cpus=self.num_cpus, causal=False)
+            attn, aux_loss = _apply_energy(self.energy, attn, self.num_tiles, self.state_width)
+            attn = self.o_proj.forward(attn, learning_rate)
+        else:
+            attn = self.o_proj.forward(qkv_source, learning_rate)
+            aux_loss = None
 
         # 3. Residual & Hard Bounding
         M_new_t = Tensor(M_prev.astype(np.float32)) + attn
