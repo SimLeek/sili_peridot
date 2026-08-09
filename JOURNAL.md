@@ -3840,3 +3840,69 @@ parity with fp32 including genuine out-of-context recall. Where actual
 production storage should land (4-bit-higher-rank vs 8-bit-rank-1 vs
 mixed) is now a real, evidence-backed design question rather than a
 guess -- not yet decided, real model-scale validation still needed.
+
+## 2026-08-09 (continued): true residual/cascaded 4-bit quantization ("multi-FP4") also matches rank1_8bit -- a second, independent 8-bit-budget scheme that fully closes the gap
+
+Direct follow-up, clarifying a real ambiguity: the user's "multi-FP4"
+idea (do 2 residual/cascaded FP4 passes, like RVQ in neural audio
+codecs) is NOT the same as the earlier `rankn_fake_quantize` dead end
+documented in this file (the rank-n entry, ~line 2953) -- that attempt
+tried to fit a SECOND SCALE ENVELOPE on top of the first, which
+provably has nothing left to refine since `rank1_fake_quantize`'s
+envelope is a strict max-cover bound. True residual/cascaded
+quantization instead refines the quantized VALUE's own rounding error
+(`v - round(v/step)*step`, always nonzero, bounded by half a step,
+totally unrelated to the envelope's cover property) -- genuinely
+different mechanism, never actually tried before now. (It's also not
+the same as this session's earlier `o_proj_depth` test, which stacked
+whole separate LAYERS/matrices in sequence, not residual codes of a
+single weight value.)
+
+**Implementation** (`model/toy_precision_models.py`):
+`residual_fake_quantize(vals, ptrs, indices, n_out, bits_per_stage,
+n_stages)` -- quantizes `vals` via `rank1_fake_quantize` at
+`bits_per_stage`, computes the residual (`vals - stage1`), quantizes
+THAT residual with a FRESH independently-fit rank-1 envelope (the
+residual has a much smaller dynamic range, so its own envelope can be
+much tighter), repeats `n_stages` times, sums every stage to
+reconstruct. Wired into `_quantize_disldo32_inplace`/
+`QuantizedDISLDOLayer32` as `scheme="residual"` with a new `n_stages`
+param. Total cost: `n_stages * bits_per_stage` bits/weight (plus
+`n_stages` independent small row/col scale pairs) -- `n_stages=2,
+bits_per_stage=4` = 8 bits/weight, directly comparable to
+`rank1_8bit`'s single 8-bit code, not a "cheat" comparison.
+
+**Sanity-checked the raw reconstruction error before spending a
+training run on it** (synthetic bimodal-magnitude CSR array, matching
+the rank-n entry's own verification style): single 4-bit MSE=4.54,
+single 8-bit MSE=0.0266, residual 2x4-bit MSE=0.0068 -- residual
+2x4-bit is actually LOWER error than plain 8-bit at the SAME bit
+budget, not just competitive. Makes sense: the second stage's envelope
+fits tightly to the residual's own small range instead of sharing one
+envelope across the full original dynamic range.
+
+**Real training result**, `multi_fp4` arm added to `ARMS`
+(`QuantizedDISLDOLayer32(bits=4, scheme="residual", n_stages=2,
+quantize_importance=True)`), identical out-of-context curriculum,
+state_width=128, baseline PEAK_LR=0.002:
+
+    step=750 (seq_len=2) through step=13500 (seq_len=8): 0.87-1.0000, mostly 1.0
+    trailing window (steps 9750-15000): mean_acc=0.9854, std=0.013, z=192.6, PLATEAUED at ceiling
+
+Matches (marginally beats, within noise) `rank1_8bit`'s 0.9708 mean at
+the same un-widened config, same 8-bit total budget. **A second,
+independently-derived scheme now closes the exact same gap** -- not a
+fluke of `rank1_8bit`'s specific envelope construction. This is real
+confirmation that the user's original synapse-analogy intuition
+(compose multiple coarse components rather than store one fine one)
+was right in spirit -- it just needed to be applied at the right
+level (per-value residual codes, not layer depth or scale-envelope
+refinement) to actually work.
+
+**Open, not yet done**: `multi_fp4` at the memory-matched-wide config
+(does it also hit exact 1.0 like `rank1_8bit` did there?), `multi_fp4`
+vs `rank1_8bit` head-to-head on speed/complexity (residual needs 2
+full `rank1_fake_quantize` passes per quantization event vs 1), and
+whether 3+ stages at finer per-stage bit-depth (e.g. 3x
+~2.67-bit-equivalent, or n_stages=4 at 2-bit) pushes the effective
+precision even further per bit spent.

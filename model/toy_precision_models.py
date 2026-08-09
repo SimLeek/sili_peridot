@@ -618,8 +618,42 @@ def rankn_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
     return out.astype(np.float32)
 
 
+def residual_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
+                           n_out: int, bits_per_stage: int, n_stages: int) -> np.ndarray:
+    """True residual/cascaded quantization -- matching neural-audio-codec
+    RVQ (e.g. EnCodec/SoundStream): quantize vals via rank1_fake_quantize
+    at bits_per_stage, then quantize the ROUNDING RESIDUAL (vals - q1)
+    with a FRESH rank1 envelope fit to the residual's own (much smaller)
+    dynamic range, repeat n_stages times, sum every stage to reconstruct.
+
+    NOT the same as the rank-n entry's documented dead end (JOURNAL.md):
+    that attempt tried to refine the rank1 SCALE ENVELOPE itself
+    (row_scale*col_scale, a max-cover bound -- provably nothing left to
+    subtract a second time, since the envelope already upper-bounds
+    every |v| in its row/col by construction). This instead refines the
+    quantized VALUE's rounding error, an unrelated, always-nonzero
+    quantity bounded by half a quantization step -- the actual mechanism
+    real residual vector quantization exploits, and genuinely untested
+    here before now.
+
+    Total cost: n_stages * bits_per_stage bits/weight (plus n_stages
+    independent row/col scale pairs -- small, O(rows+cols) overhead per
+    stage) -- e.g. n_stages=2, bits_per_stage=4 is 8 bits/weight total,
+    a fair, apples-to-apples comparison against
+    rank1_fake_quantize(bits=8)'s single 8-bit code."""
+    residual = vals.astype(np.float64).copy()
+    reconstructed = np.zeros_like(residual)
+    for _ in range(n_stages):
+        stage_q = rank1_fake_quantize(residual.astype(np.float32), ptrs, indices,
+                                      n_out, bits_per_stage).astype(np.float64)
+        reconstructed += stage_q
+        residual = residual - stage_q
+    return reconstructed.astype(np.float32)
+
+
 def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
-                               quantize_importance: bool, rank: int = 1) -> None:
+                               quantize_importance: bool, rank: int = 1,
+                               n_stages: int = 1) -> None:
     c = inner._c
     ptrs = np.array(c.ptrs, copy=True)
     indices = np.array(c.indices, copy=True)
@@ -635,6 +669,9 @@ def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
     elif scheme == "rankn":
         w_q = rankn_fake_quantize(w, ptrs, indices, n_out, bits, rank)
         imp_q = rankn_fake_quantize(imp, ptrs, indices, n_out, bits, rank) if quantize_importance else imp
+    elif scheme == "residual":
+        w_q = residual_fake_quantize(w, ptrs, indices, n_out, bits, n_stages)
+        imp_q = residual_fake_quantize(imp, ptrs, indices, n_out, bits, n_stages) if quantize_importance else imp
     else:
         raise ValueError(scheme)
     c.load_weights(ptrs, indices, w_q.astype(np.float32), imp_q.astype(np.float32))
@@ -678,13 +715,14 @@ class QuantizedDISLDOLayer32:
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, bits: int = 8, scheme: str = "rank1",
-                quantize_importance: bool = True, rank: int = 1,
+                quantize_importance: bool = True, rank: int = 1, n_stages: int = 1,
                 rng: Optional[np.random.Generator] = None):
         self._inner = DISLDOLayer32(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.bits = bits
         self.scheme = scheme
         self.quantize_importance = quantize_importance
         self.rank = rank  # only consulted when scheme == "rankn"
+        self.n_stages = n_stages  # only consulted when scheme == "residual"
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                damp_by_importance: bool = True) -> Tensor:
@@ -696,7 +734,8 @@ class QuantizedDISLDOLayer32:
             inner_bwd()  # real fp32 RMSprop update happens here first
             if learning_rate != 0.0:
                 _quantize_disldo32_inplace(self._inner, self.bits, self.scheme,
-                                           self.quantize_importance, self.rank)
+                                           self.quantize_importance, self.rank,
+                                           self.n_stages)
 
         out._backward = _bwd
         return out
