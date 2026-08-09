@@ -3906,3 +3906,91 @@ full `rank1_fake_quantize` passes per quantization event vs 1), and
 whether 3+ stages at finer per-stage bit-depth (e.g. 3x
 ~2.67-bit-equivalent, or n_stages=4 at 2-bit) pushes the effective
 precision even further per bit spent.
+
+## 2026-08-09 (continued): IMPORTANT CORRECTION -- rank1_8bit/multi_fp4 are NOT real DISLDOLayers; real DISLDOLayer8 does NOT yet replicate the win, cold-start seeding only partially closes it
+
+Direct, necessary correction after the user asked the right question:
+every winning arm this whole session except `rank1`(=`DISLDOLayer`)
+and `fp32`(=`DISLDOLayer32`) and `fp8`(=`DISLDOLayer8`) is a
+`QuantizedDISLDOLayer32` WRAPPER -- real fp32 arithmetic underneath
+(`DISLDOLayer32`), with weights+importance FAKE-quantized (rounded to
+an N-bit reconstruction, then written back) after every backward call.
+This is a deliberate, useful simulation methodology (isolates "does
+training survive N-bit storage" from "is the update-rule math itself
+precise," matching real QAT simulators) -- but it means `rank1_8bit`
+and `multi_fp4`'s wins are NOT yet running on real DISLDOLayer C++
+storage/arithmetic. Important discovery while checking this precisely:
+real `DISLDOLayer`(4-bit)/`DISLDOLayer8`(8-bit E4M3) ALREADY use a
+real, trainable rank-1 envelope natively (`value_scale`/`output_scale`,
+`linear_disldo.hpp`) -- so `DISLDOLayer8` is, by construction, meant to
+be the real-C++ version of exactly the winning `rank1_8bit` scheme,
+per its own docstring ("never lost to native FP4" in the original
+sweep this class was built from).
+
+**Direct test: does real `DISLDOLayer8` (arm `fp8`) replicate
+`rank1_8bit`'s out-of-context win?** Same config, same curriculum.
+**No** -- collapsed to near-chance: mean_acc=0.185 (trailing window),
+PLATEAUED not learning, vs the simulation's 0.971. A real, honest,
+important negative result -- not glossed over.
+
+**Root-caused the likely mechanism, not guessed at:** real
+`value_scale`/`output_scale` are learned via SLOW, noisy, RMSprop
+-style gradient descent on the actual downstream loss
+(`weights.value_scale[r] -= scale_eff_lr * g_agg / (sqrt(vs_imp)+eps)`,
+confirmed by reading `linear_disldo.hpp` directly) -- a fundamentally
+different process from the fake-quantize simulation's closed-form
+3-pass alternating max-cover fit, which recomputes an idealized
+envelope from scratch, over the WHOLE layer, every single backward
+call. The real mechanism has to slowly discover a good envelope from
+sparse, query-tick-only gradients; the simulation gets one for free
+every step. Direct, testable hypothesis: real DISLDOLayer8's envelope
+just hasn't converged within this task's step budget (a cold-start
+problem), not that 8-bit+rank-1 is insufficient in principle (already
+disproven by the simulation).
+
+**Tested the hypothesis directly**: built
+`SeededRank1DISLDOLayer8`(`model/toy_precision_models.py`) -- a real
+`DISLDOLayer8` whose `value_scale`/`output_scale` are seeded ONCE at
+construction from the same closed-form rank-1 fit
+(`_seed_rank1_scale`, using the real `set_value_scale_raw`/
+`set_output_scale_raw` pybind accessors already used by
+`AdamRowScaleDISLDOLayer`), then trains normally with DISLDOLayer8's
+own real ongoing gradient-based scale update after that. Result: real
+but PARTIAL improvement -- mid-range distances clearly better
+(seq_len=3: 0.72-0.92 vs 0.30-0.88 unseeded; seq_len=5-6: 0.47-0.67 vs
+0.32-0.42 unseeded), but still collapses at the harder distances
+(seq_len=7-8 trailing-window mean=0.225, PLATEAUED, vs the
+simulation's 0.971). **Cold-start is a real, measurable, partial
+contributor -- not the whole explanation.** Something else in real
+DISLDOLayer8's actual training dynamics (most likely: the ongoing
+gradient-based scale update itself degrading a good envelope over
+time, since the simulation never has to defend a fit against noisy
+updates -- or a genuine arithmetic difference between E4M3's own
+coding and a raw fixed-point round -- not yet distinguished) still
+separates it from the toy simulation's result.
+
+**Honest bottom line for the user's actual question ("if we can get
+DISLDO ops on both models... might be perfect"):** not yet true. The
+toy simulation is strong, real evidence that an 8-bit-rank-1 (or
+8-bit-budget residual) REPRESENTATION is sufficient for this
+architecture's recurrent state -- but making that a genuinely deployed
+`DISLDOLayer` requires either (a) fixing/strengthening real
+DISLDOLayer8's scale-learning dynamics so it actually reaches a good
+envelope and KEEPS it under continued training (real algorithm/C++
+work, not yet started), or (b) building an entirely new real C++
+residual/2-stage DISLDOLayer variant for `multi_fp4` specifically
+(also not started -- would need genuine new packed storage, 2 code
++ 2 scale-pair layout, and likely the same incremental-update-vs
+-global-refit question). Per this project's own established pattern
+(toy simulation first, then real C++ engineering once validated --
+exactly how FP8 itself was built), this is now a well-evidenced
+candidate for that investment, not yet the investment itself.
+
+**Not yet done**: distinguishing "ongoing scale update degrades a good
+fit" from "E4M3 arithmetic differs from the simulation's raw
+fixed-point round" (e.g. freeze value_scale/output_scale after seeding
+-- no further scale training -- and see if accuracy holds or still
+decays); whether a much higher/lower `scale_eff_lr` specifically for
+value_scale/output_scale (separate from the weight's own learning
+rate) closes more of the gap; real DISLDOLayer4 (plain `rank1` arm)
+was NOT re-seeded/re-tested this round, only `fp8`.

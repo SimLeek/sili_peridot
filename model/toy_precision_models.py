@@ -51,7 +51,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from sili.tensor import Tensor, banded_attention, silu, _acc
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayer8
 from sili.energy import EnergyDynamics
 
 from .toy_recall_models import rmsnorm_tensor, AdamOptimizer
@@ -742,6 +742,61 @@ class QuantizedDISLDOLayer32:
 
     def parameters(self) -> List[Tensor]:
         return []  # nothing here is an external-optimizer-trainable Tensor leaf
+
+
+def _seed_rank1_scale(inner_c, in_features: int, out_features: int) -> None:
+    """Seed value_scale/output_scale ONCE, from a real closed-form
+    3-pass alternating max-cover fit of the layer's CURRENT (freshly
+    -preseeded) weights -- same math as rank1_fake_quantize's own
+    envelope fit, applied here only to set the starting point, not to
+    quantize/round anything. Real ongoing training still uses
+    DISLDOLayer8's own gradient-based value_scale/output_scale update
+    (linear_disldo.hpp) after this -- isolates whether that slow,
+    noisy, query-tick-only-gradient learning process was simply
+    undertrained within a fixed step budget (found directly: real
+    DISLDOLayer8 collapsed out-of-context, mean_acc=0.19, despite
+    nominally using the identical 8-bit+rank1 scheme the toy
+    fake-quantize simulation solved at mean_acc=0.97), vs the
+    8-bit+rank1 REPRESENTATION itself being insufficient."""
+    ptrs = np.array(inner_c.ptrs, copy=True)
+    indices = np.array(inner_c.indices, copy=True)
+    abs_vals = np.abs(np.array(inner_c.weights_vals, copy=True).astype(np.float64))
+    row_of = np.repeat(np.arange(in_features), np.diff(ptrs).astype(np.int64))
+    col_of = indices.astype(np.int64)
+
+    row_scale = np.ones(in_features, dtype=np.float64)
+    col_scale = np.ones(out_features, dtype=np.float64)
+    for _ in range(3):
+        col_max = np.zeros(out_features, dtype=np.float64)
+        np.maximum.at(col_max, col_of, abs_vals / np.maximum(row_scale[row_of], 1e-12))
+        col_scale = np.maximum(col_max, 1e-12)
+
+        row_max = np.zeros(in_features, dtype=np.float64)
+        np.maximum.at(row_max, row_of, abs_vals / np.maximum(col_scale[col_of], 1e-12))
+        row_scale = np.maximum(row_max, 1e-12)
+
+    for r in range(in_features):
+        inner_c.set_value_scale_raw(r, float(row_scale[r]))
+    for c in range(out_features):
+        inner_c.set_output_scale_raw(c, float(col_scale[c]))
+
+
+class SeededRank1DISLDOLayer8(DISLDOLayer8):
+    """Real DISLDOLayer8 (true C++ E4M3 storage, true disldo_forward/
+    backward kernels -- NOT a fake-quantize simulation) whose
+    value_scale/output_scale are seeded once at construction from a
+    real closed-form rank-1 fit (see _seed_rank1_scale), instead of
+    left at the default 1.0 for the slow gradient-based update to
+    discover from scratch. Direct diagnostic for whether real
+    DISLDOLayer8's out-of-context collapse is a cold-start/undertrained
+    -scale problem rather than the 8-bit+rank-1 representation itself
+    being insufficient (the toy simulation already showed the
+    representation works when the envelope is well-fit)."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
+        _seed_rank1_scale(self._c, in_features, out_features)
 
 
 class ToySmallTransformerFP32Ref(ToySmallTransformerRealFP4):

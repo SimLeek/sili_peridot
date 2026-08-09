@@ -31,7 +31,7 @@ sys.path.insert(0, ".")
 
 from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import QuantizedDISLDOLayer32
+from model.toy_precision_models import QuantizedDISLDOLayer32, SeededRank1DISLDOLayer8
 from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
 
 
@@ -97,6 +97,12 @@ ARMS = {
                             # -- 8 bits/weight total, a fair fight against rank1_8bit's
                             # single 8-bit code, not the earlier ruled-out envelope-of
                             # -envelope idea
+    "fp8_seeded": SeededRank1DISLDOLayer8,  # real DISLDOLayer8 (true C++ E4M3 + rank-1
+                            # value_scale/output_scale), scale seeded from a real
+                            # closed-form fit at init instead of left at 1.0 -- tests
+                            # whether real fp8's out-of-context collapse is a
+                            # cold-start/undertrained-scale problem, not the
+                            # representation itself
 }
 
 
@@ -138,7 +144,8 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # same across arms so they wash out of a *relative* comparison; this is an
 # approximation, not a byte-exact accounting).
 ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
-                  "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4, "multi_fp4": 8}
+                  "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4, "multi_fp4": 8,
+                  "fp8_seeded": 8}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
