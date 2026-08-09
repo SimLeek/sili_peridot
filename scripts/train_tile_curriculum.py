@@ -30,9 +30,11 @@ import numpy as np
 sys.path.insert(0, ".")
 
 from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
+from sili import _cpu
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
 from model.toy_precision_models import (QuantizedDISLDOLayer32, SeededRank1DISLDOLayer8,
-                                        PeriodicSeedRank1DISLDOLayer8)
+                                        PeriodicSeedRank1DISLDOLayer8,
+                                        SeededDISLDOLayer8Resync, SeededDISLDOLayer8AdaMax)
 from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
 
 
@@ -110,6 +112,17 @@ ARMS = {
                             # whether REPEATED correction (no change to the real
                             # weight-update math) substitutes for the simulation's
                             # every-step refit
+    "fp8_resync": SeededDISLDOLayer8Resync,  # REAL C++ fix (not a Python approximation):
+                            # sili__new's disldo_backward now defers each touched
+                            # entry's store until value_scale/output_scale are BOTH
+                            # finalized for the call, instead of storing under the
+                            # stale pre-update scale. Seeded like fp8_seeded for a
+                            # fair comparison (isolates the deferred-write fix, not
+                            # "was output_scale active at all").
+    "fp8_adamax": SeededDISLDOLayer8AdaMax,  # same deferred-write fix, but
+                            # value_scale/output_scale use an AdaMax-style decayed
+                            # running-max update instead of RMSprop -- see
+                            # AdaMaxScalePolicy's docstring in sili__new.
 }
 
 
@@ -152,7 +165,7 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # approximation, not a byte-exact accounting).
 ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4, "multi_fp4": 8,
-                  "fp8_seeded": 8, "fp8_reseeded": 8}
+                  "fp8_seeded": 8, "fp8_reseeded": 8, "fp8_resync": 8, "fp8_adamax": 8}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
@@ -210,6 +223,18 @@ def main():
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
+    # Real DISLDOLayer-family (fp8/fp8_seeded/fp8_resync/fp8_adamax/rank1/
+    # fp32) arms use stochastic rounding (fp4quant.hpp/fp8quant.hpp's
+    # set_stochastic) whose RNG is thread-local and, by design, seeded
+    # from the thread id at process start -- NOT controlled by `seed`
+    # above, and NOT reproducible run-to-run without this call. Confirmed
+    # directly: the SAME unchanged binary gave different single-step
+    # results across separate process invocations (0.140625 vs 0.15625
+    # for one stored weight) purely from this. Without pinning it here,
+    # comparisons between arms (or before/after a C++ change) are
+    # confounded by an extra, uncontrolled noise source on top of `seed`.
+    if hasattr(_cpu, "seed_fp4_stochastic_rng"):
+        _cpu.seed_fp4_stochastic_rng(seed)
     model = ToyTileRecurrenceRealFP4(
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],

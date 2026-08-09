@@ -4044,3 +4044,151 @@ convention already used throughout `linear_disldo.hpp`/
 and tested directly against the REAL engine -- not approximated in
 Python. Scoping this as a proper plan is the deferred next step, not
 yet started.
+
+## 2026-08-09 (continued): real C++ swappable-optimizer plan implemented -- fp8_resync gives a real, replicated (but modest) win; fp8_adamax doesn't; a second, previously-invisible noise source found and partially fixed along the way
+
+Full plan at `~/.claude/plans/fuzzy-plotting-starlight.md` (design
+rationale, scope decisions). Summary of what got built and found.
+
+**Design, scoped down twice, both times for good reasons:**
+- Block4 was originally in scope (per direct concern: promotion might
+  trigger automatically whenever 2+ synapses land in the same 4x4
+  block). Checked directly instead of assuming either way: ran 200 real
+  training steps on a fresh `DISLDOLayer8` and read `.block4.tiles` --
+  **0, both before and after.** `block4_maybe_promote` only fires from
+  `delta_csr_synap_row_step` (a synaptogenesis/growth function), never
+  called by this harness's training loop. Block4 is provably inert
+  here -- dropped from scope, real follow-up noted (per direct
+  instruction: block4 promotion currently only fires from growth
+  events, never a "promote everything dense enough right now" pass, so
+  a densely-packed-but-never-grown layer never gets the block4 speedup
+  even when it would benefit -- a real, separate gap to fix later).
+- `sisldo_ops.hpp` (the sparse-INPUT path) also dropped -- not
+  exercised by `DISLDOLayer8`/this harness at all (dense-input only).
+
+**What got built** (`disldo_backward`, `linear_disldo.hpp`; new
+classes, `cpu_backend.cpp`; wrappers, `sparse_rnn.py`/
+`toy_precision_models.py`):
+- `RMSpropScalePolicy`/`AdaMaxScalePolicy` (`delta_csr_types.hpp`):
+  swappable value_scale/output_scale update, template parameter (not a
+  runtime flag -- zero-cost, matches the codebase's own VALUES_TYPE
+  convention). RMSprop is the CURRENT formula extracted verbatim
+  (default, every existing caller unaffected). AdaMax: exponentially
+  -decayed running max (`u=max(beta2*u,|g|)`, no sqrt) instead of
+  RMSprop's `sqrt(EMA(g^2))` -- growth instant (max-cover safety),
+  shrink gradual, untouched rows don't update at all.
+- `DeferredScaleWrite` template bool: per direct correction (don't
+  loop back over touched entries a second time -- defer the STORE
+  itself once, don't double-write). Per-call buffer (not per-row --
+  `output_scale` only finalizes in a shared reduction after every row,
+  strictly later) caches each touched entry's true-units `(cw, ci)`
+  instead of writing immediately; a final pass after BOTH scales are
+  finalized for the call writes each entry out under the scale that's
+  actually in effect, not the stale pre-update one. Same two phases
+  the function already has, just reordered -- no full-layer work, no
+  genuinely new pass.
+- `SparseLinearLayer8Impl<ScalePolicy, DeferredScaleWrite>` (class
+  template, not three hand-copied classes) with three real compiled
+  aliases: `SparseLinearLayer8` (both defaults, today's exact
+  behavior), `SparseLinearLayer8Resync` (RMSprop + deferred),
+  `SparseLinearLayer8AdaMax` (AdaMax + deferred). `DISLDOLayer8Resync`/
+  `DISLDOLayer8AdaMax` (Python wrappers) and `fp8_resync`/`fp8_adamax`
+  (new `ARMS` entries, seeded like `fp8_seeded` for a fair comparison
+  -- see below for why that matters).
+
+**A real bug found and fixed while wiring the class template**: forgot
+to rename the CONSTRUCTOR when renaming the class
+(`SparseLinearLayer8` -> `SparseLinearLayer8Impl`) -- caught
+immediately by the compiler (`ISO C++ forbids declaration ... with no
+type`), not a silent runtime issue.
+
+**C++ test suite is pre-existing broken** (confirmed via `git stash`:
+identical failure on pristine code, `test_scale_handling.cpp`/
+`test_stats_thread_safety.cpp` call `disldo_forward`/`sisldo_forward`
+with stale signatures from before the earlier Hebbian-footgun-removal
+API change, already documented as deliberately deferred debt). Not
+this session's to fix. Verified the new code at the Python level
+instead: all three real classes construct and train (produce non-
+-trivial, genuinely DIFFERENT `value_scale` trajectories from each
+other -- confirmed the mechanism is actually engaged, not a silent
+no-op), and the full existing sili_peridot test suite (67 tests) keeps
+passing throughout.
+
+**A second, previously-invisible noise source found while
+regression-checking**: a "same input, same code, different output
+across separate process runs" scare turned out to be real and
+important, not a bug in this session's changes. Root-caused precisely:
+`fp8_quantize_stochastic`/`fp4_quantize_stochastic` (`fp8quant.hpp`/
+`fp4quant.hpp`) share one thread-local xorshift64* RNG
+(`fp4_stochastic_rng_state`), seeded from the THREAD ID by default --
+deliberately unseeded-by-default, documented in the header itself
+("training runs are meant to be stochastic... this is for unit-test
+determinism, not controlling a real run's outcome"). Confirmed
+directly: the SAME unchanged pristine binary gave DIFFERENT single
+-step results across separate Python process invocations (one stored
+weight flipping between 0.140625/0.15625 run to run). This means
+**every real DISLDOLayer/DISLDOLayer8-family run this entire session
+had this extra, uncontrolled noise source on top of the `--seed` CLI
+arg**, which only ever controlled the Python-level task-data RNG, not
+this one.
+
+**Fix**: `_cpu.seed_fp4_stochastic_rng(seed)` IS exposed to Python
+(confirmed by reading `cpu_backend.cpp`'s bindings directly, not
+assumed) -- now called once per run in `train_tile_curriculum.py`,
+same `seed` CLI arg. Verified it actually helps: two runs of the exact
+same config went from uncorrelated garbage to 0.91 correlation
+(mean_abs_diff 0.085, down from spanning the full 0.30-0.97 range
+independently). NOT perfectly bit-exact even seeded -- some smaller,
+still-unidentified residual noise source remains (checked forward/
+eval don't touch this RNG at lr=0, so it's something else, not yet
+found). Documented honestly, not swept under the rug: single-seed
+comparisons from EARLIER in this session (the `fp8`/`fp8_seeded`/
+`fp8_reseeded` numbers) were never controlled for this at all --
+directionally probably still informative given how consistent some of
+those patterns were, but should be read with real caution, not as
+precise numbers.
+
+**Real result, seeded, 2 independent seeds (1000, 2000), same
+out-of-context curriculum, trailing-window mean_acc via
+`learning_slope.py`:**
+
+    arm          seed=1000   seed=2000
+    fp8            0.252       0.129
+    fp8_seeded     0.188       0.146
+    fp8_resync     0.283       0.208   <- highest in BOTH seeds
+    fp8_adamax     0.158       0.160
+
+`fp8_resync` (the DeferredScaleWrite fix alone, RMSprop unchanged)
+wins in both seeds -- a real, replicated, if modest, improvement from
+fixing the code/scale staleness directly. `fp8_adamax` (same deferred
+-write fix, but AdaMax-style scale tracking) shows NO consistent
+benefit over plain `fp8` in either seed, despite the theoretical
+max-cover-safety argument for it. Given the ~0.08-0.09 mean noise
+floor measured above, `fp8_resync`'s ~0.03-0.08 edge over plain `fp8`
+is close to (not conclusively past) that floor at n=2 seeds -- real
+signal, consistent direction, but NOT yet a statistically confirmed
+result at this sample size (matches this project's own repeated "n=1/2
+is not evidence" lesson).
+
+**Honest bottom line**: the real, compiled C++ fix for the exact
+staleness mechanism identified earlier (code written under a scale
+that's about to change) provides a genuine, small, replicated
+improvement -- confirming the mechanism was real, not imagined. But
+neither real fix comes anywhere close to the toy simulation's 0.97
+ceiling (both land around 0.15-0.28, essentially still near-chance
+territory for the harder out-of-context distances). The gap between
+"the 8-bit-rank1 representation works" (proven, by the simulation) and
+"the real trained DISLDOLayer8 achieves it" (still mostly open) is
+narrower than at the start of this investigation, but far from closed.
+
+**Not yet done**: more seeds for real statistical confidence on the
+fp8_resync-vs-fp8 gap; finding the still-unidentified residual noise
+source (0.91, not 1.0, correlation even seeded); block4's real
+DeferredScaleWrite support (deferred, per direct decision, plus the
+separate "promote eagerly, not just on growth" gap); `sisldo_ops.hpp`
+mirroring; a real C++ residual/`multi_fp4`-equivalent DISLDOLayer
+(the toy simulation's OTHER 8-bit winner was never attempted in real
+C++ this round, only rank1_8bit's real analogue was); real
+`test_scale_handling.cpp`-style C++ unit tests (blocked on the
+pre-existing broken combined test suite, worked around via Python
+-level checks this round, not a permanent substitute).

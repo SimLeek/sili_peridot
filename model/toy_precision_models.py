@@ -51,7 +51,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from sili.tensor import Tensor, banded_attention, silu, _acc
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayer8
+from sili.sparse_rnn import (DISLDOLayer, DISLDOLayer32, DISLDOLayer8,
+                             DISLDOLayer8Resync, DISLDOLayer8AdaMax)
 from sili.energy import EnergyDynamics
 
 from .toy_recall_models import rmsnorm_tensor, AdamOptimizer
@@ -792,6 +793,36 @@ class SeededRank1DISLDOLayer8(DISLDOLayer8):
     -scale problem rather than the 8-bit+rank-1 representation itself
     being insufficient (the toy simulation already showed the
     representation works when the envelope is well-fit)."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
+        _seed_rank1_scale(self._c, in_features, out_features)
+
+
+class SeededDISLDOLayer8Resync(DISLDOLayer8Resync):
+    """Real DISLDOLayer8Resync (the DeferredScaleWrite fix -- see
+    sili__new's ScalePolicy/disldo_backward docstrings) with
+    value_scale/output_scale seeded once at construction, same as
+    SeededRank1DISLDOLayer8. Seeding here isn't about cold-start (the
+    fix under test is orthogonal to that) -- it's for a FAIR comparison
+    against `fp8_seeded`: plain DISLDOLayer8's output_scale never
+    trains at all unless something calls set_output_scale_raw at least
+    once (confirmed directly: no code in DISLDOLayer8's own
+    construction path does), so without seeding here too, any
+    difference measured could just be "output_scale was active" rather
+    than "the deferred-write fix helped"."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
+        _seed_rank1_scale(self._c, in_features, out_features)
+
+
+class SeededDISLDOLayer8AdaMax(DISLDOLayer8AdaMax):
+    """Same as SeededDISLDOLayer8Resync, but the AdaMax-style scale
+    update (see AdaMaxScalePolicy's docstring, sili__new's
+    delta_csr_types.hpp) instead of RMSprop."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
