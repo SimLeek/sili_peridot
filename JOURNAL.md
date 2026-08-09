@@ -4192,3 +4192,140 @@ C++ this round, only rank1_8bit's real analogue was); real
 `test_scale_handling.cpp`-style C++ unit tests (blocked on the
 pre-existing broken combined test suite, worked around via Python
 -level checks this round, not a permanent substitute).
+
+## 2026-08-09 (continued): literature search -- who else works on this, and does anyone skip the scale entirely?
+
+Per direct request, before building more C++: is this whole class of
+problem (trainable scale + quantized weight going stale relative to
+each other; residual/cascaded low-bit weight quantization; low-bit
+recurrent state training) already worked on elsewhere, with real
+results rather than theory-only? Six real, results-based matches
+found, organized by which specific question they answer.
+
+**The exact staleness/coupling mechanism found in real `DISLDOLayer8`
+this session (trainable scale drifts out of sync with the quantized
+code written under the pre-update scale) is a recognized, actively
+-researched problem, not an obscure sili-specific issue**:
+"Scheduling Weight Transitions for Quantization-Aware Training"
+(SGDT, ICCV 2025, arXiv:2404.19248) -- their framing: quantized
+weights only transition between discrete levels when an underlying
+continuous ("latent") parameter crosses a threshold, so the DEGREE of
+quantized-weight change depends on both the learning rate and the
+latent distribution, the same category of problem as `value_scale`
+moving while the already-written code stays computed for the old
+scale. Real, peer-reviewed, accepted paper (exact benchmark numbers
+not visible past the abstract).
+
+**"8-bit specifically for recurrent/stateful weights, lower bit-width
+tolerable elsewhere" -- independently confirmed twice, on real
+hardware/benchmarks, not just this project's own toy task**:
+- Q-S5 (Quantized State Space Models, arXiv:2406.09477): real QAT
+  results on sMNIST and Long Range Arena. Accuracy degrades
+  significantly when RECURRENT weights specifically drop below 8-bit;
+  other model components tolerate much more compression. Same split
+  this project converged on tonight (8-bit for recurrence, 4-bit
+  elsewhere), on a genuinely different architecture (S5 SSMs),
+  independently.
+- Intel Loihi / Loihi 2 (shipping neuromorphic hardware, not a paper
+  proposal): synaptic weights quantized to 8 bits in production, real
+  on-chip continual-learning results (>5000x energy improvement over
+  edge GPUs on real benchmarks, arXiv:2503.18002).
+
+**Residual/cascaded quantization applied to TRAINED weights (this
+session's independently-rediscovered `multi_fp4`) is a real,
+peer-reviewed, pre-existing technique, not a novel guess**:
+"Residual Quantization for Low Bit-Width Neural Networks" (IEEE,
+document 9599561) -- trains a network with weights constrained to low
+bit-width by recursively quantizing the residual error, reformulated
+as an EM-like iterative scheme. Real training results reported (exact
+numbers paywalled past the abstract).
+
+**How much does "no scale at all" cost, empirically?** A real,
+decisive, famous result: early binary-weight networks (BinaryConnect,
+original BinaryNet) used NO scale factor at all (plain sign
+binarization). XNOR-Net added a scale (mean |weight|, deterministic,
+recomputed fresh every forward pass, no separate trained parameter)
+and beat them by ~16-17 points of top-1 accuracy on ImageNet, same
+everything else. This is one of the most-cited empirical
+demonstrations that scale-free extreme quantization measurably loses
+to scaled quantization -- "no scale" is a real, tested idea, and it's
+a bad one.
+
+**But almost all of today's best REAL results use a DETERMINISTIC,
+freshly-recomputed scale, not a separately gradient-trained one --
+avoiding the staleness problem class by construction, not fixing it**:
+BitNet b1.58 (the current flagship extreme-low-bit LLM result -- 3B
+params matching full FP16 LLaMA in perplexity/zero-shot accuracy,
+3.55x less memory, 2.71x faster, arXiv:2402.17764) uses gamma = mean
+absolute value across the WHOLE weight matrix, recomputed fresh every
+step, no momentum/optimizer state of its own. XNOR-Net's per-channel
+scale works the same way. This is architecturally what the toy
+FAKE-QUANTIZE SIMULATION already does (`rank1_fake_quantize`
+recomputes from scratch every step) -- and is exactly why it never had
+the staleness bug real `DISLDOLayer8` has.
+
+**Closest real matches to the specific "sparse, per-synapse adaptive
+residual-digit depth" idea discussed directly with the user, framed as
+an alternative to any trained scale at all** (`fp(4n) ~= 2^e_shared *
+sum_i fp4_i * B^i`, cost proportional to how many entries actually
+need extra precision, natively cheap on a real sparse engine since an
+absent digit costs nothing -- not "lightweight," zero):
+- MPQ-DMv2 (arXiv:2507.04290, 2025): dual-quantizer design -- one main
+  low-bit quantizer for the bulk of weights, one lightweight residual
+  quantizer that only fires for high-magnitude residuals ("sparse
+  outliers... via a binary operation"). Real, published, diffusion
+  -model results. Same core idea (coarse quantizer + sparse residual
+  correction, cost proportional to need), applied to a different
+  domain (diffusion models, not recurrent nets) at coarser (outlier
+  -subset, not per-synapse) granularity.
+- VBQ (Variable Bit-width Quantization, arXiv:2607.02893, 2026): learns
+  per-GROUP-of-64-weights bit-width from {1,2,4,8} via Gumbel-Softmax.
+  Real, striking numbers: 69% of groups collapse to 1 bit, the LM head
+  averages 1.09 bits, one MLP block keeps ~2.5 bits -- real,
+  working, heterogeneous per-region precision allocation, at group
+  (not per-synapse) granularity.
+- A framing line worth keeping verbatim: per-weight heterogeneous
+  quantization work explicitly treats "this synapse doesn't exist" as
+  just the bottom rung of the SAME adaptive-precision ladder ("...
+  naturally includes sparse pruning of network parameters by setting
+  their bitwidth to zero") -- validates thinking about disldo's own
+  existing CSR sparsity (which entries exist at all) as literally the
+  same mechanism as "how many residual FP4 digits does this entry
+  have," not a separate concern.
+- LLM.int8() (arXiv:2208.07339): the well-known mainstream precedent
+  for "extra precision only where needed, cheap because it's sparse"
+  -- outlier FEATURE DIMENSIONS (~0.1% of dims) get bumped to 16-bit,
+  everything else stays 8-bit. Real, large-scale, widely-used. Coarser
+  than the per-synapse idea discussed here (whole feature dimensions,
+  not individual connections) and still a mixed-precision
+  DECOMPOSITION (two separate matmuls), not an additive residual-digit
+  stack.
+
+**What's NOT found anywhere**: the specific combination of (a)
+per-INDIVIDUAL-SYNAPSE adaptive residual-digit depth (not per-group,
+not per-outlier-feature), (b) inside a REAL sparse compute engine
+where an absent digit costs exactly zero (not "lightweight" -- zero,
+architecturally, since CSR never allocates absent entries), and (c)
+for a RECURRENTLY, ONLINE-trained system (per-tick, not batch/offline
+quantization of static weights). Every real match above is either
+coarser-grained, targets dense-ish hardware where "skip compute for
+an absent entry" isn't a real primitive, or targets static/offline
+-quantized weights, not online recurrent training. Both closest
+matches (MPQ-DMv2, VBQ) are 2025/2026 -- the field looks like it's
+only just starting to move toward per-weight/per-group adaptive
+residual precision at all, consistent with the direct read that this
+specific niche (sparse CPU/many-simple-cores hardware, not dense
+GPU/tensor-core hardware) is underexplored because most quantization
+research targets hardware where this trick doesn't pay off.
+
+**Direct decision following this search**: 1-bit/2-bit (BitNet-style)
+schemes are not being pursued -- real synapses run at ~24 discrete
+levels (~4.6 bits) already, FP4 already costs ~3x this project's own
+measured compute overhead on real CPU/scattered hardware, and FP4 is
+already confirmed to learn fast/well in this project's own testing
+(the bottleneck all along was the SCALE mechanism, not FP4 itself) --
+going lower has no clear practical payoff on this hardware model. Next
+direction: build a model variant with ZERO trained scale vectors
+(no `value_scale`/`output_scale` at all), using the residual-digit
+system as the sole mechanism for representing higher-than-4-bit
+precision -- not yet started.
