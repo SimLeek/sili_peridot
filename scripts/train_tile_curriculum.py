@@ -123,6 +123,20 @@ ARMS = {
                             # value_scale/output_scale use an AdaMax-style decayed
                             # running-max update instead of RMSprop -- see
                             # AdaMaxScalePolicy's docstring in sili__new.
+    "fixed_digit_2": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual",
+                                       n_stages=2, base=4.0, quantize_importance=True),
+                            # ZERO trained/fitted scale anywhere (no row/col vector, no
+                            # per-call data-dependent recompute) -- 2 fixed FP4 "digit"
+                            # stages, base=4.0 derived directly from real FP4 (E2M1)'s own
+                            # 1-mantissa-bit relative precision, e_shared derived ONCE from
+                            # init weights and frozen for the whole run. 8 bits/weight
+                            # total, same budget as rank1_8bit/multi_fp4 -- direct test of
+                            # whether the whole trained-scale mechanism (and its staleness
+                            # bug) can be skipped entirely, per direct design discussion.
+    "fixed_digit_3": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual",
+                                       n_stages=3, base=4.0, quantize_importance=True),
+                            # same, 3 stages / 12 bits -- checks whether more digits closes
+                            # any remaining gap to rank1_8bit/multi_fp4's near-1.0 result.
 }
 
 
@@ -165,7 +179,8 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # approximation, not a byte-exact accounting).
 ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4, "multi_fp4": 8,
-                  "fp8_seeded": 8, "fp8_reseeded": 8, "fp8_resync": 8, "fp8_adamax": 8}
+                  "fp8_seeded": 8, "fp8_reseeded": 8, "fp8_resync": 8, "fp8_adamax": 8,
+                  "fixed_digit_2": 8, "fixed_digit_3": 12}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,

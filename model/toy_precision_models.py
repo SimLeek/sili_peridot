@@ -652,9 +652,56 @@ def residual_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarr
     return reconstructed.astype(np.float32)
 
 
+def fixed_digit_residual_quantize(vals: np.ndarray, bits_per_stage: int, n_stages: int,
+                                  base: float = 4.0, e_shared: float = 1.0) -> np.ndarray:
+    """Zero-scaling-VECTOR residual quantization, literal closed-form
+    digit-place-value construction per direct design discussion:
+    `fp(4n) ~= e_shared * sum_i digit_i * base**-i`. NO row/col fit
+    anywhere (contrast `residual_fake_quantize`'s own per-stage
+    `rank1_fake_quantize` calls, and `rank1_8bit`'s trained
+    value_scale/output_scale) and NO per-call data-dependent
+    computation either (contrast even a fresh-every-step global max
+    like BitNet/XNOR-Net use) -- every stage's step size is a FIXED
+    constant chosen before any data is seen, matching the literal
+    "maybe choose/learn B or e_shared, but even then I'm not sure
+    that's needed" framing directly.
+
+    `base`: ratio between consecutive residual stages' resolution.
+    Derived directly from the digit format's own mantissa bit count,
+    not fit to data -- real sili FP4 (E2M1, 1 mantissa bit) has
+    worst-case relative rounding error ~= 1/2**(mantissa_bits+1) = 1/4,
+    so consecutive stages naturally shrink ~4x regardless of what the
+    weights look like. Default 4.0 matches that directly.
+
+    `e_shared`: a single FIXED scalar (not a per-row/per-col vector,
+    not gradient-trained, never updated after being chosen) applied
+    once to bring the whole layer's values into the digit format's
+    representable floor -- has nothing to go stale relative to, since
+    it never changes after construction. Real FP4 alone only covers
+    ~[0.5, 6] before hitting its floor, and typical weight init
+    (~1/sqrt(fan_in)) sits well below that -- this is the ONE thing a
+    pure residual stack genuinely cannot fix on its own (each stage
+    only refines PRECISION within the range the previous stage already
+    covers, it can never extend the floor downward), so this parameter
+    stays even in the otherwise fully zero-scale design. Default 1.0
+    (no rescaling) -- real usage should derive this once from initial
+    weight statistics at construction, never touch it again."""
+    levels = 2 ** (bits_per_stage - 1) - 1
+    residual = vals.astype(np.float64).copy()
+    reconstructed = np.zeros_like(residual)
+    step = e_shared / levels
+    for _ in range(n_stages):
+        stage_q = np.round(residual / step) * step
+        reconstructed += stage_q
+        residual = residual - stage_q
+        step /= base
+    return reconstructed.astype(np.float32)
+
+
 def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
                                quantize_importance: bool, rank: int = 1,
-                               n_stages: int = 1) -> None:
+                               n_stages: int = 1, base: float = 4.0,
+                               e_shared: float = 1.0) -> None:
     c = inner._c
     ptrs = np.array(c.ptrs, copy=True)
     indices = np.array(c.indices, copy=True)
@@ -673,6 +720,10 @@ def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
     elif scheme == "residual":
         w_q = residual_fake_quantize(w, ptrs, indices, n_out, bits, n_stages)
         imp_q = residual_fake_quantize(imp, ptrs, indices, n_out, bits, n_stages) if quantize_importance else imp
+    elif scheme == "fixed_digit_residual":
+        w_q = fixed_digit_residual_quantize(w, bits, n_stages, base, e_shared)
+        imp_q = (fixed_digit_residual_quantize(imp, bits, n_stages, base, e_shared)
+                if quantize_importance else imp)
     else:
         raise ValueError(scheme)
     c.load_weights(ptrs, indices, w_q.astype(np.float32), imp_q.astype(np.float32))
@@ -717,13 +768,28 @@ class QuantizedDISLDOLayer32:
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, bits: int = 8, scheme: str = "rank1",
                 quantize_importance: bool = True, rank: int = 1, n_stages: int = 1,
+                base: float = 4.0, e_shared: Optional[float] = None,
                 rng: Optional[np.random.Generator] = None):
         self._inner = DISLDOLayer32(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.bits = bits
         self.scheme = scheme
         self.quantize_importance = quantize_importance
         self.rank = rank  # only consulted when scheme == "rankn"
-        self.n_stages = n_stages  # only consulted when scheme == "residual"
+        self.n_stages = n_stages  # only consulted when scheme in {"residual", "fixed_digit_residual"}
+        self.base = base  # only consulted when scheme == "fixed_digit_residual"
+        # Computed ONCE here from the initial preseeded weights, then frozen
+        # for the rest of training (matching fixed_digit_residual_quantize's
+        # own "chosen once, never touched again" design -- has nothing to go
+        # stale relative to). e_shared=None (default) derives it from the
+        # real initial weight magnitude; a caller can still pass a fixed
+        # constant directly to skip that entirely.
+        self.e_shared = 1.0  # only consulted when scheme == "fixed_digit_residual"
+        if scheme == "fixed_digit_residual":
+            if e_shared is None:
+                init_vals = np.asarray(self._inner._c.weights_vals, dtype=np.float64)
+                init_abs = np.abs(init_vals)
+                e_shared = float(np.max(init_abs)) if init_abs.size and init_abs.max() > 1e-12 else 1.0
+            self.e_shared = e_shared
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                damp_by_importance: bool = True) -> Tensor:
@@ -736,7 +802,7 @@ class QuantizedDISLDOLayer32:
             if learning_rate != 0.0:
                 _quantize_disldo32_inplace(self._inner, self.bits, self.scheme,
                                            self.quantize_importance, self.rank,
-                                           self.n_stages)
+                                           self.n_stages, self.base, self.e_shared)
 
         out._backward = _bwd
         return out

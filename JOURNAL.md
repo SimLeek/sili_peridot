@@ -4329,3 +4329,101 @@ direction: build a model variant with ZERO trained scale vectors
 (no `value_scale`/`output_scale` at all), using the residual-digit
 system as the sole mechanism for representing higher-than-4-bit
 precision -- not yet started.
+
+## 2026-08-09 (continued): zero-trained-scale fixed-digit residual quantization -- best real result of the whole session, at the SAME bit budget, with no scale-staleness mechanism possible by construction
+
+Direct follow-up, same day. Grounded the design in the real digit
+format first, not just theory: checked sili's actual FP4 table
+(`fp4quant.hpp`) -- real OCP MXFP4 E2M1 (2 exponent bits, 1 mantissa
+bit): `0, 0.5, 1, 1.5, 2, 3, 4, 6`. Genuine floating-point structure,
+roughly constant ~25% worst-case relative rounding error across its
+whole range (1 mantissa bit -> 1/2^(mantissa_bits+1)). This pins down
+the two open design questions directly instead of guessing:
+
+- **`base` (ratio between residual digit stages) does not need to be
+  learned** -- it's a closed-form property of the digit format's own
+  mantissa bit count (~4 for E2M1), not something to fit to data.
+- **`e_shared` still matters, but doesn't need to be a trained per-row
+  vector** -- E2M1 alone only covers ~[0.5, 6], and typical weight init
+  (~1/sqrt(fan_in)) sits well below that floor (already documented in
+  this project's own C++ comments re: `importance_scale`) -- a pure
+  residual stack can't fix that on its own (each stage only refines
+  PRECISION within the range the previous stage covers, never extends
+  the floor). But a single FIXED scalar, chosen once at construction
+  and never updated, has nothing to go stale relative to.
+
+**Implementation** (`model/toy_precision_models.py`):
+`fixed_digit_residual_quantize(vals, bits_per_stage, n_stages, base,
+e_shared)` -- literal closed-form digit-place-value construction,
+`fp(4n) ~= e_shared * sum_i digit_i * base**-i`. NO row/col fit
+anywhere (unlike `residual_fake_quantize`'s own per-stage
+`rank1_fake_quantize` calls) and NO per-call data-dependent
+computation either (unlike even a fresh-every-step global max the way
+BitNet/XNOR-Net use) -- every stage's step size is a plain constant
+computed before any data is seen. `QuantizedDISLDOLayer32` gained
+`scheme="fixed_digit_residual"`, computing `e_shared` ONCE at
+construction from the initial preseeded weights' own max magnitude,
+then freezing it for the rest of training.
+
+**Sanity-checked the raw math first** (2000 synthetic weights,
+typical small-magnitude init): 2 stages (8 bits/weight) gives
+MSE=0.0001, a ~15x error reduction over 1 stage (4 bits) for 2x the
+bits -- reasonable, expected scaling, before spending a training run
+on it.
+
+**Real training result, same out-of-context curriculum, same
+state_width=128/max_weights=1500 config as every other arm tonight,
+zero trained scale of any kind**:
+
+    arm                bits  mean_acc(trailing)  status
+    fixed_digit_2 (2 stages, base=4)   8   0.3125   PLATEAUED, z=15.1
+    fixed_digit_3 (3 stages, base=4)  12   0.2334   DEGRADING, z=7.1
+
+`fixed_digit_2` is the **best result of the entire session among
+every real-DISLDOLayer-family or QuantizedDISLDOLayer32-simulated arm
+tested at an 8-bit budget** -- clearly ahead of `fp8_resync`'s
+0.21-0.28 (the real, compiled C++ DeferredScaleWrite fix), `fp8`'s
+0.13-0.25, and `fp8_seeded`'s 0.15-0.19, with ZERO trained parameters
+of any kind, and therefore no scale-staleness mechanism even possible
+by construction -- there's no separately-updated scale to go out of
+sync with anything.
+
+**Honest nuance, not just the win**: `fixed_digit_3` (more digits, 12
+bits) reached much HIGHER mid-range peaks (0.97-0.98 at seq_len=4-5,
+vs `fixed_digit_2`'s 0.68-0.77) but ended up WORSE at the hardest
+out-of-context distances and DEGRADING, not plateaued -- more
+precision is not strictly better here. Not yet understood why (open
+question: does higher precision without any adaptive/trained
+correction lose more to compounding rounding error over many ticks of
+online recurrence specifically, since there's genuinely no mechanism
+to correct a systematic bias the way even a slow trained scale could
+in principle?) -- recorded honestly as a real, unresolved wrinkle, not
+smoothed over.
+
+**Why this result matters beyond the raw number**: this is
+architecturally SIMPLER than everything else built tonight, not more
+complex -- no `value_scale`/`output_scale`, no `value_scale_importance`
+/`output_scale_importance` EMA state, no `ScalePolicy`, no
+`DeferredScaleWrite` needed at all, because there's no scale to defer
+or make consistent. A real C++ implementation of this scheme would be
+a NET REMOVAL of state/complexity from `disldo_backward`, not an
+addition -- the opposite direction from this session's earlier
+`ScalePolicy`/`DeferredScaleWrite` work. Not yet built in real C++;
+this round is simulation-only (`QuantizedDISLDOLayer32`, real fp32
+arithmetic + fake-quantize after each step), same caveat as every
+other simulated arm this session -- the representation is validated,
+a real DISLDOLayer that IS this (rather than approximates it) is the
+natural next step, and per direct decision, real C++ effort now goes
+toward exploring this direction rather than 1-bit/2-bit BitNet-style
+schemes (no practical payoff on this project's own CPU/scattered
+hardware, see the literature-search entry above).
+
+**Not yet done**: real C++ implementation; understanding the
+`fixed_digit_3` degradation; sweeping `base` (is 4.0 actually optimal,
+or just a reasonable first guess from the format's own math);
+`fixed_digit_2` at the memory-matched-wide config (does it also reach
+the ~1.0 ceiling `rank1_8bit`/`multi_fp4` hit there); combining with
+the real `DeferredScaleWrite`-style fix for `e_shared` itself if a
+future version makes `e_shared` adaptive/trained after all (currently
+fixed-once, per direct design choice, deliberately not explored this
+round).
