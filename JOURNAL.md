@@ -4674,3 +4674,104 @@ earlier `fp8_resync`/`fp8_adamax` "modest, close-to-noise-floor" result
 was ALSO partly a stochastic-rounding artifact); real-model-scale
 validation (everything above is still the small toy tile-recurrence
 harness, state_width<=128, vocab=10).
+
+---
+
+## 2026-08-10 -- Both branches merged (sili__new PR #33, sili_peridot PR #13). Test plan for the next round, written down before starting per direct instruction.
+
+New branches: `fix/synaptogenesis-block4-double-free` (sili__new),
+`feature/digit-residual-base-and-synaptogenesis` (sili_peridot).
+
+**Priority order, per direct instruction: synaptogenesis fix FIRST**
+("that's a core requirement of sili"), ahead of every experiment
+below -- real dynamic growth/pruning is foundational to the project,
+not just another test arm, and the block4 `RowWorkspace` double-free
+(found while wiring `use_synaptogenesis` into the curriculum harness,
+see the previous entry) blocks it entirely right now. Nothing below
+runs for real until that's fixed.
+
+**Test 1 (highest expected impact, per direct instinct) -- residual
+`base` sweep, 12 and 24 instead of the current 4.0.** Grounded in
+real FP4 (E2M1) level math, not a guess: positive-side representable
+magnitudes are `0, 0.5, 1, 1.5, 2, 3, 4, 6`. `TrueMultiDigitLayer`/
+`fixed_digit_residual_quantize`'s `factors[i] = base**-i` means digit
+1's full raw range `[0.5, 6]` (same as digit 0's, real hardware FP4
+storage doesn't itself narrow per digit) maps to an OUTPUT
+contribution range of `[0.5/base, 6/base]`.
+
+- `base=4` (current): digit 1's output range is `[0.125, 1.5]` --
+  substantially OVERLAPS digit 0's own `[0.5, 6]`, i.e. digit 1 is
+  partly representing values digit 0 could already cover alone.
+- `base=12`: digit 1's output range becomes `[0.0417, 0.5]` -- its
+  ceiling lands EXACTLY on digit 0's floor (0.5). Zero overlap, zero
+  gap -- the two digits' representable ranges tile the number line
+  exactly edge-to-edge.
+- `base=24`: digit 1's output range is `[0.0208, 0.25]` -- now a real
+  GAP opens between digit 1's ceiling (0.25) and digit 0's floor
+  (0.5), unrepresented by either digit ALONE (though sums across
+  multiple synapses/digits, per the architecture's own "different
+  digits do different work, not just full-float decomposition"
+  behavior -- see the connectivity-sharing negative result, previous
+  entry -- could still fill it via combination).
+
+Direct hypothesis, per discussion: recurrent nets seem to need SMALL
+correction values more than large ones, so biasing digit 1+ toward
+finer/smaller representable ranges (base=12 exact-tiling, or base=24
+pushing further into small-value territory) should help more than the
+LR or synaptogenesis changes below. `base` is a pure Python-level
+parameter already exposed on both `TrueMultiDigitLayer` and
+`fixed_digit_residual_quantize` -- no C++ changes needed, this can run
+entirely on the sili_peridot side once unblocked.
+
+**Test 2 -- LR sweeps, each with a stated hypothesis, not blind
+halving:**
+- Global `peak_lr` reduction at the wide config (state_width=256),
+  tested DIRECTLY (not via stretching `train_steps`, which turned out
+  to be an equivalent-but-more-confounded way of lowering the
+  time-averaged effective LR via the cosine schedule -- caught
+  mid-discussion, see `lr_schedule`'s linear-warmup+cosine-decay-to-
+  `0.1*peak_lr` formula). Motivated by: `lr_per_row_nnz=True` already
+  divides the per-synapse update by `nnz_this_row` (measured: 11 at
+  small config, 23 at wide, ratio 2.09x) -- wide's per-step updates are
+  ALREADY proportionally smaller automatically, so this isn't really
+  "fan-in needs more damping," more a check of whether the wide
+  config's ~2x more free parameters need more than 15000 steps'
+  worth of these already-smaller updates to converge.
+- Per-digit `lr_power` (0 vs 1 vs 2) retest under DETERMINISTIC
+  rounding. The earlier stochastic-rounding-era sweep found no real
+  difference -- now explained: RMSprop's own `eff_lr*g/sqrt(importance)`
+  self-normalizes almost all of the `factor_i` scaling away on its own
+  (since `importance_i ~ EMA(g_i^2) ~ factor_i^2 * importance_total`,
+  the `factor_i` cancels in `g_i/sqrt(importance_i)` unless `eps`
+  dominates, which back-of-envelope math at realistic gradient
+  magnitudes says it shouldn't) -- `lr_power`'s extra damping was
+  therefore already predicted to be closer to redundant than helpful,
+  matching what was observed. Retesting under deterministic rounding
+  mainly to confirm this prediction still holds now that stochastic
+  noise isn't swamping everything else.
+
+**Test 3 -- synaptogenesis/pruning**, once the block4 bug is fixed.
+Direct instinct: neither fully-independent-random connectivity
+(current default) nor fully-forced-identical (tested directly, made
+things WORSE -- see previous entry) is necessarily right; real
+importance-driven growth/pruning might discover some OTHER
+connectivity pattern between digits that neither hand-picked extreme
+reaches. `k=4` (sili's own established default, `SparseRNNAgent`),
+`importance_cutoff=0.01`, capped at each layer's own already-stored
+`_max_row_weights` so nnz stays roughly stable rather than growing
+unbounded -- wiring already built (`_maybe_synaptogenesis`,
+`TrueMultiDigitLayer.synaptogenesis`, `use_synaptogenesis` CLI flag),
+committed on the new sili_peridot branch, currently unusable due to
+the block4 bug.
+
+**Open question, not yet a concrete test** -- the tile-recurrence
+state's hard clip bound (`np.clip(M_new_t.data, -2.0, 2.0)`,
+`toy_tile_precision_models.py`) was picked without much justification;
+no overflow issues seen with it, but unclear if `[-2,2]` is actually
+better or worse than e.g. `[-6,6]` (matching FP4's own max
+representable magnitude) or some other bound -- worth a direct
+comparison once the higher-priority items above are further along,
+since the state itself is plain fp32 (not FP4-stored) and rmsnorm'd
+before feeding any disldo layer, so the connection to FP4's own range
+isn't as direct as it might first seem; still worth checking
+empirically rather than assuming either bound is fine.
