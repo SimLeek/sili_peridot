@@ -5024,3 +5024,42 @@ sweep in the background; result not yet in at the time of this entry
 argument for it, exact digit-range tiling, is independent of the
 seeding bug), but is now explicitly flagged as pending re-confirmation
 rather than settled. Follow-up entry once the sweep completes.
+
+**2026-08-10, follow-up: multi-seed sweep landed, base=12 holds up.**
+4 arms (base=4/6/12/24) x 5 seeds (1000-1004), post-rng-fix, paired
+(same 5 seeds across every arm):
+
+    base   mean    std     per-seed
+    4      0.6417  0.1006  [0.723, 0.750, 0.633, 0.498, 0.604]
+    6      0.6929  0.0786  [0.750, 0.652, 0.725, 0.575, 0.762]
+    12     0.7296  0.0429  [0.744, 0.746, 0.785, 0.681, 0.692]
+    24     0.6775  0.0614  [0.733, 0.700, 0.665, 0.577, 0.713]
+
+base=12 wins on both mean (highest) and stability (std 0.043, roughly
+half of every other arm's) -- notably the most CONSISTENT arm across
+seeds, not just the highest average. Paired win counts: beats base=4
+on 4/5 seeds, base=24 on 4/5, base=6 on 3/5 (closer, but still ahead).
+This is a real, multi-seed-backed result -- unlike the retracted
+single-seed one, it survives exactly the "usually, not just exists"
+bar the user set. base=12 confirmed as the project default.
+
+Immediately after this, per direct discussion: the seed-to-seed spread
+even at base=12 (0.68-0.79) is still fairly wide for a supposedly
+"identical" config -- raised the hypothesis that this project's
+sparse, randomly-preseeded "echo network" connectivity (a different
+random subset of active synapses per seed) may be a bigger source of
+that spread than `base` itself, similar to known reservoir-computing
+seed sensitivity. Decided to test FULLY DENSE block4 disldo layers
+(no synaptogenesis/pruning at all) as the next step, on the reasoning
+that removing the random-connectivity-draw confound might both reduce
+seed sensitivity AND give a cleaner, more directly comparable signal
+for the quantization/base comparisons already in progress -- sparse
+echo-init and zero-init are still planned, but as later comparison
+arms once synaptogenesis/pruning work resumes, not the default going
+forward. No existing bulk "load dense weights directly into block4"
+API exists (only importance-gated per-synapse growth, or a scattered
+-CSR loader that never touches block4) -- this doubles as real
+infrastructure for task #5 (MiniCPM5's own planned "100% dense into
+block4, then prune toward net-zero" conversion path), so building it
+properly in C++ rather than a growth-loop bootstrap hack, per direct
+choice. Design in progress.
