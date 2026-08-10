@@ -4902,3 +4902,48 @@ now only applies to `backward_dense`) and the script was never
 updated. Confirmed via the pre-fix worktree that this predates #34 --
 unrelated stale-script bug, not a regression from the block4 fix.
 Fixed and merged: `SimLeek/sili__new#35`.
+
+**2026-08-10, later still: base=12/24 residual-scale sweep -- base=12
+confirmed as a real win.** First item off the recorded quality-test
+list (explicitly not synaptogenesis). Added
+`true_multi_digit_deterministic_base12`/`_base24` arms to
+`train_tile_curriculum.py` (`base=12.0`/`24.0`, everything else
+identical to `true_multi_digit_deterministic`: `digit_cls=
+DISLDOLayerDeterministic`, `n_stages=3`, `lr_power=0.0` -- `base` was
+already a plain constructor kwarg on `TrueMultiDigitLayer`, no C++
+changes needed, matching the prediction in the queued hypothesis
+entry above). Ran all three arms back-to-back, same seed=1000/config
+(`0 1 15000 750 1000 1500 16 8 1500 8 0.002 1`), 15000 steps each
+(~105s/run):
+
+    base   mean_acc  status      std
+    4      0.8771    PLATEAUED   0.031
+    12     0.9375    PLATEAUED   0.023
+    24     0.7000    LEARNING    0.074
+
+`base=12` wins cleanly -- higher mean, lower variance, already
+plateaued, exactly matching the "exact tiling" prediction (digit 1's
+range ceiling lands exactly on digit 0's floor at base=12, per the
+E2M1-math reasoning in the queued hypothesis entry). `base=24` is
+NOT a clean result -- it's still trending up at step 15000 (not
+plateaued like the other two), so its lower mean_acc isn't a fair
+final comparison; would need a longer run to know if it converges
+higher or genuinely underperforms.
+
+Side note, not yet investigated: this run's base=4 baseline
+(0.8771) is noticeably higher than the historical 0.7854 first
+recorded for the same arm/seed/config earlier this session. Doesn't
+threaten today's comparison (all three arms ran back-to-back on
+identical current code, so the internal ranking is valid), but the
+absolute-number drift suggests something in the intervening C++ work
+(ScalePolicy refactor, the block4 fixes, or something else) changed
+this arm's behavior even though it shouldn't touch this code path
+(small max_weights=1500, likely stays scattered CSR, not block4).
+Worth a real look if it recurs, not chased further right now.
+
+**Recommendation**: switch the project's default residual base from
+4 to 12 for real-FP4 `TrueMultiDigitLayer` usage going forward; leave
+base=24 as an open question pending a longer run. Recorded in
+[[project_hybrid_precision_plan]]. Not yet promoted into any
+production/default arm -- the new base12/base24 arms are additive,
+existing arms unchanged.

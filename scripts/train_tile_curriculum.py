@@ -223,6 +223,20 @@ ARMS = {
     "true_multi_digit_deterministic": functools.partial(TrueMultiDigitLayer,
                                                         digit_cls=DISLDOLayerDeterministic,
                                                         n_stages=3, base=4.0, lr_power=0.0),
+    # base=4.0 was derived from real FP4 (E2M1)'s own worst-case relative
+    # rounding error (~1/4), not fit to data -- these two arms test whether
+    # a coarser per-stage split (base=12/24, i.e. each successive digit
+    # covers a wider relative error band than FP4's own rounding implies)
+    # changes anything now that deterministic rounding + real DISLDO are
+    # both confirmed working (0.7854 static-sparsity baseline). Same
+    # digit_cls/n_stages/lr_power as true_multi_digit_deterministic --
+    # base is the only varied axis.
+    "true_multi_digit_deterministic_base12": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=0.0),
+    "true_multi_digit_deterministic_base24": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=24.0, lr_power=0.0),
     "true_multi_digit_noscale_deterministic": functools.partial(TrueMultiDigitLayer,
                                                                 digit_cls=DISLDOLayerNoScaleDeterministic,
                                                                 n_stages=3, base=4.0, lr_power=0.0),
@@ -317,6 +331,7 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
                   "row_4bit_noscale_deterministic": 4,
                   "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12,
+                  "true_multi_digit_deterministic_base12": 12, "true_multi_digit_deterministic_base24": 12,
                   "true_multi_digit_shared_conn": 12}
 
 
