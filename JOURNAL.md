@@ -4839,3 +4839,27 @@ continuous per-step growth here (`k=1` or `k=2`, or growing every few
 steps instead of every step, are the leading candidates to try).
 Explicitly deferred as its own tuning question, separate from the
 crash fix -- not yet tested.
+
+**Direction update, per direct instruction, recorded here before
+stopping for this session -- not yet built:** synaptogenesis/pruning
+tuning shouldn't be its own isolated test track. It joins a combined
+"RNN sweep" alongside the other interacting knobs already in play --
+synaptogenesis (growth: on/off, `k`, cadence), pruning (implicit in
+the same `synap_step` mechanism, but worth a separate on/off axis --
+e.g. growth-only vs prune-only vs both, given pruning specifically is
+expected to be the more disruptive half at this scale per the
+discussion above), energy_rl (`use_energy`/`EnergyDynamics`, already
+a toggle in `train_tile_curriculum.py`), and scale (the residual
+`base` sweep -- 4 current, 12/24 not yet tested, see the entry above
+this session's synaptogenesis work interrupted). These four are
+related (growth budget interacts with pruning aggressiveness,
+energy's exploration noise interacts with both, and `base` changes
+what precision synaptogenesis is even fighting over) -- testing them
+jointly as a standard "does this change improve things" checklist is
+more honest going forward than isolated one-at-a-time tests. Caveat
+worth keeping in mind once this is built: a joint sweep finds good
+*combinations* but doesn't by itself explain *why* one wins -- still
+want a targeted single-variable ablation (matching
+[[feedback_do_science_correctly]]) whenever a joint-sweep result is
+surprising enough to need explaining, not as a replacement for it.
+Not started -- next session's starting point.
