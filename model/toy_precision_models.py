@@ -770,9 +770,42 @@ class TrueMultiDigitLayer:
                 num_cpus: int = 4, digit_cls=DISLDOLayer, bits_per_stage: int = 4,
                 n_stages: int = 2, base: float = 4.0, e_shared: Optional[float] = None,
                 lr_power: float = 0.0, simulate_quantize: bool = False,
+                share_connectivity: bool = False,
                 rng: Optional[np.random.Generator] = None):
         self.digits = [digit_cls(in_features, out_features, max_weights, num_cpus, rng=rng)
                       for _ in range(n_stages)]
+        # share_connectivity: per direct hypothesis check -- each digit's
+        # OWN independent preseed/synaptogenesis (real DISLDOLayer, no
+        # coordination between digits) means digit i's active (row,col)
+        # synapses generally do NOT coincide with digit 0's. Verified
+        # directly: fresh preseed of 3 digits at max_weights=40/n=20
+        # showed 0/20, 0/20, 1/20 overlap -- essentially disjoint. The
+        # residual-correction mechanism this whole scheme depends on
+        # (digit i correcting digit i-1's rounding error AT THE SAME
+        # synapse) can only fire where digits' connectivity actually
+        # coincides -- with near-zero overlap it almost never does,
+        # unlike the SIMULATED fixed_digit_residual_quantize, which
+        # decomposes one shared value at one shared (row,col) by
+        # construction. When True, force every digit after the first
+        # onto digit 0's EXACT (ptrs, indices) -- same synapses, each
+        # digit's own independently-drawn/trained weight values -- a
+        # direct test of whether connectivity alignment, not more bits
+        # or a different LR, is what the residual composition actually
+        # needed. See sili_peridot/JOURNAL.md for the investigation.
+        if share_connectivity and n_stages > 1:
+            base_c = self.digits[0]._c
+            ptrs0 = np.asarray(base_c.ptrs)
+            idx0 = np.asarray(base_c.indices)
+            nnz = len(idx0)
+            per_row = max(1, nnz // max(1, in_features))
+            scale = 1.0 / np.sqrt(max(1, per_row))
+            for digit in self.digits[1:]:
+                dc = digit._c
+                fresh_rng = rng if rng is not None else np.random.default_rng()
+                values = (fresh_rng.standard_normal(nnz).astype(np.float32) * scale)
+                dc.load_weights(ptrs0.astype(np.int32), idx0.astype(np.int32), values)
+                if hasattr(dc, "equalize_to_capacity"):
+                    dc.equalize_to_capacity(per_row)
         self.bits_per_stage = bits_per_stage
         self.n_stages = n_stages
         self.base = base
@@ -808,6 +841,19 @@ class TrueMultiDigitLayer:
         for i in range(1, self.n_stages):
             total = total + outs[i] * self._factors[i]
         return total
+
+    def synaptogenesis(self, k: int, importance_cutoff: float):
+        """Delegate to each digit's own real synaptogenesis
+        (sili.sparse_rnn._SparseLayerBase.synaptogenesis: build_probes+
+        synap_step+equalizer_step), each capped at its OWN already
+        -stored `_max_row_weights` (set at construction from the SAME
+        `max_weights` every digit received -- see __init__). No shared
+        -connectivity coordination here (that was tested directly and
+        made things WORSE, not better -- see JOURNAL.md); each digit
+        grows/prunes independently, same as at construction time."""
+        for digit in self.digits:
+            if hasattr(digit, "synaptogenesis"):
+                digit.synaptogenesis(k, importance_cutoff, digit._max_row_weights)
 
     def parameters(self) -> List[Tensor]:
         return []

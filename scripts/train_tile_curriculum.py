@@ -226,7 +226,47 @@ ARMS = {
     "true_multi_digit_noscale_deterministic": functools.partial(TrueMultiDigitLayer,
                                                                 digit_cls=DISLDOLayerNoScaleDeterministic,
                                                                 n_stages=3, base=4.0, lr_power=0.0),
+
+    # Direct hypothesis check: each digit's independent preseed/synaptogenesis
+    # means digits' connectivity is essentially disjoint (verified: 0/20, 0/20,
+    # 1/20 overlap on a fresh preseed) -- the residual-correction mechanism can
+    # only fire where digits' connectivity actually coincides. share_connectivity
+    # forces every digit onto digit 0's exact (ptrs, indices) at construction.
+    "true_multi_digit_shared_conn": functools.partial(TrueMultiDigitLayer,
+                                                       digit_cls=DISLDOLayerDeterministic,
+                                                       n_stages=3, base=4.0, lr_power=0.0,
+                                                       share_connectivity=True),
 }
+
+
+def _maybe_synaptogenesis(model, k: int = 4, importance_cutoff: float = 0.01):
+    """Real structural growth+pruning (sili's actual synap_step/
+    build_probes/equalizer_step, via _SparseLayerBase.synaptogenesis or
+    TrueMultiDigitLayer's own per-digit delegate) on every disldo-family
+    sublayer of the model, k=4 -- the established default elsewhere in
+    the codebase (SparseRNNAgent's own synaptogenesis_k default; k=64
+    was measured to saturate a 1000x1000 layer's connectivity in ONE
+    call, k=4 grows gradually instead). Each sublayer's own already
+    -stored `_max_row_weights` cap keeps nnz roughly STABLE over time
+    (grow-and-prune balance against a fixed target, not unbounded
+    growth) -- per direct instruction, not a new/growing budget.
+    Dense/Adam-controlled sublayers (no `.synaptogenesis`, no sparse
+    structure) are silently skipped."""
+    for attr in ("q_proj", "k_proj", "v_proj", "lm_head"):
+        sub = getattr(model, attr, None)
+        if sub is None:
+            continue
+        if hasattr(sub, "_max_row_weights"):
+            sub.synaptogenesis(k, importance_cutoff, sub._max_row_weights)
+        elif hasattr(sub, "synaptogenesis"):
+            sub.synaptogenesis(k, importance_cutoff)
+    o_proj = getattr(model, "o_proj", None)
+    o_layers = o_proj if isinstance(o_proj, list) else ([o_proj] if o_proj is not None else [])
+    for sub in o_layers:
+        if hasattr(sub, "_max_row_weights"):
+            sub.synaptogenesis(k, importance_cutoff, sub._max_row_weights)
+        elif hasattr(sub, "synaptogenesis"):
+            sub.synaptogenesis(k, importance_cutoff)
 
 
 def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
@@ -276,7 +316,8 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "true_multi_digit_resync": 12, "true_multi_digit_noscale": 12,
                   "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
                   "row_4bit_noscale_deterministic": 4,
-                  "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12}
+                  "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12,
+                  "true_multi_digit_shared_conn": 12}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
@@ -328,6 +369,16 @@ def main():
     # a cascaded/residual-quantization-style test of whether composing coarse
     # stages recovers precision that widening alone doesn't, per direct idea.
     o_proj_depth = int(sys.argv[13]) if len(sys.argv) > 13 else 1
+    # use_synaptogenesis: real dynamic growth+pruning (build_probes+
+    # synap_step+equalizer_step via _maybe_synaptogenesis, k=4) every
+    # outer step, instead of the static pre-seeded-only sparsity every
+    # arm has used so far this session -- per direct request, testing
+    # whether the residual digits want some OTHER connectivity pattern
+    # discovered via real importance-driven growth/pruning, distinct
+    # from both fully-independent-random and forced-identical (both
+    # already tested). Default 0/off, backward-compatible with every
+    # existing invocation.
+    use_synaptogenesis = bool(int(sys.argv[14])) if len(sys.argv) > 14 else False
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -362,7 +413,7 @@ def main():
           f"column_neurons={COLUMN_NEURONS} state_width={state_width} "
           f"max_weights={MAX_WEIGHTS_PER_LAYER} o_proj_depth={o_proj_depth} "
           f"peak_lr={PEAK_LR} est_value_bits={value_bits} "
-          f"(~{value_bits/8:.0f} bytes) "
+          f"(~{value_bits/8:.0f} bytes) use_synaptogenesis={use_synaptogenesis} "
           f"seq_len={SEQ_LEN_START}->{SEQ_LEN_MAX} (+1/{steps_per_stage} steps)",
           flush=True)
 
@@ -382,6 +433,9 @@ def main():
                     loss = loss + aux
                 loss.backward()
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+
+        if use_synaptogenesis:
+            _maybe_synaptogenesis(model)
 
         if step % checkpoint_every == 0:
             acc = evaluate(model, rng, embed_table, seq_len)
