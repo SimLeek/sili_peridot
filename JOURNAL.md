@@ -4775,3 +4775,67 @@ since the state itself is plain fp32 (not FP4-stored) and rmsnorm'd
 before feeding any disldo layer, so the connection to FP4's own range
 isn't as direct as it might first seem; still worth checking
 empirically rather than assuming either bound is fine.
+
+---
+
+## 2026-08-10 (cont.) -- synaptogenesis unblocked: root-caused and fixed two real block4 memory-safety bugs in sili__new (feature/tile-recurrence-prototype's own JOURNAL.md and PR only cover static sparsity; this is the follow-up branch)
+
+Wired real dynamic growth/pruning (`build_probes`+`synap_step`+
+`equalizer_step`, `k=4`, matching `SparseRNNAgent`'s own established
+default) into `train_tile_curriculum.py` via a new `use_synaptogenesis`
+flag and `TrueMultiDigitLayer.synaptogenesis()`. Every arm tested this
+whole session before now used only static, pre-seeded sparsity --
+first time this project's toy-scale precision testing has actually
+exercised dynamic growth end-to-end with real training. It crashed
+immediately (double free / heap corruption), reliably within ~20-40
+growth cycles.
+
+Root-caused via AddressSanitizer (not guesswork) to TWO independent,
+additive bugs in `sili__new`'s block4 promotion machinery, both
+letting a row's used-byte boundary exceed its own allocated capacity
+and corrupt the next row's stored bytes:
+
+1. `Block4Store(8)::merge_row_workspace`'s write-back was
+   unconditional -- its own eviction loop can legitimately fail to
+   shrink a row enough (each distinct block-column touched needs >=1
+   byte of structural overhead eviction alone can't remove), and the
+   old code wrote past the row's headroom anyway when that happened.
+2. `block4_row_shift` (shared by both FP4 and FP8, used by both
+   `get_or_create`'s growth path and `equalize_step`'s redistribution)
+   could shrink a row's allocation below what it was ALREADY using --
+   `equalize_step` targets the AVERAGE allocation across every row,
+   with no check against any individual row's real current usage.
+
+Fixed both with the SAME philosophy already established in this
+codebase for `dropped_growth_events` (`commit_dirty_sparse_tile`): no
+lock, no throw, no inline growth of the shared store from inside
+`disldo_backward`'s parallel region (real callers use `num_cpus>1`, a
+lock-free clamp avoids a genuine multi-threaded reallocation race
+against other rows' in-flight reads that a naive "just grow inline"
+fix would have introduced) -- clamp the write-back to whatever whole
+tiles actually fit, leave the rest at their pre-call content, and keep
+training. New `row_merge_overflow_events`/`_bytes_dropped` counters
+(exposed via `Block4View`/`Block4View8`) are the signal a caller
+should watch to call `expand_headroom_to()` with a bigger budget.
+Full details/commit: `sili__new`'s `fix/synaptogenesis-block4-double-free`
+branch.
+
+**Verification**: AddressSanitizer-instrumented build crashed
+reliably (5/5) before the fix, ran clean (5/5) after; a full real
+15000-step curriculum run with `use_synaptogenesis=1` completed
+without error. Full regression suite unaffected -- 196 Python tests +
+8/9 block4-relevant C++ unit tests pass (the 1 failure confirmed
+pre-existing via stash-testing against the unfixed baseline).
+
+**The crash is fixed; the resulting accuracy is NOT good** -- with
+dynamic growth/pruning now safely running,
+`true_multi_digit_deterministic` dropped to mean_acc=0.0917
+(DEAD/CHANCE, z=-0.50) on the same out-of-context curriculum,
+substantially worse than the SAME arm's static-sparsity result of
+0.7854. Per direct discussion: not surprising at this small a network
+scale -- pruning specifically is expected to be disruptive, and
+synaptogenesis only sometimes helps; `k=4` may be too aggressive for
+continuous per-step growth here (`k=1` or `k=2`, or growing every few
+steps instead of every step, are the leading candidates to try).
+Explicitly deferred as its own tuning question, separate from the
+crash fix -- not yet tested.
