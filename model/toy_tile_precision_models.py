@@ -29,7 +29,8 @@ class ToyTileRecurrenceRealFP4:
                  mlp_hidden: int, num_tiles: int, max_weights: int,
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  use_energy: bool = False, energy_kwargs: Optional[dict] = None,
-                 use_attention: bool = True, o_proj_depth: int = 1):
+                 use_attention: bool = True, o_proj_depth: int = 1,
+                 rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
 
@@ -68,18 +69,41 @@ class ToyTileRecurrenceRealFP4:
 
         state_width = self.state_width
 
+        # Per-layer independent seeds derived from `rng`, matching this
+        # project's own established convention (scripts/disldo_*_ablation.py:
+        # np.random.default_rng(seed+1)/(seed+2) per sublayer) -- NOT passing
+        # `rng=` down to disldo_cls at all was a real bug found directly (same
+        # unseeded-RNG class as feedback_seed_stochastic_rng_for_comparisons):
+        # _preseed_random_sparse defaults to np.random.default_rng() (fresh OS
+        # entropy) whenever rng=None, so every layer's initial connectivity
+        # and initial weight values were NEVER controlled by the `seed` CLI
+        # arg -- confirmed directly, same command/seed gave 0.70 then 0.65
+        # final-step accuracy across two back-to-back runs. `seed` only ever
+        # controlled the embed table, task generation, and (separately) FP4
+        # stochastic rounding.
+        if rng is None:
+            rng = np.random.default_rng()
+        n_layer_seeds = 4 + max(o_proj_depth, 1)  # q, k, v, lm_head + o_proj sublayer(s)
+        layer_seeds = iter(int(s) for s in rng.integers(0, 2**31 - 1, size=n_layer_seeds))
+
         # 1. Core Attention & Output Projections
         if use_attention:
-            self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
-            self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
-            self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
+            self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                     rng=np.random.default_rng(next(layer_seeds)))
+            self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                     rng=np.random.default_rng(next(layer_seeds)))
+            self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                     rng=np.random.default_rng(next(layer_seeds)))
         if o_proj_depth > 1:
             per_layer_weights = max(max_weights // o_proj_depth, state_width)
-            self.o_proj = [disldo_cls(state_width, state_width, per_layer_weights, num_cpus)
+            self.o_proj = [disldo_cls(state_width, state_width, per_layer_weights, num_cpus,
+                                      rng=np.random.default_rng(next(layer_seeds)))
                           for _ in range(o_proj_depth)]
         else:
-            self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus)
-        self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus)
+            self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                     rng=np.random.default_rng(next(layer_seeds)))
+        self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
+                                  rng=np.random.default_rng(next(layer_seeds)))
         
         # 2. Norms & Gaussian Attention Params
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))

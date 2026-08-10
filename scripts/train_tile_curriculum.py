@@ -220,26 +220,45 @@ ARMS = {
                             # quantize's own design: zero trained scale AND
                             # deterministic rounding together.
 
+    # base=12.0: exact digit-range tiling (E2M1 math, see
+    # fixed_digit_residual_quantize's docstring), the project's working
+    # default. IMPORTANT: the single-seed sweep that first picked this
+    # (JOURNAL.md 2026-08-10, mean_acc 0.9375 vs base=4's 0.8771) was run
+    # BEFORE a real bug was found and fixed -- ToyTileRecurrenceRealFP4
+    # never passed `rng=` down to disldo_cls, so every layer's initial
+    # connectivity/weight values were genuinely unseeded regardless of
+    # `seed` (confirmed directly: same seed, same command, gave
+    # final-step accuracies of 0.70 then 0.65 across two back-to-back
+    # runs). That single-seed comparison only shows "there exists a draw
+    # where base=12 wins," not "usually wins" -- needs a proper
+    # multi-seed re-run now that construction is actually reproducible
+    # (see tests/test_residual_base_sweep.py) before this default is
+    # fully trusted. Kept as the default in the meantime since the
+    # theoretical argument (exact tiling) is independent of that bug.
     "true_multi_digit_deterministic": functools.partial(TrueMultiDigitLayer,
                                                         digit_cls=DISLDOLayerDeterministic,
-                                                        n_stages=3, base=4.0, lr_power=0.0),
-    # base=4.0 was derived from real FP4 (E2M1)'s own worst-case relative
-    # rounding error (~1/4), not fit to data -- these two arms test whether
-    # a coarser per-stage split (base=12/24, i.e. each successive digit
-    # covers a wider relative error band than FP4's own rounding implies)
-    # changes anything now that deterministic rounding + real DISLDO are
-    # both confirmed working (0.7854 static-sparsity baseline). Same
+                                                        n_stages=3, base=12.0, lr_power=0.0),
+    # base=4.0 was the ORIGINAL default, derived from real FP4 (E2M1)'s
+    # own worst-case relative rounding error (~1/4) -- kept as an explicit
+    # comparison point now that base=12 is the default above. Same
     # digit_cls/n_stages/lr_power as true_multi_digit_deterministic --
     # base is the only varied axis.
-    "true_multi_digit_deterministic_base12": functools.partial(
+    "true_multi_digit_deterministic_base4": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=12.0, lr_power=0.0),
+        n_stages=3, base=4.0, lr_power=0.0),
+    # base=6.0: halfway between base=4 (overlapping digit ranges) and
+    # base=12 (exact tiling) -- added per direct request to fill in the
+    # sparse 4/12/24 sweep with a point between the two closest-together
+    # candidates.
+    "true_multi_digit_deterministic_base6": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=6.0, lr_power=0.0),
     "true_multi_digit_deterministic_base24": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
         n_stages=3, base=24.0, lr_power=0.0),
     "true_multi_digit_noscale_deterministic": functools.partial(TrueMultiDigitLayer,
                                                                 digit_cls=DISLDOLayerNoScaleDeterministic,
-                                                                n_stages=3, base=4.0, lr_power=0.0),
+                                                                n_stages=3, base=12.0, lr_power=0.0),
 
     # Direct hypothesis check: each digit's independent preseed/synaptogenesis
     # means digits' connectivity is essentially disjoint (verified: 0/20, 0/20,
@@ -331,7 +350,8 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
                   "row_4bit_noscale_deterministic": 4,
                   "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12,
-                  "true_multi_digit_deterministic_base12": 12, "true_multi_digit_deterministic_base24": 12,
+                  "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
+                  "true_multi_digit_deterministic_base24": 12,
                   "true_multi_digit_shared_conn": 12}
 
 
@@ -412,11 +432,18 @@ def main():
     # confounded by an extra, uncontrolled noise source on top of `seed`.
     if hasattr(_cpu, "seed_fp4_stochastic_rng"):
         _cpu.seed_fp4_stochastic_rng(seed)
+    # Separate Generator (not the legacy RandomState `rng` above, used for
+    # tokens/embed_table) for model construction -- ToyTileRecurrenceRealFP4
+    # threads this down to each disldo_cls layer's initial connectivity/weight
+    # values (see its own docstring for the bug this fixes: this was
+    # previously never passed at all, so every layer's preseed was genuinely
+    # unseeded regardless of `seed`).
+    model_rng = np.random.default_rng(seed)
     model = ToyTileRecurrenceRealFP4(
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
-        use_attention=use_attention, o_proj_depth=o_proj_depth)
+        use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 

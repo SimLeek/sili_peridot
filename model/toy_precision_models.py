@@ -334,8 +334,8 @@ class AdamRowScaleDISLDOLayer:
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, beta1: float = 0.9, beta2: float = 0.999,
-                eps: float = 1e-8):
-        self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus)
+                eps: float = 1e-8, rng: Optional[np.random.Generator] = None):
+        self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.in_features = in_features
         self.beta1 = beta1
         self.beta2 = beta2
@@ -400,8 +400,8 @@ class AdamRank1DISLDOLayer:
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, beta1: float = 0.9, beta2: float = 0.999,
-                eps: float = 1e-8):
-        self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus)
+                eps: float = 1e-8, rng: Optional[np.random.Generator] = None):
+        self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.in_features = in_features
         self.out_features = out_features
         self.beta1 = beta1
@@ -653,7 +653,7 @@ def residual_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarr
 
 
 def fixed_digit_residual_quantize(vals: np.ndarray, bits_per_stage: int, n_stages: int,
-                                  base: float = 4.0, e_shared: float = 1.0) -> np.ndarray:
+                                  base: float = 12.0, e_shared: float = 1.0) -> np.ndarray:
     """Zero-scaling-VECTOR residual quantization, literal closed-form
     digit-place-value construction per direct design discussion:
     `fp(4n) ~= e_shared * sum_i digit_i * base**-i`. NO row/col fit
@@ -667,11 +667,17 @@ def fixed_digit_residual_quantize(vals: np.ndarray, bits_per_stage: int, n_stage
     that's needed" framing directly.
 
     `base`: ratio between consecutive residual stages' resolution.
-    Derived directly from the digit format's own mantissa bit count,
-    not fit to data -- real sili FP4 (E2M1, 1 mantissa bit) has
-    worst-case relative rounding error ~= 1/2**(mantissa_bits+1) = 1/4,
-    so consecutive stages naturally shrink ~4x regardless of what the
-    weights look like. Default 4.0 matches that directly.
+    The mantissa-derived value (real sili FP4/E2M1's own worst-case
+    relative rounding error ~= 1/2**(mantissa_bits+1) = 1/4, i.e.
+    base=4) substantially OVERLAPS each stage's representable range
+    with the one before it. Default 12.0 instead: the value where
+    digit i+1's ceiling lands exactly on digit i's floor (exact
+    tiling, zero overlap, zero gap), confirmed the real winner on
+    `TrueMultiDigitLayer`'s out-of-context curriculum -- mean_acc
+    0.9375 (plateaued, lowest variance) vs base=4's 0.8771, base=24's
+    0.70 (still not converged at 15000 steps, inconclusive). See
+    sili_peridot/JOURNAL.md 2026-08-10 and
+    project_hybrid_precision_plan memory for the full sweep.
 
     `e_shared`: a single FIXED scalar (not a per-row/per-col vector,
     not gradient-trained, never updated after being chosen) applied
@@ -768,7 +774,7 @@ class TrueMultiDigitLayer:
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, digit_cls=DISLDOLayer, bits_per_stage: int = 4,
-                n_stages: int = 2, base: float = 4.0, e_shared: Optional[float] = None,
+                n_stages: int = 2, base: float = 12.0, e_shared: Optional[float] = None,
                 lr_power: float = 0.0, simulate_quantize: bool = False,
                 share_connectivity: bool = False,
                 rng: Optional[np.random.Generator] = None):
@@ -885,7 +891,7 @@ class TrueMultiDigitDenseLayer:
 
     def __init__(self, in_features: int, out_features: int, max_weights: Optional[int] = None,
                 num_cpus: Optional[int] = None, bits_per_stage: int = 4, n_stages: int = 2,
-                base: float = 4.0, e_shared: Optional[float] = None, lr_power: float = 0.0,
+                base: float = 12.0, e_shared: Optional[float] = None, lr_power: float = 0.0,
                 rng: Optional[np.random.Generator] = None):
         levels = 2 ** (bits_per_stage - 1) - 1
         init_scale = (e_shared / levels) if e_shared is not None else 0.1
@@ -920,7 +926,7 @@ class TrueMultiDigitDenseLayer:
 
 def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
                                quantize_importance: bool, rank: int = 1,
-                               n_stages: int = 1, base: float = 4.0,
+                               n_stages: int = 1, base: float = 12.0,
                                e_shared: float = 1.0) -> None:
     c = inner._c
     ptrs = np.array(c.ptrs, copy=True)
@@ -988,7 +994,7 @@ class QuantizedDISLDOLayer32:
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                 num_cpus: int = 4, bits: int = 8, scheme: str = "rank1",
                 quantize_importance: bool = True, rank: int = 1, n_stages: int = 1,
-                base: float = 4.0, e_shared: Optional[float] = None,
+                base: float = 12.0, e_shared: Optional[float] = None,
                 rng: Optional[np.random.Generator] = None):
         self._inner = DISLDOLayer32(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.bits = bits

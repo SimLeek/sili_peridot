@@ -4947,3 +4947,80 @@ base=24 as an open question pending a longer run. Recorded in
 [[project_hybrid_precision_plan]]. Not yet promoted into any
 production/default arm -- the new base12/base24 arms are additive,
 existing arms unchanged.
+
+**2026-08-10, later still: user agreed base=12 makes sense, asked for
+an (optional) integration test + made it the actual default -- then a
+real methodology bug surfaced while building the confirmation test.**
+Made base=12 the class-level default in `TrueMultiDigitLayer`,
+`TrueMultiDigitDenseLayer`, `fixed_digit_residual_quantize`,
+`QuantizedDISLDOLayer32`, and the primary `true_multi_digit_deterministic`/
+`_noscale_deterministic` arms; kept a `_base4` arm for comparison
+(historical lr0/lr1/lr2/fp32_ref/dense/resync/noscale-stochastic/
+shared_conn arms left untouched at base=4.0, since those are fixed
+comparison points from earlier investigations, not "the default").
+
+While writing the confirmation test (`tests/test_residual_base_sweep.py`,
+opt-in via `SILI_RUN_BASE_SWEEP=1`), re-ran the exact base=4 vs base=12
+command from the sweep above and got a DIFFERENT result each time
+(0.70, then 0.65 final-step accuracy, same seed=1000, same everything).
+Root-caused: `ToyTileRecurrenceRealFP4.__init__` never passed `rng=`
+down to `disldo_cls(...)` for ANY of its 5-6 sublayers (q/k/v/o_proj/
+lm_head) -- `_preseed_random_sparse` (sili__new) defaults to
+`np.random.default_rng()` (fresh OS entropy) whenever `rng=None`, so
+every layer's initial connectivity AND initial weight values have
+been genuinely unseeded this ENTIRE session, regardless of the `seed`
+CLI arg -- `seed` only ever controlled the embed table, task
+generation, and (once added) FP4 stochastic rounding. Same underlying
+bug class as [[feedback_seed_stochastic_rng_for_comparisons]], just a
+different call site, and a much larger one: initial connectivity is
+plausibly the single biggest source of run-to-run variance on a tiny
+toy network like this.
+
+Fixed: `ToyTileRecurrenceRealFP4` now accepts `rng:
+Optional[np.random.Generator]`, derives one independent per-layer seed
+from it via `rng.integers(...)` (matching this project's own existing
+convention in `scripts/disldo_*_ablation.py`:
+`np.random.default_rng(seed+1)`/`(seed+2)` per sublayer, not one
+shared consumed stream), and passes `rng=np.random.default_rng(seed)`
+from `train_tile_curriculum.py`'s `main()`. Also had to add `rng=`
+passthrough to `AdamRowScaleDISLDOLayer`/`AdamRank1DISLDOLayer`
+(discovered because the full test suite -- not just this new test --
+started throwing `TypeError: unexpected keyword argument 'rng'` once
+`ToyTileRecurrenceRealFP4` unconditionally started passing it).
+Verified: same command run twice now gives byte-identical checkpoint
+accuracies (0.5167/0.6833 both times, vs the pre-fix 0.70/0.65
+divergence). Full fast test suite (232 tests) passes clean. Separately
+also found `PeakEligibilityDISLDOLayer` has the same never-passes-rng
+bug (causes an intermittent flake in its own test) -- NOT fixed here
+(unrelated to this task), logged as a todo alongside a broader "stop
+threading `rng=` through every call site, use a context-manager-scoped
+RNG instead" refactor the user requested be recorded rather than done
+immediately.
+
+**Consequence for every accuracy number in this session's precision
+work**: none of them are necessarily wrong (the mechanism/architecture
+findings -- deterministic-vs-stochastic rounding, the digit-residual
+design, etc. -- don't depend on any specific connectivity draw), but
+every SPECIFIC number (0.7854, 0.8771, 0.9375, 0.70, ...) was drawn
+from an uncontrolled random initial connectivity, i.e. one anecdote,
+not a controlled comparison. Directly matches the user's own framing:
+"forcing specific seeds can only verify 'there exists,' not 'for all'
+or 'usually.'" Immediately confirmed by re-testing with an actual
+fresh seed (2000) once the fix landed: base=6 won that draw (0.6812),
+not base=12 (0.6125) -- a different single-seed anecdote flips the
+"winner" yet again, underscoring exactly why a single seed was never
+enough.
+
+**Response, per direct instruction**: rebuilt the sweep as a real,
+paired, multi-seed comparison -- added a `base=6` arm (the midpoint
+between base=4's overlapping ranges and base=12's exact tiling, filling
+in the sparse 4/12/24 grid per direct request) and rewrote
+`test_residual_base_sweep.py` to run N seeds (default 5: 1000-1004)
+per arm, print a full per-seed table, and assert on a PAIRED win count
+(how many of the N seeds base=12 beats base=4 on) rather than a single
+point estimate. Launched the real 4-arm x 5-seed (20 run, ~35 min)
+sweep in the background; result not yet in at the time of this entry
+-- base=12 stays the working default in the meantime (the theoretical
+argument for it, exact digit-range tiling, is independent of the
+seeding bug), but is now explicitly flagged as pending re-confirmation
+rather than settled. Follow-up entry once the sweep completes.
