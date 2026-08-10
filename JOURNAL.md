@@ -4863,3 +4863,42 @@ want a targeted single-variable ablation (matching
 [[feedback_do_science_correctly]]) whenever a joint-sweep result is
 surprising enough to need explaining, not as a replacement for it.
 Not started -- next session's starting point.
+
+**2026-08-10, later: timing check on the merge_row_workspace fix --
+no slowdown found.** Direct question after the block4 crash fix
+merged: does the new clamp-and-walk loop in `merge_row_workspace`
+(always runs now, not just on overflow -- it walks every touched tile
+computing `fit_pos`/`fit_tiles` before the write-back, where the old
+code did a single unconditional `std::copy`) meaningfully slow down
+block4 backward? Built an A/B comparison using sili__new's existing
+`scripts/bench_block4_layer.py` (times `backward_dense` before/after a
+growth phase that triggers block4 promotion, directly exercising
+`merge_row_workspace`) across two builds: a `git worktree` checkout at
+`0b15f60` (immediately pre-fix) in a fresh temp venv, and the current
+post-fix `main` (`9e70e01`) in the normal `.venv`. 7 interleaved
+repeats each (`OMP_NUM_THREADS=1`/`OPENBLAS_NUM_THREADS=1`/
+`MKL_NUM_THREADS=1` pinned to avoid BLAS-thread confounds), confirmed
+block4 promotion actually fired in every run (120 tiles / 322
+synapses after growth).
+
+Result: `backward_after_growth` (the specific timing that exercises
+the fix) was ~4% *faster* post-fix -- 569us vs 592us median -- well
+inside the ~530-660us run-to-run noise band both builds show. All
+other timed phases (forward before/after, backward before growth)
+showed the same pattern: no direction, no magnitude, indistinguishable
+from noise. Conclusion: the fix's extra walk loop is not a real cost
+at these sizes -- it's dwarfed by the rest of `disldo_backward`'s
+work. No optimization needed; per direct instruction ("check timing...
+if there's a clear quick fix now, implement and commit, otherwise get
+back to the tests"), this closes the timing question with no code
+change, and the next step is the quality tests recorded above
+(base=12/24, LR sweeps, clip range) -- explicitly NOT synaptogenesis
+tuning, which stays deferred to the joint-sweep phase described above.
+
+Along the way, found `bench_block4_layer.py` itself was broken on
+ANY current build -- it called `forward_dense(x, learning_rate=0.0)`,
+but `forward_dense()` dropped that kwarg at some point (`learning_rate`
+now only applies to `backward_dense`) and the script was never
+updated. Confirmed via the pre-fix worktree that this predates #34 --
+unrelated stale-script bug, not a regression from the block4 fix.
+Fixed and merged: `SimLeek/sili__new#35`.
