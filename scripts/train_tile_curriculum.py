@@ -256,6 +256,29 @@ ARMS = {
     "true_multi_digit_deterministic_base24": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
         n_stages=3, base=24.0, lr_power=0.0),
+
+    # _dense variants: fully dense connectivity (every synapse present,
+    # loaded straight into block4 via sili__new's load_dense_codes) instead
+    # of the random SPARSE "echo network" preseed every arm above uses --
+    # per direct request, to test whether that random-connectivity-draw is
+    # itself a significant source of the seed-to-seed variance seen even at
+    # base=12 (std 0.043 across 5 seeds, JOURNAL.md 2026-08-10), independent
+    # of base or bits. Same digit_cls/n_stages/lr_power/base as their
+    # non-dense counterparts -- dense=True is the only varied axis, so this
+    # is a direct paired comparison, not a new axis tangled with others.
+    "true_multi_digit_deterministic_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=0.0, dense=True),
+    "true_multi_digit_deterministic_base4_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=4.0, lr_power=0.0, dense=True),
+    "true_multi_digit_deterministic_base6_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=6.0, lr_power=0.0, dense=True),
+    "true_multi_digit_deterministic_base24_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=24.0, lr_power=0.0, dense=True),
+
     "true_multi_digit_noscale_deterministic": functools.partial(TrueMultiDigitLayer,
                                                                 digit_cls=DISLDOLayerNoScaleDeterministic,
                                                                 n_stages=3, base=12.0, lr_power=0.0),
@@ -352,6 +375,8 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12,
                   "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
                   "true_multi_digit_deterministic_base24": 12,
+                  "true_multi_digit_deterministic_dense": 12, "true_multi_digit_deterministic_base4_dense": 12,
+                  "true_multi_digit_deterministic_base6_dense": 12, "true_multi_digit_deterministic_base24_dense": 12,
                   "true_multi_digit_shared_conn": 12}
 
 

@@ -30,6 +30,7 @@ class ToyTileRecurrenceRealFP4:
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  use_energy: bool = False, energy_kwargs: Optional[dict] = None,
                  use_attention: bool = True, o_proj_depth: int = 1,
+                 dense: bool = False,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
@@ -86,24 +87,32 @@ class ToyTileRecurrenceRealFP4:
         n_layer_seeds = 4 + max(o_proj_depth, 1)  # q, k, v, lm_head + o_proj sublayer(s)
         layer_seeds = iter(int(s) for s in rng.integers(0, 2**31 - 1, size=n_layer_seeds))
 
+        # dense=True only forwarded when set (not unconditionally) -- only
+        # disldo_cls options that were actually updated for it (DISLDOLayer/
+        # DISLDOLayerDeterministic in sili__new, TrueMultiDigitLayer here)
+        # accept a `dense` kwarg at all; every other existing disldo_cls
+        # option would TypeError on an unexpected kwarg otherwise, breaking
+        # every caller that doesn't ask for it.
+        dense_kwargs = {"dense": True} if dense else {}
+
         # 1. Core Attention & Output Projections
         if use_attention:
             self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)))
+                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
             self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)))
+                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
             self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)))
+                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
         if o_proj_depth > 1:
             per_layer_weights = max(max_weights // o_proj_depth, state_width)
             self.o_proj = [disldo_cls(state_width, state_width, per_layer_weights, num_cpus,
-                                      rng=np.random.default_rng(next(layer_seeds)))
+                                      rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
                           for _ in range(o_proj_depth)]
         else:
             self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)))
+                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
-                                  rng=np.random.default_rng(next(layer_seeds)))
+                                  rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
         
         # 2. Norms & Gaussian Attention Params
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
