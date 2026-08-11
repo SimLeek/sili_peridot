@@ -38,6 +38,8 @@ class ToyTileRecurrenceRealFP4:
                  use_attention: bool = True, o_proj_depth: int = 1,
                  dense: bool = False, clip_range: float = 6.0,
                  magnitude_penalty_coef: float = 0.0,
+                 spectral_norm_target: Optional[float] = None,
+                 spectral_norm_ema_decay: float = 0.9,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
@@ -84,7 +86,40 @@ class ToyTileRecurrenceRealFP4:
         combined, not gated on it) -- direct instruction to keep this
         mechanism isolated for testing rather than compounding it with
         energy_rl's own extinguishing pressure, which "adds a lot right
-        now" on its own and would confound an isolated test of this."""
+        now" on its own and would confound an isolated test of this.
+
+        spectral_norm_target: if set, rescales o_proj's real output by
+        `target/sigma_ema` every step, where `sigma_ema` is an
+        EMA-smoothed power-iteration estimate of o_proj's dominant
+        singular value -- the actual root-cause fix for dense
+        connectivity's instability (JOURNAL.md 2026-08-11: measured
+        spectral radius 1.19 at init, 1.50 after 400 steps for dense
+        vs 0.85/0.83 flat for sparse -- a spectral-radius-above-1
+        recurrent map structurally amplifies signal every pass,
+        independent of and NOT fixed by magnitude_penalty_coef/energy_rl,
+        which only constrain average magnitude, not the weight matrix's
+        dominant eigenvalue specifically). Standard "Spectral
+        Normalization" technique (Miyato et al. 2018): a persistent
+        probe vector `u` (NOT the actual recurrent state -- deliberately
+        decoupled from the real data/RMSNorm/clip/residual path so the
+        estimate reflects o_proj alone) is updated via ONE power
+        -iteration step per real step (`layer.forward(u, 0.0)` --
+        forward-only, same zero-side-effect convention `evaluate()`
+        already uses, no backward/optimizer call needed at all, cheap:
+        one forward pass plus a numpy norm, nothing like the O(n^3) cost
+        of an exact eigendecomposition). `sigma_ema` (not the raw
+        per-step estimate) is what's actually used, smoothed at
+        `spectral_norm_ema_decay` -- important once synaptogenesis is
+        active: a structural change (new synapse) can make one step's
+        raw estimate jump before `u` re-converges to the new dominant
+        eigenvector, and unlike an init-time-only fix, this whole
+        mechanism re-tracks automatically as the weight matrix changes,
+        whether from ordinary gradient updates or future synaptogenesis.
+        The rescale itself is an ordinary Tensor*float multiply already
+        supported by autograd (out * (target/sigma_ema)) -- no new
+        differentiable primitive needed anywhere. None/off by default,
+        independent of magnitude_penalty_coef/use_energy (composable,
+        not mutually exclusive -- direct request to test combinations)."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -92,6 +127,8 @@ class ToyTileRecurrenceRealFP4:
         self.rms_eps = rms_eps
         self.clip_range = clip_range
         self.magnitude_penalty_coef = magnitude_penalty_coef
+        self.spectral_norm_target = spectral_norm_target
+        self.spectral_norm_ema_decay = spectral_norm_ema_decay
         self.num_cpus = num_cpus
         self.use_attention = use_attention
         self.o_proj_depth = o_proj_depth
@@ -157,6 +194,37 @@ class ToyTileRecurrenceRealFP4:
         self.centers = Tensor(np.array([i + 0.5 for i in range(num_tiles)], dtype=np.float32))
         self.log_sigmas = Tensor(np.zeros(num_tiles, dtype=np.float32))
 
+        # 3. Spectral-norm probe state (only used if spectral_norm_target is
+        # set) -- one persistent probe vector + EMA sigma PER o_proj sublayer
+        # (o_proj_depth>1 chains several square state_width->state_width
+        # layers, each needs its own independent estimate). Seeded from the
+        # same `rng` as everything else above for reproducibility.
+        # Only allocated/RNG-consuming when actually used -- must NOT
+        # perturb rng's consumption sequence for the (default, every
+        # existing arm/test) spectral_norm_target=None path, or every
+        # downstream draw from this same `rng` shifts silently, breaking
+        # reproducibility for code that never asked for this feature.
+        if spectral_norm_target is not None:
+            n_o_layers = o_proj_depth if o_proj_depth > 1 else 1
+            self._spectral_u = [rng.standard_normal(state_width).astype(np.float32)
+                                for _ in range(n_o_layers)]
+            self._spectral_u = [u / (np.linalg.norm(u) + 1e-8) for u in self._spectral_u]
+            self._spectral_sigma_ema = [None] * n_o_layers
+            # Warm-start: a single untrained random probe vector badly
+            # underestimates the true dominant singular value (power
+            # iteration hasn't converged yet), so the FIRST real-step
+            # rescale would overshoot the target -- confirmed directly
+            # (measured effective spectral radius 1.38 at step 0 vs the
+            # 0.9 target, JOURNAL.md 2026-08-11). 20 extra iterations here
+            # (cheap, O(n^2) each, no backward/optimizer call) converges
+            # u/sigma_ema BEFORE any real training step, matching
+            # EnergyDynamics' own "allow N steps for noise, don't wait
+            # forever" warm-start convention.
+            o_layers = self.o_proj if o_proj_depth > 1 else [self.o_proj]
+            for _ in range(20):
+                for idx, layer in enumerate(o_layers):
+                    self._spectral_rescale_factor(layer, idx)
+
     def parameters_for_optimizer(self) -> List[Tensor]:
         """ONLY the plain leaf params (RMSNorm weights, gaussian
         centers/log_sigmas) -- DISLDOLayer-family layers' own big
@@ -186,12 +254,40 @@ class ToyTileRecurrenceRealFP4:
                 print(f"{name:12s} | Data Active: {data_active} (mean: {data_mean:.4f}) | Grad: NONE (Not computed yet)")
         print("==================================\n")
 
+    def _spectral_rescale_factor(self, layer, idx: int) -> float:
+        """One power-iteration step against `layer` alone (NOT the real
+        data -- a persistent probe vector, decoupled from RMSNorm/clip/
+        residual, so the estimate reflects this layer's own dominant
+        singular value only). forward(..., 0.0): zero-side-effect
+        convention already used everywhere (evaluate(), the earlier
+        spectral-radius diagnostic) -- no backward/optimizer call, so
+        this costs one extra forward pass, nothing like an
+        eigendecomposition. EMA-smoothed sigma (not the raw per-step
+        estimate) is what's actually used -- see __init__'s own
+        docstring for why (synaptogenesis-readiness)."""
+        eps = 1e-8
+        u = self._spectral_u[idx]
+        probe = Tensor(u.reshape(1, -1).astype(np.float32))
+        raw = np.asarray(layer.forward(probe, 0.0).data).reshape(-1)
+        sigma = float(np.linalg.norm(raw))
+        self._spectral_u[idx] = raw / (sigma + eps)
+        prev = self._spectral_sigma_ema[idx]
+        ema = sigma if prev is None else (
+            self.spectral_norm_ema_decay * prev + (1.0 - self.spectral_norm_ema_decay) * sigma)
+        self._spectral_sigma_ema[idx] = ema
+        return self.spectral_norm_target / max(ema, eps)
+
     def _apply_o_proj(self, x: Tensor, learning_rate: float) -> Tensor:
         if self.o_proj_depth > 1:
-            for layer in self.o_proj:
+            for idx, layer in enumerate(self.o_proj):
                 x = layer.forward(x, learning_rate)
+                if self.spectral_norm_target is not None:
+                    x = x * self._spectral_rescale_factor(layer, idx)
             return x
-        return self.o_proj.forward(x, learning_rate)
+        x = self.o_proj.forward(x, learning_rate)
+        if self.spectral_norm_target is not None:
+            x = x * self._spectral_rescale_factor(self.o_proj, 0)
+        return x
 
     def step(self, x_window: np.ndarray, M_prev: np.ndarray,
              learning_rate: float, debug: bool = False) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:

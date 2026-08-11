@@ -5498,3 +5498,89 @@ priority ordering -- given three real, substantive, correctly
 -implemented and validated attempts have each fallen well short, this
 last option is increasingly the pragmatic call rather than continuing
 to guess-and-check regularization strength/kind indefinitely.
+
+**2026-08-11, later still: measured the ACTUAL root cause directly --
+spectral radius, not just magnitude.** Direct user reframing: all
+three fixes above only constrain average activation/gradient
+MAGNITUDE, never the recurrent weight matrix's actual eigenvalue
+structure -- worth measuring the real thing before guessing another
+magnitude-based lever. Extracted `o_proj`'s effective dense matrix via
+`layer.forward(identity)` (works regardless of internal FP4/sparse
+storage, no new C++ needed) and computed its spectral radius directly:
+
+    sparse   at init:         spectral_radius=0.85
+    sparse   after 400 steps: spectral_radius=0.83   (flat, stable)
+    dense    at init:         spectral_radius=1.19   (already >1!)
+    dense    after 400 steps: spectral_radius=1.50   (growing)
+
+This is the real mechanism: a spectral radius above 1 means the
+recurrence structurally AMPLIFIES signal every pass -- a linear
+-systems instability present at initialization (even before any
+training) that gets WORSE during training. Sparse echo sits below 1
+and stays flat (textbook reservoir-computing "echo state property").
+Explains cleanly why all three magnitude-based fixes only partially
+helped: penalizing average magnitude doesn't specifically constrain
+the matrix's DOMINANT eigenvalue, which can stay above 1 even at
+moderate average magnitude if the matrix has the wrong structure.
+
+**Fix implemented: Spectral Normalization** (Miyato et al. 2018,
+`ToyTileRecurrenceRealFP4`'s new `spectral_norm_target`/
+`spectral_norm_ema_decay` params). A persistent probe vector `u` per
+o_proj sublayer -- deliberately NOT the actual recurrent state
+(M_prev/M_new), since the real state trajectory passes through
+RMSNorm/residual/clip which aren't part of the linear map and would
+conflate the estimate (RMSNorm actively re-normalizes magnitude
+regardless of the underlying matrix's true eigenvalues, which is
+likely part of why we saw magnitude drift over TRAINING time rather
+than blowing up within one forward pass). `u` is updated via ONE
+power-iteration step per real step (`layer.forward(u, 0.0)` --
+forward-only, zero side effects, same convention `evaluate()` already
+uses; cheap, O(n^2), nothing like an O(n^3) eigendecomposition, and no
+new differentiable primitive needed anywhere since it's built entirely
+from ops `sili` already has). The real layer output is rescaled by
+`target/sigma_ema` (an ordinary Tensor*float multiply, already
+autograd-safe) -- sigma is EMA-smoothed, not used raw, so a
+synaptogenesis-triggered structural change doesn't cause a sudden
+single-step jump before `u` re-converges to the new dominant
+eigenvector. Unlike an init-time-only fix, this re-tracks continuously
+as the matrix changes (gradient updates OR future synaptogenesis) --
+directly addressed a concern raised before implementing: a one-shot
+init rescale would go stale the moment synaptogenesis adds a synapse.
+
+Two real bugs caught during implementation, both fixed before
+committing:
+1. A single untrained random probe vector badly underestimates the
+   true dominant singular value (power iteration hasn't converged
+   yet), so the FIRST real-step rescale overshot the target --
+   measured directly (effective spectral radius 1.38 at step 0 vs the
+   0.9 target). Fixed with a 20-iteration warm-start at construction
+   (cheap, no backward/optimizer call) -- after the fix, effective
+   radius is 0.9467 at step 0 and 0.9016 after 400 steps, both close
+   to the 0.9 target.
+2. The probe-vector state was being allocated (and consuming `rng`
+   draws) UNCONDITIONALLY, even when `spectral_norm_target=None` (the
+   default, every existing arm/test) -- silently shifted RNG
+   consumption for code that never asked for this feature, broke one
+   existing test (`test_row_silent_at_query_tick_still_gets_credited_
+   from_an_earlier_peak`, an unrelated-looking failure that was
+   actually this). Fixed by making the whole block conditional; full
+   suite back to 100 passed after.
+
+Quick multi-seed short-run probing (1500 steps): task-accuracy signal
+was noisy/inconclusive (same "short runs don't predict full-scale
+behavior" pattern as every other fix tonight -- unfixed dense_base12
+ALSO looks fine at 1500 steps before its eventual full-scale
+collapse), but the skip-rate signal was the cleanest of the whole
+night: non-finite-gradient skip rate dropped from 2.267% (unfixed) to
+**exactly 0.000%** at every tested target (0.7/0.8/0.9/1.0) -- a
+complete elimination, stronger than either the magnitude penalty or
+energy_rl achieved. Picked `target=0.9` (standard reservoir-computing
+echo-state-property convention) for the full validation.
+
+**Full 15000-step/5-seed validation of spectral-norm-only (target=0.9,
+no magnitude penalty, no energy) on dense_base12: LAUNCHED, result
+pending -- append here once it lands.** This is the highest-priority
+of the 8-way test matrix discussed (dense_base12 x
+{none/spectral/magnitude/both} x {energy on/off}), since it's the
+first fix this session that targets the MEASURED mechanism directly
+rather than a magnitude-based proxy for it.

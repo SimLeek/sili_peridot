@@ -481,6 +481,14 @@ def main():
     # docstring) -- default 0.0/off, backward-compatible. Direct instruction
     # to keep this independent of use_energy for isolated testing.
     magnitude_penalty_coef = float(sys.argv[16]) if len(sys.argv) > 16 else 0.0
+    # spectral_norm_target: rescales o_proj's real output by a persistent,
+    # power-iteration-tracked estimate of its own dominant singular value
+    # (see ToyTileRecurrenceRealFP4.__init__'s own docstring) -- the
+    # measured root cause of dense connectivity's instability (spectral
+    # radius 1.2 at init, growing to 1.5+ over training, vs sparse's flat
+    # 0.85). None/off by default, backward-compatible, independent of
+    # magnitude_penalty_coef/use_energy (composable per direct request).
+    spectral_norm_target = float(sys.argv[17]) if len(sys.argv) > 17 else None
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -511,7 +519,8 @@ def main():
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
         use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng,
-        clip_range=clip_range, magnitude_penalty_coef=magnitude_penalty_coef)
+        clip_range=clip_range, magnitude_penalty_coef=magnitude_penalty_coef,
+        spectral_norm_target=spectral_norm_target)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
