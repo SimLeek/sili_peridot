@@ -5063,3 +5063,82 @@ infrastructure for task #5 (MiniCPM5's own planned "100% dense into
 block4, then prune toward net-zero" conversion path), so building it
 properly in C++ rather than a growth-loop bootstrap hack, per direct
 choice. Design in progress.
+
+**2026-08-10, follow-up: fully dense block4 built and verified real
+infrastructure -- but the seed-sensitivity experiment it was built to
+run doesn't work yet, paused rather than chased further.** Built and
+shipped, in `sili__new` (PR #36, merged into `feature/block4-dense-
+loader`): `block4_load_dense` (loading-only, takes already-quantized
+codes, no float/quantization/scale logic inside -- corrected mid
+-review from an earlier draft that conflated loading with
+quantization), `fp4_quantize_array`/`fp8_quantize_array` (separate
+standalone bulk quantizers), `load_dense_codes` pybind bindings on all
+9 FP4/FP8 layer variants sharing the template impl, and
+`test_block4_load_dense.cpp` (losslessness + forward-output
+correctness, passing). Zero regressions -- every pre-existing C++/
+Python test failure confirmed identical against the unmodified
+baseline via repeated git-stash comparisons.
+
+Wired `dense=True` through `DISLDOLayer`/`DISLDOLayerDeterministic` ->
+`TrueMultiDigitLayer` -> `ToyTileRecurrenceRealFP4` -> 4 new `*_dense`
+arms in `train_tile_curriculum.py`. Two real, sequential bugs found and
+fixed while getting this to actually train (not just construct):
+
+1. **FP4 zero-rounding floor vs naive fan-in scaling.** FP4 (E2M1) has
+   a FIXED absolute zero-rounding floor (~0.25), independent of layer
+   width. `_preseed_random_sparse`'s own `1/sqrt(k)` scaling, carried
+   over naively into the RAW quantized value at k=n_outputs=128, gives
+   `1/sqrt(128)~=0.09` -- nearly every drawn value collapses to code 0
+   ("not live"), silently turning "dense init" back into mostly-empty.
+   Fixed with a FIXED (not fan-in-shrunk) raw scale (1.5) for the
+   stored code, keeping ~87.5% actual live density.
+
+2. **Fan-in variance blowup once codes stay live.** A fixed raw scale
+   with NO compensating correction elsewhere gave row-output variance
+   ~128*1.5^2~=288 (vs sparse's properly-normalized ~1) -- confirmed
+   directly: every base=4/6/12/24 dense arm collapsed to IDENTICAL
+   chance-level accuracy (mean_acc~0.094, std~0.003 across 3 seeds),
+   consistent with the architecture's hard `[-2,2]` state clip
+   saturating output to a constant regardless of input -- a dead state
+   `value_scale`'s own RMSprop training can't escape from (clipping has
+   zero gradient outside its linear region, so no correcting signal
+   reaches the scale either). First fix attempt applied the correction
+   via per-ROW `value_scale` -- caught in review as the WRONG axis
+   (`output[c] = sum_r input[r]*weight[r,c]`'s variance depends on
+   column c's fan-in, not the row's width; the wrong-axis fix only
+   "worked" by coincidence on square q/k/v/o_proj layers, would have
+   been wrong for the non-square lm_head). Corrected to a per-COLUMN
+   `output_scale` set via `set_output_scale_raw`, computed from the
+   REAL post-quantization live count per column (not an assumed
+   uniform width) -- verified directly afterward: single-digit forward
+   output std=0.937 (was previously either near-zero or saturating),
+   healthy and in-range.
+
+**Even with both fixes, the full 15000-step curriculum still shows
+ZERO learning** -- all 4 dense base arms give BYTE-IDENTICAL per-seed
+accuracy trajectories (not just similar numbers: literally identical),
+strong evidence only digit 0 (whose `base**0=1` composition factor is
+base-independent) influences the output at all, and even digit 0 alone
+isn't learning over the full run. The problem has moved from "forward
+saturation" (fixed, confirmed via direct forward-output measurement)
+to something in TRAINING DYNAMICS specifically -- likely scale drift/
+staleness under much higher fan-in (this project's own earlier
+`value_scale` staleness investigation, `ScalePolicy`/
+`DeferredScaleWrite`, may be relevant here at a scale it wasn't
+exercised at before) or a backward-pass gradient-magnitude issue not
+yet isolated.
+
+**Per direct decision, paused rather than chased further right now**:
+the block4 dense LOADER infrastructure itself is real, correct, tested
+work (task #5's own eventual need, independent of whether THIS toy
+comparison succeeds) -- keeping it. The specific seed-sensitivity
+experiment it was built to run (does removing the sparse echo
+-network's random-connectivity draw reduce seed variance) is UNRESOLVED,
+not negative -- "dense doesn't train at all yet" is a different finding
+than "dense trains fine but is still seed-sensitive." Revisiting this
+alongside synaptogenesis/pruning work later, per the original plan this
+detour came from ([[project_sili_synaptogenesis_pruning_testing]]).
+Returning now to the quality-improvement track that was in progress
+before this detour: LR sweeps, clip-range test -- on the sparse echo
+network, whose comparisons (base=12 win, etc.) remain valid and
+unaffected by any of this.
