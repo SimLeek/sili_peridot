@@ -164,43 +164,98 @@ class ToyTileRecurrenceRealFP4:
         return self.o_proj.forward(x, learning_rate)
 
     def step(self, x_window: np.ndarray, M_prev: np.ndarray,
-             learning_rate: float, debug: bool = True) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
+             learning_rate: float, debug: bool = False) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
         """One recurrence tick. x_window, M_prev: [num_tiles,
         state_width] numpy, DETACHED (no BPTT, matching
         ToyTileRecurrence's own design). Returns (M_new numpy [num_tiles,
-        state_width], logits Tensor [num_tiles, vocab_size], aux_loss)."""
-        
+        state_width], logits Tensor [num_tiles, vocab_size], aux_loss).
+
+        `debug=True`: records per-stage value statistics (mean/std/min/
+        max, plus the fraction of elements the hard clip actually
+        touches) into `self._last_step_debug_stats` (a dict, stage name
+        -> stats dict) -- does NOT change the return signature (every
+        existing caller unpacks a 3-tuple positionally), so this is
+        purely additive/inspectable after the call. Default False (was
+        previously an unused, dead `debug: bool = True` param -- this
+        is the first real implementation) to avoid the extra numpy
+        reduction overhead in the normal training hot path. Built to
+        diagnose why fully-dense connectivity fails to train at all
+        (JOURNAL.md 2026-08-10) while the usual sparse echo-network
+        succeeds -- compare `_last_step_debug_stats` across a dense and
+        a sparse model at the same seed/step to find exactly where
+        their value distributions diverge."""
+        def _stats(name, arr):
+            a = np.asarray(arr)
+            return {"mean": float(a.mean()), "std": float(a.std()),
+                   "min": float(a.min()), "max": float(a.max()),
+                   "abs_max": float(np.abs(a).max())}
+
+        dbg = {} if debug else None
+
         # 1. Combine Input and State
         x_normed = rmsnorm_tensor(Tensor(x_window.astype(np.float32)), self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         qkv_source = x_normed + m_normed
-        
+        if debug:
+            dbg["qkv_source"] = _stats("qkv_source", qkv_source.data)
+
         # 2. Gaussian Attention (or bypass -- see use_attention docstring)
         if self.use_attention:
             q = self.q_proj.forward(qkv_source, learning_rate)
             k = self.k_proj.forward(qkv_source, learning_rate)
             v = self.v_proj.forward(qkv_source, learning_rate)
             sigmas = exp(self.log_sigmas)
+            if debug:
+                dbg["q"] = _stats("q", q.data)
+                dbg["k"] = _stats("k", k.data)
+                dbg["v"] = _stats("v", v.data)
 
             attn = gaussian_attention(q, k, v, self.centers, sigmas,
                                       num_cpus=self.num_cpus, causal=False)
+            if debug:
+                dbg["attn_raw"] = _stats("attn_raw", attn.data)
             attn, aux_loss = _apply_energy(self.energy, attn, self.num_tiles, self.state_width)
             attn = self._apply_o_proj(attn, learning_rate)
         else:
             attn = self._apply_o_proj(qkv_source, learning_rate)
             aux_loss = None
+        # Forward clip on the residual UPDATE itself, not just the final
+        # state (see clip below) -- found NECESSARY, not just belt-and
+        # -suspenders: gradient clipping alone (clip_grad_norm_ on the
+        # plain-Tensor Adam params, train_tile_curriculum.py) only bounds
+        # the SIZE of each individual step, not the CUMULATIVE drift from
+        # many small unclipped-in-effect steps compounding in the same
+        # direction over hundreds of steps -- confirmed directly: with
+        # only gradient clipping, dense connectivity's NaN divergence
+        # moved from step ~275 to step ~450 but still happened.
+        # attn_o_proj was already measured reaching |9.47| BEFORE the
+        # state's own post-residual-and-norm clip ever saw it. Same
+        # straight-through bypass-autograd convention as the state clip
+        # below (this is about bounding FORWARD magnitude, not shaping
+        # the backward gradient -- that's clip_grad_norm_'s job).
+        attn.data = np.clip(attn.data, -self.clip_range, self.clip_range)
+        if debug:
+            dbg["attn_o_proj"] = _stats("attn_o_proj", attn.data)
 
         # 3. Residual & Hard Bounding
         M_new_t = Tensor(M_prev.astype(np.float32)) + attn
         M_new_t = rmsnorm_tensor(M_new_t, self.state_ln, self.rms_eps)
-        
+        if debug:
+            dbg["pre_clip"] = _stats("pre_clip", M_new_t.data)
+            dbg["clip_fraction"] = float(np.mean(np.abs(M_new_t.data) >= self.clip_range))
+
         # Hard clip bounds the state to avoid exploding activations over time.
         # Direct .data modification bypasses any autograd tracking for the clip.
         M_new_t.data = np.clip(M_new_t.data, -self.clip_range, self.clip_range)
+        if debug:
+            dbg["post_clip"] = _stats("post_clip", M_new_t.data)
 
         # 4. Generate Logits
         pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)  # [num_tiles, embed_width]
         logits = self.lm_head.forward(pooled, learning_rate)  # [num_tiles, vocab_size]
-        
+        if debug:
+            dbg["logits"] = _stats("logits", logits.data)
+            self._last_step_debug_stats = dbg
+
         return M_new_t.data, logits, aux_loss

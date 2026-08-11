@@ -5229,3 +5229,91 @@ post-norm dynamic range the network needed, especially once
 meaningfully more headroom before the clip's zero-gradient region
 kicks in, matching FP4's own natural ceiling rather than an arbitrary
 tighter one.
+
+**2026-08-10 (cont.): dense connectivity's "fails to train" bug
+root-caused -- a NaN-blind gradient-clip guard, on BOTH sides of the
+Python/C++ boundary, not a value-scale/magnitude problem.** Resumed
+the dense-vs-sparse investigation (paused earlier this session after
+the naive block4-dense-loader comparison showed zero learning) per
+direct instruction to dig into real intermediate values rather than
+guess at another scale fix. Built `scripts/diagnose_dense_vs_sparse.py`
+(new, real diagnostic infra, not a one-off): constructs matched
+dense/sparse `ToyTileRecurrenceRealFP4` models at the same seed, runs
+real training steps, and compares every pipeline stage's value
+statistics side-by-side. Also gave `ToyTileRecurrenceRealFP4.step()`
+real `debug=True` instrumentation (previously a dead, unused
+parameter) recording per-stage mean/std/min/max/abs_max into
+`self._last_step_debug_stats`.
+
+Initial finding: dense connectivity doesn't fail to train from step 1
+(the original wrong assumption) -- `logits_std` grows steadily for
+~250-400 steps then the ENTIRE model (every stage, every parameter,
+including `centers`, a directly-stored leaf with no computation
+dependency on anything else) goes NaN in a single step and stays NaN
+**forever** after, on every subsequent step. Ruled out, with direct
+measurements, every "runaway magnitude" hypothesis first: DISLDO's own
+stored weight codes stay hard-bounded by FP4's structural ceiling the
+whole time; `output_scale`/`value_scale` stay small and only drift
+mildly; `log_sigmas`/`sigmas` (gaussian_attention's per-query std dev)
+barely move from init; `centers` barely drifts either. Tried backward
+global-gradient-norm clipping (`clip_grad_norm_`, already-existing
+infra) and forward activation clipping on `attn_o_proj` (matching the
+existing state clip's convention) -- both delayed but did NOT prevent
+the NaN, individually or combined.
+
+The real mechanism, found by noticing `centers` (unrelated to any
+forward computation) went NaN in lockstep with everything else: this
+is a **NaN gradient during backward**, not a forward blowup. Two
+independent silent-NaN-passthrough bugs, same shape, one on each side
+of the Python/C++ boundary:
+
+- **sili_peridot** (`model/toy_recall_models.py`, `clip_grad_norm_`):
+  `if total_norm > max_norm and total_norm > 0:` -- both comparisons
+  are `False` when `total_norm` is `NaN` (IEEE 754 semantics), so a
+  NaN gradient silently skips the clip and flows straight into
+  `AdamOptimizer.step()`, permanently corrupting its `m`/`v` moving
+  averages (every future update also NaN after that, explaining the
+  "forever" persistence).
+- **sili__new** (`sili/lib/headers/delta_csr_types.hpp`,
+  `RMSpropScalePolicy::update`/`AdaMaxScalePolicy::update`, plus a
+  hand-inlined duplicate of the same formula for the block4 path in
+  `linear_disldo.hpp`'s `disldo_backward`): the per-column/per-row
+  gradient aggregate is accumulated in `double` across every
+  contributing synapse x batch term (many more of them under dense's
+  much higher fan-in than sparse ever has), then narrowed to `float`
+  with **no range check**. Once that narrowing overflows to `Inf`,
+  `scale_state = beta2*scale_state + (1-beta2)*Inf^2 = Inf` and never
+  decays back down (`beta2 * Inf` stays `Inf` forever), then
+  `Inf / (sqrt(Inf)+eps) = Inf/Inf = NaN` by IEEE-754 -- confirmed
+  directly via the diagnostic: `output_scale` went NaN in the same
+  step as the whole model, while the raw stored weight code (fp4
+  saturates independently) stayed correctly bounded the whole time.
+
+**Fix (both sides, matching the "clip backwards AND forwards, and make
+NaN structurally impossible rather than just unlikely" directive):**
+`clip_grad_norm_` now explicitly checks `not np.isfinite(total_norm)`
+and zeros the gradients (skips that step's update) instead of falling
+through the original NaN-blind comparison. Both `ScalePolicy::update`
+implementations (RMSprop, AdaMax) and the block4-path inline update now
+check `isfinite` on the aggregated gradient AND the computed
+scale/scale_state before writing anything back, skipping the update on
+a non-finite result rather than writing corrupted state. A skipped
+update just means "no learning signal reached this parameter this
+step" -- strictly better than freezing the entire model into permanent
+garbage. Verified via the diagnostic run to 1500 steps, 3 separate
+runs, same seed: zero NaN occurrences (previously reliable by
+step ~250-400 every time), q/k/v/attn activations grow somewhat over
+the run (up to ~10-12 by step 1500) but stay finite and don't runaway
+further. Zero regressions: sili__new's Python test suite gives
+identical pass/fail counts with and without the fix (65 failed/152
+passed/23 errors either way -- all pre-existing, unrelated stale-test
+issues, confirmed via direct `git stash` comparison); sili_peridot's
+directly-relevant test files (toy_recall_models, toy_tile_precision
+_models, toy_precision_models, tile_recurrence, residual_base_sweep)
+all pass.
+
+**Not yet done**: a real multi-seed quality re-sweep of the dense arms
+now that training no longer dies partway through -- the diagnostic
+only proves training survives, not that dense connectivity reaches
+competitive accuracy. That's the natural next step before deciding
+whether dense becomes a real default alongside sparse-echo.

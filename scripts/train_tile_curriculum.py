@@ -39,7 +39,8 @@ from model.toy_precision_models import (QuantizedDISLDOLayer32, SeededRank1DISLD
                                         PeriodicSeedRank1DISLDOLayer8,
                                         SeededDISLDOLayer8Resync, SeededDISLDOLayer8AdaMax,
                                         TrueMultiDigitLayer, TrueMultiDigitDenseLayer)
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
+from model.toy_recall_models import (cross_entropy_sum, predicted_token, AdamOptimizer,
+                                     lr_schedule, clip_grad_norm_)
 
 
 def generate_copy_sequence(rng: np.random.RandomState, vocab: int, seq_len: int):
@@ -68,6 +69,19 @@ MAX_WEIGHTS_PER_LAYER = 128    # per_row=32 at state_width=32 -- generous at
 NUM_CPUS = 1
 PEAK_LR = 0.002
 WARMUP_STEPS = 50
+# Global gradient-norm clip on the plain-Tensor params (input_ln/state_ln/
+# centers/log_sigmas, trained via the external AdamOptimizer -- NOT
+# DISLDOLayer's own weights, which update inline during backward() and
+# can't be clipped the same way, see clip_grad_norm_'s own docstring).
+# Found NECESSARY, not just good practice: fully-dense connectivity's
+# larger fan-in lets logits grow large enough (mean_acc collapse traced
+# to real exponential blowup, JOURNAL.md 2026-08-10) that the resulting
+# cross-entropy gradient reaching these params via Adam produces a NaN
+# parameter update -- confirmed via direct per-stage diagnosis
+# (scripts/diagnose_dense_vs_sparse.py), reproducibly at the same step
+# every time. 1.0 matches nanoGPT's own commonly-used default (already
+# this project's cited reference elsewhere, e.g. lr_schedule's docstring).
+MAX_GRAD_NORM = 1.0
 EVAL_SEQUENCES = 60
 
 SEQ_LEN_START = 2
@@ -523,6 +537,7 @@ def main():
                 if aux is not None:
                     loss = loss + aux
                 loss.backward()
+                clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
 
         if use_synaptogenesis:
