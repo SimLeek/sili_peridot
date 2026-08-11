@@ -5317,3 +5317,122 @@ now that training no longer dies partway through -- the diagnostic
 only proves training survives, not that dense connectivity reaches
 competitive accuracy. That's the natural next step before deciding
 whether dense becomes a real default alongside sparse-echo.
+
+**2026-08-11: multi-seed dense quality sweep run -- REAL NEGATIVE
+RESULT, dense connectivity still doesn't learn even with the NaN fix.**
+4 dense arms (base4/6/12/24) x 5 seeds (1000-1004), identical 15000
+-step/checkpoint-every-750 config to the sparse-echo reference sweep
+(see `tests/test_residual_base_sweep_dense.py`, new):
+
+    arm            mean    std     dense vs sparse-echo
+    base4_dense    0.0938  0.0097  sparse: 0.6417
+    base6_dense    0.1171  0.0310  sparse: 0.6929
+    base12_dense   0.1050  0.0163  sparse: 0.7296
+    base24_dense   0.0979  0.0240  sparse: 0.6775
+
+Every arm, every seed (19/20) status DEAD/CHANCE -- essentially pure
+chance (0.10 for VOCAB=10). This is a materially different, more
+sobering picture than short (1500-step) smoke checks suggested
+earlier in this same investigation (which showed real, varying,
+non-degenerate accuracy and looked like genuine learning) -- those
+checks just hadn't run long enough to see the eventual collapse;
+dense connectivity trains for a while, then decays to chance by the
+time the harder curriculum stages are reached, for every base value.
+Low variance here reflects uniform failure, not uniform success --
+this directly answers the original block4-dense-loader question
+(does dense reduce seed-to-seed variance vs sparse-echo): yes,
+trivially, because it's stuck at chance in every run.
+
+**Root-cause investigation, per direct user diagnosis ("pathological
+attractor"):** correlated the accuracy collapse with the NEW
+`clip_grad_norm_`/`ScalePolicy` skip mechanism firing -- an isolated
+probe (monkey-patched skip counter around the unmodified production
+code, not touching any shared file) found `base4_dense` hits
+non-finite gradients on ~4.3% of steps overall, with a MUCH denser
+skip storm (~15% of steps) concentrated exactly at the seq_len 3->4
+curriculum transition, correlated 1:1 with accuracy crashing to chance
+at that exact point. `base12_dense` (the project's default base, exact
+digit-range tiling) showed only 0.4% skips and no collapse in the same
+short window -- independent evidence base=12's tiling isn't just more
+accurate, it's more NUMERICALLY STABLE under dense connectivity too.
+
+Direct user diagnosis: with dense connectivity's much higher fan-in,
+recurrent state has every incentive (via the softmax-style attention
+gating) to grow activation magnitude without bound -- "high value in
+RNN shuts off wrong competitor signals... no real cap on magnitude,
+every reason to increase it" -- and the existing hard clip
+(`M_new_t.data = np.clip(...)`) is a straight-through, autograd
+-bypassing overwrite that gives ZERO gradient signal discouraging this;
+biologically, a real neuron hit with 10k synapses' worth of signal at
+once would get damaged and learn not to let that happen again -- the
+network currently has no equivalent training pressure at all.
+
+**Fix attempted**: added `magnitude_penalty_coef` to
+`ToyTileRecurrenceRealFP4` -- a real, differentiable `coef*mean(x**2)`
+aux-loss term at both existing clip sites (attn_o_proj, post-clip
+state), independent of `use_energy`/EnergyDynamics per direct
+instruction (energy_rl's own extinguishing pressure "adds a lot right
+now" and would confound an isolated test of this specific mechanism).
+Computed from the POST-clip value deliberately, not pre-clip: `power`'s
+backward reads `.data` lazily at backward-call time, so building the
+penalty from the Tensor before the existing `.data = clip(...)`
+straight-through overwrite would silently differentiate against the
+wrong (already-mutated) value once `loss.backward()` actually runs
+later; using the post-clip value sidesteps that entirely (self
+-consistent, nothing mutates it again) and additionally gives a
+gradient magnitude that's itself bounded by clip_range, rather than
+risking reintroducing unbounded-magnitude gradients in the very
+mechanism meant to prevent that.
+
+**Short-run signal was very clean and promising**: a 5-seed, 1500-step
+smoke sweep (`base4_dense`, coef in {0, 0.0003, 0.001, 0.003, 0.01})
+showed coef=0.01 beating coef=0.0 on 4/5 seeds (mean of last-3
+-checkpoint accuracy 0.276 vs 0.171). The skip-rate probe was even
+cleaner and closer to binary: at seed=1000, skip rate dropped from
+4.67% (coef=0) to ~0% at EVERY tested nonzero coefficient (0.001,
+0.01, 0.03) -- the penalty essentially eliminates the non-finite
+-gradient events entirely, confirming the mechanism works exactly as
+intended at the level it targets.
+
+**Full 15000-step, 5-seed validation at coef=0.01: NO real improvement
+over the no-penalty baseline** (`tests/test_dense_magnitude_penalty_sweep.py`,
+new):
+
+    base     magpen mean   nopen mean   sparse mean
+    base4    0.0946        0.0938       0.6417
+    base6    0.0962        0.1171       0.6929
+    base12   0.1054        0.1050       0.7296
+    base24   0.0875        0.0979       0.6775
+
+Every arm still DEAD/CHANCE, statistically indistinguishable from the
+no-penalty numbers. **The disconnect between the short-run and
+full-run results is itself the real finding**: eliminating the
+non-finite-gradient skip storms (confirmed to work cleanly, a real and
+correct fix for a real bug) was NOT sufficient to make dense
+connectivity learn over a full curriculum. The skip storms were a
+genuine, fixable symptom of the underlying attractor dynamic, but not
+themselves the primary reason dense fails at full scale -- something
+else in the same "large activation magnitude, growing incentive"
+mechanism the user diagnosed is still winning out over a
+`coef=0.01` L2 penalty at this scope (both clip sites, this specific
+coefficient), or a materially different mechanism is needed
+(stronger coefficient, penalty placement elsewhere in the recurrence,
+or the originally-deferred energy_rl extinguishing pressure, still
+untested in isolation from this specific fix).
+
+**Status**: `magnitude_penalty_coef` is real, tested, zero-regression
+infrastructure (default 0.0/off, fully backward compatible) -- kept,
+since it correctly does what it was built to do (eliminate the skip
+storms) even though that wasn't sufficient on its own. Dense
+connectivity remains NOT competitive with sparse-echo at project scale
+as of this entry. Sparse-echo (base=12, mean 0.7296) remains the
+working default; dense connectivity is not yet a viable alternative
+despite two real, substantive fixes this session (permanent-NaN
+prevention, magnitude penalty) -- both necessary-but-not-sufficient.
+Next candidates, not yet tried: a meaningfully larger
+`magnitude_penalty_coef` (0.01 fully suppressed the SKIP mechanism at
+1500 steps but may still be too weak a restoring force against the
+attractor over a full 15000-step run); energy_rl's extinguishing
+mechanism in isolation; or accepting sparse-echo as the connectivity
+choice and moving on to synaptogenesis/pruning/energy stability work
+per the original stated priority ordering.

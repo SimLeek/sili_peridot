@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu
+from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu, power
 from sili.sparse_rnn import DISLDOLayer
 from sili.energy import EnergyDynamics
 
@@ -37,6 +37,7 @@ class ToyTileRecurrenceRealFP4:
                  use_energy: bool = False, energy_kwargs: Optional[dict] = None,
                  use_attention: bool = True, o_proj_depth: int = 1,
                  dense: bool = False, clip_range: float = 6.0,
+                 magnitude_penalty_coef: float = 0.0,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
@@ -55,13 +56,42 @@ class ToyTileRecurrenceRealFP4:
         roughly comparable to depth=1 -- a residual/cascaded
         -quantization-style test of whether N sequential coarse (e.g.
         FP4) layers can compose into something closer to a single
-        higher-precision layer, rather than needing more WIDTH."""
+        higher-precision layer, rather than needing more WIDTH.
+
+        magnitude_penalty_coef>0: adds coef*mean(x**2) aux-loss terms
+        on the (post-clip) attn_o_proj/state values -- a real gradient
+        discouraging large recurrent activation magnitude, independent
+        of and in addition to the hard clip below. Motivated directly:
+        the hard clip is a straight-through `.data` overwrite (bypasses
+        autograd entirely), so nothing currently tells the network NOT
+        to keep driving activation magnitude up against it -- a
+        pathological attractor under dense connectivity specifically
+        (found via JOURNAL.md 2026-08-10's dense-vs-sparse investigation:
+        even with NaN-safety fixed, dense connectivity still collapses
+        to chance over a full run, correlated with frequent non-finite
+        -gradient skips concentrated right at harder curriculum stages).
+        Computed from the ALREADY-CLIPPED value (not the pre-clip one)
+        deliberately: `power`'s backward reads `.data` lazily at
+        backward-call time, so building it from the pre-clip Tensor
+        before mutating `.data` in place would silently differentiate
+        against the wrong (already-overwritten) value by the time
+        backward actually runs; using the post-clip value instead is
+        self-consistent (nothing mutates it again after) AND gives a
+        gradient magnitude that's itself bounded by clip_range (can't
+        blow up for extreme pre-clip values), rather than reintroducing
+        the same kind of unbounded-magnitude risk this is meant to fix.
+        Deliberately independent of use_energy/EnergyDynamics (not
+        combined, not gated on it) -- direct instruction to keep this
+        mechanism isolated for testing rather than compounding it with
+        energy_rl's own extinguishing pressure, which "adds a lot right
+        now" on its own and would confound an isolated test of this."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
         self.num_tiles = num_tiles
         self.rms_eps = rms_eps
         self.clip_range = clip_range
+        self.magnitude_penalty_coef = magnitude_penalty_coef
         self.num_cpus = num_cpus
         self.use_attention = use_attention
         self.o_proj_depth = o_proj_depth
@@ -236,6 +266,9 @@ class ToyTileRecurrenceRealFP4:
         attn.data = np.clip(attn.data, -self.clip_range, self.clip_range)
         if debug:
             dbg["attn_o_proj"] = _stats("attn_o_proj", attn.data)
+        if self.magnitude_penalty_coef > 0:
+            mag_penalty = reduce_sum(power(attn, 2)) * (self.magnitude_penalty_coef / attn.data.size)
+            aux_loss = mag_penalty if aux_loss is None else aux_loss + mag_penalty
 
         # 3. Residual & Hard Bounding
         M_new_t = Tensor(M_prev.astype(np.float32)) + attn
@@ -249,6 +282,9 @@ class ToyTileRecurrenceRealFP4:
         M_new_t.data = np.clip(M_new_t.data, -self.clip_range, self.clip_range)
         if debug:
             dbg["post_clip"] = _stats("post_clip", M_new_t.data)
+        if self.magnitude_penalty_coef > 0:
+            mag_penalty = reduce_sum(power(M_new_t, 2)) * (self.magnitude_penalty_coef / M_new_t.data.size)
+            aux_loss = mag_penalty if aux_loss is None else aux_loss + mag_penalty
 
         # 4. Generate Logits
         pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))

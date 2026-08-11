@@ -476,6 +476,11 @@ def main():
     # wins clearly (mean_acc 0.98 vs 0.75, 3/3 seeds) -- now the default,
     # matching ToyTileRecurrenceRealFP4's own updated default.
     clip_range = float(sys.argv[15]) if len(sys.argv) > 15 else 6.0
+    # magnitude_penalty_coef: real gradient discouraging large recurrent
+    # activation magnitude (see ToyTileRecurrenceRealFP4.__init__'s own
+    # docstring) -- default 0.0/off, backward-compatible. Direct instruction
+    # to keep this independent of use_energy for isolated testing.
+    magnitude_penalty_coef = float(sys.argv[16]) if len(sys.argv) > 16 else 0.0
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -506,7 +511,7 @@ def main():
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
         use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng,
-        clip_range=clip_range)
+        clip_range=clip_range, magnitude_penalty_coef=magnitude_penalty_coef)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
