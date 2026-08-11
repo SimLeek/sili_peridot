@@ -5142,3 +5142,25 @@ Returning now to the quality-improvement track that was in progress
 before this detour: LR sweeps, clip-range test -- on the sparse echo
 network, whose comparisons (base=12 win, etc.) remain valid and
 unaffected by any of this.
+
+**2026-08-10 (cont.): LR sweep Test 2 -- lr_power retest under
+deterministic rounding, prediction CONFIRMED.** Added
+`true_multi_digit_deterministic_lr1`/`_lr2` (base=12, matching the
+confirmed default; `lr_power=1.0`/`2.0`) alongside the existing
+`lr_power=0.0` default arm, 3 seeds each, paired:
+
+    arm         mean    std     per-seed             status
+    lr_power=0  0.7389  0.0429  [0.694, 0.744, 0.779]  all LEARNING
+    lr_power=1  0.7431  0.0445  [0.769, 0.769, 0.692]  all PLATEAUED
+    lr_power=2  0.7243  0.0839  [0.802, 0.735, 0.635]  2 LEARNING, 1 PLATEAUED
+
+No clear winner -- lr_power=0 beats lr_power=1 on only 1/3 seeds
+(coin-flip), beats lr_power=2 on 2/3 (weak). Means overlap well within
+noise; lr_power=2's higher std (0.084 vs 0.043-0.045) is the only
+real distinguishing signal, and it points toward MORE variance, not
+less. Confirms the prediction from the original (stochastic-rounding
+-era) sweep: RMSprop's own `eff_lr*g/sqrt(importance)` update already
+self-normalizes almost all of `lr_power`'s extra per-digit damping
+away, so it doesn't meaningfully matter either way. `lr_power=0.0`
+(the simplest option, already the default) stays the right choice --
+no reason to add the extra parameter/complexity.
