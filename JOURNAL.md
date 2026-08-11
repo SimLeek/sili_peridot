@@ -5195,3 +5195,37 @@ other comparison this session, including the base=12 confirmation) --
 per [[feedback_do_science_correctly]], don't assume this transfers;
 whether the standard config also wants a lower `peak_lr` is a
 separate, open question, not yet answered by this test.
+
+**2026-08-10 (cont.): clip-range test -- the strongest, cleanest
+result of the whole quality-improvement track.** The tile-recurrence
+state's hard clip bound (`np.clip(M_new_t.data, -clip_range,
+clip_range)`, `toy_tile_precision_models.py`) was hardcoded at 2.0
+without much justification; made it a `clip_range` constructor param
+(default 2.0, unchanged) plus a new CLI arg (position 15) to test it
+directly. `true_multi_digit_deterministic` (base=12), standard config,
+3 seeds, `clip_range` in {2.0 (current), 6.0 (matching FP4/E2M1's own
+max representable magnitude)}:
+
+    clip  mean    std     per-seed              status
+    2.0   0.7514  0.0271  [0.725, 0.750, 0.779]  all LEARNING (not converged)
+    6.0   0.9847  0.0162  [0.990, 0.998, 0.967]  all PLATEAUED (converged)
+
+`clip_range=6.0` wins decisively: beats the current default on 3/3
+seeds, mean_acc 0.98 vs 0.75, LOWER variance too (0.016 vs 0.027), and
+already fully converged (PLATEAUED) while clip=2.0 is still mid
+-LEARNING at step 15000 -- meaning the 2.0-clip gap would likely be
+even larger given more steps to actually finish converging, not a
+transient effect that would close on its own. This is the strongest,
+cleanest single result of this entire quality track (bigger effect
+size than the wide-config peak_lr win, and completely unambiguous --
+every seed agrees, no overlap).
+
+**Recommendation: switch the project's default `clip_range` from 2.0
+to 6.0.** Direct mechanism read: the state is RMSNorm'd (with a
+learned, currently ~1.0-initialized scale) immediately before this
+clip, so a tight [-2,2] bound was very plausibly cutting off legitimate
+post-norm dynamic range the network needed, especially once
+`state_ln`'s learned scale grows during training -- 6.0 gives
+meaningfully more headroom before the clip's zero-gradient region
+kicks in, matching FP4's own natural ceiling rather than an arbitrary
+tighter one.

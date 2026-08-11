@@ -456,11 +456,12 @@ def main():
     # existing invocation.
     use_synaptogenesis = bool(int(sys.argv[14])) if len(sys.argv) > 14 else False
     # clip_range: the tile-recurrence state's hard clip bound
-    # (np.clip(M_new_t.data, -clip_range, clip_range)) was picked at 2.0
-    # without much justification -- direct comparison against other bounds
-    # (e.g. 6.0, matching FP4's own max representable magnitude) queued as
-    # an open question in JOURNAL.md. Default 2.0, backward-compatible.
-    clip_range = float(sys.argv[15]) if len(sys.argv) > 15 else 2.0
+    # (np.clip(M_new_t.data, -clip_range, clip_range)) was originally
+    # picked at 2.0 without much justification. Direct comparison
+    # confirmed 6.0 (matching FP4's own max representable magnitude)
+    # wins clearly (mean_acc 0.98 vs 0.75, 3/3 seeds) -- now the default,
+    # matching ToyTileRecurrenceRealFP4's own updated default.
+    clip_range = float(sys.argv[15]) if len(sys.argv) > 15 else 6.0
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT

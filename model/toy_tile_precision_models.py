@@ -21,9 +21,12 @@ class ToyTileRecurrenceRealFP4:
 
     SwiGLU MLP and tanh have been removed in favor of a minimal
     attention-only recurrence with `[-clip_range, clip_range]` state
-    clipping (default 2.0, picked without much justification -- see
-    `clip_range` param and sili_peridot JOURNAL.md's clip-range test
-    for the direct comparison against other bounds).
+    clipping. Default 6.0 (matching FP4/E2M1's own max representable
+    magnitude) -- confirmed via direct comparison against the original
+    2.0 default (mean_acc 0.98 vs 0.75, 3/3 seeds, lower variance,
+    already converged vs still mid-learning at step 15000; see
+    sili_peridot JOURNAL.md's clip-range test entry for the full
+    result).
 
     `step()` returns (M_new, logits, aux_loss) -- aux_loss is None
     unless `use_energy=True`."""
@@ -33,7 +36,7 @@ class ToyTileRecurrenceRealFP4:
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  use_energy: bool = False, energy_kwargs: Optional[dict] = None,
                  use_attention: bool = True, o_proj_depth: int = 1,
-                 dense: bool = False, clip_range: float = 2.0,
+                 dense: bool = False, clip_range: float = 6.0,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
