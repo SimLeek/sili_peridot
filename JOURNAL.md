@@ -5164,3 +5164,34 @@ self-normalizes almost all of `lr_power`'s extra per-digit damping
 away, so it doesn't meaningfully matter either way. `lr_power=0.0`
 (the simplest option, already the default) stays the right choice --
 no reason to add the extra parameter/complexity.
+
+**2026-08-10 (cont.): LR sweep Test 1 -- peak_lr at the wide config,
+a REAL win found (not noise-level like Test 2).** Memory-matched-wide
+config (`embed_width=32, column_neurons=8` -> `state_width=256`,
+`max_weights=6000`), `true_multi_digit_deterministic` (base=12), 3
+seeds, `peak_lr` in {0.002 (current default), 0.001, 0.0005}:
+
+    peak_lr  mean    std     per-seed              status
+    0.002    0.7424  0.0717  [0.773, 0.660, 0.794]  all PLATEAUED
+    0.001    0.9014  0.0643  [0.940, 0.827, 0.938]  all PLATEAUED
+    0.0005   0.7333  0.0344  [0.769, 0.700, 0.731]  all PLATEAUED
+
+`peak_lr=0.001` (HALF the current default) wins clearly: beats the
+current default on 3/3 seeds, mean_acc 0.90 vs 0.74 -- a real,
+substantial gap, not overlapping noise like the lr_power result above.
+`peak_lr=0.0005` (a further half) does NOT help further -- actually
+slightly worse than even the current default, confirming this is a
+genuine sweet spot at 0.001, not just "lower is always better" for the
+wide config. Matches the original hypothesis directly: the wide
+config's ~2x more free parameters need a lower peak_lr to converge
+well within the fixed 15000-step budget, even though
+`lr_per_row_nnz=True` already partially compensates via larger
+per-row nnz.
+
+**Recommendation**: use `peak_lr=0.001` (not 0.002) specifically for
+wide-config (`state_width=256`) runs going forward. **Not yet tested
+at the standard config** (`state_width=128`, used throughout every
+other comparison this session, including the base=12 confirmation) --
+per [[feedback_do_science_correctly]], don't assume this transfers;
+whether the standard config also wants a lower `peak_lr` is a
+separate, open question, not yet answered by this test.
