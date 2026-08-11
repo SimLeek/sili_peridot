@@ -455,6 +455,12 @@ def main():
     # already tested). Default 0/off, backward-compatible with every
     # existing invocation.
     use_synaptogenesis = bool(int(sys.argv[14])) if len(sys.argv) > 14 else False
+    # clip_range: the tile-recurrence state's hard clip bound
+    # (np.clip(M_new_t.data, -clip_range, clip_range)) was picked at 2.0
+    # without much justification -- direct comparison against other bounds
+    # (e.g. 6.0, matching FP4's own max representable magnitude) queued as
+    # an open question in JOURNAL.md. Default 2.0, backward-compatible.
+    clip_range = float(sys.argv[15]) if len(sys.argv) > 15 else 2.0
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -484,7 +490,8 @@ def main():
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
-        use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng)
+        use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng,
+        clip_range=clip_range)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 

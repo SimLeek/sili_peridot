@@ -19,8 +19,11 @@ class ToyTileRecurrenceRealFP4:
     trained by a small external AdamOptimizer via
     `parameters_for_optimizer()`.
 
-    SwiGLU MLP and tanh have been removed in favor of a minimal 
-    attention-only recurrence with [-2.0, 2.0] state clipping.
+    SwiGLU MLP and tanh have been removed in favor of a minimal
+    attention-only recurrence with `[-clip_range, clip_range]` state
+    clipping (default 2.0, picked without much justification -- see
+    `clip_range` param and sili_peridot JOURNAL.md's clip-range test
+    for the direct comparison against other bounds).
 
     `step()` returns (M_new, logits, aux_loss) -- aux_loss is None
     unless `use_energy=True`."""
@@ -30,7 +33,7 @@ class ToyTileRecurrenceRealFP4:
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  use_energy: bool = False, energy_kwargs: Optional[dict] = None,
                  use_attention: bool = True, o_proj_depth: int = 1,
-                 dense: bool = False,
+                 dense: bool = False, clip_range: float = 2.0,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
@@ -55,6 +58,7 @@ class ToyTileRecurrenceRealFP4:
         self.state_width = embed_width * column_neurons
         self.num_tiles = num_tiles
         self.rms_eps = rms_eps
+        self.clip_range = clip_range
         self.num_cpus = num_cpus
         self.use_attention = use_attention
         self.o_proj_depth = o_proj_depth
@@ -189,7 +193,7 @@ class ToyTileRecurrenceRealFP4:
         
         # Hard clip bounds the state to avoid exploding activations over time.
         # Direct .data modification bypasses any autograd tracking for the clip.
-        M_new_t.data = np.clip(M_new_t.data, -2.0, 2.0)
+        M_new_t.data = np.clip(M_new_t.data, -self.clip_range, self.clip_range)
 
         # 4. Generate Logits
         pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))
