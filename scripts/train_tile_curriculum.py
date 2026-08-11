@@ -257,6 +257,21 @@ ARMS = {
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
         n_stages=3, base=24.0, lr_power=0.0),
 
+    # lr_power retest under deterministic rounding (JOURNAL.md 2026-08-10
+    # "Test 2"): the stochastic-rounding-era true_multi_digit_lr0/lr1/lr2
+    # sweep found no real difference between lr_power values, predicted
+    # to be because RMSprop's own eff_lr*g/sqrt(importance) self
+    # -normalizes almost all of the extra per-digit factor_i damping away
+    # on its own. Retesting under deterministic rounding (base=12, matching
+    # the confirmed default) to confirm that prediction still holds now
+    # that stochastic noise isn't swamping everything else.
+    "true_multi_digit_deterministic_lr1": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=1.0),
+    "true_multi_digit_deterministic_lr2": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=2.0),
+
     # _dense variants: fully dense connectivity (every synapse present,
     # loaded straight into block4 via sili__new's load_dense_codes) instead
     # of the random SPARSE "echo network" preseed every arm above uses --
@@ -375,6 +390,7 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12,
                   "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
                   "true_multi_digit_deterministic_base24": 12,
+                  "true_multi_digit_deterministic_lr1": 12, "true_multi_digit_deterministic_lr2": 12,
                   "true_multi_digit_deterministic_dense": 12, "true_multi_digit_deterministic_base4_dense": 12,
                   "true_multi_digit_deterministic_base6_dense": 12, "true_multi_digit_deterministic_base24_dense": 12,
                   "true_multi_digit_shared_conn": 12}
