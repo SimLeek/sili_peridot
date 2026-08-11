@@ -5436,3 +5436,65 @@ attractor over a full 15000-step run); energy_rl's extinguishing
 mechanism in isolation; or accepting sparse-echo as the connectivity
 choice and moving on to synaptogenesis/pruning/energy stability work
 per the original stated priority ordering.
+
+**2026-08-11, later: energy_rl tested (2 configs) -- real, replicated,
+but still-small improvement, gap to sparse-echo remains wide open.**
+Direct user hypothesis: the magnitude-penalty null result looked like
+a regularization-STRENGTH-or-KIND issue, not a dead end -- EnergyDynamics'
+`activation_cost` term is L1-flavored (`new_energy -= activation_cost *
+abs(h)`, not L2), plus it brings real homeostatic machinery (KL
+density targeting, refractory drain, forced-firing bootstrap)
+`magnitude_penalty_coef` doesn't have at all. Tested via the existing,
+already-wired `use_energy=True` path (`_apply_energy` in `step()` was
+already unconditionally present, zero new code needed) at two
+configs, full 15000-step/5-seed validation for both:
+
+    base     no-fix   energy(default)  energy(ac=.02,prec=.01)  sparse-echo
+    base4    0.0938   0.1325           0.1233                   0.6417
+    base6    0.1171   0.1575           0.1500                   0.6929
+    base12   0.1050   0.1308           0.1200                   0.7296
+    base24   0.0979   0.1358           0.1333                   0.6775
+
+"default" = this project's existing already-tuned-low `ENERGY_KWARGS`
+(drive=0.00535, activation_cost=0.005, precision=0.001, density=0.005,
+p=0.995, reactivity=0.0001), used elsewhere. "ac=.02,prec=.01" =
+activation_cost 4x, precision 10x, chosen from an isolated 3-seed
+/1500-step skip-rate probe that showed it suppressing non-finite
+-gradient skips further than the default (0.33% vs the probed
+default's own rate) -- built as a standalone script
+(`scripts/energy_param_validation.py`, new, constructs models directly
+rather than adding CLI-exposed energy params, since a parallel default
+-config sweep was already running against `train_tile_curriculum.py`
+and editing it would have contaminated that run).
+
+Both energy configs beat no-fix CONSISTENTLY across all 4 base values
+(a real, small, replicated effect, unlike the magnitude-penalty
+fix's statistically-zero result) -- energy_rl's L1/homeostatic
+mechanism genuinely does something the pure L2 penalty didn't. But
+the STRONGER config did NOT clearly beat the default (overlapping,
+if anything slightly worse on every base) -- the same "short-run
+signal didn't scale with strength at full duration" pattern seen with
+`magnitude_penalty_coef` repeats here too. Both remain far short of
+sparse-echo's 0.68-0.73.
+
+**Cumulative status after 3 real, substantively different fix
+attempts this session (permanent-NaN prevention, L2 magnitude
+penalty, energy_rl at 2 strengths)**: dense connectivity has moved
+from "crashes to permanent NaN" -> "survives but stuck near chance"
+-> "consistently, measurably better than chance but still ~5x worse
+than sparse-echo." Each fix targeted the SAME diagnosed mechanism
+(large recurrent activation magnitude, encouraged by the softmax-style
+attention gating, unpunished by the existing straight-through hard
+clip) via a different lever, with diminishing-but-nonzero returns.
+Open next candidates, none yet tried: energy_rl's OWN forced-firing/
+exploration bootstrap in isolation (not just activation_cost/precision,
+the OTHER "some other stuff" the user flagged); combining energy_rl
+with the magnitude penalty (never tested together); a fundamentally
+different regularization site (per-head/per-projection normalization
+rather than a single scalar penalty on the whole state); or accepting
+sparse-echo as the working connectivity choice and moving on to
+synaptogenesis/pruning/energy stability work, per the original stated
+priority ordering -- given three real, substantive, correctly
+-implemented and validated attempts have each fallen well short, this
+last option is increasingly the pragmatic call rather than continuing
+to guess-and-check regularization strength/kind indefinitely.
