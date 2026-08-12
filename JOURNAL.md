@@ -5477,6 +5477,24 @@ signal didn't scale with strength at full duration" pattern seen with
 `magnitude_penalty_coef` repeats here too. Both remain far short of
 sparse-echo's 0.68-0.73.
 
+**2026-08-12: spectral-norm-alone win CONFIRMED GENERAL, not
+base=12-specific -- full validation across base=4/6/24.** Same
+15000-step/5-seed config, `spectral_norm_target=0.9`, no magnitude
+penalty, no energy:
+
+    arm            spectral mean  spectral std   nofix    sparse-echo
+    base4_dense    0.9158         0.0350         0.0938   0.6417
+    base6_dense    0.8779         0.0609         0.1171   0.6929
+    base24_dense   0.8625         0.0167         0.0979   0.6775
+    base12_dense   0.8858         0.0566         0.1050   0.7296  (already confirmed)
+
+Every base value shows the identical pattern: dense connectivity
+with the spectral fix beats sparse-echo by a wide margin (+0.15 to
++0.28 absolute), comparable-to-lower variance. This is now a fully
+general result, not conditional on any specific base -- dense +
+Spectral Normalization is a strong candidate for the new project
+default across the whole base sweep, not just base=12.
+
 **Cumulative status after 3 real, substantively different fix
 attempts this session (permanent-NaN prevention, L2 magnitude
 penalty, energy_rl at 2 strengths)**: dense connectivity has moved
