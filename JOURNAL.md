@@ -6562,10 +6562,123 @@ but not yet a converged, validated result: needs more steps and/or
 q/k/v/o_proj) before treating this as a real landmark alongside the
 dense/echo-init L1-sparsity result above.
 
-**Not yet done**: multi-seed validation, `lm_head` L1 wiring, a longer
-run to check for actual convergence, and re-checking whether the
-`fire_wake_gradient`/`fire_reset_to_zero` energy mechanisms add
-anything now that the real blocker is fixed (they were investigated
-under the wrong root-cause theory and may no longer be needed at all
-for this specific deadlock -- worth re-examining only if a still
--slower-than-hoped cascade shows up at full multi-seed scale).
+**Not yet done (superseded by the follow-ups below)**: multi-seed
+validation, `lm_head` L1 wiring, a longer run to check for actual
+convergence, and re-checking whether `fire_wake_gradient`/
+`fire_reset_to_zero` add anything now that the real blocker is fixed.
+
+## Follow-ups: lm_head L1, multi-seed validation, energy_rl speedup, a real RNG bug, and fire_wake_gradient's verdict
+
+Worked through the full "not yet done" list above, plus direct
+follow-up requests ("energy_rl is also curiosity_rl... it might be the
+only training signal sometimes... the energy rl might help getting the
+network started faster, especially attention").
+
+**1. `lm_head` L1 wiring** (`_l1_sparsity_split(self.lm_head, pooled,
+lr, self.l1_sparsity_coef)`, added to `step()` in both the tmp probe
+and `scripts/l1_sparsity_probe.py`) -- `lm_head` previously had no L1
+term at all, unlike q/k/v/o_proj.
+
+**2. `zero_init_importance_code` made configurable** (default 1,
+unchanged) on `OriginalArchModel`, in both scripts (was hardcoded, and
+a first attempt at syncing this to the committed script was
+accidentally skipped -- caught and fixed).
+
+**3. Does noisy firing decay importance back toward 0, re-triggering
+the prune bug mid-training?** Direct hypothesis, worth testing given
+the block4-liveness root cause above. First attempt at measuring this
+via `layer.digits[0]._c.importance` gave a false positive (importance
+appearing to collapse to 0/NaN within 1000-1500 steps, in BOTH energy
+-on and energy-off arms) -- caught before reporting: `.importance`
+reflects the SCATTERED CSR side (array shape 21 -> 0 over training),
+completely unrelated to block4 storage for a `dense=True` layer, a
+measurement artifact not a real signal. Switched to the same direct
+methodology that found the original bug: checkpoint-test trainability
+by pausing training, forcing a large explicit gradient into a probe
+layer, and checking the stored weight actually moves. Result: q/v/o
+all stayed genuinely trainable (real, substantial forced-gradient
+response) throughout 3000 steps in BOTH energy-on and energy-off
+configs -- no evidence of re-pruning. The hypothesized risk doesn't
+materialize in practice, at least at the energy config tested
+(drive=0.05, activation_cost=0.05, p=0.3).
+
+**4. Does energy_rl speed up the cascade?** Single-seed test: with
+energy OFF, `o`/`M` stayed at exactly 0.0000 for a full 12000-step run
+(this particular seed, with `lm_head`'s new L1 term added, took longer
+than the earlier 15000-step trace that woke by ~11000 -- a real
+RNG-stream-perturbation effect from the added forward calls, not a
+regression). With energy ON, `o`/`M` woke almost immediately (real,
+nonzero by step 1000) and stayed active the whole run -- `v`
+(participates LINEARLY in the attention output) woke vigorously (1-7),
+while `q` stayed near-zero throughout, consistent with the earlier
+finding that q/k's bilinear bootstrap through gaussian_attention is
+structurally weak (see below).
+
+Confirmed at real multi-seed scale (3 seeds, 10000 steps,
+`zero_init_importance_code=1`, `drive=0.05, activation_cost=0.05,
+precision=0.01, density=0.05, p=0.3`):
+
+    use_energy=False: o_wake_step=[None, None, None]  mean_final_acc=0.200
+    use_energy=True:  o_wake_step=[1000, 1000, 1000]  mean_final_acc=0.133
+
+3/3 seeds wake `o_proj` by step 1000 with energy vs 0/3 waking at all
+within 10000 steps without it -- a robust, reproducible speedup, not
+single-seed noise. Final task accuracy is NOT yet converged in either
+arm (both still noisy/low) -- energy's mean was actually LOWER than
+no-energy's here, an early signal (not conclusive on its own, per
+direct discussion) that energy's exploration noise may trade off
+against precise convergence once real signal is flowing, even though
+it dramatically speeds up escaping the dead state. Motivated a
+proposed (not yet built) per-neuron wake-gated energy annealing idea
+-- high drive/exploration while a neuron hasn't fired recently, taper
+once it has -- tracked separately (see memory:
+project_energy_wake_gated_annealing_idea, not this file, since it's a
+forward-looking design note rather than a completed result).
+
+**5. Real bug found: `EnergyDynamics`'s exploration noise was
+unseeded.** While re-checking `fire_wake_gradient` (below), the
+IDENTICAL config (same `seed=1000`, same energy params, same 6000
+-step schedule) produced a healthy run in one process and a NaN
+-diverged one in another. Root-caused: `noise = np.random.normal(...)`
+inside `_apply_energy_dynamics` drew from bare global numpy RNG state,
+completely independent of the `seed=1000` passed to the model (which
+only seeds `task_rng` and the FP4 rounding RNG) -- confirmed directly
+by adding an explicit `np.random.seed(1000)` at the top of two separate
+process runs and getting byte-identical energy trajectories. This is
+the same bug class as an earlier falsified sweep (missing layer
+-construction seeding) -- fixed in `sili__new` by adding an opt-in
+`rng: Optional[np.random.Generator]` parameter to both
+`_apply_energy_dynamics` and `EnergyDynamics` (default None, exact
+existing unseeded-global behavior preserved), matching DISLDOLayer's
+own `rng=` convention. `OriginalArchModel` now derives a seeded rng for
+its `EnergyDynamics` construction automatically (same convention as
+q/k/v/o_proj) unless the caller supplies their own via `energy_kwargs`.
+
+**6. `fire_wake_gradient`'s real verdict, now properly seeded** (3
+seeds x 2 arms, 6000 steps, `drive=0.05, activation_cost=0.05,
+p=0.3`):
+
+    energy alone:                    0/3 seeds diverged
+    energy + fire_wake_gradient=200: 1/3 seeds diverged (step 6000)
+
+Combined with the earlier finding that `fire_wake_gradient` backprops
+through `gaussian_attention` into `v` (real, large gradient -- `v`
+participates LINEARLY in the attention output) but NOT into `q`/`k`
+(whose local Jacobian is EXACTLY zero whenever both are zero -- a
+bilinear-degenerate-point property, confirmed by direct gradient
+inspection, that no injected gradient magnitude can cross): plain
+energy already gets the useful part of this (waking `v`, and via `v`,
+`o`/`M`) for free, with zero divergence risk across 3 seeds, while
+`fire_wake_gradient` adds real instability without helping the one
+place (`q`/`k`) it was meant to reach. **Verdict: not recommended for
+this use case** -- plain `energy_rl` is sufficient and safer. Kept in
+`sili__new` as real, correct, tested library functionality (it does
+exactly what it's documented to do), just not the right tool here.
+
+**Summary of what actually helps zero-init, in order of impact:**
+seeding importance nonzero at zero-value init (removes the hard
+deadlock entirely) > plain `energy_rl` (dramatic wake-speed
+improvement, still needs the importance fix underneath) >
+`fire_wake_gradient` (not recommended -- adds risk, doesn't reach q/k).
+Convergence to real task accuracy remains open at both 10000-15000
+step scales tested so far.

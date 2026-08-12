@@ -84,7 +84,8 @@ class OriginalArchModel:
     split-backward L1-sparsity (and L2-ratio, for comparison) mechanism
     wired onto all 4 layers instead of spectral_norm_target."""
     def __init__(self, seed, dense, o_proj_coef, all_layer_coef=0.0, l1_sparsity_coef=0.0,
-                 all_zero_init=False, use_energy=False, energy_kwargs=None, scale_clip_max=None):
+                 all_zero_init=False, zero_init_importance_code=1, use_energy=False,
+                 energy_kwargs=None, scale_clip_max=None):
         if hasattr(_cpu, "seed_fp4_stochastic_rng"):
             _cpu.seed_fp4_stochastic_rng(seed)
         digit_cls = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
@@ -117,7 +118,15 @@ class OriginalArchModel:
         if use_energy:
             from sili.energy import EnergyDynamics
             if energy_kwargs is not None:
-                self.energy = EnergyDynamics(**energy_kwargs)
+                # EnergyDynamics' own exploration-noise draw is unseeded
+                # global np.random unless an explicit rng= is given (fixed
+                # in sili__new, confirmed a real run-to-run non-
+                # reproducibility bug otherwise) -- derive one from this
+                # model's own seed stream, same convention as q/k/v/o_proj,
+                # unless the caller already supplied their own.
+                ek = dict(energy_kwargs)
+                ek.setdefault("rng", np.random.default_rng(rng.integers(2**31)))
+                self.energy = EnergyDynamics(**ek)
             else:
                 from model.toy_precision_models import _toy_scale_energy
                 self.energy = _toy_scale_energy()
@@ -136,17 +145,24 @@ class OriginalArchModel:
             # decays to weight=0 AND importance=0 during real training
             # is reasonable to prune -- but it means intentional
             # zero-VALUE init must seed importance nonzero to stay live.
+            # zero_init_importance_code default 1 is the bare minimum to
+            # survive the initial maybe_compress call -- callers combining
+            # this with energy_rl (whose gating can silence a neuron for
+            # stretches, decaying its synapses' g toward 0 and thus their
+            # RMSprop-style importance accumulator back toward 0 too) may
+            # want a larger starting buffer; sweep via this param rather
+            # than assuming 1 is always enough.
             n = sw * sw
             zeros = np.zeros(n, dtype=np.uint8)
-            ones = np.ones(n, dtype=np.uint8)
+            imp = np.full(n, zero_init_importance_code, dtype=np.uint8)
             for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
                 for digit in layer.digits:
-                    digit._c.load_dense_codes(zeros, ones)
+                    digit._c.load_dense_codes(zeros, imp)
             n_lm = EMBED_WIDTH * VOCAB
             zeros_lm = np.zeros(n_lm, dtype=np.uint8)
-            ones_lm = np.ones(n_lm, dtype=np.uint8)
+            imp_lm = np.full(n_lm, zero_init_importance_code, dtype=np.uint8)
             for digit in self.lm_head.digits:
-                digit._c.load_dense_codes(zeros_lm, ones_lm)
+                digit._c.load_dense_codes(zeros_lm, imp_lm)
             # Neuron-level (input_ln/state_ln, centers/log_sigmas) stay at
             # their normal baseline -- zero-init is for SYNAPSES (weight
             # matrices) specifically, not neuron-level gain/threshold
@@ -222,6 +238,14 @@ class OriginalArchModel:
 
         pooled = M_new_t.reshape((NUM_TILES, EMBED_WIDTH, COLUMN_NEURONS))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / COLUMN_NEURONS)
+        if self.l1_sparsity_coef > 0.0:
+            # lm_head previously had NO L1 term -- under all_zero_init it was
+            # a separate, un-instrumented deadlock: dL/d(pooled)=W_lmhead^T@
+            # grad_logits is exactly 0 whenever W_lmhead=0, so main-task
+            # gradient alone could never reach it until pooled was already
+            # nonzero from upstream. This term gives it the same direct,
+            # pooled-independent escape route q/k/v/o_proj already have.
+            reg_terms.append(self._l1_sparsity_split(self.lm_head, pooled, lr, self.l1_sparsity_coef))
         logits = self.lm_head.forward(pooled, lr)
 
         total_aux = reg_terms[0] if reg_terms else None
