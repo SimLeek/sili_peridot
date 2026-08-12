@@ -6374,3 +6374,125 @@ Complete comparison table:
     L2-ratio alone, orig arch, all-4, coef=50      0.4000
     L1-sparsity alone, split arch, coef=0.07       0.2000  architecture-dependent, unstable
     any o_proj-only soft mechanism, either arch    0.0-0.27  collapses
+
+## EnergyDynamics fire_reset_to_zero + zero-init deadlock root cause
+
+Per direct proposal ("firing should just set energy back to zero or
+should have a huge energy cost, since it's different from normal
+operation") implemented two new opt-in `EnergyDynamics`
+constructor/forward params in `sili__new/sili/energy.py`:
+`fire_reset_to_zero` (e<-0.0 on fire, replacing the default
+`e -= 2*activation_cost` refractory drain) and `fire_cost` (fixed
+drain amount). Motivation: under a cold/near-zero-init population, the
+default drain is tiny relative to `drive` whenever the opposing
+continuous term (`activation_cost*E[|h|]`) is near zero, so the
+population re-fires every ~10 ticks -- a tight sawtooth that looks
+"pinned" in snapshot mean/min/max measurements rather than a genuine
+rare recovery event. Cross-checked against `energy-proofs.md` Theorem
+6(a) (`Ω={|e|<=2}` positively invariant) -- the proof only requires
+the post-fire update to strictly reduce `|e|`, which `e<-0` satisfies
+unconditionally, so this doesn't weaken any existing guarantee.
+Smoke-tested directly: default behavior unchanged; `fire_reset_to_zero
+=True` after 20 zero-input steps produces varied, non-pinned energy
+values (`[0.499, 0.500, 1.9999, 0.999, 1.501, ...]`) instead of all
+sitting near the 2.0 ceiling. Also fixed a latent `abs_backward`
+scalar-tensor crash (`local_gradient[a==0.0]=1.0` in-place assignment
+throws on 0-d/scalar inputs since `np.sign()` returns a bare numpy
+scalar there, not an ndarray) hit only by the new L1-shaped scalar
+penalty terms -- switched to `np.where`, verified array-input
+gradients byte-for-byte unchanged. Both landed in `sili__new` (commit
+c653df8) and `sili_peridot` (commit af8ceb2, alongside the L1-sparsity
+landmark writeup above).
+
+**Then actually tested the motivating scenario end-to-end** (zero-init
++ L1-sparsity + `fire_reset_to_zero=True`), which had never been run
+before -- and found `fire_reset_to_zero` does NOT rescue it. Root
+-caused with a sequence of direct measurements rather than assumed:
+
+1. First 3-seed/3000-step comparison (no-energy vs default-drain vs
+   `fire_reset_to_zero`) gave IDENTICAL results across all three
+   (`accs=[0.0, 0.3333, 0.3333]` every time). Traced this to a
+   calibration bug in my own test, not the mechanism: at
+   `drive=0.0001` with zero opposing force (`E[|attn_raw|]=0` exactly,
+   per the earlier finding), reaching the +2.0 firing threshold takes
+   `2.0/0.0001=20000` steps -- energy never fired even once in any of
+   the three 3000-step arms. Re-ran with `drive=0.01` (fires every
+   ~200 steps) -- STILL identical results.
+
+2. Direct instrumentation confirmed firing genuinely IS occurring with
+   `fire_reset_to_zero=True` (energy population mean visibly drops
+   from ~1.88 to ~0.86-0.98 at steps 600/800, consistent with periodic
+   reset-and-recharge) -- so the energy mechanism itself is working
+   exactly as designed. The lack of effect on accuracy is real, not a
+   test artifact.
+
+3. Traced the actual blocker further upstream than energy touches at
+   all: `lm_head` is ALSO zero-initialized under `all_zero_init=True`
+   but was never wired into the L1-sparsity `reg_terms` list (only
+   q/k/v/o_proj were) -- so `lm_head`'s own weight has no mechanism to
+   ever move, and since `dL/d(pooled) = W_lmhead^T @ grad_logits` is
+   exactly zero whenever `W_lmhead=0`, NO gradient from the main task
+   loss can ever cross it, regardless of what energy or L1 does
+   upstream. Confirmed directly: `logits` stayed EXACTLY `[0,0,...,0]`
+   after 400 AND 1400 training steps (with `fire_reset_to_zero=True`
+   engaged the whole time), and a direct forward probe on a nonzero
+   input confirmed `lm_head`'s stored weight is still exactly zero.
+
+4. Added an L1 term on `lm_head` (input=`pooled`) to close that gap --
+   but `pooled` itself is downstream of `M`, which is downstream of
+   `o_proj`, which is downstream of `q/k/v_proj` -- so this only helps
+   once the WHOLE upstream chain has already woken up. Traced the
+   upstream chain directly over 4000 steps (probing `q_proj`/`o_proj`
+   via a fixed all-ones input every 400 steps): `E|q_proj(ones)|` and
+   `E|o_proj(ones)|` stayed EXACTLY `0.00000` the entire 4000 steps,
+   energy engaged throughout. The deadlock isn't even reaching
+   `o_proj` or `M` -- it's `q_proj` itself, the very FIRST layer,
+   which receives `qkv_source` (always real, nonzero input) as its L1
+   term's input the whole time.
+
+5. Sanity-checked the measurement methodology wasn't itself the bug:
+   the SAME probe on a `dense=True, all_zero_init=False` control model
+   correctly reads `E|q_proj(ones)|=0.97` (real, nonzero) -- so the
+   probe is valid, and the zero reading under `all_zero_init=True` is
+   a genuine model-state finding, not an instrumentation artifact.
+
+6. Root-caused with a single, isolated manual step: zero-init
+   `q_proj`, one real nonzero random input, one `damp_by_importance=
+   False` forward call (confirmed `out_aux` is exactly `0.0`, as
+   expected from all-zero weights), one L1-loss `.backward()` call --
+   then re-probed. Still EXACTLY `0.00000`. The underlying C++ update
+   (`linear_disldo.hpp`'s `cw += damp_by_importance ? ... : (-effective
+   _lr * g)`, `g = dyv * iv`) computes a real, nonzero mathematical
+   gradient here (`abs_backward`'s zero-position subgradient=1.0 fix
+   makes `dyv` nonzero even though `out_aux` is exactly 0; `iv` is a
+   real nonzero input) -- but at this toy scale (`coef=0.05`,
+   `effective_lr = lr/nnz_this_row ~ 0.01/32`, embedding-scale input
+   ~0.3), the resulting `cw` delta works out to roughly `1e-5` to
+   `1e-6` in the layer's own storage units. FP4 (OCP E2M1, 16 discrete
+   levels) has a minimum nonzero step size several orders of magnitude
+   larger than that near zero -- so the update, while mathematically
+   real, rounds straight back to code 0 on quantization. This matches
+   -- and gives a concrete, measured mechanism for -- this project's
+   own established prior understanding that zero-init layers need
+   synaptogenesis (a direct code WRITE, not a gradient-accumulated
+   nudge) or some other coarse-jump mechanism to escape, not ordinary
+   per-step gradient descent, regardless of which soft loss term
+   supplies the gradient.
+
+**Conclusion**: `fire_reset_to_zero` is a correct, working fix for its
+own stated problem (firing-drain-too-small-to-create-real-separation)
+and is real, useful production code -- but it operates on the
+attn_raw/output SIGNAL (via firing's `+2.0` additive constant), not on
+WEIGHTS, so it cannot by itself rescue a zero-initialized weight matrix
+from FP4's quantization-step floor. The zero-init deadlock is a
+genuinely different, upstream problem: ordinary gradient descent
+(soft losses included) cannot move a zero-init FP4 weight at all at
+this scale, because the per-step delta is smaller than one
+quantization level. A real fix needs either a much larger effective
+per-step delta specifically for near-zero weights (e.g. a
+synaptogenesis-style direct code write, or a very large first-few
+-steps learning-rate specifically gated on zero-weight detection) --
+not attempted yet, out of scope for this pass. Zero-init + L1-sparsity
+remains an OPEN problem; the landmark L1-sparsity result above used
+the project's normal dense/echo (nonzero) initialization throughout,
+which is unaffected by any of this.
