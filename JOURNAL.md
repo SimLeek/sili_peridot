@@ -5602,12 +5602,59 @@ is fixed rather than worked around.
 **Status update**: dense connectivity, via block4 + real Spectral
 Normalization, is now a genuinely BETTER default than sparse-echo on
 this toy task -- a complete reversal from where this investigation
-started ("zero learning, byte-identical across bases," PAUSED). The
-remaining 7 cells of the originally-planned 8-way matrix
-(spectral+magnitude, spectral+energy, spectral+magnitude+energy, each
-x energy on/off) are now lower priority -- this single result already
-answers the practical question (should dense become the default) --
-but still worth running to see whether combining fixes adds anything
-ON TOP of spectral normalization alone, and whether the OTHER 3 base
-values (4/6/24) show the same win (not yet tested with the spectral
-fix -- only base=12 confirmed so far).
+started ("zero learning, byte-identical across bases," PAUSED).
+
+**2026-08-11 (continued the next day): combination tests -- spectral
+normalization does NOT stack with magnitude-based regularizers; both
+combinations tested actively HURT rather than help.**
+
+    spectral-alone:              mean=0.8858  std=0.0566
+    spectral(0.9)+magnitude(0.01): mean=0.1671  std=0.0328
+    spectral(0.9)+energy(default): mean=0.2200  std=0.0360
+    (both dense_base12, 15000 steps, 5 seeds, same as spectral-alone)
+
+Combining spectral norm with EITHER the L2 magnitude penalty or
+energy_rl (default ENERGY_KWARGS) collapses accuracy back down to
+near-chance territory (0.17-0.22), a 65-80% relative drop from
+spectral-alone's 0.886. Two independent tests showing the same
+qualitative failure (not just the L2 one) makes this look like a
+real, general interaction: any mechanism that independently drives
+o_proj's raw weight magnitude via its own gradient/update signal
+fights against spectral norm's ADAPTIVE rescale (which re-inflates
+whatever gets shrunk, via its own separate power-iteration-tracked
+sigma, to keep hitting the spectral target regardless) -- wasted,
+destabilizing tension between two control philosophies for the same
+underlying quantity, rather than complementary pressure. The
+"+magnitude+energy" triple-combo test was skipped given this
+consistent pattern -- very likely would just compound the same
+conflict, not worth the ~90min-2hr cost to confirm the predictable
+outcome.
+
+**Practical conclusion**: spectral normalization ALONE (no magnitude
+penalty, no energy_rl) is the current best-known configuration for
+dense connectivity's o_proj, by a wide margin. Direct implication for
+future EnergyDynamics/energy_rl design (raised by direct discussion,
+see project_hybrid_precision_plan memory for the fuller writeup): a
+"recurrent-state-space" energy_rl variant should NOT include
+magnitude-penalizing terms (L1/L2 on raw magnitude) on any layer
+spectral normalization already covers -- whatever else it contributes
+there (symmetry-breaking exploration/forced-firing, sparsity via
+GATING rather than via penalty) needs separate testing to see whether
+those specific mechanisms also conflict with the rescale or are
+compatible because they don't compete for the same magnitude-control
+variable the way L1/L2 do.
+
+**Not yet done**: confirm spectral-alone's win generalizes to
+base=4/6/24 (only base=12 tested); extend spectral normalization to
+q/k/v if warranted at larger/production scale (currently only
+o_proj, the layer directly embedded in the recurrent loop, per the
+"only layers applied repeatedly in a feedback loop need this"
+reasoning -- q/k/v transform the current input+state once per step,
+not compounded across steps, so likely lower priority but not ruled
+out); redesign EnergyDynamics to separate "state-space" (spectral
+-aware, no magnitude penalty) from "input/output" (full L1/L2/
+homeostasis, no spectral -- not part of a multiplicative loop)
+variants, per direct discussion -- premature until more of the
+individual-component ablations (does the drive/exhaustion/twitch
+-init/symmetry-breaking piece alone conflict with spectral norm, or
+only the magnitude-penalizing pieces specifically?) are run.
