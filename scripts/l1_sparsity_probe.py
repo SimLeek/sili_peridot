@@ -125,15 +125,28 @@ class OriginalArchModel:
         self.scale_clip_max = scale_clip_max
 
         if all_zero_init:
+            # weight codes 0 (value 0.0), importance codes 1 (NOT 0) --
+            # load_dense_codes(zeros, zeros) gets every synapse pruned to
+            # 0 live entries by block4_load_dense's maybe_compress step
+            # (block4_count_live tests the packed weight|importance<<4
+            # byte against exactly 0 -- both codes 0 means every packed
+            # byte is 0), and disldo_backward's block4 path then skips
+            # every row (nnz_row==0) forever, independent of gradient
+            # magnitude. Not a library bug -- a synapse that legitimately
+            # decays to weight=0 AND importance=0 during real training
+            # is reasonable to prune -- but it means intentional
+            # zero-VALUE init must seed importance nonzero to stay live.
             n = sw * sw
             zeros = np.zeros(n, dtype=np.uint8)
+            ones = np.ones(n, dtype=np.uint8)
             for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
                 for digit in layer.digits:
-                    digit._c.load_dense_codes(zeros, zeros)
+                    digit._c.load_dense_codes(zeros, ones)
             n_lm = EMBED_WIDTH * VOCAB
             zeros_lm = np.zeros(n_lm, dtype=np.uint8)
+            ones_lm = np.ones(n_lm, dtype=np.uint8)
             for digit in self.lm_head.digits:
-                digit._c.load_dense_codes(zeros_lm, zeros_lm)
+                digit._c.load_dense_codes(zeros_lm, ones_lm)
             # Neuron-level (input_ln/state_ln, centers/log_sigmas) stay at
             # their normal baseline -- zero-init is for SYNAPSES (weight
             # matrices) specifically, not neuron-level gain/threshold

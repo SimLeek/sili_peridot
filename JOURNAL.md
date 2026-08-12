@@ -6479,20 +6479,93 @@ before -- and found `fire_reset_to_zero` does NOT rescue it. Root
    per-step gradient descent, regardless of which soft loss term
    supplies the gradient.
 
-**Conclusion**: `fire_reset_to_zero` is a correct, working fix for its
-own stated problem (firing-drain-too-small-to-create-real-separation)
-and is real, useful production code -- but it operates on the
-attn_raw/output SIGNAL (via firing's `+2.0` additive constant), not on
-WEIGHTS, so it cannot by itself rescue a zero-initialized weight matrix
-from FP4's quantization-step floor. The zero-init deadlock is a
-genuinely different, upstream problem: ordinary gradient descent
-(soft losses included) cannot move a zero-init FP4 weight at all at
-this scale, because the per-step delta is smaller than one
-quantization level. A real fix needs either a much larger effective
-per-step delta specifically for near-zero weights (e.g. a
-synaptogenesis-style direct code write, or a very large first-few
--steps learning-rate specifically gated on zero-weight detection) --
-not attempted yet, out of scope for this pass. Zero-init + L1-sparsity
-remains an OPEN problem; the landmark L1-sparsity result above used
-the project's normal dense/echo (nonzero) initialization throughout,
-which is unaffected by any of this.
+**Conclusion (superseded below)**: `fire_reset_to_zero` is a correct,
+working fix for its own stated problem (firing-drain-too-small-to
+-create-real-separation) and is real, useful production code -- but it
+operates on the attn_raw/output SIGNAL (via firing's `+2.0` additive
+constant), not on WEIGHTS, so it cannot by itself rescue a zero
+-initialized weight matrix. The "FP4 quantization-step floor" framing
+below turned out to be WRONG -- see the correction immediately
+following this section.
+
+## CORRECTION: the real root cause was never FP4 quantization -- it was a synapse-liveness bug in block4_load_dense
+
+The "FP4 quantization floor" conclusion above was falsified by a direct
+follow-up test, per user prompt ("just change things so the force fire
+backprop is always above the zero init floor... that's a good test"):
+implemented `fire_wake_gradient`/`wake_sign` on `EnergyDynamics`
+(sili__new commit, guaranteed-magnitude gradient injection at
+kept-fired positions, straight-through via `(h*wake_gate).sum()`) and
+pushed it from 200 up to 20000 -- q_proj's stored weight STILL never
+moved, at ANY magnitude. That ruled out "gradient too small" outright:
+a single isolated test with an explicit `out.grad = 1000` (undamped,
+`damp_by_importance=False`, lr=0.1) on a raw zero-init
+`DISLDOLayerDeterministic` ALSO produced exactly zero movement --
+proving no gradient magnitude, however large, was the issue.
+
+Root-caused via direct comparison against a control: `nnz`/
+`block4.synapses` read 0 for the zero-init layer (not 1024, the true
+dense count) -- `block4_load_dense` calls `maybe_compress` right after
+loading, and `block4_count_live` (block4.hpp:866) tests the packed
+byte (`weight_code | importance_code<<4`) against exactly 0. Loading
+BOTH weight AND importance as code 0 (`all_zero_init`'s original
+`load_dense_codes(zeros, zeros)`) makes every packed byte exactly 0,
+so `block4_count_live` reads 0 live slots, `maybe_compress` immediately
+packs every tile down to an effectively-empty sparse representation,
+and `disldo_backward`'s row loop (`if (nnz_row == 0) continue`) skips
+every row from that point on -- structurally, not just numerically,
+independent of any gradient's magnitude. Confirmed directly: the
+IDENTICAL setup with importance loaded as code 1 instead of 0 shows
+real `nnz`/`synapses`=1024, and a forced gradient produces a genuine,
+substantial weight change (0 -> 10.14 in one step).
+
+Per direct discussion: this is NOT a library bug needing a fix.
+Weight=0 AND importance=0 simultaneously is a state real training can
+legitimately reach too (not just at init), and treating it as
+"prune this synapse" is the CORRECT behavior there -- a synapse whose
+importance has genuinely decayed to nothing alongside its weight is a
+reasonable one to discard. The actual fix belongs entirely at the
+zero-VALUE-init call site: always seed importance with something
+nonzero (code 1, in `original_arch_l2_probe.py`'s `all_zero_init`)
+so the synapse stays structurally live while its VALUE starts at
+zero, distinguishing "intentionally zero-valued but should still
+train" from "decayed to nothing, safe to prune."
+
+**Result with the corrected init** (importance=1, weight=0, no energy,
+no fire-wake, seed=1000, 15000 steps, dense_base12): the full 5-layer
+cascade this architecture needs (q/k/v_proj wake via their own direct
+L1 gradient on the always-nonzero `qkv_source` input -> attn_raw
+becomes real once v_proj moves -> o_proj wakes via its own L1 term
+once attn_raw is real -> M becomes real -> pooled becomes real ->
+lm_head can finally receive a nonzero main-task gradient) plays out
+exactly as hypothesized:
+
+    step=1000  E|q|=0.021 E|v|=0.0001 E|o|=0.0000 E|M|=0.0000
+    step=3000  E|q|=0.683 E|v|=0.0073 E|o|=0.0000 E|M|=0.0000
+    step=10000 E|q|=0.886 E|v|=0.0270 E|o|=0.0000 E|M|=0.0000
+    step=11000 E|q|=0.530 E|v|=0.0302 E|o|=0.0115 E|M|=0.2237  <- o/M wake together
+    step=15000 E|q|=0.050 E|v|=0.1769 E|o|=0.0801 E|M|=0.2858
+
+q/v wake almost immediately (step 1000). o/M stay at EXACTLY 0.0000
+for the first ~11000 steps, then wake together the moment attn_raw
+carries enough real signal -- direct confirmation that o_proj's own
+L1 gradient really was gated on v_proj's progress, not a separate
+stuck point of its own. Accuracy is still noisy and NOT converged by
+step 15000 (1.0 at steps 11000/12000, back to 0.0 by 15000) -- some
+of the earlier "1.0" readings before step 11000 are almost certainly
+the old degenerate constant-prediction pattern (logits were still
+exactly 0 then), not real learning. This is genuine progress -- a
+zero-init network that was previously PROVABLY, structurally
+undtrainable (not just slow) now demonstrably trains every layer --
+but not yet a converged, validated result: needs more steps and/or
+`lm_head`'s own L1 term (still missing from `step()`, unlike
+q/k/v/o_proj) before treating this as a real landmark alongside the
+dense/echo-init L1-sparsity result above.
+
+**Not yet done**: multi-seed validation, `lm_head` L1 wiring, a longer
+run to check for actual convergence, and re-checking whether the
+`fire_wake_gradient`/`fire_reset_to_zero` energy mechanisms add
+anything now that the real blocker is fixed (they were investigated
+under the wrong root-cause theory and may no longer be needed at all
+for this specific deadlock -- worth re-examining only if a still
+-slower-than-hoped cascade shows up at full multi-seed scale).
