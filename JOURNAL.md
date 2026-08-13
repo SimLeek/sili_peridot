@@ -6682,3 +6682,76 @@ improvement, still needs the importance fix underneath) >
 `fire_wake_gradient` (not recommended -- adds risk, doesn't reach q/k).
 Convergence to real task accuracy remains open at both 10000-15000
 step scales tested so far.
+
+## 2026-08-12 (cont.) -- baseline_energy's 46.8% skip rate root-caused: `-ffast-math` was silently defeating every NaN/Inf guard in sili__new's C++ hot path, including the one that would have caught this
+
+Deep dive into why `baseline_energy` (dense_base12, `use_energy=True`)
+was hitting `clip_grad_norm_`-detected non-finite gradients on ~47% of
+steps. `qkv_source.grad` (and its two upstream `+`-branches,
+`x_normed.grad`/`m_normed.grad`) went NaN at a full column across all
+4 tile rows; `q.grad`/`k.grad`/`v.grad` (the gradient flowing INTO
+q/k/v_proj's own backward) stayed finite -- proving the corruption was
+created inside q/k/v_proj's own `disldo_backward` call.
+
+Added exhaustive, unconditional (every row, every element, no
+foreknowledge needed) `!std::isfinite(...)` checks at BOTH remaining
+candidate write sites in `linear_disldo.hpp`'s block4 backward: the
+per-row `*mdx_row += hsum_contrib` SIMD accumulation, and the final
+per-thread `input_grad[i] += s[i]` reduction. Ran full training to a
+real NaN failure with both checks active: **zero events**. Same for a
+Python-level `_acc()` instrumentation (checks the incoming `dx` before
+it's summed into `qkv_source.grad`) -- this one DID fire, with `g_bad`
+(the incoming gradient) already non-finite, directly contradicting the
+C++ side reporting clean.
+
+Root cause of the contradiction, not the NaN itself: `cpu_backend.cpp`
+is built with `-ffast-math` (`setup.py`), which implies
+`-ffinite-math-only` -- the compiler is licensed to assume
+`isnan`/`isinf` are always false and `isfinite` always true, and
+constant-folds accordingly. Confirmed directly: compiling with
+`-ffast-math` produces a `.o` where the debug fprintf's own format
+string (`"[mdx_any] ..."`) is completely absent from the binary --
+the entire `if (!std::isfinite(x)) { fprintf(...); }` branch was
+dead-code-eliminated, unconditionally, regardless of the runtime
+env-var gate. This is not specific to debug instrumentation --
+`ScalePolicy`'s own real production NaN/Inf guards (the ones that fixed
+the earlier `RMSpropScalePolicy::update` permanent-corruption bug,
+2026-08-10) rely on the exact same `std::isfinite` pattern and would be
+silently defeated the same way.
+
+Fix: added `-fno-finite-math-only` to `extra_compile_args` in
+`setup.py`, right after `-ffast-math` (GCC applies flags left-to-right;
+this re-enables real IEEE NaN/Inf semantics for `isnan`/`isinf`/
+`isfinite` specifically while keeping `-ffast-math`'s other
+optimizations -- reciprocal approximations, reassociation, etc. --
+intact). Rebuilt, reran the same 6000-step and 15000-step single-seed
+repros that previously reliably failed by step ~2000-2500: **zero
+non-finite events**, twice. Then ran the full 4-config
+`landmark_checklist.py` sweep:
+
+    5 seeds x 15000 steps, coef=0.05:
+    baseline            mean=0.8667  skip_rate=0.000%  (ref 0.8667, exact match)
+    baseline_energy     mean=0.1333  skip_rate=0.000%  (ref 0.1333, exact match -- was 46.8% skip rate)
+    baseline_zeroinit   mean=0.0000  skip_rate=0.000%  (unchanged, separate known issue)
+    zeroinit_energy     mean=0.0000  skip_rate=0.000%  (unchanged, separate known issue)
+
+No regressions anywhere; `baseline_energy`'s skip rate goes from
+46.8% to 0.000% with the task-accuracy mean UNCHANGED (the model was
+already learning what it could learn -- it just also NaN'd out on
+about half its update steps, discarding real gradient signal each
+time). An earlier, single-run 3-seed check had flagged `baseline`
+itself as "regressed" (0.7778 vs ref 0.8667) -- re-run at the
+reference's own 5-seed count landed on the *exact* reference mean,
+confirming that was 3-seed noise, not a real effect of the fix (this
+codebase's seed-to-seed variance for `baseline` was already documented
+as ~0.80-0.93 in `landmark_checklist.py`'s own REFERENCE comment).
+
+All debug instrumentation added during the investigation
+(`SILI_DEBUG_MDX_ANY`, `SILI_DEBUG_INPUT_GRAD_ANY`,
+`SILI_DEBUG_QUANT_RATIO`, `SILI_DEBUG_TARGET_ROW` in `linear_disldo.hpp`,
+`SILI_DEBUG_ACC_ANY` in `tensor.py`) removed once the fix was confirmed
+-- kept `-fno-finite-math-only` and `landmark_checklist.py`'s reference
+note update as the only permanent changes. This is now the new
+baseline for all further sili_peridot work: any future `!isfinite`-style
+guard added to `sili__new`'s C++ hot path is only real if it survives
+this exact compiler flag.

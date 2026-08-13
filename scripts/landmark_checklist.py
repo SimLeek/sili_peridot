@@ -17,14 +17,15 @@ SEEDS = [1000, 1001, 1002, 1003, 1004]
 N_STEPS = 15000
 COEF = 0.05
 
-# Current best-known reference (2026-08-12, post block4 StochasticRounding
-# fix, commit 900b318 in sili__new). Update these when a real, deliberate
-# improvement lands -- not silently, and not from a single run (see
-# feedback_always_regression_test_before_commit memory: run-to-run variance
-# on this hardware is real, ~0.80-0.93 for baseline across repeats).
+# Current best-known reference (2026-08-12, post -ffast-math NaN fix,
+# sili__new setup.py's -fno-finite-math-only). Update these when a real,
+# deliberate improvement lands -- not silently, and not from a single run
+# (see feedback_always_regression_test_before_commit memory: run-to-run
+# variance on this hardware is real, ~0.80-0.93 for baseline across
+# repeats).
 REFERENCE = {
     "baseline":          {"mean": 0.8667, "note": "avg of 3 runs: 0.8000, 0.8667, 0.9333"},
-    "baseline_energy":   {"mean": 0.1333, "note": "skip_rate 46.8% -- known bad, see open investigation"},
+    "baseline_energy":   {"mean": 0.1333, "note": "skip_rate 0.000% post -ffast-math fix (was 46.8%, see JOURNAL.md)"},
     "baseline_zeroinit": {"mean": 0.0000, "note": "total failure, all seeds"},
     "zeroinit_energy":   {"mean": 0.0000, "note": "total failure, all seeds"},
 }
