@@ -85,7 +85,7 @@ class OriginalArchModel:
     wired onto all 4 layers instead of spectral_norm_target."""
     def __init__(self, seed, dense, o_proj_coef, all_layer_coef=0.0, l1_sparsity_coef=0.0,
                  all_zero_init=False, zero_init_importance_code=1, use_energy=False,
-                 energy_kwargs=None, scale_clip_max=None):
+                 energy_kwargs=None, scale_clip_max=None, log_sigma_clip_max=None):
         if hasattr(_cpu, "seed_fp4_stochastic_rng"):
             _cpu.seed_fp4_stochastic_rng(seed)
         digit_cls = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
@@ -132,6 +132,7 @@ class OriginalArchModel:
                 self.energy = _toy_scale_energy()
 
         self.scale_clip_max = scale_clip_max
+        self.log_sigma_clip_max = log_sigma_clip_max
 
         if all_zero_init:
             # weight codes 0 (value 0.0), importance codes 1 (NOT 0) --
@@ -189,6 +190,30 @@ class OriginalArchModel:
                 os_ = c.get_output_scale(col)
                 if os_ > max_val or os_ < -max_val:
                     c.set_output_scale_raw(col, float(np.clip(os_, -max_val, max_val)))
+
+    def clip_log_sigmas(self, max_val: float):
+        """Bound the Gaussian-attention kernel width's log-scale parameter.
+        Found via direct investigation (2026-08-12,
+        scripts/debug_energy_log_sigmas_runaway.py): under use_energy=True,
+        log_sigmas drifts monotonically negative and UNBOUNDED from its
+        zero-init start, with no sign of leveling off. Symmetric bound
+        (|log_sigma| <= max_val), matching clip_scales' single-magnitude
+        style above -- sigma=exp(log_sigma) stays in
+        [exp(-max_val), exp(max_val)].
+
+        CORRECTED, tested directly with max_val=2.0 on the same 5-seed
+        sweep used for baseline_energy: this does NOT fix the ~47%
+        gradient-skip rate (46.76% unclamped vs 47.56% clamped,
+        essentially unchanged; mean accuracy 0.1333 vs 0.2667, within
+        this project's own established run-to-run noise range). The
+        unbounded log_sigmas drift is a real, independently-worth-fixing
+        problem, but it is NOT the (or at least not the sole) cause of
+        baseline_energy's instability -- the actual source is still
+        unidentified as of this docstring."""
+        data = self.log_sigmas.data
+        clipped = np.clip(data, -max_val, max_val)
+        if not np.array_equal(data, clipped):
+            self.log_sigmas.data = clipped.astype(np.float32)
 
     def _ratio_penalty_split(self, layer, input_t: Tensor, lr: float, coef: float) -> Tensor:
         out_aux = layer.forward(input_t, lr, damp_by_importance=False)
@@ -288,6 +313,8 @@ def run(model, n_steps, seed):
                 if model.scale_clip_max is not None:
                     for layer in (model.q_proj, model.k_proj, model.v_proj, model.o_proj):
                         model.clip_scales(layer, model.scale_clip_max)
+                if model.log_sigma_clip_max is not None:
+                    model.clip_log_sigmas(model.log_sigma_clip_max)
         if step % 200 == 0:
             last_accs.append(correct / max(ntgt, 1))
     return last_accs, skips, total
