@@ -2,27 +2,37 @@
 sili_peridot/model, sili_peridot/scripts, or sili__new's sili/.
 
 Runs the 4-config dense-init L1-sparsity sweep (baseline x {energy, zero_init}
-x {on, off}) and prints a table against the current best-known reference for
-each config. Each of the 4 configs tracks its OWN "best so far" -- baseline
-is not the only thing worth comparing against; a change meant to fix energy_rl
-should be judged against baseline_energy's own current number, not baseline's.
+x {on, off}) and prints results AS EACH SEED/CONFIG COMPLETES (not just at
+the very end) -- lets a caller pull partial numbers from the log mid-run
+instead of only getting a final summary table once everything finishes.
+
+Reports TWO metrics per seed:
+  - old_style: statistics.mean(accs[-3:]), run()'s own in-training sampling.
+    Only has 4 possible values per seed (0, 1/3, 2/3, 1) -- confirmed too
+    coarse to tell a real regression from sampling noise on its own, kept
+    only for continuity against the existing REFERENCE table (itself
+    measured with this same coarse metric, so it's an apples-to-apples,
+    if noisy, comparison).
+  - eval_acc: evaluate(model, 100, seed), a real post-training accuracy on
+    100 fresh held-out sequences at full curriculum length. This is the
+    metric that should actually be trusted -- REFERENCE has no evaluate()
+    -based numbers yet (added after REFERENCE was last set), so THIS run's
+    eval_acc numbers are establishing a fresh baseline, not being compared
+    against a prior one. Future changes should diff against these.
 
 Usage: PYTHONPATH=<sili_peridot repo root> python scripts/landmark_checklist.py [--seeds N] [--steps N]
 """
 import argparse
 import statistics
-from scripts.l1_sparsity_probe import OriginalArchModel, run
+from scripts.l1_sparsity_probe import OriginalArchModel, run, evaluate
 
 SEEDS = [1000, 1001, 1002, 1003, 1004]
 N_STEPS = 15000
+N_EVAL = 100
 COEF = 0.05
 
-# Current best-known reference (2026-08-12, post -ffast-math NaN fix,
-# sili__new setup.py's -fno-finite-math-only). Update these when a real,
-# deliberate improvement lands -- not silently, and not from a single run
-# (see feedback_always_regression_test_before_commit memory: run-to-run
-# variance on this hardware is real, ~0.80-0.93 for baseline across
-# repeats).
+# old_style reference (2026-08-12, post -ffast-math NaN fix). No eval_acc
+# reference exists yet -- this run is establishing the first one.
 REFERENCE = {
     "baseline":          {"mean": 0.8667, "note": "avg of 3 runs: 0.8000, 0.8667, 0.9333"},
     "baseline_energy":   {"mean": 0.1333, "note": "skip_rate 0.000% post -ffast-math fix (was 46.8%, see JOURNAL.md)"},
@@ -38,8 +48,9 @@ CONFIGS = [
 ]
 
 
-def run_config(name, kwargs, seeds, n_steps):
-    per_seed = []
+def run_config(name, kwargs, seeds, n_steps, n_eval):
+    per_seed_old = []
+    per_seed_eval = []
     tot_skips = tot_calls = 0
     step_times = []
     for seed in seeds:
@@ -49,42 +60,56 @@ def run_config(name, kwargs, seeds, n_steps):
         )
         print(f"[{name}] starting seed={seed} ({n_steps} steps)...", flush=True)
         accs, skips, total, avg_step_time = run(model, n_steps, seed, verbose=True)
-        per_seed.append(statistics.mean(accs[-3:]))
+        old_style = statistics.mean(accs[-3:])
+        eval_acc = evaluate(model, n_eval, seed)
+        per_seed_old.append(old_style)
+        per_seed_eval.append(eval_acc)
         tot_skips += skips
         tot_calls += total
         step_times.append(avg_step_time)
-    mean = statistics.mean(per_seed)
+        # Printed IMMEDIATELY per seed -- this is what makes partial
+        # results pullable mid-run instead of only at the very end.
+        print(f"[{name}] seed={seed} done: old_style={old_style:.4f} "
+              f"eval_acc({n_eval})={eval_acc:.4f}", flush=True)
+
+    mean_old = statistics.mean(per_seed_old)
+    mean_eval = statistics.mean(per_seed_eval)
     skip_rate = tot_skips / tot_calls if tot_calls else 0.0
     avg_step_time_overall = statistics.mean(step_times)
-    return mean, per_seed, skip_rate, avg_step_time_overall
+    print(f"[{name}] CONFIG DONE: old_style_mean={mean_old:.4f} "
+          f"eval_acc_mean={mean_eval:.4f} eval_per_seed={[round(v,4) for v in per_seed_eval]} "
+          f"skip_rate={skip_rate:.3%} avg_step={avg_step_time_overall*1000:.1f}ms\n", flush=True)
+    return mean_old, mean_eval, per_seed_old, per_seed_eval, skip_rate, avg_step_time_overall
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=len(SEEDS))
     ap.add_argument("--steps", type=int, default=N_STEPS)
+    ap.add_argument("--eval", type=int, default=N_EVAL)
     args = ap.parse_args()
     seeds = SEEDS[: args.seeds]
 
-    print(f"landmark_checklist: {len(seeds)} seeds x {args.steps} steps, coef={COEF}\n")
+    print(f"landmark_checklist: {len(seeds)} seeds x {args.steps} steps x {args.eval}-eval, coef={COEF}\n")
     rows = []
     for name, kwargs in CONFIGS:
-        mean, per_seed, skip_rate, avg_step_time = run_config(name, kwargs, seeds, args.steps)
+        mean_old, mean_eval, per_seed_old, per_seed_eval, skip_rate, avg_step_time = run_config(
+            name, kwargs, seeds, args.steps, args.eval)
         ref = REFERENCE[name]["mean"]
-        delta = mean - ref
-        flag = "OK" if delta >= -0.05 else "REGRESSED"
-        rows.append((name, mean, ref, delta, flag, skip_rate, per_seed, avg_step_time))
+        delta_old = mean_old - ref
+        flag = "OK" if delta_old >= -0.05 else "REGRESSED (old_style, noisy)"
+        rows.append((name, mean_old, mean_eval, ref, delta_old, flag, skip_rate, per_seed_eval, avg_step_time))
 
-    print(f"{'config':<18} {'mean':>7} {'ref':>7} {'delta':>7}  {'flag':<10} {'skip_rate':>10} {'avg_step':>10}")
-    for name, mean, ref, delta, flag, skip_rate, per_seed, avg_step_time in rows:
-        print(f"{name:<18} {mean:>7.4f} {ref:>7.4f} {delta:>+7.4f}  {flag:<10} {skip_rate:>9.3%} {avg_step_time*1000:>8.1f}ms")
-        print(f"    per_seed={[round(v, 4) for v in per_seed]}")
+    print(f"{'config':<18} {'old_style':>10} {'eval_acc':>9} {'old_ref':>8} {'flag':<28} {'skip_rate':>10} {'avg_step':>10}")
+    for name, mean_old, mean_eval, ref, delta_old, flag, skip_rate, per_seed_eval, avg_step_time in rows:
+        print(f"{name:<18} {mean_old:>10.4f} {mean_eval:>9.4f} {ref:>8.4f} {flag:<28} {skip_rate:>9.3%} {avg_step_time*1000:>8.1f}ms")
+        print(f"    eval_per_seed={[round(v, 4) for v in per_seed_eval]}")
 
-    regressed = [r for r in rows if r[4] == "REGRESSED"]
-    if regressed:
-        print(f"\nREGRESSION in: {', '.join(r[0] for r in regressed)} -- do not commit without understanding why.")
-    else:
-        print("\nNo regressions vs. current reference table.")
+    print("\nNote: eval_acc has no prior reference to diff against yet (added")
+    print("after REFERENCE was last set) -- these numbers ARE the new baseline")
+    print("for future comparisons. old_style/old_ref is the only apples-to-")
+    print("apples check against history, and it's known-noisy (4 possible")
+    print("values per seed).")
 
 
 if __name__ == "__main__":

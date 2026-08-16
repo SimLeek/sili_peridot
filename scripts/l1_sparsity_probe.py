@@ -467,7 +467,7 @@ def evaluate(model, n_eval, seed):
     return correct / max(ntgt, 1)
 
 
-def run(model, n_steps, seed, verbose=False):
+def run(model, n_steps, seed, verbose=False, periodic_eval_n=20):
     task_rng = np.random.RandomState(seed)
     embed_table = task_rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
     opt = AdamOptimizer()
@@ -539,8 +539,17 @@ def run(model, n_steps, seed, verbose=False):
                 elapsed = time.time() - t_start
                 avg_step = elapsed / step
                 eta = avg_step * (n_steps - step)
+                # Quality alongside progress, same cadence -- a live
+                # trajectory instead of one number at the very end. Small
+                # n_eval (cheap, not the full n_eval=100 used for the
+                # final report) since this runs ~75 times over a 15000
+                # -step run; forward-only, so calling it mid-training does
+                # not disturb the training state (see evaluate()'s own
+                # docstring).
+                periodic_eval = evaluate(model, periodic_eval_n, seed) if periodic_eval_n > 0 else None
+                eval_str = f" eval({periodic_eval_n})={periodic_eval:.3f}" if periodic_eval is not None else ""
                 print(f"  [seed={seed}] step={step}/{n_steps} "
-                      f"avg_step={avg_step*1000:.1f}ms elapsed={elapsed:.0f}s eta={eta:.0f}s",
+                      f"avg_step={avg_step*1000:.1f}ms elapsed={elapsed:.0f}s eta={eta:.0f}s{eval_str}",
                       flush=True)
     avg_step_time = (time.time() - t_start) / n_steps
     return last_accs, skips, total, avg_step_time
