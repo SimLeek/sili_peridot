@@ -45,7 +45,31 @@ CONFIGS = [
     ("baseline_energy",   dict(use_energy=True,  all_zero_init=False)),
     ("baseline_zeroinit", dict(use_energy=False, all_zero_init=True)),
     ("zeroinit_energy",   dict(use_energy=True,  all_zero_init=True)),
+    # rank-N re-test of the zero-init arms (sili__new block4 chain-rule
+    # fix + rank-N generalization + headroom-starvation fix, this
+    # session) -- baseline_zeroinit/zeroinit_energy above (rank=1
+    # implicitly, the scale_rank default) previously "total failure,
+    # all seeds" per REFERENCE, measured before ALL of: the chain-rule
+    # fix (quant*=S not /=S, letting a dead weight escape 0 at all under
+    # deterministic rounding), the rank-N generalization (avoids a
+    # shared row-scale value_scale cancelling across columns with
+    # opposite-signed demand), and the block4 headroom fix (a weight
+    # that DID escape 0 was getting evicted right back out by
+    # merge_row_workspace on the very next call, silently undoing every
+    # step). rank1 here is a FRESH re-baseline under the fixed formula
+    # (not comparable to REFERENCE's rank1 number, which predates the
+    # chain-rule/headroom fixes too) -- rank2 is the actual new
+    # mechanism being tested, added specifically to avoid the
+    # cross-column cancellation the rank1 shared-scale is vulnerable to.
+    ("zeroinit_rank1",         dict(use_energy=False, all_zero_init=True, scale_rank=1)),
+    ("zeroinit_rank2",         dict(use_energy=False, all_zero_init=True, scale_rank=2)),
+    ("zeroinit_energy_rank1",  dict(use_energy=True,  all_zero_init=True, scale_rank=1)),
+    ("zeroinit_energy_rank2",  dict(use_energy=True,  all_zero_init=True, scale_rank=2)),
 ]
+
+# No REFERENCE entry for the rank-N configs -- see their own comment
+# above, these establish a fresh baseline, not a diff against history.
+_NO_REF = {"zeroinit_rank1", "zeroinit_rank2", "zeroinit_energy_rank1", "zeroinit_energy_rank2"}
 
 
 def run_config(name, kwargs, seeds, n_steps, n_eval):
@@ -95,9 +119,12 @@ def main():
     for name, kwargs in CONFIGS:
         mean_old, mean_eval, per_seed_old, per_seed_eval, skip_rate, avg_step_time = run_config(
             name, kwargs, seeds, args.steps, args.eval)
-        ref = REFERENCE[name]["mean"]
-        delta_old = mean_old - ref
-        flag = "OK" if delta_old >= -0.05 else "REGRESSED (old_style, noisy)"
+        if name in _NO_REF:
+            ref, delta_old, flag = float("nan"), float("nan"), "NEW (no reference)"
+        else:
+            ref = REFERENCE[name]["mean"]
+            delta_old = mean_old - ref
+            flag = "OK" if delta_old >= -0.05 else "REGRESSED (old_style, noisy)"
         rows.append((name, mean_old, mean_eval, ref, delta_old, flag, skip_rate, per_seed_eval, avg_step_time))
 
     print(f"{'config':<18} {'old_style':>10} {'eval_acc':>9} {'old_ref':>8} {'flag':<28} {'skip_rate':>10} {'avg_step':>10}")

@@ -83,10 +83,36 @@ class OriginalArchModel:
     v_proj on the combined qkv_source, single o_proj -- with the
     split-backward L1-sparsity (and L2-ratio, for comparison) mechanism
     wired onto all 4 layers instead of spectral_norm_target."""
+
+    # Every neuron-producing tensor in the forward pass -- input, every
+    # hidden layer, and the output -- gets its own EnergyDynamics tap,
+    # applied uniformly via the plain _apply_energy(state, tensor, ...)
+    # op (see __init__'s energy-construction comment).
+    _ENERGY_TAPS = ("input", "q", "k", "v", "attn", "raw", "logits")
+
     def __init__(self, seed, dense, o_proj_coef, all_layer_coef=0.0, l1_sparsity_coef=0.0,
                  all_zero_init=False, zero_init_importance_code=1, use_energy=False,
                  energy_kwargs=None, scale_clip_max=None, log_sigma_clip_max=None,
-                 stochastic_qkv=False, stochastic_o=False, lr_per_row_nnz=True):
+                 stochastic_qkv=False, stochastic_o=False, lr_per_row_nnz=True,
+                 scale_rank=1, empty_init=False, synap_k=3, synap_importance_cutoff=0.0):
+        # empty_init: the GENUINE zero-weight-init design -- every layer
+        # starts with literally zero connections (not all_zero_init's
+        # dense-grid-preloaded-with-0 hack, a different synthetic arm --
+        # see sili/sparse_rnn.py's _preseed_empty docstring). Real
+        # synapses are created by synaptogenesis() (build_probes/
+        # synap_step/equalizer_step, called every step in run() -- see
+        # its own "meant to be called every online step" docstring),
+        # each starting with weight=0/importance=probe_score (a REAL,
+        # activity-derived nonzero importance, not a hardcoded one) --
+        # confirmed via isolated smoke test to actually escape 0 given
+        # real training (unlike all_zero_init's dense simultaneous-zero
+        # deadlock, since only a HANDFUL of synapses per row need to
+        # escape, not the entire row/column at once). Mutually exclusive
+        # with dense/all_zero_init in practice (not enforced) -- doesn't
+        # make sense combined with either.
+        self.empty_init = bool(empty_init)
+        self.synap_k = int(synap_k)
+        self.synap_importance_cutoff = float(synap_importance_cutoff)
         # lr_per_row_nnz: passed straight through to every layer's
         # .forward() call, RAW lr, no Python-side pre-division. Controls
         # ONLY whether the per-synapse weight-CODE update is additionally
@@ -124,7 +150,8 @@ class OriginalArchModel:
         if hasattr(_cpu, "seed_fp4_stochastic_rng"):
             _cpu.seed_fp4_stochastic_rng(seed)
         digit_cls = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-                                      n_stages=3, base=12.0, lr_power=0.0, dense=dense)
+                                      n_stages=3, base=12.0, lr_power=0.0, dense=dense,
+                                      scale_rank=scale_rank, empty_init=empty_init)
         # stochastic_qkv/stochastic_o: use stochastic-rounding storage
         # (DISLDOLayer) instead of deterministic (DISLDOLayerDeterministic)
         # for the selected layers -- lm_head always stays deterministic
@@ -148,10 +175,12 @@ class OriginalArchModel:
         # findings show stochastic rounding can hurt final accuracy
         # broadly, so keep it opt-in per layer rather than always-on.
         qkv_digit_cls = (functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                           n_stages=3, base=12.0, lr_power=0.0, dense=dense)
+                                           n_stages=3, base=12.0, lr_power=0.0, dense=dense,
+                                           scale_rank=scale_rank, empty_init=empty_init)
                           if stochastic_qkv else digit_cls)
         o_digit_cls = (functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                         n_stages=3, base=12.0, lr_power=0.0, dense=dense)
+                                         n_stages=3, base=12.0, lr_power=0.0, dense=dense,
+                                         scale_rank=scale_rank, empty_init=empty_init)
                        if stochastic_o else digit_cls)
         rng = np.random.default_rng(seed)
         self.state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -177,29 +206,25 @@ class OriginalArchModel:
         # weight magnitude down along active directions.
         self.l1_sparsity_coef = l1_sparsity_coef
 
-        # Energy_rl's forced-firing is meant to give EVERY hidden layer's
-        # weight update both a nonzero x (input) AND a nonzero dy (output
-        # gradient) at once -- per direct correction. A single shared
-        # EnergyDynamics wrapping only attn_raw (between attention and
-        # o_proj) gives q/k/v_proj a legitimate dy (backprop through
-        # gaussian_attention) but gives o_proj NOTHING on its own output
-        # side: o_proj's dy can only ever come from downstream (blocked
-        # while lm_head is also zero-weight) since nothing injects noise/
-        # fire directly at `raw` (o_proj's own output). Confirmed directly:
-        # under all-zero-init, q/k/v_proj's weights move (once rounding
-        # lets sub-threshold pushes accumulate -- see stochastic_qkv) but
-        # o_proj/lm_head's weights_vals stay EXACTLY 0 regardless of
-        # rounding mode, because their gradient really is mathematically
-        # zero (W=0 kills downstream propagation; sign(0)=0 kills the L1
-        # path too) -- not just numerically small. So instead of one
-        # shared instance, build one INDEPENDENT EnergyDynamics per hidden
-        # -layer output (q, k, v, attn/o_proj-input, raw/o_proj-output),
-        # each with its own energy/steps_since_fired state. lm_head is
-        # deliberately NOT wrapped here -- its dy already comes for free
-        # from cross-entropy (the terminal loss, never structurally zero
-        # regardless of lm_head's own weight), it only needs its INPUT
-        # (pooled) to go nonzero, which cascades naturally once o_proj
-        # wakes via the raw-side wrap below.
+        # Energy is applied as a plain per-tap OP (_apply_energy(state,
+        # tensor, ...), a bare function -- not a bespoke wrapper class
+        # per layer) to EVERY neuron-producing tensor in the model --
+        # input, every hidden layer, and the output -- uniformly, not a
+        # hand-curated subset. Per direct correction: reasoning
+        # case-by-case about which specific layer's gradient path
+        # "needs" energy is exactly the kind of fragile, easy-to-miss
+        # analysis that caused the earlier o_proj/lm_head cascade stall
+        # (see JOURNAL.md/this session -- a curated 5-tap set silently
+        # left o_proj and lm_head permanently stuck under empty_init).
+        # Since the number of neurons (layer widths) is cheap relative
+        # to the number of parameters, wrapping every tap uniformly
+        # costs little and removes the need to re-derive "does this
+        # specific layer need it" every time the architecture changes.
+        # Each tap gets its OWN independent EnergyDynamics instance
+        # (own energy/steps_since_fired state) -- see _ENERGY_TAPS
+        # below. _apply_energy(None, tensor, ...) is already a no-op
+        # pass-through, so step() can call the op unconditionally at
+        # every tap regardless of use_energy, rather than branching.
         # fire_wake_gradient's EFFECT on the actual weight update is
         # delta = -effective_lr*g/(sqrt(ci)+eps), i.e. proportional to
         # whatever `lr` happens to be THIS call (lr_schedule's warmup/
@@ -220,7 +245,6 @@ class OriginalArchModel:
             self._fire_wake_gradient_base = float(energy_kwargs.pop("fire_wake_gradient"))
 
         self.energies = {}
-        self.energy = None
         if use_energy:
             from sili.energy import EnergyDynamics
             def _make_energy():
@@ -237,9 +261,8 @@ class OriginalArchModel:
                 else:
                     from model.toy_precision_models import _toy_scale_energy
                     return _toy_scale_energy()
-            for name in ("q", "k", "v", "attn", "raw"):
+            for name in self._ENERGY_TAPS:
                 self.energies[name] = _make_energy()
-            self.energy = self.energies["attn"]  # backward-compat alias
 
         self.scale_clip_max = scale_clip_max
         self.log_sigma_clip_max = log_sigma_clip_max
@@ -281,6 +304,17 @@ class OriginalArchModel:
 
     def parameters_for_optimizer(self):
         return [self.input_ln, self.state_ln, self.centers, self.log_sigmas]
+
+    def synaptogenesis_all(self):
+        """Grow real synapses on every layer -- no-op unless empty_init
+        (nothing to grow into on a preseeded layer; TrueMultiDigitLayer.
+        synaptogenesis is defined regardless, but calling it on an
+        already-full-capacity preseeded layer just churns probes for no
+        effect, so skip entirely rather than pay the cost for nothing)."""
+        if not self.empty_init:
+            return
+        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.lm_head):
+            layer.synaptogenesis(self.synap_k, self.synap_importance_cutoff)
 
     def _l2(self, t: Tensor) -> Tensor:
         return power(reduce_sum(power(t, 2)) + 1e-8, 0.5)
@@ -359,23 +393,24 @@ class OriginalArchModel:
             compensated = self._fire_wake_gradient_base / lr
             for energy in self.energies.values():
                 energy.fire_wake_gradient = compensated
+        energy_aux_terms = []
+        def tap(name, tensor, n_hidden=self.state_width):
+            # Plain op, always called -- _apply_energy(None, tensor, ...)
+            # is already a no-op pass-through when use_energy=False, so
+            # every tap uses the SAME call regardless (see _ENERGY_TAPS).
+            gated, aux = _apply_energy(self.energies.get(name), tensor, NUM_TILES, n_hidden)
+            if aux is not None:
+                energy_aux_terms.append(aux)
+            return gated
+
         x_normed = rmsnorm_tensor(Tensor(x_window.astype(np.float32)), self.input_ln, 1e-6)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, 1e-6)
-        qkv_source = x_normed + m_normed
-        q = self.q_proj.forward(qkv_source, qkv_lr, lr_per_row_nnz=self.lr_per_row_nnz)
-        k = self.k_proj.forward(qkv_source, qkv_lr, lr_per_row_nnz=self.lr_per_row_nnz)
-        v = self.v_proj.forward(qkv_source, qkv_lr, lr_per_row_nnz=self.lr_per_row_nnz)
-        energy_aux_terms = []
-        if self.energies:
-            q, aux_q = _apply_energy(self.energies["q"], q, NUM_TILES, self.state_width)
-            k, aux_k = _apply_energy(self.energies["k"], k, NUM_TILES, self.state_width)
-            v, aux_v = _apply_energy(self.energies["v"], v, NUM_TILES, self.state_width)
-            energy_aux_terms += [t for t in (aux_q, aux_k, aux_v) if t is not None]
+        qkv_source = tap("input", x_normed + m_normed)
+        q = tap("q", self.q_proj.forward(qkv_source, qkv_lr, lr_per_row_nnz=self.lr_per_row_nnz))
+        k = tap("k", self.k_proj.forward(qkv_source, qkv_lr, lr_per_row_nnz=self.lr_per_row_nnz))
+        v = tap("v", self.v_proj.forward(qkv_source, qkv_lr, lr_per_row_nnz=self.lr_per_row_nnz))
         sigmas = exp(self.log_sigmas)
-        attn_raw = gaussian_attention(q, k, v, self.centers, sigmas, num_cpus=1, causal=False)
-        attn_raw, energy_aux_loss = _apply_energy(self.energy, attn_raw, NUM_TILES, self.state_width)
-        if energy_aux_loss is not None:
-            energy_aux_terms.append(energy_aux_loss)
+        attn_raw = tap("attn", gaussian_attention(q, k, v, self.centers, sigmas, num_cpus=1, causal=False))
 
         reg_terms = []
         if self.all_layer_coef > 0.0:
@@ -383,11 +418,7 @@ class OriginalArchModel:
             reg_terms.append(self._ratio_penalty_split(self.k_proj, qkv_source, qkv_lr, self.all_layer_coef))
             reg_terms.append(self._ratio_penalty_split(self.v_proj, qkv_source, qkv_lr, self.all_layer_coef))
 
-        raw = self.o_proj.forward(attn_raw, o_lr, lr_per_row_nnz=self.lr_per_row_nnz)
-        if self.energies:
-            raw, aux_raw = _apply_energy(self.energies["raw"], raw, NUM_TILES, self.state_width)
-            if aux_raw is not None:
-                energy_aux_terms.append(aux_raw)
+        raw = tap("raw", self.o_proj.forward(attn_raw, o_lr, lr_per_row_nnz=self.lr_per_row_nnz))
         if self.o_proj_coef > 0.0:
             raw_aux = self.o_proj.forward(attn_raw, o_lr, lr_per_row_nnz=self.lr_per_row_nnz, damp_by_importance=False)
             l2_in = float(np.linalg.norm(attn_raw.data)) + 1e-6
@@ -415,7 +446,8 @@ class OriginalArchModel:
             # nonzero from upstream. This term gives it the same direct,
             # pooled-independent escape route q/k/v/o_proj already have.
             reg_terms.append(self._l1_sparsity_split(self.lm_head, pooled, lmhead_lr, self.l1_sparsity_coef))
-        logits = self.lm_head.forward(pooled, lmhead_lr, lr_per_row_nnz=self.lr_per_row_nnz)
+        logits = tap("logits", self.lm_head.forward(pooled, lmhead_lr, lr_per_row_nnz=self.lr_per_row_nnz),
+                     n_hidden=VOCAB)
 
         total_aux = reg_terms[0] if reg_terms else None
         for extra in reg_terms[1:]:
@@ -425,7 +457,7 @@ class OriginalArchModel:
         return M_new_t.data, logits, total_aux
 
 
-def evaluate(model, n_eval, seed):
+def evaluate(model, n_eval, seed, verbose=False):
     """Post-training capability check: n_eval FRESH, independently-drawn
     sequences at full in-context length (NUM_TILES), forward-only --
     never calls .backward()/opt.step(), so nothing trains (forward_dense
@@ -448,11 +480,21 @@ def evaluate(model, n_eval, seed):
     token->vector lookup the model's WEIGHTS were calibrated to use).
     Sequences are drawn from a DIFFERENT RNG stream than training's own
     (seed offset), so these are genuinely held-out draws, not a replay
-    of the training curriculum's own sequence order."""
+    of the training curriculum's own sequence order.
+
+    verbose: prints the last 5 (prediction, target) token-id pairs seen
+    (across the whole n_eval run, most-recent-last) -- per direct
+    request: a bare accuracy number can't distinguish "the model is
+    degenerate/guessing a narrow set of tokens" from "these particular
+    held-out sequences happened to skew toward one target token" (a real
+    confound with a small n_eval and VOCAB tokens to choose from). Does
+    NOT change the return value -- existing callers (landmark_checklist.py,
+    run()'s own periodic eval) are unaffected."""
     embed_table = np.random.RandomState(seed).randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
     eval_rng = np.random.RandomState(seed + 999_983)
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     correct = ntgt = 0
+    last_answers = []  # (pred, target) pairs, most-recent-last
     for _ in range(n_eval):
         tokens, pairs = generate_copy_sequence(eval_rng, VOCAB, NUM_TILES)
         targets = dict(pairs)
@@ -464,6 +506,12 @@ def evaluate(model, n_eval, seed):
                 pred = int(np.argmax(logits.data[NUM_TILES - 1]))
                 ntgt += 1
                 correct += int(pred == targets[i])
+                if verbose:
+                    last_answers.append((pred, targets[i]))
+                    if len(last_answers) > 5:
+                        last_answers.pop(0)
+    if verbose:
+        print(f"  evaluate() last 5 (pred, target): {last_answers}", flush=True)
     return correct / max(ntgt, 1)
 
 
@@ -533,6 +581,7 @@ def run(model, n_steps, seed, verbose=False, periodic_eval_n=20):
                     model.clip_scales(layer, model.scale_clip_max)
             if model.log_sigma_clip_max is not None:
                 model.clip_log_sigmas(model.log_sigma_clip_max)
+        model.synaptogenesis_all()  # no-op unless model.empty_init -- see its own docstring
         if step % 200 == 0:
             last_accs.append(correct / max(ntgt, 1))
             if verbose:

@@ -777,15 +777,22 @@ class TrueMultiDigitLayer:
                 n_stages: int = 2, base: float = 12.0, e_shared: Optional[float] = None,
                 lr_power: float = 0.0, simulate_quantize: bool = False,
                 share_connectivity: bool = False, dense: bool = False,
+                scale_rank: int = 1, empty_init: bool = False,
                 rng: Optional[np.random.Generator] = None):
-        # dense=True only forwarded when set (not unconditionally) -- only
-        # DISLDOLayer/DISLDOLayerDeterministic (sili__new) accept a `dense`
-        # kwarg at all; older/other digit_cls options (DISLDOLayer32,
-        # DISLDOLayerResync, etc.) would TypeError on an unexpected kwarg
-        # otherwise, breaking every existing caller that doesn't ask for it.
+        # dense=True / scale_rank>1 / empty_init=True only forwarded when
+        # set (not unconditionally) -- only DISLDOLayer/
+        # DISLDOLayerDeterministic (sili__new) accept these kwargs at
+        # all; older/other digit_cls options (DISLDOLayer32,
+        # DISLDOLayerResync, etc.) would TypeError on an unexpected
+        # kwarg otherwise, breaking every existing caller that doesn't
+        # ask for it.
         digit_kwargs = {"rng": rng}
         if dense:
             digit_kwargs["dense"] = True
+        if scale_rank != 1:
+            digit_kwargs["scale_rank"] = scale_rank
+        if empty_init:
+            digit_kwargs["empty_init"] = True
         self.digits = [digit_cls(in_features, out_features, max_weights, num_cpus, **digit_kwargs)
                       for _ in range(n_stages)]
         # share_connectivity: per direct hypothesis check -- each digit's
