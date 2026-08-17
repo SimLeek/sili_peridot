@@ -1,5 +1,22 @@
 # Testing sili_peridot
 
+## Before comparing against the reference commits (af8ceb2 / c653df8)
+
+sili__new commit `54e29b5` (paired with this repo's `ebab9d0`) fixes a
+real, previously-present sign-discarding bug in `linear_disldo.hpp`'s
+`quant_floor` (was unconditionally `zero_escape_eps + |quant|` for
+EVERY synapse, discarding `quant`'s real sign even when nonzero -- not
+just at the intended `quant==0` escape-from-zero case; now gated to
+`quant == 0` only, real signed `quant` used otherwise). This bug
+predates and was present THROUGHOUT the `af8ceb2`/`c653df8` landmark
+run and everything since, up until this session. **A numeric
+difference against those reference commits is not automatically a
+regression** -- it may simply be backprop correctly handling negative
+weights for the first time. If a number moved, check the DIRECTION and
+magnitude of the change (a sign-correctness fix should generically
+help or be neutral, not cause wholesale collapse) before treating it
+as a red flag.
+
 Quick reference for verifying changes after a commit. Run these from
 the repo root (`sili_peridot/`) with `PYTHONPATH=.` (or from inside the
 repo, since several scripts do `sys.path.insert(0, ".")` themselves)
