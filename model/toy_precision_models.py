@@ -827,6 +827,8 @@ class TrueMultiDigitLayer:
                 dc.load_weights(ptrs0.astype(np.int32), idx0.astype(np.int32), values)
                 if hasattr(dc, "equalize_to_capacity"):
                     dc.equalize_to_capacity(per_row)
+        self.in_features = in_features
+        self.out_features = out_features
         self.bits_per_stage = bits_per_stage
         self.n_stages = n_stages
         self.base = base

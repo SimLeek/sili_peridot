@@ -257,14 +257,37 @@ class ToyTileRecurrenceRealFP4:
     def _spectral_rescale_factor(self, layer, idx: int) -> float:
         """One power-iteration step against `layer` alone (NOT the real
         data -- a persistent probe vector, decoupled from RMSNorm/clip/
-        residual, so the estimate reflects this layer's own dominant
-        singular value only). forward(..., 0.0): zero-side-effect
-        convention already used everywhere (evaluate(), the earlier
-        spectral-radius diagnostic) -- no backward/optimizer call, so
-        this costs one extra forward pass, nothing like an
-        eigendecomposition. EMA-smoothed sigma (not the raw per-step
-        estimate) is what's actually used -- see __init__'s own
-        docstring for why (synaptogenesis-readiness)."""
+        residual). forward(..., 0.0): zero-side-effect convention
+        already used everywhere (evaluate(), the earlier spectral-
+        radius diagnostic) -- no backward/optimizer call, so this costs
+        one extra forward pass, nothing like an eigendecomposition.
+        EMA-smoothed sigma (not the raw per-step estimate) is what's
+        actually used -- see __init__'s own docstring for why
+        (synaptogenesis-readiness).
+
+        CORRECTION (was previously mislabeled "dominant singular
+        value" everywhere in this method, including its own variable/
+        parameter names like spectral_norm_target): this is forward-
+        only iteration (u_{k+1} = layer(u_k)/||layer(u_k)||), which only
+        converges to the top SINGULAR value when the underlying linear
+        map is symmetric. For a real weight matrix (generically NOT
+        symmetric, and its dominant eigenvalue is generically a complex
+        pair, not real), this instead approximates something close to
+        the SPECTRAL RADIUS (max |eigenvalue|), not the spectral norm --
+        confirmed directly: for a random 16x16 Gaussian matrix, this
+        iteration converges to ~3.43 while the true top singular value
+        (np.linalg.svd) is ~7.13 and the true spectral radius
+        (np.linalg.eigvals) is ~3.49 -- clearly tracking the latter, not
+        the former. Left AS-IS here (this correction is comment-only,
+        no behavior change) since spectral radius is actually the
+        theoretically correct quantity for recurrent-dynamics stability
+        anyway (spectral norm is a conservative upper bound on it) --
+        but any existing spectral_norm_target tuning should be
+        understood as having tuned against radius-like behavior, not
+        norm, this whole time. See model/eval_eigenvalues.py for an
+        EXACT (non-iterative, SVD/eigval-based) alternative if a
+        precise answer is ever needed instead of this cheap per-step
+        approximation."""
         eps = 1e-8
         u = self._spectral_u[idx]
         probe = Tensor(u.reshape(1, -1).astype(np.float32))
