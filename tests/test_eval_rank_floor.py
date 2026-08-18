@@ -104,7 +104,7 @@ class TestMeasureRankFloorHarnessSanity:
                     reason=f"real short training run, opt in via {RUN_ENV_VAR}=1")
 class TestRankFloorRealModel:
     def test_disldo_vs_low_rank_vs_float32_at_scale_rank_2(self):
-        from sili.sparse_rnn import DISLDOLayer32, DISLDOLayerDeterministic
+        from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayerDeterministic
 
         n = 8
         rank = 2
@@ -119,10 +119,19 @@ class TestRankFloorRealModel:
             opt=AdamOptimizer(), opt_step=lambda o, p, l: o.step(p, lr=l),
             clip_grad_norm=clip_grad_norm_)
 
-        fp4_layer = DISLDOLayerDeterministic(n, n, n * n, num_cpus=1,
-                                             rng=np.random.default_rng(2001),
-                                             dense=True, scale_rank=rank)
-        fp4_report = measure_rank_floor(fp4_layer, target, n_steps, lr, rank)
+        fp4_det_layer = DISLDOLayerDeterministic(n, n, n * n, num_cpus=1,
+                                                  rng=np.random.default_rng(2001),
+                                                  dense=True, scale_rank=rank)
+        fp4_det_report = measure_rank_floor(fp4_det_layer, target, n_steps, lr, rank)
+
+        # Stochastic FP4 too -- per this same session's earlier finding
+        # (deterministic rounding is exactly the variant that gets stuck on
+        # already-live synapses), deterministic alone isn't the relevant
+        # comparison for "can real FP4 weights reach a rank-limited target."
+        fp4_stoch_layer = DISLDOLayer(n, n, n * n, num_cpus=1,
+                                      rng=np.random.default_rng(2007),
+                                      dense=True, scale_rank=rank)
+        fp4_stoch_report = measure_rank_floor(fp4_stoch_layer, target, n_steps, lr, rank)
 
         # DISLDOLayer32 has no dense=/scale_rank= kwargs (no quantization
         # at all, so no scale envelope to constrain) -- max_weights=n*n
@@ -136,12 +145,15 @@ class TestRankFloorRealModel:
               f"ey_floor={low_rank_report.ey_floor:.3f}\n"
               f"  low_rank_dense: final_sse={low_rank_report.final_sse:.3f} "
               f"ratio={low_rank_report.ratio_to_floor:.3f}\n"
-              f"  fp4_deterministic: final_sse={fp4_report.final_sse:.3f} "
-              f"ratio={fp4_report.ratio_to_floor:.3f} beat_floor={fp4_report.beat_floor}\n"
+              f"  fp4_deterministic: final_sse={fp4_det_report.final_sse:.3f} "
+              f"ratio={fp4_det_report.ratio_to_floor:.3f} beat_floor={fp4_det_report.beat_floor}\n"
+              f"  fp4_stochastic: final_sse={fp4_stoch_report.final_sse:.3f} "
+              f"ratio={fp4_stoch_report.ratio_to_floor:.3f} beat_floor={fp4_stoch_report.beat_floor}\n"
               f"  fp32_reference: final_sse={fp32_report.final_sse:.3f} "
               f"ratio={fp32_report.ratio_to_floor:.3f} beat_floor={fp32_report.beat_floor}")
 
-        assert np.isfinite(fp4_report.final_sse)
+        assert np.isfinite(fp4_det_report.final_sse)
+        assert np.isfinite(fp4_stoch_report.final_sse)
         assert np.isfinite(fp32_report.final_sse)
         # float32 reference should always be able to beat a rank-limited
         # floor (nothing there to get stuck on) -- this is the one hard
