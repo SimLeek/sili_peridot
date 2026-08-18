@@ -515,7 +515,7 @@ def evaluate(model, n_eval, seed, verbose=False):
     return correct / max(ntgt, 1)
 
 
-def run(model, n_steps, seed, verbose=False, periodic_eval_n=20):
+def run(model, n_steps, seed, verbose=False, periodic_eval_n=20, peak_lr=0.002):
     task_rng = np.random.RandomState(seed)
     embed_table = task_rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
     opt = AdamOptimizer()
@@ -524,7 +524,7 @@ def run(model, n_steps, seed, verbose=False, periodic_eval_n=20):
     last_accs = []
     t_start = time.time()
     for step in range(1, n_steps + 1):
-        lr = lr_schedule(step, n_steps, 0.002, 50)
+        lr = lr_schedule(step, n_steps, peak_lr, 50)
         seq_len = min(2 + step // STEPS_PER_STAGE, NUM_TILES)
         tokens, pairs = generate_copy_sequence(task_rng, VOCAB, seq_len)
         targets = dict(pairs)
