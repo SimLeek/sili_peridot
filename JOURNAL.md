@@ -6755,3 +6755,77 @@ note update as the only permanent changes. This is now the new
 baseline for all further sili_peridot work: any future `!isfinite`-style
 guard added to `sili__new`'s C++ hot path is only real if it survives
 this exact compiler flag.
+
+## 2026-08-18 -- FP4 stuck-weights investigation: stochastic rounding moves already-live synapses, but scale alone doesn't reliably beat it; short out-of-context tasks are a better diagnostic than the long landmark runs
+
+Follow-up to the earlier finding that deterministic-rounding FP4 weights
+are bit-exact frozen (`mean|delta_w|=0.0`) at every `state_width` tested
+32-1024. `model/eval_stuck_weights.py`'s snapshot/diff was keyed by raw
+array position, which breaks under stochastic rounding (dead synapses
+waking up shifts every later CSR array index) -- redesigned to key
+snapshots by `(row, col)` instead (reconstructed from the layer's own
+`ptrs`/`indices` CSR arrays), diffing via key intersection so growth/
+pruning between snapshots (`n_new`/`n_died`/`churn_fraction`) no longer
+blocks the comparison. Confirmed cleanly: on synapses live at BOTH
+snapshots, deterministic rounding is still exactly `0.0`, but stochastic
+rounding shows real nonzero movement (`mean_delta_w=0.002259`,
+`churn_fraction=0.132`) -- stochastic rounding moves already-live
+synapses, not just wakes dead ones.
+
+Built `scripts/stochastic_stability_vs_scale_sparsity.py` to test
+whether that movement's inherent noise costs real accuracy, and whether
+the cost shrinks with `state_width` or with input/activation sparsity.
+First version accidentally swept CONNECTIVITY/weight sparsity (`dense=
+False`, `max_weights` as a fraction) under the label "density" --
+corrected per direct feedback to hold connectivity fully dense and
+instead sparsify each vocab token's embedding to a fixed random subset
+of active dims (genuine input/activation sparsity, independent axis).
+Also corrected to use a genuinely OUT-OF-CONTEXT task (`seq_len =
+NUM_TILES + 2`) -- the in-context `seq_len<=NUM_TILES` setup every
+other probe in this investigation used is solvable from the local tile
+window alone with zero dependency on the carried recurrent state `M`
+(confirmed via `_build_tile_window`'s own sliding-window math), so it
+can't actually exercise the recurrence-carried-signal question this
+investigation is about.
+
+Grid (state_width x {weight density, then corrected to input density},
+3 seeds/arm): the weight-density version showed a striking trend --
+gap (det_mean - stoch_mean) shrank and flipped negative at
+state_width=512/density=1.0 (stochastic BEAT deterministic, 0.811 vs
+0.767) but got dramatically WORSE with scale at density=0.25 (gap grew
+0.022 -> 0.133 -> 0.378). The corrected input-density version showed a
+much flatter picture throughout (gaps all within +-0.07, no systematic
+harm from input sparsity at any width tested up to 512) -- input
+sparsity looks safe for this mechanism, unlike weight/connectivity
+sparsity.
+
+Per direct correction ("You can't fix a seed to determine a statistical
+answer"): the width=512/density=1.0 "stochastic wins" flip was n=3,
+not enough to trust over run-to-run noise -- especially since DISLDOLayer's
+stochastic rounding has its own not-fully-pinned-down RNG (see
+`feedback_seed_stochastic_rng_for_comparisons` memory), so seeding
+harder answers "what does one seed do," not "is this a real effect."
+Ran a focused 12-seed confirmation at exactly that grid cell
+(`scripts/stochastic_scale_dense_confirmation.py`, fresh seed block
+2000-2011): `det mean=0.7528 std=0.1218`, `stoch mean=0.7472 std=0.1306`,
+paired `gap=0.0056 sem=0.0090 t=0.62` -- **not statistically distinguishable
+from zero**. The n=3 flip was noise, exactly the same shape of mistake
+`landmark_checklist.py`'s own history already has on record (2026-08-12
+entry above: an n=3 "regression" that vanished at n=5). Conclusion:
+scale does NOT reliably give stochastic rounding an edge over
+deterministic by itself -- at width=512 they're statistically tied, not
+"stochastic wins." Whether scale + higher WEIGHT density together do
+something real (the widest gap-flip signal seen) is still open and
+would need its own multi-seed confirmation before trusting either
+direction.
+
+Side finding, useful going forward: these out-of-context copy-task
+probes (200 training steps, ~2-90s per run depending on `state_width`)
+produced a genuinely informative width-dependent learning curve
+(state_width 32 -> ~0.2-0.25 accuracy, barely above the 0.1 chance
+floor; state_width 512 -> ~0.75, clearly real recurrent memory) in a
+small fraction of the time `landmark_checklist.py`'s 15000-step runs
+take, while directly exercising the property (signal surviving past the
+local context window, carried only through `M`) this whole project
+track cares about. Worth treating as a first-line diagnostic for
+future recurrence-relevant changes, not just this investigation.
