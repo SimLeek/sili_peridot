@@ -106,6 +106,7 @@ class ToyTileRecurrenceRealFP4:
                  l1_sparsity_coef: float = 0.0,
                  cosine_lm_head: bool = False,
                  gated_combine: bool = False,
+                 gated_update: bool = False,
                  gate_floor: float = 0.1,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
@@ -318,7 +319,18 @@ class ToyTileRecurrenceRealFP4:
         two NEW dense layers uncovered would be a foreseeable regression
         of exactly that already-fixed failure mode, not a hypothetical
         one. Unvalidated as a combination (same caveat as input_proj's
-        own L1 term) until tested."""
+        own L1 term) until tested.
+
+        gated_update: distinct from gated_combine -- see this class's own
+        "Known differences" docstring item 2. Replaces the plain residual
+        `M_new = M_prev + attn_o_proj_output` with a learned forget gate
+        (`M_new = forget_gate*M_prev + (1-forget_gate)*attn_o_proj_output`),
+        the step Block-Recurrent Transformer's actual LSTM-style gates
+        control. Same gate_floor clamping, two-summed-projections
+        construction, and L1 coverage convention as gated_combine (its own
+        two new layers, `update_forget_proj`/`update_input_proj`).
+        Composable with gated_combine (untested combination until both are
+        validated independently)."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -327,6 +339,7 @@ class ToyTileRecurrenceRealFP4:
         self.clip_range = clip_range
         self.cosine_lm_head = cosine_lm_head
         self.gated_combine = gated_combine
+        self.gated_update = gated_update
         self.gate_floor = gate_floor
         self.magnitude_penalty_coef = magnitude_penalty_coef
         self.spectral_norm_target = spectral_norm_target
@@ -368,6 +381,9 @@ class ToyTileRecurrenceRealFP4:
             # (and hence every existing test/script's reproducibility) is
             # untouched -- same concern already flagged for spectral_norm_
             # target's own probe-vector RNG draws above.
+        if gated_update:
+            n_layer_seeds += 2  # update_forget_proj, update_input_proj -- same
+            # only-reserved-when-used rule as gated_combine's seeds above.
         layer_seeds = iter(int(s) for s in rng.integers(0, 2**31 - 1, size=n_layer_seeds))
 
         # dense=True only forwarded when set (not unconditionally) -- only
@@ -399,6 +415,11 @@ class ToyTileRecurrenceRealFP4:
                                           rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
             self.gate_m_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
                                           rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+        if gated_update:
+            self.update_forget_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                                 rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+            self.update_input_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                                rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
 
         # 1. Core Attention & Output Projections
         if use_attention:
@@ -672,7 +693,29 @@ class ToyTileRecurrenceRealFP4:
             aux_loss = mag_penalty if aux_loss is None else aux_loss + mag_penalty
 
         # 3. Residual & Hard Bounding
-        M_new_t = Tensor(M_prev.astype(np.float32)) + attn
+        if self.gated_update:
+            # Learned forget gate on the STATE UPDATE itself -- distinct
+            # from gated_combine (which gates the PRE-attention qkv_source
+            # combination). This is the step Block-Recurrent Transformer's
+            # actual LSTM-style gates control (forget_gate*old_state +
+            # input_gate*new_content) -- see this class's own docstring
+            # "Known differences" item 2. Same two-projections-summed
+            # (avoids needing concat), sigmoid, gate_floor-clamped pattern
+            # as gated_combine, applied here instead/as well.
+            M_prev_t = Tensor(M_prev.astype(np.float32))
+            forget_logit = self.update_forget_proj.forward(M_prev_t, learning_rate) \
+                + self.update_input_proj.forward(attn, learning_rate)
+            forget_raw = sigmoid_tensor(forget_logit)
+            forget_gate = self.gate_floor + (1.0 - 2.0 * self.gate_floor) * forget_raw
+            if self.l1_sparsity_coef > 0.0:
+                update_l1 = self._l1_sparsity_split(self.update_forget_proj, M_prev_t, learning_rate, self.l1_sparsity_coef) \
+                    + self._l1_sparsity_split(self.update_input_proj, attn, learning_rate, self.l1_sparsity_coef)
+                aux_loss = update_l1 if aux_loss is None else aux_loss + update_l1
+            M_new_t = forget_gate * M_prev_t + (1.0 - forget_gate) * attn
+            if debug:
+                dbg["forget_gate"] = _stats("forget_gate", forget_gate.data)
+        else:
+            M_new_t = Tensor(M_prev.astype(np.float32)) + attn
         M_new_t = rmsnorm_tensor(M_new_t, self.state_ln, self.rms_eps)
         if debug:
             dbg["pre_clip"] = _stats("pre_clip", M_new_t.data)

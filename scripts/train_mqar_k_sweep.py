@@ -114,7 +114,8 @@ def seq_len_for_k(num_kv_pairs: int) -> int:
 
 def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
                    pool_size: int = 1, refresh_every: int = 1, eval_every: int = None,
-                   cosine_lm_head: bool = False, gated_combine: bool = False) -> dict:
+                   cosine_lm_head: bool = False, gated_combine: bool = False,
+                   gated_update: bool = False) -> dict:
     """pool_size/refresh_every: sample-efficiency fix, per direct diagnosis
     (see conversation) -- drawing a brand-new random MQAR sequence every
     single step gives each specific key/value/gap pattern exactly ONE
@@ -150,7 +151,8 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, 0, num_tiles, MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS, disldo_cls=DISLDO_CLS, rng=model_rng,
         clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        cosine_lm_head=cosine_lm_head, gated_combine=gated_combine)
+        cosine_lm_head=cosine_lm_head, gated_combine=gated_combine,
+        gated_update=gated_update)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
