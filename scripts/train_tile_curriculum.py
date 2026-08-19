@@ -252,6 +252,24 @@ ARMS = {
     "true_multi_digit_deterministic": functools.partial(TrueMultiDigitLayer,
                                                         digit_cls=DISLDOLayerDeterministic,
                                                         n_stages=3, base=12.0, lr_power=0.0),
+    # STOCHASTIC rounding, otherwise identical config (sparse, base=12,
+    # n_stages=3) to true_multi_digit_deterministic above -- per direct
+    # instruction (see conversation), stochastic rounding is now the
+    # PREFERRED choice for real runs: sili_peridot's rank-floor and
+    # superposition eval harnesses both found deterministic rounding gets
+    # permanently stuck (never escapes its current FP4 code once the
+    # residual is smaller than one quantization step), while stochastic
+    # genuinely reaches properties deterministic never does (beat the
+    # Eckart-Young rank floor AND the float32 reference at rank>2; the
+    # only FP4 arm that ever achieved genuine superposition, i.e. beat the
+    # no-superposition baseline, in sili_peridot/model/eval_superposition.py).
+    # Kept as a SEPARATE arm rather than repurposing the deterministic
+    # name, matching this file's own established _base4/_base6/_dense
+    # convention (direct, paired comparison points, not silent
+    # replacement) -- deterministic remains available for comparison.
+    "true_multi_digit_stochastic": functools.partial(TrueMultiDigitLayer,
+                                                      digit_cls=DISLDOLayer,
+                                                      n_stages=3, base=12.0, lr_power=0.0),
     # base=4.0 was the ORIGINAL default, derived from real FP4 (E2M1)'s
     # own worst-case relative rounding error (~1/4) -- kept as an explicit
     # comparison point now that base=12 is the default above. Same
@@ -401,7 +419,8 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "true_multi_digit_resync": 12, "true_multi_digit_noscale": 12,
                   "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
                   "row_4bit_noscale_deterministic": 4,
-                  "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12,
+                  "true_multi_digit_deterministic": 12, "true_multi_digit_stochastic": 12,
+                  "true_multi_digit_noscale_deterministic": 12,
                   "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
                   "true_multi_digit_deterministic_base24": 12,
                   "true_multi_digit_deterministic_lr1": 12, "true_multi_digit_deterministic_lr2": 12,
