@@ -8,7 +8,7 @@ from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu, power
 from sili.sparse_rnn import DISLDOLayer
 from sili.energy import EnergyDynamics
 
-from .toy_recall_models import rmsnorm_tensor
+from .toy_recall_models import rmsnorm_tensor, sigmoid_tensor
 from .toy_precision_models import _toy_scale_energy, _apply_energy
 
 
@@ -41,6 +41,9 @@ class ToyTileRecurrenceRealFP4:
                  spectral_norm_target: Optional[float] = None,
                  spectral_norm_ema_decay: float = 0.9,
                  l1_sparsity_coef: float = 0.0,
+                 cosine_lm_head: bool = False,
+                 gated_combine: bool = False,
+                 gate_floor: float = 0.1,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
@@ -158,13 +161,110 @@ class ToyTileRecurrenceRealFP4:
         result (the probe never tested it) -- if set, L1 is applied
         per-sublayer using each sublayer's own real input, a direct
         analogous extension, but treat that combination as unvalidated
-        until tested."""
+        until tested.
+
+        cosine_lm_head: makes lm_head's readout a "cosine classifier"
+        (row-normalized matched filter) instead of a raw dot product.
+        Root cause found directly (see conversation): with a fixed,
+        untrained, random `embed_table` (e.g. VOCAB=128,
+        EMBED_WIDTH=16 in the MQAR K-sweep), a raw-dot-product readout
+        genuinely misclassifies ~2-5% of possible value tokens even
+        with an OPTIMAL hand-built lm_head, because raw logit[v] =
+        ||pooled||*||W_row[v]||*cos_sim(pooled,W_row[v]) conflates
+        direction similarity with W_row[v]'s own magnitude -- an
+        unrelated token whose row happens to have a larger norm can
+        outscore the true match even at lower cosine similarity.
+        RMSNorm already fixes this on the INPUT side (x_normed/M_new
+        have fixed magnitude regardless of which token arrived, so
+        pooled's own scale never affects the argmax -- confirmed
+        numerically, normalizing pooled alone changes nothing), so the
+        fix only needs to touch lm_head's OUTPUT-row norms. This is
+        NOT a fundamental embedding-width/dimension-counting ceiling
+        (an earlier hypothesis, WRONG, retracted after direct
+        numerical verification with a properly row-normalized template
+        reached exactly 64/64 at the SAME embed_width=16) -- it's
+        purely this one magnitude/direction conflation, fixable
+        without touching embed_width, column_neurons, or the recurrent
+        state at all.
+
+        Since lm_head is a real disldo_cls layer (its weights live in
+        FP4-quantized C++ storage, not a plain accessible matrix), row
+        norms are reconstructed the same way `_spectral_rescale_factor`
+        already probes a layer's weights elsewhere in this file: feed
+        the `embed_width` standard basis vectors through
+        `lm_head.forward(..., 0.0)` (one batched, zero-side-effect,
+        no-backward call -- forward(e_i) = W_row[:, i], i.e. column i
+        of the effective weight matrix; stacking all E columns gives
+        every row's norm in one call) and divide the real logits by
+        (row_norm + eps) before the loss ever sees them. Recomputed
+        fresh every step (no EMA smoothing, unlike spectral_norm_
+        target's sigma_ema) -- lm_head's weights update every step via
+        its own inline backward, so a stale norm would drift; the
+        extra forward call is cheap (E rows, not O(vocab)). Default
+        False (opt-in, unvalidated against a full multi-seed sweep
+        yet -- confirmed only via the standalone numeric witness in
+        conversation).
+
+        gated_combine: replaces the plain `qkv_source = x_normed +
+        m_normed` sum with a LEARNED, content-dependent gate. Root
+        cause found directly (see conversation): every real, working
+        segment/block-recurrent transformer this project's design was
+        checked against (Recurrent Memory Transformer, Block-Recurrent
+        Transformer, Infini-attention) combines fresh input and
+        carried state either as separate attention-visible tokens or
+        through a LEARNED gate -- none of them use an untrained plain
+        elementwise sum. A plain sum forces two different signals into
+        superposition in the same channels before the network has any
+        mechanism (attention weights, a gate) to tell them apart, and
+        the state update itself (residual add + RMSNorm + hard clip)
+        has no learned forget mechanism at all -- architecturally the
+        pre-LSTM "vanilla RNN" pattern gating was invented to fix.
+
+        Two new real disldo_cls layers, `gate_x_proj`/`gate_m_proj`
+        (state_width -> state_width each), computed from x_normed/
+        m_normed SEPARATELY and summed (`gate_x_proj(x_normed) +
+        gate_m_proj(m_normed)`) -- mathematically identical to a
+        single state_width*2 -> state_width layer over the
+        concatenation, but avoids needing a Tensor concat op. Gate =
+        sigmoid(that sum), matching Infini-attention's learned gating
+        scalar in spirit, but per-channel and INPUT-DEPENDENT (a
+        function of the actual x_normed/m_normed content each step,
+        not a single static learned scalar) -- closer to a real LSTM/
+        GRU-style gate, since the task fundamentally needs
+        content-dependent decisions ("keep old state when nothing new
+        happened, overwrite when something did"), which a static gate
+        can't express.
+
+        `qkv_source = gate*x_normed + (1-gate)*m_normed`.
+
+        gate_floor: per direct instruction, the gate must NOT be able
+        to reach full-input-only (gate=1) or full-state-only (gate=0)
+        -- both are real failure modes (total forgetting every step,
+        or the state going permanently deaf to new input) -- so the
+        raw sigmoid output is rescaled into `[gate_floor,
+        1-gate_floor]` rather than used directly on `(0, 1)`. Default
+        0.1: even at full saturation, each stream always keeps >=10%
+        weight.
+
+        When `l1_sparsity_coef > 0`, `gate_x_proj`/`gate_m_proj` get
+        the same split-backward L1 term as every other real weight
+        layer (their own real inputs: x_normed/m_normed respectively)
+        -- added for the same reason input_proj's L1 coverage was:
+        dense connectivity is documented (JOURNAL.md 2026-08-13) to
+        destabilize without L1 on every real weight layer, and leaving
+        two NEW dense layers uncovered would be a foreseeable regression
+        of exactly that already-fixed failure mode, not a hypothetical
+        one. Unvalidated as a combination (same caveat as input_proj's
+        own L1 term) until tested."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
         self.num_tiles = num_tiles
         self.rms_eps = rms_eps
         self.clip_range = clip_range
+        self.cosine_lm_head = cosine_lm_head
+        self.gated_combine = gated_combine
+        self.gate_floor = gate_floor
         self.magnitude_penalty_coef = magnitude_penalty_coef
         self.spectral_norm_target = spectral_norm_target
         self.spectral_norm_ema_decay = spectral_norm_ema_decay
@@ -199,6 +299,12 @@ class ToyTileRecurrenceRealFP4:
         if rng is None:
             rng = np.random.default_rng()
         n_layer_seeds = 5 + max(o_proj_depth, 1)  # input_proj, q, k, v, lm_head + o_proj sublayer(s)
+        if gated_combine:
+            n_layer_seeds += 2  # gate_x_proj, gate_m_proj -- only reserved when
+            # actually used, so gated_combine=False callers' RNG consumption
+            # (and hence every existing test/script's reproducibility) is
+            # untouched -- same concern already flagged for spectral_norm_
+            # target's own probe-vector RNG draws above.
         layer_seeds = iter(int(s) for s in rng.integers(0, 2**31 - 1, size=n_layer_seeds))
 
         # dense=True only forwarded when set (not unconditionally) -- only
@@ -222,6 +328,14 @@ class ToyTileRecurrenceRealFP4:
         # a real learned mapping, same as q/k/v/o_proj/lm_head.
         self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
                                      rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+
+        # 0.5. Gated combine (opt-in) -- see gated_combine's own docstring
+        # above for the full rationale.
+        if gated_combine:
+            self.gate_x_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                          rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+            self.gate_m_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+                                          rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
 
         # 1. Core Attention & Output Projections
         if use_attention:
@@ -419,7 +533,16 @@ class ToyTileRecurrenceRealFP4:
         # 1. Combine Input and State
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
-        qkv_source = x_normed + m_normed
+        if self.gated_combine:
+            gate_logit = self.gate_x_proj.forward(x_normed, learning_rate) \
+                + self.gate_m_proj.forward(m_normed, learning_rate)
+            gate_raw = sigmoid_tensor(gate_logit)
+            gate = self.gate_floor + (1.0 - 2.0 * self.gate_floor) * gate_raw
+            qkv_source = gate * x_normed + (1.0 - gate) * m_normed
+            if debug:
+                dbg["gate"] = _stats("gate", gate.data)
+        else:
+            qkv_source = x_normed + m_normed
         if debug:
             dbg["qkv_source"] = _stats("qkv_source", qkv_source.data)
 
@@ -448,6 +571,9 @@ class ToyTileRecurrenceRealFP4:
 
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef)]
+            if self.gated_combine:
+                l1_terms.append(self._l1_sparsity_split(self.gate_x_proj, x_normed, learning_rate, self.l1_sparsity_coef))
+                l1_terms.append(self._l1_sparsity_split(self.gate_m_proj, m_normed, learning_rate, self.l1_sparsity_coef))
             if self.use_attention:
                 l1_terms.append(self._l1_sparsity_split(self.q_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
                 l1_terms.append(self._l1_sparsity_split(self.k_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
@@ -501,6 +627,22 @@ class ToyTileRecurrenceRealFP4:
         # 4. Generate Logits
         pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)  # [num_tiles, embed_width]
+        if self.cosine_lm_head:
+            # MUST run before any other lm_head.forward() call this step
+            # (including the L1 split below) and before the real logits
+            # forward -- disldo_cls layers cache their input on the C++
+            # side between forward()/backward() (a single most-recent
+            # -call slot, not scoped per Tensor node), so a probe call
+            # sandwiched AFTER the real forward would clobber that cached
+            # state with the wrong (probe) batch shape before the real
+            # backward ever runs -- confirmed directly (a `(4,16) vs
+            # (16,16)` broadcast crash in the real backward pass) when
+            # this was first tried in the other order. Placing it first
+            # guarantees the real `pooled`-shaped forward call below is
+            # always the LAST lm_head.forward() before backward.
+            probes = Tensor(np.eye(self.embed_width, dtype=np.float32))
+            probe_out = self.lm_head.forward(probes, 0.0).data  # [embed_width, vocab_size]
+            row_norms = np.sqrt((probe_out ** 2).sum(axis=0)) + self.rms_eps  # [vocab_size]
         if self.l1_sparsity_coef > 0.0:
             # lm_head's own direct escape route -- see l1_sparsity_coef's
             # docstring for why this can't just rely on q/k/v/o_proj's
@@ -508,6 +650,10 @@ class ToyTileRecurrenceRealFP4:
             lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate)  # [num_tiles, vocab_size]
+        if self.cosine_lm_head:
+            logits = logits / Tensor(row_norms.astype(np.float32))
+            if debug:
+                dbg["lm_head_row_norms"] = _stats("lm_head_row_norms", row_norms)
         if debug:
             dbg["logits"] = _stats("logits", logits.data)
             self._last_step_debug_stats = dbg
