@@ -32,6 +32,16 @@ import json
 import numpy as np
 import torch
 
+# Multiple instances of this script run in parallel (background ablation
+# sweep) -- each torch process defaults to using every available core for
+# its own ops, so N parallel processes on an M-core machine oversubscribe
+# to N*M effective threads and thrash instead of parallelizing (confirmed
+# directly: 7-way parallel launch on an 8-thread CPU ran ~35x slower than
+# isolated single-process timing predicted). Cap each process to 1 thread
+# so 7 processes actually divide the 8 real threads instead of fighting
+# over all of them.
+torch.set_num_threads(1)
+
 sys.path.insert(0, ".")
 
 from model.toy_recall_task import generate_mqar_sequence
