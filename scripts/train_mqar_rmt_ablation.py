@@ -28,6 +28,7 @@ from __future__ import annotations
 import sys
 import time
 import json
+from typing import Optional
 
 import numpy as np
 import torch
@@ -76,8 +77,23 @@ CONFIGS = {
     "swap_attn_bias": _swap(use_gaussian_bias=False),
     "swap_norm": _swap(use_rmsnorm=False),
     "swap_l1_sparsity": _swap(l1_sparsity_coef=0.0),
+    "swap_optimizer_and_clip": _swap(use_custom_optimizer=False, use_hard_clip=False),
     "baseline_b": _END,
 }
+
+# use_custom_optimizer=False configs need Adam's OWN properly-tuned lr
+# (0.001, matching the validated standard reference -- model/
+# toy_tile_recurrence_rmt_standard.py, task #233), NOT the custom
+# DISLDO optimizer's lr=0.01 -- confirmed as a real, not cosmetic,
+# confound directly: DISLDO's effective_lr = lr/row_degree (row_degree
+# ~=128 here) means its nominal 0.01 is really ~0.000078 effective, so
+# reusing "0.01" for plain Adam is actually ~128x too aggressive, not
+# "the same lr" at all. First pass at swap_optimizer/baseline_b using
+# a uniform lr=0.01 gave curve fits with R^2<0.6 (vs >0.99 for every
+# custom-optimizer config) -- a clear signature of lr-driven
+# instability, not a genuine "Adam is worse" result.
+_ADAM_ONLY_PEAK_LR = 0.001
+NEEDS_ADAM_LR = {"swap_optimizer", "swap_optimizer_and_clip", "baseline_b"}
 
 
 def lr_schedule(step: int, total_steps: int, peak_lr: float, warmup_steps: int) -> float:
@@ -105,8 +121,10 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
 
 
 def train_and_eval(config_name: str, num_kv_pairs: int, seed: int, train_steps: int,
-                   log_every: int = 500, log_fn=None) -> dict:
+                   log_every: int = 500, log_fn=None, peak_lr: Optional[float] = None) -> dict:
     cfg = CONFIGS[config_name]
+    if peak_lr is None:
+        peak_lr = _ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -143,7 +161,7 @@ def train_and_eval(config_name: str, num_kv_pairs: int, seed: int, train_steps: 
     recent_query_loss = []
     trajectory = []  # (step, mean_query_loss, quick_acc)
     for step in range(1, train_steps + 1):
-        lr = lr_schedule(step, train_steps, PEAK_LR, WARMUP_STEPS)
+        lr = lr_schedule(step, train_steps, peak_lr, WARMUP_STEPS)
         if opt is not None:
             for g in opt.param_groups:
                 g["lr"] = lr
@@ -202,8 +220,9 @@ def main():
     train_steps = int(sys.argv[2]) if len(sys.argv) > 2 else 3000
     seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
 
+    resolved_lr = _ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR
     print(f"# ToyTileRecurrenceRMTAblation config={config_name} train_steps={train_steps} "
-          f"seed={seed} cfg={CONFIGS[config_name]}", flush=True)
+          f"seed={seed} peak_lr={resolved_lr} cfg={CONFIGS[config_name]}", flush=True)
 
     def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc):
         print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
