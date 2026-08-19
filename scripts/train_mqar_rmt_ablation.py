@@ -219,8 +219,10 @@ def main():
     config_name = sys.argv[1] if len(sys.argv) > 1 else "baseline_a"
     train_steps = int(sys.argv[2]) if len(sys.argv) > 2 else 3000
     seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+    peak_lr_override = float(sys.argv[4]) if len(sys.argv) > 4 else None
 
-    resolved_lr = _ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR
+    resolved_lr = peak_lr_override if peak_lr_override is not None else (
+        _ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR)
     print(f"# ToyTileRecurrenceRMTAblation config={config_name} train_steps={train_steps} "
           f"seed={seed} peak_lr={resolved_lr} cfg={CONFIGS[config_name]}", flush=True)
 
@@ -228,7 +230,7 @@ def main():
         print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
               f"quick_acc={quick_acc:.4f}  ({elapsed:.0f}s elapsed)", flush=True)
 
-    r = train_and_eval(config_name, 1, seed, train_steps, log_fn=log_fn)
+    r = train_and_eval(config_name, 1, seed, train_steps, log_fn=log_fn, peak_lr=peak_lr_override)
     print(f"\nFINAL config={config_name} acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)", flush=True)
     print("TRAJECTORY_JSON " + json.dumps(r["trajectory"]), flush=True)
 
