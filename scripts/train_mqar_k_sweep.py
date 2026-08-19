@@ -115,7 +115,29 @@ def seq_len_for_k(num_kv_pairs: int) -> int:
     return minimum + (minimum % 2)
 
 
-def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None) -> dict:
+def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
+                   pool_size: int = 1, refresh_every: int = 1, eval_every: int = None) -> dict:
+    """pool_size/refresh_every: sample-efficiency fix, per direct diagnosis
+    (see conversation) -- drawing a brand-new random MQAR sequence every
+    single step gives each specific key/value/gap pattern exactly ONE
+    gradient update before being discarded, confirmed too little signal
+    to generalize within a few thousand steps at this model's scale
+    (directly verified: the SAME architecture converges from loss=9.69 to
+    0.006 on ONE repeated fixed example within 500 reps, so the
+    architecture itself is not the problem). pool_size=1/refresh_every=1
+    (the default) reproduces the original fresh-example-every-step
+    behavior exactly. pool_size=N/refresh_every=M: maintains a pool of N
+    generated sequences, cycled through round-robin, giving each ~M/N
+    gradient updates before the whole pool is replaced with N fresh
+    draws -- more repeated exposure per pattern without ever training on
+    only one example forever (which wouldn't generalize to unseen
+    key/value draws at all).
+
+    eval_every: if set, runs a real (fresh-sequence) accuracy eval every
+    this many steps and logs it via log_fn's optional 6th arg -- lets a
+    comparison between pooled and non-pooled training see the ACTUAL
+    accuracy trajectory over wall-clock time, not just training loss
+    (which can look fine while still not generalizing)."""
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -133,17 +155,42 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None) 
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
+    def _quick_eval(n_sequences: int) -> float:
+        correct, total = 0, 0
+        for _ in range(n_sequences):
+            eval_tokens, eval_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
+            eval_by_pos = dict(eval_pairs)
+            M_eval = np.zeros((num_tiles, state_width), dtype=np.float32)
+            for i in range(seq_len):
+                window = _build_tile_window(embed_table, eval_tokens, i, num_tiles, M_eval, COLUMN_NEURONS)
+                M_eval, eval_logits, _ = model.step(window, M_eval, 0.0)
+                if i in eval_by_pos:
+                    pred = predicted_token(eval_logits, num_tiles - 1)
+                    correct += int(pred == eval_by_pos[i])
+                    total += 1
+        return correct / total if total else 0.0
+
     t0 = time.time()
+    recent_query_loss = []   # raw cross-entropy on QUERY positions only, no aux --
+                             # isolates task-learning signal from the L1 penalty's
+                             # own magnitude, which would otherwise mask whether the
+                             # main task loss is moving at all.
+    pool: list = []
     for step in range(1, train_steps + 1):
         lr = lr_schedule(step, train_steps, PEAK_LR, WARMUP_STEPS)
-        tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
+        if pool_size <= 1 or (step - 1) % refresh_every == 0 or not pool:
+            pool = [generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs) for _ in range(pool_size)]
+        tokens, mqar_pairs = pool[(step - 1) % pool_size]
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
+        query_positions = set(pos for pos, _ in mqar_pairs)
         M = np.zeros((num_tiles, state_width), dtype=np.float32)
         for i in range(seq_len):
             window = _build_tile_window(embed_table, tokens, i, num_tiles, M, COLUMN_NEURONS)
             M, logits, aux = model.step(window, M, lr)
             if i in targets:
                 loss = cross_entropy_sum(logits, [(num_tiles - 1, targets[i])])
+                if i in query_positions:
+                    recent_query_loss.append(float(loss.data))
                 if aux is not None:
                     loss = loss + aux
                 loss.backward()
@@ -151,7 +198,10 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None) 
                 opt.step(model.parameters_for_optimizer(), lr=lr)
 
         if log_fn is not None and (step % max(train_steps // 10, 1) == 0 or step == train_steps):
-            log_fn(num_kv_pairs, step, train_steps, time.time() - t0)
+            mean_q_loss = float(np.mean(recent_query_loss)) if recent_query_loss else float("nan")
+            recent_query_loss = []
+            quick_acc = _quick_eval(40) if eval_every and step % eval_every == 0 else None
+            log_fn(num_kv_pairs, step, train_steps, time.time() - t0, mean_q_loss, quick_acc)
 
     correct, total = 0, 0
     for _ in range(EVAL_SEQUENCES):
@@ -181,9 +231,10 @@ def main():
           f"state_width={EMBED_WIDTH*COLUMN_NEURONS} vocab={VOCAB} "
           f"l1_sparsity_coef={L1_SPARSITY_COEF} peak_lr={PEAK_LR}", flush=True)
 
-    def log_fn(k, step, total_steps, elapsed):
-        print(f"  [K={k}] step={step:>6}/{total_steps}  ({elapsed:.0f}s elapsed, "
-              f"{elapsed/step:.4f}s/step)", flush=True)
+    def log_fn(k, step, total_steps, elapsed, mean_q_loss, quick_acc=None):
+        acc_str = f"  quick_acc={quick_acc:.4f}" if quick_acc is not None else ""
+        print(f"  [K={k}] step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  "
+              f"({elapsed:.0f}s elapsed, {elapsed/step:.4f}s/step)", flush=True)
 
     results = []
     for k in k_values:
