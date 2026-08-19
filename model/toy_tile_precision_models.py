@@ -29,7 +29,70 @@ class ToyTileRecurrenceRealFP4:
     result).
 
     `step()` returns (M_new, logits, aux_loss) -- aux_loss is None
-    unless `use_energy=True`."""
+    unless `use_energy=True`.
+
+    ── Known differences from proven segment/block-recurrent transformers ──
+    Found by direct comparison against real, working designs (Recurrent
+    Memory Transformer/RMT, Block-Recurrent Transformer, Infini-attention,
+    Perceiver IO) after this model's own K=1 MQAR runs stalled around
+    0.12-0.25 despite an fp32 hand-built witness reaching ~0.95-1.0 (see
+    conversation) -- i.e. the individual pieces (attention, RMSNorm, fp32
+    layers) provably work; something about how they're WIRED TOGETHER here
+    is the suspect. Listed so each can be ablated independently, one at a
+    time, toward whichever known-working design it's checked against --
+    NOT to be "fixed all at once," since that would confound which change
+    (if any) actually matters:
+
+    1. State/input combination (`qkv_source`) is a plain untrained
+       elementwise sum of two independently-RMSNorm'd streams
+       (`x_normed + m_normed`). Every cited design either keeps state as
+       separate attention-visible tokens (RMT: memory tokens literally
+       concatenated into the sequence) or merges via a LEARNED gate
+       (Infini-attention: sigmoid beta). Partially ablated: `gated_combine`
+       replaces the sum with a learned, per-channel, input-dependent
+       sigmoid gate -- real trained comparison (K=1 MQAR, single seed,
+       20k steps) did not yet beat the plain-sum baseline (0.133 vs
+       0.250), though loss/trajectory were the smoothest of any arm tried
+       -- inconclusive on n=1, multi-seed re-test pending.
+
+    2. State UPDATE has no learned forget gate at all -- STILL UNFIXED.
+       `M_new = M_prev + attn_o_proj_output` is a plain residual add,
+       then RMSNorm, then a hard (non-learned, autograd-bypassing) clip.
+       This is architecturally the pre-LSTM "vanilla RNN" pattern gating
+       was invented to fix. Block-Recurrent Transformer's actual
+       LSTM-style gates control exactly THIS step (forget_gate*M_prev +
+       input_gate*new_content), not the pre-attention combination --
+       `gated_combine` above gates a DIFFERENT, earlier point in the
+       pipeline and should not be assumed to substitute for this. Next
+       real ablation to build, independent of #1.
+
+    3. Readout (`pooled`) is a uniform, content-blind mean over each
+       block of `column_neurons` state channels -- every element in a
+       column contributes EQUALLY regardless of whether it actually
+       carries useful signal for that output channel. Perceiver IO (the
+       closest proven precedent for a narrow<->wide bottleneck) bridges
+       narrow<->wide via LEARNED cross-attention (the narrow side queries
+       the wide side, content-based weights) in both directions, never
+       fixed unweighted averaging. Not yet ablated.
+
+    4. State occupies the SAME `num_tiles` window slots as fresh input,
+       pre-merged before attention ever runs -- attention itself never
+       gets to choose "read from state" vs "read from input" as a
+       separate degree of freedom, since that choice is collapsed before
+       Q/K/V are even computed. RMT/Block-Recurrent Transformer instead
+       give state its own separate token(s)/cross-attention target, kept
+       genuinely distinct from input tokens throughout. Tracked as its
+       own exploration (see project task list: "Explore RMT-style
+       separate-token state"), not yet built -- a bigger structural
+       change than 1-3 above, deliberately deferred until those are
+       ruled in/out first.
+
+    Also planned (see project task list): a from-scratch reference
+    implementation of one of the proven designs above (RMT or
+    Block-Recurrent Transformer), run on the SAME K=1 MQAR task/harness
+    as a sanity control -- if a known-good design also fails here, the
+    problem is in the task/embedding/harness, not this class's
+    recurrence design specifically."""
 
     def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
                  mlp_hidden: int, num_tiles: int, max_weights: int,
