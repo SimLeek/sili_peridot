@@ -1,0 +1,13 @@
+# K=1 calibration: train_steps=200000 seed=1000 eval_every=5000 embed_width=16 column_neurons=8 state_width=128 vocab=128 l1_sparsity_coef=0.05 peak_lr=0.01
+  [K=1] step= 20000/200000  mean_query_loss=3.9772  acc=0.1000  (806s elapsed, 0.0403s/step)
+  [K=1] step= 40000/200000  mean_query_loss=3.5824  acc=0.2750  (1613s elapsed, 0.0403s/step)
+  [K=1] step= 60000/200000  mean_query_loss=3.6452  acc=0.2500  (2422s elapsed, 0.0404s/step)
+  [K=1] step= 80000/200000  mean_query_loss=3.6424  acc=0.1250  (3235s elapsed, 0.0404s/step)
+  [K=1] step=100000/200000  mean_query_loss=3.8307  acc=0.1750  (4044s elapsed, 0.0404s/step)
+  [K=1] step=120000/200000  mean_query_loss=3.7215  acc=0.0500  (4863s elapsed, 0.0405s/step)
+  [K=1] step=140000/200000  mean_query_loss=3.6531  acc=0.1500  (5674s elapsed, 0.0405s/step)
+  [K=1] step=160000/200000  mean_query_loss=3.9048  acc=0.0500  (6485s elapsed, 0.0405s/step)
+  [K=1] step=180000/200000  mean_query_loss=3.8085  acc=0.1000  (7293s elapsed, 0.0405s/step)
+  [K=1] step=200000/200000  mean_query_loss=3.7623  acc=0.2500  (8102s elapsed, 0.0405s/step)
+
+# FINAL: {'num_kv_pairs': 1, 'seq_len': 4, 'acc': 0.16666666666666666, 'elapsed_s': 8103.218326330185}  (total 8103s)
