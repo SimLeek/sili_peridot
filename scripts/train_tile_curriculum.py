@@ -316,6 +316,18 @@ ARMS = {
     "true_multi_digit_deterministic_dense": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
         n_stages=3, base=12.0, lr_power=0.0, dense=True),
+    # STOCHASTIC + dense, combined -- the two winning axes found separately
+    # this session (stochastic rounding beats deterministic for genuine
+    # superposition/rank-floor properties; dense connectivity beats sparse
+    # -echo once instability is fixed) had never actually been tested
+    # together until now. Current best-known production combination when
+    # paired with l1_sparsity_coef=0.05-0.07 at the training-script level
+    # (see main()'s own l1_sparsity_coef CLI arg) -- L1 output-sparsity is
+    # what makes dense connectivity stable at all (JOURNAL.md 2026-08-13),
+    # replacing spectral_norm_target, which is unavailable in production.
+    "true_multi_digit_stochastic_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer,
+        n_stages=3, base=12.0, lr_power=0.0, dense=True),
     "true_multi_digit_deterministic_base4_dense": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
         n_stages=3, base=4.0, lr_power=0.0, dense=True),
@@ -420,6 +432,7 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
                   "row_4bit_noscale_deterministic": 4,
                   "true_multi_digit_deterministic": 12, "true_multi_digit_stochastic": 12,
+                  "true_multi_digit_stochastic_dense": 12,
                   "true_multi_digit_noscale_deterministic": 12,
                   "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
                   "true_multi_digit_deterministic_base24": 12,
@@ -508,6 +521,12 @@ def main():
     # 0.85). None/off by default, backward-compatible, independent of
     # magnitude_penalty_coef/use_energy (composable per direct request).
     spectral_norm_target = float(sys.argv[17]) if len(sys.argv) > 17 else None
+    # l1_sparsity_coef: the LANDMARK dense-connectivity stability mechanism
+    # (see ToyTileRecurrenceRealFP4.__init__'s own docstring for the full
+    # rationale and JOURNAL.md 2026-08-13) -- reaches mean=1.0000 at
+    # coef=0.05 or 0.07, replacing spectral_norm_target entirely (do not
+    # set both). None/0.0 off by default, backward-compatible.
+    l1_sparsity_coef = float(sys.argv[18]) if len(sys.argv) > 18 else 0.0
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -539,7 +558,7 @@ def main():
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
         use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng,
         clip_range=clip_range, magnitude_penalty_coef=magnitude_penalty_coef,
-        spectral_norm_target=spectral_norm_target)
+        spectral_norm_target=spectral_norm_target, l1_sparsity_coef=l1_sparsity_coef)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 

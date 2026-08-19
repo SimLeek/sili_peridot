@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu, power
+from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu, power, tensor_abs
 from sili.sparse_rnn import DISLDOLayer
 from sili.energy import EnergyDynamics
 
@@ -40,6 +40,7 @@ class ToyTileRecurrenceRealFP4:
                  magnitude_penalty_coef: float = 0.0,
                  spectral_norm_target: Optional[float] = None,
                  spectral_norm_ema_decay: float = 0.9,
+                 l1_sparsity_coef: float = 0.0,
                  rng: Optional[np.random.Generator] = None):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
@@ -119,7 +120,41 @@ class ToyTileRecurrenceRealFP4:
         supported by autograd (out * (target/sigma_ema)) -- no new
         differentiable primitive needed anywhere. None/off by default,
         independent of magnitude_penalty_coef/use_energy (composable,
-        not mutually exclusive -- direct request to test combinations)."""
+        not mutually exclusive -- direct request to test combinations).
+
+        l1_sparsity_coef: the LANDMARK dense-connectivity stability
+        mechanism (see scripts/l1_sparsity_probe.py's own header
+        docstring and sili_peridot JOURNAL.md's 2026-08-13 entry) --
+        ported here from that probe script's standalone
+        `OriginalArchModel` reproduction, which is architecturally
+        identical to this class (single v_proj on the combined
+        qkv_source, single o_proj) and had NOT previously been merged
+        into this shared model. Found to reach mean=1.0000 across 5
+        seeds at coef=0.05 AND 0.07 on the 15000-step out-of-context
+        curriculum, dense_base12 -- the single best stability result of
+        the entire investigation, beating spectral_norm_target's own
+        0.8858 (a hard rescale, since made unavailable as a production
+        mechanism) with NO hard rescale of any kind. Do NOT combine with
+        spectral_norm_target or magnitude_penalty_coef -- combining L1
+        with an L2-ratio-shaped mechanism was tested and HURTS (0.7333
+        vs 1.0000), and spectral is off the table anyway; this is meant
+        to be used ALONE. Applied via the same "split-backward" delivery
+        as the probe: a SECOND, independent forward(..., damp_by_
+        importance=False) call per layer gives the L1 term its own
+        undamped gradient path, avoiding dilution by DISLDO's own
+        RMSprop-style per-synapse update (~1731x magnitude ratio
+        otherwise, see JOURNAL.md). Applied to q_proj/k_proj/v_proj (on
+        qkv_source), o_proj (on its own real input -- the post-attention/
+        post-energy tensor when use_attention=True, else qkv_source
+        directly), and lm_head (on pooled) -- all 5 real weight layers,
+        matching the probe's own final "lm_head previously had no L1
+        term" fix (task #176: under all_zero_init, dL/d(pooled) is
+        exactly 0 whenever W_lmhead=0, so lm_head needs this same direct
+        escape route). o_proj_depth>1 is NOT covered by the validated
+        result (the probe never tested it) -- if set, L1 is applied
+        per-sublayer using each sublayer's own real input, a direct
+        analogous extension, but treat that combination as unvalidated
+        until tested."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -129,6 +164,7 @@ class ToyTileRecurrenceRealFP4:
         self.magnitude_penalty_coef = magnitude_penalty_coef
         self.spectral_norm_target = spectral_norm_target
         self.spectral_norm_ema_decay = spectral_norm_ema_decay
+        self.l1_sparsity_coef = l1_sparsity_coef
         self.num_cpus = num_cpus
         self.use_attention = use_attention
         self.o_proj_depth = o_proj_depth
@@ -300,6 +336,17 @@ class ToyTileRecurrenceRealFP4:
         self._spectral_sigma_ema[idx] = ema
         return self.spectral_norm_target / max(ema, eps)
 
+    def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float) -> Tensor:
+        """Exact port of l1_sparsity_probe.py's own `_l1_sparsity_split`
+        -- see l1_sparsity_coef's docstring in __init__ for the full
+        rationale. A second, undamped forward call gives this term its
+        own gradient path into `layer`'s weights, independent of (and
+        not diluted by) the main-task damped forward call already made
+        elsewhere in step()."""
+        out_aux = layer.forward(input_t, lr, damp_by_importance=False)
+        n = float(np.asarray(out_aux.data).size)
+        return reduce_sum(tensor_abs(out_aux)) * (coef / n)
+
     def _apply_o_proj(self, x: Tensor, learning_rate: float) -> Tensor:
         if self.o_proj_depth > 1:
             for idx, layer in enumerate(self.o_proj):
@@ -364,10 +411,28 @@ class ToyTileRecurrenceRealFP4:
             if debug:
                 dbg["attn_raw"] = _stats("attn_raw", attn.data)
             attn, aux_loss = _apply_energy(self.energy, attn, self.num_tiles, self.state_width)
+            o_proj_input = attn
             attn = self._apply_o_proj(attn, learning_rate)
         else:
+            o_proj_input = qkv_source
             attn = self._apply_o_proj(qkv_source, learning_rate)
             aux_loss = None
+
+        if self.l1_sparsity_coef > 0.0:
+            l1_terms = []
+            if self.use_attention:
+                l1_terms.append(self._l1_sparsity_split(self.q_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
+                l1_terms.append(self._l1_sparsity_split(self.k_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
+                l1_terms.append(self._l1_sparsity_split(self.v_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
+            if self.o_proj_depth > 1:
+                cur = o_proj_input
+                for layer in self.o_proj:
+                    l1_terms.append(self._l1_sparsity_split(layer, cur, learning_rate, self.l1_sparsity_coef))
+                    cur = layer.forward(cur, 0.0)
+            else:
+                l1_terms.append(self._l1_sparsity_split(self.o_proj, o_proj_input, learning_rate, self.l1_sparsity_coef))
+            for term in l1_terms:
+                aux_loss = term if aux_loss is None else aux_loss + term
         # Forward clip on the residual UPDATE itself, not just the final
         # state (see clip below) -- found NECESSARY, not just belt-and
         # -suspenders: gradient clipping alone (clip_grad_norm_ on the
@@ -408,6 +473,12 @@ class ToyTileRecurrenceRealFP4:
         # 4. Generate Logits
         pooled = M_new_t.reshape((self.num_tiles, self.embed_width, self.column_neurons))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)  # [num_tiles, embed_width]
+        if self.l1_sparsity_coef > 0.0:
+            # lm_head's own direct escape route -- see l1_sparsity_coef's
+            # docstring for why this can't just rely on q/k/v/o_proj's
+            # terms (dL/d(pooled) is exactly 0 whenever W_lmhead=0).
+            lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef)
+            aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate)  # [num_tiles, vocab_size]
         if debug:
             dbg["logits"] = _stats("logits", logits.data)
