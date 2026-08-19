@@ -143,10 +143,14 @@ class ToyTileRecurrenceRealFP4:
         importance=False) call per layer gives the L1 term its own
         undamped gradient path, avoiding dilution by DISLDO's own
         RMSprop-style per-synapse update (~1731x magnitude ratio
-        otherwise, see JOURNAL.md). Applied to q_proj/k_proj/v_proj (on
-        qkv_source), o_proj (on its own real input -- the post-attention/
-        post-energy tensor when use_attention=True, else qkv_source
-        directly), and lm_head (on pooled) -- all 5 real weight layers,
+        otherwise, see JOURNAL.md). Applied to input_proj (on the raw
+        narrow x_window), q_proj/k_proj/v_proj (on qkv_source), o_proj
+        (on its own real input -- the post-attention/post-energy tensor
+        when use_attention=True, else qkv_source directly), and lm_head
+        (on pooled) -- all 6 real weight layers (5 at the time this was
+        first validated, before input_proj existed -- see conversation
+        for why input_proj was added; treat its own L1 coverage as a
+        direct, analogous extension, not independently re-validated),
         matching the probe's own final "lm_head previously had no L1
         term" fix (task #176: under all_zero_init, dL/d(pooled) is
         exactly 0 whenever W_lmhead=0, so lm_head needs this same direct
@@ -194,7 +198,7 @@ class ToyTileRecurrenceRealFP4:
         # stochastic rounding.
         if rng is None:
             rng = np.random.default_rng()
-        n_layer_seeds = 4 + max(o_proj_depth, 1)  # q, k, v, lm_head + o_proj sublayer(s)
+        n_layer_seeds = 5 + max(o_proj_depth, 1)  # input_proj, q, k, v, lm_head + o_proj sublayer(s)
         layer_seeds = iter(int(s) for s in rng.integers(0, 2**31 - 1, size=n_layer_seeds))
 
         # dense=True only forwarded when set (not unconditionally) -- only
@@ -204,6 +208,20 @@ class ToyTileRecurrenceRealFP4:
         # option would TypeError on an unexpected kwarg otherwise, breaking
         # every caller that doesn't ask for it.
         dense_kwargs = {"dense": True} if dense else {}
+
+        # 0. Input projection: embed_width -> state_width, a REAL trained
+        # layer, not the np.repeat tiling this class used to receive its
+        # window through. Direct correction (see conversation): column-
+        # averaging's actual purpose is letting a narrow OUTPUT's gradient
+        # reach the entire wide state on readout (mean-pool down, so
+        # d(mean)/d(each element)=1/column_neurons spreads credit to every
+        # column) -- applying that same repeat/average pairing to the
+        # INPUT side too was a misapplication of the same operator to a
+        # problem it was never meant to solve, not an intentional design.
+        # The wide state's actual content for a fresh token must come from
+        # a real learned mapping, same as q/k/v/o_proj/lm_head.
+        self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
+                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
 
         # 1. Core Attention & Output Projections
         if use_attention:
@@ -361,9 +379,13 @@ class ToyTileRecurrenceRealFP4:
 
     def step(self, x_window: np.ndarray, M_prev: np.ndarray,
              learning_rate: float, debug: bool = False) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
-        """One recurrence tick. x_window, M_prev: [num_tiles,
-        state_width] numpy, DETACHED (no BPTT, matching
-        ToyTileRecurrence's own design). Returns (M_new numpy [num_tiles,
+        """One recurrence tick. x_window: [num_tiles, embed_width] numpy
+        (a real, narrow per-tile input -- e.g. a token embedding, or
+        zeros for "nothing here yet" -- mapped into the wide state by
+        input_proj, a real trained layer, NOT tiled/repeated by the
+        caller; see input_proj's own docstring in __init__ for why).
+        M_prev: [num_tiles, state_width] numpy, DETACHED (no BPTT,
+        matching ToyTileRecurrence's own design). Returns (M_new numpy [num_tiles,
         state_width], logits Tensor [num_tiles, vocab_size], aux_loss).
 
         `debug=True`: records per-stage value statistics (mean/std/min/
@@ -388,8 +410,14 @@ class ToyTileRecurrenceRealFP4:
 
         dbg = {} if debug else None
 
+        # 0. Project the narrow per-tile input into the wide state.
+        x_window_t = Tensor(x_window.astype(np.float32))
+        x_wide = self.input_proj.forward(x_window_t, learning_rate)
+        if debug:
+            dbg["x_wide"] = _stats("x_wide", x_wide.data)
+
         # 1. Combine Input and State
-        x_normed = rmsnorm_tensor(Tensor(x_window.astype(np.float32)), self.input_ln, self.rms_eps)
+        x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         qkv_source = x_normed + m_normed
         if debug:
@@ -419,7 +447,7 @@ class ToyTileRecurrenceRealFP4:
             aux_loss = None
 
         if self.l1_sparsity_coef > 0.0:
-            l1_terms = []
+            l1_terms = [self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef)]
             if self.use_attention:
                 l1_terms.append(self._l1_sparsity_split(self.q_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
                 l1_terms.append(self._l1_sparsity_split(self.k_proj, qkv_source, learning_rate, self.l1_sparsity_coef))

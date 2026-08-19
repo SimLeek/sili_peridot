@@ -58,6 +58,7 @@ from model.toy_recall_task import generate_mqar_sequence
 from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule, clip_grad_norm_
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
 from model.toy_precision_models import TrueMultiDigitLayer
+from scripts.train_tile_curriculum import _build_tile_window
 import functools
 
 EMBED_WIDTH = 16
@@ -96,15 +97,11 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
     return targets
 
 
-def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                       num_tiles: int, M_prev: np.ndarray, column_neurons: int) -> np.ndarray:
-    state_width = embed_table.shape[1] * column_neurons
-    window = np.empty((num_tiles, state_width), dtype=np.float32)
-    for j in range(num_tiles):
-        src = i - (num_tiles - 1) + j
-        window[j] = (np.repeat(embed_table[tokens[src]], column_neurons)
-                     if src >= 0 else M_prev[j])
-    return window
+# _build_tile_window now lives in train_tile_curriculum.py (imported
+# above) -- narrow [num_tiles, embed_width] window, zero-filled for
+# "nothing here yet", no M_prev carry-over and no np.repeat tiling
+# (see ToyTileRecurrenceRealFP4's own docstring for why: input_proj is
+# now the real, trained narrow->wide mapping).
 
 
 def seq_len_for_k(num_kv_pairs: int) -> int:
@@ -162,7 +159,7 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
             eval_by_pos = dict(eval_pairs)
             M_eval = np.zeros((num_tiles, state_width), dtype=np.float32)
             for i in range(seq_len):
-                window = _build_tile_window(embed_table, eval_tokens, i, num_tiles, M_eval, COLUMN_NEURONS)
+                window = _build_tile_window(embed_table, eval_tokens, i, num_tiles)
                 M_eval, eval_logits, _ = model.step(window, M_eval, 0.0)
                 if i in eval_by_pos:
                     pred = predicted_token(eval_logits, num_tiles - 1)
@@ -185,7 +182,7 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
         query_positions = set(pos for pos, _ in mqar_pairs)
         M = np.zeros((num_tiles, state_width), dtype=np.float32)
         for i in range(seq_len):
-            window = _build_tile_window(embed_table, tokens, i, num_tiles, M, COLUMN_NEURONS)
+            window = _build_tile_window(embed_table, tokens, i, num_tiles)
             M, logits, aux = model.step(window, M, lr)
             if i in targets:
                 loss = cross_entropy_sum(logits, [(num_tiles - 1, targets[i])])
@@ -209,7 +206,7 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
         mqar_by_pos = dict(mqar_pairs)
         M = np.zeros((num_tiles, state_width), dtype=np.float32)
         for i in range(seq_len):
-            window = _build_tile_window(embed_table, tokens, i, num_tiles, M, COLUMN_NEURONS)
+            window = _build_tile_window(embed_table, tokens, i, num_tiles)
             M, logits, _aux = model.step(window, M, 0.0)
             if i in mqar_by_pos:
                 pred = predicted_token(logits, num_tiles - 1)

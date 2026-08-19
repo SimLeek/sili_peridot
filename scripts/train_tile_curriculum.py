@@ -385,13 +385,24 @@ def _maybe_synaptogenesis(model, k: int = 4, importance_cutoff: float = 0.01):
 
 
 def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                       num_tiles: int, column_neurons: int) -> np.ndarray:
-    state_width = embed_table.shape[1] * column_neurons
-    window = np.zeros((num_tiles, state_width), dtype=np.float32)
+                       num_tiles: int, column_neurons: int = None) -> np.ndarray:
+    """Returns [num_tiles, embed_width] -- a real embed_width vector per
+    tile position (zeros for "nothing here yet", before sequence start),
+    NOT tiled/repeated into state_width. The model's own input_proj
+    layer maps this into the wide recurrent state (see
+    ToyTileRecurrenceRealFP4's own docstring for the full correction:
+    that used to be done via np.repeat here, a misapplication of
+    column-averaging's actual purpose -- letting a narrow OUTPUT's
+    gradient reach the whole wide state on readout -- to the input side,
+    which was never what it was for). column_neurons kept as an unused,
+    ignored parameter for backward-compat with existing call sites that
+    still pass it; new callers should omit it."""
+    embed_width = embed_table.shape[1]
+    window = np.zeros((num_tiles, embed_width), dtype=np.float32)
     for j in range(num_tiles):
         src = i - (num_tiles - 1) + j
         if src >= 0:
-            window[j] = np.repeat(embed_table[tokens[src]], column_neurons)
+            window[j] = embed_table[tokens[src]]
     return window
 
 
