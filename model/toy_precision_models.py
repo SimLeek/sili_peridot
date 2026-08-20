@@ -883,6 +883,16 @@ class TrueMultiDigitLayer:
             if hasattr(digit, "synaptogenesis"):
                 digit.synaptogenesis(k, importance_cutoff, digit._max_row_weights)
 
+    def magnitude_rescale_output(self, target: float, correction_rate: float,
+                                 scale_invariant: bool = False) -> None:
+        """Delegate to each digit's own real magnitude_rescale_output
+        (sili.sparse_rnn._SparseLayerBase.magnitude_rescale_output) --
+        same independent-per-digit pattern as synaptogenesis above (no
+        shared-scale coordination across digits)."""
+        for digit in self.digits:
+            if hasattr(digit, "_c") and hasattr(digit._c, "magnitude_rescale_output"):
+                digit.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
     def parameters(self) -> List[Tensor]:
         return []
 

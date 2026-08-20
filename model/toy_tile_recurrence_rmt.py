@@ -47,6 +47,7 @@ class ToyTileRecurrenceRMT:
                  dense: bool = False, clip_range: float = 6.0,
                  l1_sparsity_coef: float = 0.0,
                  synapse_kwargs: Optional[dict] = None,
+                 scale_rank: int = 1,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -82,19 +83,26 @@ class ToyTileRecurrenceRMT:
         n_layer_seeds = 6  # input_proj, q, k, v, o_proj, lm_head
         layer_seeds = iter(int(s) for s in rng.integers(0, 2**31 - 1, size=n_layer_seeds))
         dense_kwargs = {"dense": True} if dense else {}
+        # Conditionally forwarded, matching dense_kwargs' own pattern --
+        # only DISLDOLayer/DISLDOLayerDeterministic/DISLDOLayer8-family
+        # (and TrueMultiDigitLayer, which forwards it into each digit)
+        # accept scale_rank at all; unconditionally splatting it would
+        # TypeError any disldo_cls that doesn't (e.g. DISLDOLayer32).
+        rank_kwargs = {"scale_rank": scale_rank} if scale_rank != 1 else {}
+        layer_kwargs = {**dense_kwargs, **rank_kwargs}
 
         self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+                                     rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
         self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                 rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+                                 rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
         self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                 rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+                                 rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
         self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                 rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+                                 rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
         self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                 rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+                                 rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
-                                  rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+                                  rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
 
         # Separate RMSNorm gains for memory vs content tokens -- unlike
         # ToyTileRecurrenceRealFP4 (which reuses one input_ln for both
@@ -111,6 +119,22 @@ class ToyTileRecurrenceRMT:
 
     def parameters_for_optimizer(self) -> List[Tensor]:
         return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
+
+    def magnitude_rescale_output(self, target: float, correction_rate: float,
+                                 scale_invariant: bool = False) -> None:
+        """Apply magnitude_rescale_output to every real disldo_cls weight
+        layer (input_proj/q/k/v/o_proj/lm_head) -- skips a layer whose
+        backend has no scale concept at all (e.g. the fp32 DISLDOLayerV
+        control), matching _SparseLayerBase.magnitude_rescale_output's
+        own guard convention. Meant to be called periodically from the
+        training loop, not every step (see delta_csr_types.hpp's own
+        magnitude_rescale_output docstring for its intended cadence)."""
+        for layer in (self.input_proj, self.q_proj, self.k_proj,
+                     self.v_proj, self.o_proj, self.lm_head):
+            if hasattr(layer, "_c") and hasattr(layer._c, "magnitude_rescale_output"):
+                layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
+            elif hasattr(layer, "magnitude_rescale_output") and hasattr(layer, "digits"):
+                layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
 
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float) -> Tensor:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its
