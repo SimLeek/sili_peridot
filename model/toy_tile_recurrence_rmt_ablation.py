@@ -78,7 +78,8 @@ class ToyTileRecurrenceRMTAblation:
                  clip_range: float = 6.0, l1_sparsity_coef: float = 0.0,
                  use_custom_optimizer: bool = True, use_hard_clip: bool = True,
                  use_gaussian_bias: bool = True, use_rmsnorm: bool = True,
-                 rng: Optional[np.random.Generator] = None):
+                 rng: Optional[np.random.Generator] = None,
+                 optimizer_kwargs: Optional[dict] = None):
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -96,10 +97,11 @@ class ToyTileRecurrenceRMTAblation:
         if rng is None:
             rng = np.random.default_rng()
         sw = self.state_width
+        self.optimizer_kwargs = optimizer_kwargs or {}
 
         def make_linear(in_f, out_f):
-            return DISLDOTorchLinear(in_f, out_f, rng=rng) if use_custom_optimizer \
-                else PlainAdamLinear(in_f, out_f)
+            return DISLDOTorchLinear(in_f, out_f, rng=rng, **self.optimizer_kwargs) \
+                if use_custom_optimizer else PlainAdamLinear(in_f, out_f)
 
         self.input_proj = make_linear(embed_width, sw)
         self.q_proj = make_linear(sw, sw)

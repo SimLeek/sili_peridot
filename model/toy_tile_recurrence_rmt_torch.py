@@ -137,7 +137,21 @@ class DISLDOTorchLinear:
                  beta2: float = 0.999, eps: float = 1e-8,
                  max_abs_delta: float = 2.0, max_ci: float = 100.0,
                  min_decay_frac: float = 0.0, lr_per_row_nnz: bool = True,
-                 rng: Optional[np.random.Generator] = None):
+                 rng: Optional[np.random.Generator] = None,
+                 bias_correct_ci: bool = False, use_momentum: bool = False,
+                 momentum_beta1: float = 0.9, include_contrib_in_ci: bool = True,
+                 clip_raw_delta: bool = True):
+        """The five bias_correct_ci/use_momentum/momentum_beta1/
+        include_contrib_in_ci/clip_raw_delta args default to exactly
+        the production C++ BoundedRMSpropSynapsePolicy's own behavior
+        (no bias correction, no momentum, contrib^2 included, raw
+        delta hard-clipped) -- they exist to let single-factor
+        optimizer-internals ablation run cheaply in torch before
+        touching delta_csr_types.hpp, not to change the default. Note
+        the asymmetry this exposes: RMSpropScalePolicy's own
+        _scale_update DOES bias-correct its EMA (see below) while this
+        per-synapse update never has -- bias_correct_ci=True makes the
+        two consistent."""
         self.in_features = in_features
         self.out_features = out_features
         self.beta2 = beta2
@@ -146,6 +160,11 @@ class DISLDOTorchLinear:
         self.max_ci = max_ci
         self.min_decay_frac = min_decay_frac
         self.lr_per_row_nnz = lr_per_row_nnz
+        self.bias_correct_ci = bias_correct_ci
+        self.use_momentum = use_momentum
+        self.momentum_beta1 = momentum_beta1
+        self.include_contrib_in_ci = include_contrib_in_ci
+        self.clip_raw_delta = clip_raw_delta
 
         if rng is None:
             rng = np.random.default_rng()
@@ -158,6 +177,8 @@ class DISLDOTorchLinear:
         self.value_scale = torch.ones(in_features, dtype=torch.float32)
         self.output_scale = torch.ones(out_features, dtype=torch.float32)
         self.ci = torch.zeros((in_features, out_features), dtype=torch.float32)
+        self.m = torch.zeros((in_features, out_features), dtype=torch.float32)
+        self.ci_step = 0
         self.value_scale_state = torch.zeros(in_features, dtype=torch.float32)
         self.output_scale_state = torch.zeros(out_features, dtype=torch.float32)
         self.value_scale_step = 0
@@ -200,12 +221,33 @@ class DISLDOTorchLinear:
             x_sum = x_det.sum(dim=0)                            # [in]
             contrib = w_det * x_sum.unsqueeze(1)                # [in, out]
 
-            ema = self.beta2 * self.ci + (1.0 - self.beta2) * (g * g + contrib * contrib)
+            sq_term = g * g
+            if self.include_contrib_in_ci:
+                sq_term = sq_term + contrib * contrib
+            ema = self.beta2 * self.ci + (1.0 - self.beta2) * sq_term
             floor = self.min_decay_frac * self.ci
             self.ci = torch.clamp(torch.maximum(ema, floor), max=self.max_ci)
+            self.ci_step += 1
 
-            raw = (-g) / (torch.sqrt(self.ci) + self.eps) if damp else -g
-            raw = torch.clamp(raw, -self.max_abs_delta, self.max_abs_delta)
+            if self.bias_correct_ci:
+                bc2 = 1.0 - self.beta2 ** self.ci_step
+                ci_hat = self.ci / bc2 if bc2 > 0 else self.ci
+            else:
+                ci_hat = self.ci
+
+            if self.use_momentum:
+                self.m = self.momentum_beta1 * self.m + (1.0 - self.momentum_beta1) * g
+                if self.bias_correct_ci:
+                    bc1 = 1.0 - self.momentum_beta1 ** self.ci_step
+                    numerator = -(self.m / bc1 if bc1 > 0 else self.m)
+                else:
+                    numerator = -self.m
+            else:
+                numerator = -g
+
+            raw = numerator / (torch.sqrt(ci_hat) + self.eps) if damp else numerator
+            if self.clip_raw_delta:
+                raw = torch.clamp(raw, -self.max_abs_delta, self.max_abs_delta)
             self.w_stored = self.w_stored + eff_lr * raw
 
             g_row = g.sum(dim=1)
