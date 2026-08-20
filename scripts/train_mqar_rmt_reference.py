@@ -26,7 +26,7 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayer8
 from sili import _cpu
 from model.toy_recall_task import generate_mqar_sequence
 from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule, clip_grad_norm_
@@ -51,6 +51,14 @@ DISLDO_CLS_BY_PRECISION = {
     "fp4": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
                              n_stages=3, base=12.0, lr_power=0.0, dense=True),
     "fp32": DISLDOLayer32,
+    # Single-digit real FP8 E4M3 (fp8quant.hpp), NOT wrapped in
+    # TrueMultiDigitLayer -- per conversation, E4M3's own native
+    # dynamic range (~17.8 bits with subnormals, floor ~0.00195) already
+    # covers the trained-dense-weight distribution better than 3-stage
+    # multi-digit FP4 (~10.9 bits, floor ~0.0035) while using FEWER
+    # total bits (8 vs 12), so this tests it directly rather than
+    # building a new custom mantissa+exponent codec.
+    "fp8": DISLDOLayer8,
 }
 
 

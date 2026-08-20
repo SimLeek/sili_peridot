@@ -86,10 +86,12 @@ quantize/dequantize round-trip a real 4-bit/8-bit storage would add).
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+from .fake_quantize_torch import fake_quantize
 
 
 def straight_through_clip(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
@@ -141,7 +143,15 @@ class DISLDOTorchLinear:
                  bias_correct_ci: bool = False, use_momentum: bool = False,
                  momentum_beta1: float = 0.9, include_contrib_in_ci: bool = True,
                  clip_raw_delta: bool = True, include_scale_chain_rule: bool = False,
-                 clip_pre_ci: bool = False, pre_ci_clip_value: Optional[float] = None):
+                 clip_pre_ci: bool = False, pre_ci_clip_value: Optional[float] = None,
+                 scale_grad_diag_fn: Optional[Callable] = None,
+                 use_magnitude_scale: bool = False, magnitude_scale_target: float = 16.0,
+                 magnitude_correction_rate: float = 0.01,
+                 fake_quantize_kind: Optional[str] = None,
+                 scale_invariant_chain_rule: bool = False,
+                 fake_quantize_stochastic: bool = False,
+                 magnitude_rescale_ema_beta: Optional[float] = None,
+                 magnitude_scale_both_axes: bool = False):
         """The five bias_correct_ci/use_momentum/momentum_beta1/
         include_contrib_in_ci/clip_raw_delta args default to exactly
         the production C++ BoundedRMSpropSynapsePolicy's own behavior
@@ -170,6 +180,27 @@ class DISLDOTorchLinear:
         difference (not the clip, not batch-consistency -- both already
         investigated) is what makes sili's real engine underperform
         this same architecture in torch.
+
+        use_magnitude_scale: default False -- direct measurement (this
+        conversation) found value_scale/output_scale's OWN RMSprop
+        gradient signal is ~65-88% cancelled by cross-row/cross-column
+        sign disagreement among the per-synapse contributions that get
+        summed into it (worst in the 128-wide q/k/v/o_proj layers), so
+        it barely moves from its 1.0 init even in a fully-converged
+        run -- a genuine rank-1 structural limit (project task #196),
+        not a weak-signal problem. That leaves w_stored's own raw
+        magnitude to do ALL the work of representing small weights,
+        which is fine in fp32 but pushes the STORED CODE into a
+        quantizer's coarse/subnormal region once the codec is FP4/FP8.
+        This is a gradient-FREE fix instead of trying to un-cancel that
+        signal: a pure reparametrization that keeps true_weight =
+        w_stored*value_scale*output_scale algebraically IDENTICAL while
+        moving magnitude from output_scale into w_stored (or back) each
+        step, so w_stored's own per-column RMS tracks toward
+        magnitude_scale_target -- chosen once, not learned, so it can't
+        be cancelled. No effect at all in fp32 (same true_weight either
+        way); the whole point is giving the STORED representation a
+        favorable magnitude before quantization ever happens.
 
         clip_pre_ci: default False -- targets a DIFFERENT failure mode
         than clip_raw_delta (which clips the post-division update, AFTER
@@ -201,6 +232,17 @@ class DISLDOTorchLinear:
         self.clip_raw_delta = clip_raw_delta
         self.clip_pre_ci = clip_pre_ci
         self.pre_ci_clip_value = pre_ci_clip_value if pre_ci_clip_value is not None else max_abs_delta
+        self.scale_grad_diag_fn = scale_grad_diag_fn
+        self.use_magnitude_scale = use_magnitude_scale
+        self.magnitude_scale_target = magnitude_scale_target
+        self.magnitude_correction_rate = magnitude_correction_rate
+        self.fake_quantize_kind = fake_quantize_kind
+        self.scale_invariant_chain_rule = scale_invariant_chain_rule
+        self.fake_quantize_stochastic = fake_quantize_stochastic
+        self.magnitude_rescale_ema_beta = magnitude_rescale_ema_beta
+        self.col_rms_ema: Optional[torch.Tensor] = None
+        self.magnitude_scale_both_axes = magnitude_scale_both_axes
+        self.row_rms_ema: Optional[torch.Tensor] = None
 
         if rng is None:
             rng = np.random.default_rng()
@@ -298,41 +340,224 @@ class DISLDOTorchLinear:
             else:
                 ci_hat = self.ci
 
+            # scale_invariant_chain_rule: default False. Both branches
+            # above (chain_rule on OR off) share ci tracking RAW g^2 (see
+            # g_for_ci above, unaffected by include_scale_chain_rule) --
+            # but when chain_rule=True, numerator=g*S while ci is
+            # calibrated to plain g^2, so raw=numerator/sqrt(ci_hat)
+            # scales LINEARLY with S (not O(1)-normalized), making
+            # Delta(true_weight)=S*Delta(w_stored) scale QUADRATICALLY
+            # with S -- i.e. the effective learning rate for true_weight
+            # silently collapses as S shrinks (or explodes as S grows).
+            # Never surfaced before because every prior config left S
+            # near its 1.0 init (value_scale/output_scale barely move --
+            # see the cross-column-cancellation finding, this
+            # conversation) -- magnitude_scale is the first mechanism
+            # that deliberately drives S away from 1, exposing it.
+            # Fix: compute raw from the RAW gradient g (properly self-
+            # normalized by ci, which already tracks g^2), giving a
+            # step that's a fixed size in TRUE_WEIGHT units regardless
+            # of parametrization -- then convert to w_stored's own
+            # units by dividing by S (the correct inverse chain rule),
+            # so Delta(true_weight) = S * (eff_lr*raw/S) = eff_lr*raw,
+            # independent of S entirely. Per direct instruction: this
+            # (not a one-off rescale patch) is the fix -- remove the
+            # "S stays near 1" assumption, don't just compensate for it
+            # after the fact.
+            numerator_for_ci_norm = -g if (self.scale_invariant_chain_rule and self.include_scale_chain_rule) else -g_for_w
+
             if self.use_momentum:
-                self.m = self.momentum_beta1 * self.m + (1.0 - self.momentum_beta1) * g_for_w
+                self.m = self.momentum_beta1 * self.m + (1.0 - self.momentum_beta1) * numerator_for_ci_norm
                 if self.bias_correct_ci:
                     bc1 = 1.0 - self.momentum_beta1 ** self.ci_step
-                    numerator = -(self.m / bc1 if bc1 > 0 else self.m)
+                    numerator = (self.m / bc1 if bc1 > 0 else self.m)
                 else:
-                    numerator = -self.m
+                    numerator = self.m
             else:
-                numerator = -g_for_w
+                numerator = numerator_for_ci_norm
 
             raw = numerator / (torch.sqrt(ci_hat) + self.eps) if damp else numerator
             if self.clip_raw_delta:
                 raw = torch.clamp(raw, -self.max_abs_delta, self.max_abs_delta)
-            new_w = self.w_stored + eff_lr * raw
+            if self.scale_invariant_chain_rule and self.include_scale_chain_rule:
+                delta_w = eff_lr * raw / S
+            else:
+                delta_w = eff_lr * raw
+            new_w = self.w_stored + delta_w
             if torch.isfinite(new_w).all():
                 self.w_stored = new_w
+            if self.fake_quantize_kind is not None:
+                # Quantize IMMEDIATELY, not once at the very end of the
+                # step -- the real production system keeps NO float
+                # shadow of any weight (see TrueMultiDigitLayer's own
+                # docstring: "a real hardware implementation has no
+                # room for a hidden full-precision shadow"); every
+                # update writes directly to the quantized representation.
+                # Quantizing only once per step (as this code used to)
+                # let w_stored silently accumulate float precision
+                # between the RMSprop step and the magnitude-rescale
+                # step below, which isn't how the real system behaves.
+                self.w_stored = fake_quantize(self.w_stored, self.fake_quantize_kind,
+                                              stochastic=self.fake_quantize_stochastic)
 
             g_row = g_row_signal.sum(dim=1)
             contrib_row = contrib_row_signal.sum(dim=1)
+            if self.scale_grad_diag_fn is not None:
+                self.scale_grad_diag_fn("value_scale", g_row_signal, g_row)
             self.value_scale_step += 1
             self._scale_update("value_scale", g_row, contrib_row, eff_lr, self.value_scale_step)
 
             g_col = g_col_signal.sum(dim=0)
             contrib_col = contrib_col_signal.sum(dim=0)
+            if self.scale_grad_diag_fn is not None:
+                self.scale_grad_diag_fn("output_scale", g_col_signal, g_col)
             self.output_scale_step += 1
             self._scale_update("output_scale", g_col, contrib_col, eff_lr, self.output_scale_step)
+
+            if self.use_magnitude_scale:
+                self._magnitude_rescale()  # re-quantizes internally, see its own docstring
+
+    def _magnitude_rescale(self) -> None:
+        """Gradient-free reparametrization: true_weight = w_stored *
+        value_scale * output_scale is UNCHANGED by this (algebraically),
+        only WHERE the magnitude lives changes -- moves each column's
+        share of magnitude between w_stored and output_scale so
+        w_stored's own per-column RMS drifts toward magnitude_scale_target
+        (a fixed constant, so it can't be cancelled the way a gradient-
+        summed target could be). Applies a DAMPED (magnitude_correction_
+        rate) step toward the full correction each call rather than
+        jumping all the way there, so it doesn't fight the RMSprop
+        updates that just happened in the same step.
+
+        ci (per-synapse RMSprop denominator) accumulates g^2+contrib^2
+        from the RAW chain-rule gradient g, which is independent of how
+        magnitude is split between w_stored/output_scale -- but the
+        actual update numerator is g*S (S=value_scale*output_scale).
+        Shrinking output_scale by k shrinks S by k, shrinking the
+        numerator, while ci (calibrated to g^2, not (g*S)^2) doesn't
+        track that -- silently damping w_stored's own effective step
+        size every time this fires. Found empirically: without this,
+        fp32 accuracy dropped 1.0->0.18 despite true_weight being
+        algebraically unchanged. Rescaling ci by k^2 alongside keeps it
+        calibrated to the new S regime -- ONLY needed when
+        scale_invariant_chain_rule is off: that flag already decouples
+        ci from S entirely (ci tracks raw g^2 and the S-dependence is
+        removed via explicit division at apply time instead), so
+        rescaling ci here too would double-correct and be wrong.
+
+        magnitude_rescale_ema_beta: default None (use the instantaneous
+        col_rms each call). With fake_quantize active, w_stored has
+        ALREADY been quantized to a coarse grid by the time this runs
+        (immediately above, in apply_pending_updates) -- measuring
+        col_rms from that coarsely-rounded w_stored means the rescale
+        target itself carries quantization noise, and since this fires
+        EVERY step (not periodically), that noise feeds straight back
+        into the next quantize call, compounding. Found empirically:
+        fp32 (no quantization noise in the measurement) reaches a clean
+        1.0 with this mechanism, but fake-fp8 collapses to 0.0 despite
+        the SAME optimizer math. Set magnitude_rescale_ema_beta (e.g.
+        0.9) to track an EMA of col_rms across steps instead, filtering
+        out per-step quantization jitter from the signal driving k."""
+        with torch.no_grad():
+            instant_col_rms = torch.sqrt((self.w_stored ** 2).mean(dim=0) + self.eps)
+            if self.magnitude_rescale_ema_beta is not None:
+                if self.col_rms_ema is None:
+                    self.col_rms_ema = instant_col_rms.clone()
+                else:
+                    beta = self.magnitude_rescale_ema_beta
+                    self.col_rms_ema = beta * self.col_rms_ema + (1.0 - beta) * instant_col_rms
+                col_rms = self.col_rms_ema
+            else:
+                col_rms = instant_col_rms
+            k = (self.magnitude_scale_target / col_rms).clamp(min=1e-6) ** self.magnitude_correction_rate
+            new_w = self.w_stored * k.unsqueeze(0)
+            new_output_scale = self.output_scale / k
+            if self.scale_invariant_chain_rule:
+                new_ci = self.ci
+            else:
+                new_ci = self.ci / (k.unsqueeze(0) ** 2)
+            if (torch.isfinite(new_w).all() and torch.isfinite(new_output_scale).all()
+                    and torch.isfinite(new_ci).all()):
+                self.w_stored = new_w
+                self.output_scale = new_output_scale
+                self.ci = new_ci
+                if self.fake_quantize_kind is not None:
+                    # Same "no float shadow" reasoning as the RMSprop
+                    # update site -- re-quantize immediately, this
+                    # rescaled w_stored is what actually gets "stored".
+                    self.w_stored = fake_quantize(self.w_stored, self.fake_quantize_kind,
+                                                  stochastic=self.fake_quantize_stochastic)
+
+            if self.magnitude_scale_both_axes:
+                # SAME treatment on the ROW axis (value_scale) -- per
+                # direct question: this whole mechanism only ever
+                # touched output_scale (columns), value_scale (rows)
+                # was left to its own cancellation-limited RMSprop
+                # signal and barely moves (see cross-row-cancellation
+                # finding, this conversation). Nothing about the
+                # mechanism is column-specific; applying it symmetrically
+                # gives the full rank-1 (value_scale (x) output_scale)
+                # envelope the same magnitude-matching ability on both
+                # axes, not just one -- and is a useful data point for
+                # whether rank-2 (task #196) is worth the extra cost:
+                # if a second SHARED axis doesn't help even when it's
+                # allowed to move freely, more basis vectors on the same
+                # axis structure are unlikely to help more.
+                row_rms_instant = torch.sqrt((self.w_stored ** 2).mean(dim=1) + self.eps)
+                if self.magnitude_rescale_ema_beta is not None:
+                    if self.row_rms_ema is None:
+                        self.row_rms_ema = row_rms_instant.clone()
+                    else:
+                        beta = self.magnitude_rescale_ema_beta
+                        self.row_rms_ema = beta * self.row_rms_ema + (1.0 - beta) * row_rms_instant
+                    row_rms = self.row_rms_ema
+                else:
+                    row_rms = row_rms_instant
+                k_row = (self.magnitude_scale_target / row_rms).clamp(min=1e-6) ** self.magnitude_correction_rate
+                new_w_row = self.w_stored * k_row.unsqueeze(1)
+                new_value_scale = self.value_scale / k_row
+                if self.scale_invariant_chain_rule:
+                    new_ci_row = self.ci
+                else:
+                    new_ci_row = self.ci / (k_row.unsqueeze(1) ** 2)
+                if (torch.isfinite(new_w_row).all() and torch.isfinite(new_value_scale).all()
+                        and torch.isfinite(new_ci_row).all()):
+                    self.w_stored = new_w_row
+                    self.value_scale = new_value_scale
+                    self.ci = new_ci_row
+                    if self.fake_quantize_kind is not None:
+                        self.w_stored = fake_quantize(self.w_stored, self.fake_quantize_kind,
+                                                      stochastic=self.fake_quantize_stochastic)
 
     def _scale_update(self, name: str, g_agg: torch.Tensor, contrib_agg: torch.Tensor,
                        eff_lr: float, step: int) -> None:
         scale = getattr(self, name)
         state = getattr(self, f"{name}_state")
-        new_state = self.beta2 * state + (1.0 - self.beta2) * (g_agg * g_agg + contrib_agg * contrib_agg)
-        bias_correction = 1.0 - self.beta2 ** step
-        state_hat = new_state / bias_correction if bias_correction > 0 else new_state
-        new_scale = scale - eff_lr * g_agg / (torch.sqrt(state_hat) + self.eps)
+        if self.scale_invariant_chain_rule:
+            # Multiplicative (log-space) step instead of additive: an
+            # ADDITIVE step of size ~eff_lr is a huge RELATIVE change
+            # once scale has shrunk far below 1 (which magnitude_scale
+            # deliberately does) and negligible once it's grown large --
+            # same "assumes scale stays near 1" bug as w_stored's own
+            # update (see that fix's docstring above), just on scale
+            # itself. d(loss)/d(log(scale)) = d(loss)/d(scale)*scale =
+            # g_agg*scale (chain rule through scale=exp(log_scale));
+            # RMSprop-normalizing THAT keeps the step a fixed RELATIVE
+            # (percentage) size regardless of scale's own magnitude.
+            # Bonus: scale can never cross zero this way (exp()>0),
+            # unlike the additive step.
+            log_grad = g_agg * scale
+            log_contrib = contrib_agg * scale
+            new_state = self.beta2 * state + (1.0 - self.beta2) * (log_grad * log_grad + log_contrib * log_contrib)
+            bias_correction = 1.0 - self.beta2 ** step
+            state_hat = new_state / bias_correction if bias_correction > 0 else new_state
+            log_step = eff_lr * log_grad / (torch.sqrt(state_hat) + self.eps)
+            new_scale = scale * torch.exp(-log_step)
+        else:
+            new_state = self.beta2 * state + (1.0 - self.beta2) * (g_agg * g_agg + contrib_agg * contrib_agg)
+            bias_correction = 1.0 - self.beta2 ** step
+            state_hat = new_state / bias_correction if bias_correction > 0 else new_state
+            new_scale = scale - eff_lr * g_agg / (torch.sqrt(state_hat) + self.eps)
         if torch.isfinite(new_state).all() and torch.isfinite(new_scale).all():
             setattr(self, f"{name}_state", new_state)
             setattr(self, name, new_scale)

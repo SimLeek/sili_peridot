@@ -125,6 +125,77 @@ OPT_CONFIGS = {
     # mechanism once clip_raw_delta's accidental backstop is removed.
     # Tests removing BOTH artificial ceilings together.
     "scale_chain_rule_nocaps": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9),
+    # value_scale/output_scale's own RMSprop gradient is ~65-88% cancelled
+    # by cross-row/cross-column sign disagreement (measured this
+    # conversation), so it barely moves from 1.0 even fully converged --
+    # gradient-free fix: reparametrize true_weight = w_stored*value_scale*
+    # output_scale (algebraically unchanged) to move magnitude from
+    # output_scale into w_stored each step, targeting a fixed w_stored
+    # column-RMS. No effect on fp32 accuracy expected (same true_weight);
+    # real payoff is giving the quantizer (FP4/FP8) a better-centered
+    # stored magnitude, tested separately on the real engine.
+    "scale_chain_rule_nocaps_magscale": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+                                             use_magnitude_scale=True, magnitude_scale_target=16.0),
+    # Real payoff test (per direct correction -- comparing magnitude_scale
+    # on/off in fp32 is meaningless, true_weight is identical either way):
+    # fake-quantize w_stored to real FP8 E4M3 codes each step (model/
+    # fake_quantize_torch.py, reuses the real C++ codec for encode) and
+    # see whether magnitude-scale actually recovers accuracy lost to
+    # quantization, not just whether it's harmless in fp32.
+    "scale_chain_rule_nocaps_fp8fake": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+                                            fake_quantize_kind="fp8"),
+    "scale_chain_rule_nocaps_fp8fake_magscale": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+                                                     use_magnitude_scale=True, magnitude_scale_target=16.0,
+                                                     fake_quantize_kind="fp8"),
+    # scale_invariant_chain_rule: removes the "S stays near 1" assumption
+    # baked into w_stored's own update (see its docstring, model/
+    # toy_tile_recurrence_rmt_torch.py) -- per direct instruction, this
+    # is the real fix, not a one-off rescale patch, so magnitude_scale
+    # should be retested WITH it rather than assuming magnitude_scale
+    # itself was the wrong idea.
+    "scale_chain_rule_nocaps_siv_magscale": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+                                                 scale_invariant_chain_rule=True,
+                                                 use_magnitude_scale=True, magnitude_scale_target=16.0),
+    "scale_chain_rule_nocaps_siv_fp8fake": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+                                                scale_invariant_chain_rule=True,
+                                                fake_quantize_kind="fp8"),
+    "scale_chain_rule_nocaps_siv_fp8fake_magscale": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+                                                         scale_invariant_chain_rule=True,
+                                                         use_magnitude_scale=True, magnitude_scale_target=16.0,
+                                                         fake_quantize_kind="fp8"),
+    # 4-way check per direct instruction: {deterministic, stochastic
+    # quantize} x {instantaneous, EMA-smoothed magnitude-rescale RMS} --
+    # magnitude_rescale_ema_beta=0.9 filters per-step quantization
+    # noise out of the rescale target (see _magnitude_rescale's own
+    # docstring, model/toy_tile_recurrence_rmt_torch.py).
+    "scale_chain_rule_nocaps_siv_fp8fake_magscale_det": dict(
+        include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+        scale_invariant_chain_rule=True, use_magnitude_scale=True, magnitude_scale_target=16.0,
+        fake_quantize_kind="fp8", fake_quantize_stochastic=False),
+    "scale_chain_rule_nocaps_siv_fp8fake_magscale_stoch": dict(
+        include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+        scale_invariant_chain_rule=True, use_magnitude_scale=True, magnitude_scale_target=16.0,
+        fake_quantize_kind="fp8", fake_quantize_stochastic=True),
+    "scale_chain_rule_nocaps_siv_fp8fake_magscale_det_ema": dict(
+        include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+        scale_invariant_chain_rule=True, use_magnitude_scale=True, magnitude_scale_target=16.0,
+        fake_quantize_kind="fp8", fake_quantize_stochastic=False, magnitude_rescale_ema_beta=0.9),
+    "scale_chain_rule_nocaps_siv_fp8fake_magscale_stoch_ema": dict(
+        include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+        scale_invariant_chain_rule=True, use_magnitude_scale=True, magnitude_scale_target=16.0,
+        fake_quantize_kind="fp8", fake_quantize_stochastic=True, magnitude_rescale_ema_beta=0.9),
+    # Direct question: _magnitude_rescale only ever touched output_scale
+    # (columns) -- value_scale (rows) was left to its own cancellation
+    # -limited RMSprop signal and barely moves. Nothing about the
+    # mechanism is column-specific; this applies it to BOTH axes
+    # (magnitude_scale_both_axes=True) to test whether giving the full
+    # rank-1 envelope (not just half of it) the same treatment helps,
+    # harms, or is neutral -- direct comparison vs the already-validated
+    # output_scale-only config above (both stochastic fp8fake).
+    "scale_chain_rule_nocaps_siv_fp8fake_magscale_stoch_bothaxes": dict(
+        include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9,
+        scale_invariant_chain_rule=True, use_magnitude_scale=True, magnitude_scale_target=16.0,
+        fake_quantize_kind="fp8", fake_quantize_stochastic=True, magnitude_scale_both_axes=True),
 }
 
 MODEL_CFG = dict(use_custom_optimizer=True, use_hard_clip=True,

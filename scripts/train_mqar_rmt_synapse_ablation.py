@@ -26,8 +26,8 @@ production precision) and "fp32" (DISLDOLayer32, unlimited precision,
 isolates the optimizer-rule question from quantization).
 
 Run: python3 scripts/train_mqar_rmt_synapse_ablation.py <config_name> <precision> [train_steps] [seed] [peak_lr]
-  config_name: production | clip_off
-  precision: fp4 | fp32
+  config_name: production | clip_off | nocaps
+  precision: fp4 | fp32 | fp8
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def train_and_eval(config_name: str, precision: str, num_kv_pairs: int, seed: in
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     disldo_cls = DISLDO_CLS_BY_PRECISION[precision]
-    dense = (precision == "fp4")
+    dense = precision in ("fp4", "fp8")
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
