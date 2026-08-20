@@ -270,6 +270,20 @@ ARMS = {
     "true_multi_digit_stochastic": functools.partial(TrueMultiDigitLayer,
                                                       digit_cls=DISLDOLayer,
                                                       n_stages=3, base=12.0, lr_power=0.0),
+    # "fp4+fp4 dual" -- exactly TWO real stochastic-FP4 digits (n_stages=2)
+    # instead of three, per direct instruction to replace the fixed-base
+    # 3-digit scheme with this as the new precision option used going
+    # forward (real-engine MQAR sweep, task #247). base=12's exact-tiling
+    # rationale (digit i+1's ceiling lands exactly on digit i's floor,
+    # true_multi_digit_deterministic's own docstring above) is a PAIRWISE
+    # condition between adjacent digits, not stage-count-dependent, so it
+    # carries over unchanged from the n_stages=3 sweep -- not re-tuned here.
+    # Kept as its own separate arm (not a modification of
+    # true_multi_digit_stochastic), matching this file's own established
+    # non-destructive-comparison convention.
+    "true_multi_digit_dual": functools.partial(TrueMultiDigitLayer,
+                                                digit_cls=DISLDOLayer,
+                                                n_stages=2, base=12.0, lr_power=0.0),
     # base=4.0 was the ORIGINAL default, derived from real FP4 (E2M1)'s
     # own worst-case relative rounding error (~1/4) -- kept as an explicit
     # comparison point now that base=12 is the default above. Same
@@ -328,6 +342,13 @@ ARMS = {
     "true_multi_digit_stochastic_dense": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayer,
         n_stages=3, base=12.0, lr_power=0.0, dense=True),
+    # DENSE counterpart to true_multi_digit_dual above -- same n_stages=2
+    # "fp4+fp4" pairing, matching true_multi_digit_stochastic_dense's own
+    # dense-connectivity precedent (paired with l1_sparsity_coef at the
+    # training-script level, same as that arm).
+    "true_multi_digit_dual_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer,
+        n_stages=2, base=12.0, lr_power=0.0, dense=True),
     "true_multi_digit_deterministic_base4_dense": functools.partial(
         TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
         n_stages=3, base=4.0, lr_power=0.0, dense=True),
@@ -444,6 +465,7 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "row_4bit_noscale_deterministic": 4,
                   "true_multi_digit_deterministic": 12, "true_multi_digit_stochastic": 12,
                   "true_multi_digit_stochastic_dense": 12,
+                  "true_multi_digit_dual": 8, "true_multi_digit_dual_dense": 8,
                   "true_multi_digit_noscale_deterministic": 12,
                   "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
                   "true_multi_digit_deterministic_base24": 12,
