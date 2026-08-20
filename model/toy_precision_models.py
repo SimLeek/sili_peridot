@@ -843,12 +843,17 @@ class TrueMultiDigitLayer:
         self._factors = [self.base ** (-i) for i in range(n_stages)]
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-               damp_by_importance: bool = True) -> Tensor:
+               damp_by_importance: bool = True, **synapse_kwargs) -> Tensor:
+        # synapse_kwargs: passed straight through to each digit's own
+        # forward() -- min_decay_frac/max_abs_delta/max_ci (see
+        # sili.sparse_rnn.DISLDOLayer.forward's own docstring), or
+        # nothing at all if the caller doesn't override them (each
+        # digit falls back to its own C++-side production defaults).
         outs = []
         for i, digit in enumerate(self.digits):
             eff_lr = learning_rate / (self.base ** (self.lr_power * i))
             out_i = digit.forward(x, eff_lr, lr_per_row_nnz=lr_per_row_nnz,
-                                  damp_by_importance=damp_by_importance)
+                                  damp_by_importance=damp_by_importance, **synapse_kwargs)
             if learning_rate != 0.0 and self.simulate_quantize:
                 inner_bwd = out_i._backward
                 digit_i = digit

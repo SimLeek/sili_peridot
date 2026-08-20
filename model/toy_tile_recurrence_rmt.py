@@ -46,6 +46,7 @@ class ToyTileRecurrenceRMT:
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  dense: bool = False, clip_range: float = 6.0,
                  l1_sparsity_coef: float = 0.0,
+                 synapse_kwargs: Optional[dict] = None,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -67,6 +68,13 @@ class ToyTileRecurrenceRMT:
         self.clip_range = clip_range
         self.l1_sparsity_coef = l1_sparsity_coef
         self.num_cpus = num_cpus
+        # min_decay_frac/max_abs_delta/max_ci passthrough (see
+        # sili.sparse_rnn.DISLDOLayer.forward's own docstring) -- lets a
+        # caller toggle e.g. max_abs_delta=1e30 (effectively off) for a
+        # real ablation on this actual model without a C++ rebuild or
+        # touching every one of this step()'s own 6 disldo_cls.forward()
+        # call sites by hand.
+        self.synapse_kwargs = synapse_kwargs or {}
 
         state_width = self.state_width
         if rng is None:
@@ -107,7 +115,7 @@ class ToyTileRecurrenceRMT:
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float) -> Tensor:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its
         l1_sparsity_coef docstring for the full split-backward rationale."""
-        out_aux = layer.forward(input_t, lr, damp_by_importance=False)
+        out_aux = layer.forward(input_t, lr, damp_by_importance=False, **self.synapse_kwargs)
         n = float(np.asarray(out_aux.data).size)
         return reduce_sum(tensor_abs(out_aux)) * (coef / n)
 
@@ -126,7 +134,7 @@ class ToyTileRecurrenceRMT:
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
         x_window_t = Tensor(x_window.astype(np.float32))
-        x_wide = self.input_proj.forward(x_window_t, learning_rate)          # [n_content, sw]
+        x_wide = self.input_proj.forward(x_window_t, learning_rate, **self.synapse_kwargs)  # [n_content, sw]
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -134,13 +142,13 @@ class ToyTileRecurrenceRMT:
 
         combined_normed = concat([memory_normed, x_normed], axis=0)          # [total_slots, sw]
 
-        q = self.q_proj.forward(combined_normed, learning_rate)
-        k = self.k_proj.forward(combined_normed, learning_rate)
-        v = self.v_proj.forward(combined_normed, learning_rate)
+        q = self.q_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
+        k = self.k_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
+        v = self.v_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
         sigmas = exp(self.log_sigmas)
         attn = gaussian_attention(q, k, v, self.centers, sigmas,
                                   num_cpus=self.num_cpus, causal=False)
-        attn = self.o_proj.forward(attn, learning_rate)
+        attn = self.o_proj.forward(attn, learning_rate, **self.synapse_kwargs)
         attn.data = np.clip(attn.data, -self.clip_range, self.clip_range)
 
         aux_loss = None
@@ -180,6 +188,6 @@ class ToyTileRecurrenceRMT:
         if self.l1_sparsity_coef > 0.0:
             lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
-        logits = self.lm_head.forward(pooled, learning_rate)
+        logits = self.lm_head.forward(pooled, learning_rate, **self.synapse_kwargs)
 
         return memory_new, logits, aux_loss
