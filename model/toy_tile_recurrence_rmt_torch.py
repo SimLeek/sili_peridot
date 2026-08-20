@@ -140,7 +140,8 @@ class DISLDOTorchLinear:
                  rng: Optional[np.random.Generator] = None,
                  bias_correct_ci: bool = False, use_momentum: bool = False,
                  momentum_beta1: float = 0.9, include_contrib_in_ci: bool = True,
-                 clip_raw_delta: bool = True):
+                 clip_raw_delta: bool = True, include_scale_chain_rule: bool = False,
+                 clip_pre_ci: bool = False, pre_ci_clip_value: Optional[float] = None):
         """The five bias_correct_ci/use_momentum/momentum_beta1/
         include_contrib_in_ci/clip_raw_delta args default to exactly
         the production C++ BoundedRMSpropSynapsePolicy's own behavior
@@ -151,7 +152,39 @@ class DISLDOTorchLinear:
         the asymmetry this exposes: RMSpropScalePolicy's own
         _scale_update DOES bias-correct its EMA (see below) while this
         per-synapse update never has -- bias_correct_ci=True makes the
-        two consistent."""
+        two consistent.
+
+        include_scale_chain_rule: default False -- REPRODUCES A REAL BUG
+        found this session (see conversation): true_weight = w_stored *
+        value_scale * output_scale, so the correct chain-rule gradient
+        is dL/d(w_stored) = g*S (S = value_scale (x) output_scale,
+        matching sili's real C++ non-deferred/quant formula, update_cw's
+        own `-g*S` term, delta_csr_types.hpp) and dL/d(value_scale[r]) =
+        sum_c(g[r,c]*w_stored[r,c]*output_scale[c]) -- this class has
+        always used raw g directly for both instead (missing the S/
+        w_stored*output_scale factor entirely), a genuinely different,
+        simpler optimization dynamic than what sili actually runs.
+        Kept default False (i.e. reproduce the historical bug) so every
+        existing ablation result stays reproducible; True applies the
+        real chain rule, to test directly whether THIS specific
+        difference (not the clip, not batch-consistency -- both already
+        investigated) is what makes sili's real engine underperform
+        this same architecture in torch.
+
+        clip_pre_ci: default False -- targets a DIFFERENT failure mode
+        than clip_raw_delta (which clips the post-division update, AFTER
+        ci already absorbed whatever g/contrib produced it). Multi-seed
+        scale_chain_rule sweeps (this conversation) found ci sometimes
+        takes one single-step jump of +70-80 straight to max_ci's
+        ceiling (e.g. seed=1000: ~25.7->99.9 in ONE step), coincident
+        with the query loss permanently collapsing to ln(vocab) (uniform
+        guessing) a few hundred steps later -- clip_raw_delta doesn't
+        prevent this because the damage is in what THAT one step's raw
+        g/contrib do (to ci's EMA and, via g_for_w, to w_stored itself),
+        not in the post-division magnitude. clip_pre_ci clips g and
+        contrib to +-pre_ci_clip_value (defaults to max_abs_delta) BEFORE
+        squaring into ci's EMA, capping how much any single anomalous
+        step can move ci at all."""
         self.in_features = in_features
         self.out_features = out_features
         self.beta2 = beta2
@@ -162,9 +195,12 @@ class DISLDOTorchLinear:
         self.lr_per_row_nnz = lr_per_row_nnz
         self.bias_correct_ci = bias_correct_ci
         self.use_momentum = use_momentum
+        self.include_scale_chain_rule = include_scale_chain_rule
         self.momentum_beta1 = momentum_beta1
         self.include_contrib_in_ci = include_contrib_in_ci
         self.clip_raw_delta = clip_raw_delta
+        self.clip_pre_ci = clip_pre_ci
+        self.pre_ci_clip_value = pre_ci_clip_value if pre_ci_clip_value is not None else max_abs_delta
 
         if rng is None:
             rng = np.random.default_rng()
@@ -221,12 +257,39 @@ class DISLDOTorchLinear:
             x_sum = x_det.sum(dim=0)                            # [in]
             contrib = w_det * x_sum.unsqueeze(1)                # [in, out]
 
-            sq_term = g * g
+            # S: dL/d(w_stored) = g*S, dL/d(value_scale[r]) needs
+            # w_stored*output_scale, dL/d(output_scale[c]) needs
+            # w_stored*value_scale -- see include_scale_chain_rule's own
+            # docstring above for the full derivation. g_for_w/g_row/g_col
+            # (and their contrib counterparts) default to the historical
+            # (buggy, raw-g) behavior when the flag is off, so every
+            # existing ablation result stays bit-reproducible.
+            if self.include_scale_chain_rule:
+                S = self.value_scale.unsqueeze(1) * self.output_scale.unsqueeze(0)  # [in, out]
+                g_for_w = g * S
+                g_row_signal = self.w_stored * self.output_scale.unsqueeze(0) * g
+                contrib_row_signal = self.w_stored * self.output_scale.unsqueeze(0) * contrib
+                g_col_signal = self.w_stored * self.value_scale.unsqueeze(1) * g
+                contrib_col_signal = self.w_stored * self.value_scale.unsqueeze(1) * contrib
+            else:
+                g_for_w = g
+                g_row_signal = g
+                contrib_row_signal = contrib
+                g_col_signal = g
+                contrib_col_signal = contrib
+
+            g_for_ci, contrib_for_ci = g, contrib
+            if self.clip_pre_ci:
+                g_for_ci = torch.clamp(g, -self.pre_ci_clip_value, self.pre_ci_clip_value)
+                contrib_for_ci = torch.clamp(contrib, -self.pre_ci_clip_value, self.pre_ci_clip_value)
+            sq_term = g_for_ci * g_for_ci
             if self.include_contrib_in_ci:
-                sq_term = sq_term + contrib * contrib
+                sq_term = sq_term + contrib_for_ci * contrib_for_ci
             ema = self.beta2 * self.ci + (1.0 - self.beta2) * sq_term
             floor = self.min_decay_frac * self.ci
-            self.ci = torch.clamp(torch.maximum(ema, floor), max=self.max_ci)
+            new_ci = torch.clamp(torch.maximum(ema, floor), max=self.max_ci)
+            if torch.isfinite(new_ci).all():
+                self.ci = new_ci
             self.ci_step += 1
 
             if self.bias_correct_ci:
@@ -236,27 +299,29 @@ class DISLDOTorchLinear:
                 ci_hat = self.ci
 
             if self.use_momentum:
-                self.m = self.momentum_beta1 * self.m + (1.0 - self.momentum_beta1) * g
+                self.m = self.momentum_beta1 * self.m + (1.0 - self.momentum_beta1) * g_for_w
                 if self.bias_correct_ci:
                     bc1 = 1.0 - self.momentum_beta1 ** self.ci_step
                     numerator = -(self.m / bc1 if bc1 > 0 else self.m)
                 else:
                     numerator = -self.m
             else:
-                numerator = -g
+                numerator = -g_for_w
 
             raw = numerator / (torch.sqrt(ci_hat) + self.eps) if damp else numerator
             if self.clip_raw_delta:
                 raw = torch.clamp(raw, -self.max_abs_delta, self.max_abs_delta)
-            self.w_stored = self.w_stored + eff_lr * raw
+            new_w = self.w_stored + eff_lr * raw
+            if torch.isfinite(new_w).all():
+                self.w_stored = new_w
 
-            g_row = g.sum(dim=1)
-            contrib_row = contrib.sum(dim=1)
+            g_row = g_row_signal.sum(dim=1)
+            contrib_row = contrib_row_signal.sum(dim=1)
             self.value_scale_step += 1
             self._scale_update("value_scale", g_row, contrib_row, eff_lr, self.value_scale_step)
 
-            g_col = g.sum(dim=0)
-            contrib_col = contrib.sum(dim=0)
+            g_col = g_col_signal.sum(dim=0)
+            contrib_col = contrib_col_signal.sum(dim=0)
             self.output_scale_step += 1
             self._scale_update("output_scale", g_col, contrib_col, eff_lr, self.output_scale_step)
 

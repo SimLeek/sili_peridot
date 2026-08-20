@@ -86,6 +86,45 @@ OPT_CONFIGS = {
     "clip_4": dict(max_abs_delta=4.0),
     "clip_8": dict(max_abs_delta=8.0),
     "clip_16": dict(max_abs_delta=16.0),
+    # Tests whether DISLDOTorchLinear's own missing-S-chain-rule bug (see
+    # conversation) -- found by re-deriving dL/d(w_stored) directly, not
+    # by breakpoint bisection -- is why this torch reference reaches
+    # acc=1.0 while the real sili engine (which DOES apply the correct
+    # S-multiplied chain rule, confirmed via delta_csr_types.hpp's
+    # update_cw) caps around 0.2-0.25 on the identical task/harness even
+    # in pure fp32 (no quantization confound). production alone already
+    # reproduces the historical (bugged) formula; this ADDS ONLY the S
+    # chain-rule correction on top, single-variable A/B.
+    "scale_chain_rule": dict(include_scale_chain_rule=True),
+    # scale_chain_rule (seed=1000, lr=0.03) sometimes trains to 0.55-0.83 and
+    # sometimes collapses to ~0.00-0.02 (multi-seed sweep, this conversation)
+    # -- never reaches drop_raw_clip's clean 1.0000. drop_raw_clip and
+    # scale_chain_rule are INDEPENDENT toggles that were never tested
+    # together until now: drop_raw_clip alone (single seed=1000) already
+    # hits 1.0000 WITHOUT the chain-rule fix, so the clip itself (not some
+    # inherent custom-optimizer ceiling) was capping production at 0.70.
+    # This combines both, single new variable vs scale_chain_rule alone.
+    "scale_chain_rule_noclip": dict(include_scale_chain_rule=True, clip_raw_delta=False),
+    # Alternative fix targeting the observed mechanism directly: ci itself
+    # (not value_scale/output_scale) takes a single-step +70-80 jump to
+    # max_ci's ceiling right before collapse. clip_raw_delta clips the
+    # POST-division update; this clips g/contrib BEFORE they're squared
+    # into ci's EMA, so one anomalous step can't dominate it. Keeps the
+    # normal clip_raw_delta=True active too (both clips together).
+    "scale_chain_rule_preciclip": dict(include_scale_chain_rule=True, clip_pre_ci=True),
+    # scale_chain_rule_noclip (8-seed sweep, this conversation) fixed
+    # seed=1000's single-step ci-spike-to-ceiling collapse cleanly (ci
+    # never exceeds 12 there anymore, vs hitting the 100 ceiling before)
+    # -- but seed=1005 shows a DIFFERENT failure noclip does NOT guard
+    # against: ci pins at EXACTLY max_ci=100 continuously for 800+ steps
+    # (not a one-step spike) while output_scale keeps climbing (1.62+,
+    # vs ~1.1-1.2 everywhere else), and accuracy regresses from 1.0 back
+    # down to ~0.33. Once ci is capped, a persistently-large gradient no
+    # longer gets a proportionally-growing denominator (g/sqrt(ci) stops
+    # being normalized), so max_ci alone can ALSO be an unbounded-update
+    # mechanism once clip_raw_delta's accidental backstop is removed.
+    # Tests removing BOTH artificial ceilings together.
+    "scale_chain_rule_nocaps": dict(include_scale_chain_rule=True, clip_raw_delta=False, max_ci=1e9),
 }
 
 MODEL_CFG = dict(use_custom_optimizer=True, use_hard_clip=True,
@@ -93,7 +132,7 @@ MODEL_CFG = dict(use_custom_optimizer=True, use_hard_clip=True,
 
 
 def train_and_eval(opt_config_name: str, num_kv_pairs: int, seed: int, train_steps: int,
-                   peak_lr: float, log_every: int = 500, log_fn=None) -> dict:
+                   peak_lr: float, log_every: int = 500, log_fn=None, step_diag_fn=None) -> dict:
     opt_kwargs = OPT_CONFIGS[opt_config_name]
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
@@ -164,6 +203,13 @@ def train_and_eval(opt_config_name: str, num_kv_pairs: int, seed: int, train_ste
                     opt.step()
             else:
                 memory = model.extract_memory()
+
+        if step_diag_fn is not None:
+            # Weight-only introspection -- reads existing tensors, draws
+            # nothing from `rng`, so calling this every step (regardless of
+            # log_every) cannot perturb the training-data sequence the way
+            # an extra _quick_eval call would.
+            step_diag_fn(step, model)
 
         if step % log_every == 0 or step == train_steps:
             mean_q_loss = float(np.mean(recent_query_loss)) if recent_query_loss else float("nan")

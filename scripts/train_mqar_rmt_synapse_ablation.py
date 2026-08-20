@@ -65,6 +65,19 @@ DEFAULT_PEAK_LR = 0.03
 CONFIGS = {
     "production": {},                    # C++'s own tuned defaults (max_abs_delta=2.0)
     "clip_off": {"max_abs_delta": 1e30},  # effectively no clip
+    # torch-side multi-seed sweep (this conversation) found clip_off alone
+    # (max_abs_delta only) fixes ONE failure mode (single-step ci spike to
+    # its ceiling) but leaves a second one: once ci itself pins at
+    # max_ci's ceiling, a persistently-large gradient no longer gets a
+    # proportionally-growing denominator, so g/sqrt(ci) stops being
+    # normalized -- max_ci alone can be an unbounded-update mechanism too.
+    # Removing BOTH ceilings together (matching PlainRMSpropSynapsePolicy,
+    # delta_csr_types.hpp -- already exists, already isfinite-guarded, just
+    # never made the default) got 7/7 non-dead torch seeds to a clean
+    # 1.0000. This is the real-engine equivalent, still using
+    # BoundedRMSpropSynapsePolicy's own runtime kwargs (no C++ rebuild
+    # needed -- max_abs_delta/max_ci at 1e30 make its clips true no-ops).
+    "nocaps": {"max_abs_delta": 1e30, "max_ci": 1e30},
 }
 
 
