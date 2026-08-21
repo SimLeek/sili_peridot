@@ -66,6 +66,7 @@ DEFAULT_PEAK_LR = 0.03  # see train_mqar_rmt_synapse_ablation.py's own rationale
 NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 MAGNITUDE_SCALE_TARGET = 16.0
 MAGNITUDE_CORRECTION_RATE = 0.01
+LOSS_CHANCE = float(np.log(VOCAB))  # near-chance query cross-entropy, quality-LR reference point
 
 PRECISION_CLS = {
     "fp4": DISLDOLayer,
@@ -79,12 +80,23 @@ PRECISION_CLS = {
 def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                    num_kv_pairs: int, seed: int, train_steps: int,
                    peak_lr: float = DEFAULT_PEAK_LR,
-                   log_every: int = 500, log_fn=None) -> dict:
+                   log_every: int = 500, log_fn=None,
+                   scale_invariant: bool = False,
+                   lr_mode: str = "step",
+                   min_lr_frac: float = 0.05,
+                   loss_ema_decay: float = 0.98,
+                   acc_ema_decay: float = 0.98) -> dict:
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     disldo_cls = PRECISION_CLS[precision]
-    dense = precision != "fp32"
+    # dense=True for every precision including fp32 now that
+    # DISLDOLayer32 has a real dense-init path (_preseed_dense_scattered,
+    # sili/sparse_rnn.py) -- previously fp32 alone stayed on
+    # _preseed_random_sparse's sparse init (no dense= kwarg existed for
+    # it), giving it far fewer trainable synapses than the other dense
+    # arms or a fully-connected torch reference. See conversation.
+    dense = True
     effective_rank = scale_rank if precision != "fp32" else 1
     use_magscale = magnitude_scale and precision != "fp32"
 
@@ -94,11 +106,19 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
         _cpu.seed_fp4_stochastic_rng(seed)
     model_rng = np.random.default_rng(seed)
 
+    # scale_invariant: tests whether the real engine's weight-delta
+    # numerator always multiplying by S=value_scale*output_scale (unlike
+    # torch's validated winner, which never does) explains the late-run
+    # divergence seen in fp32 dense sweeps -- see conversation.
+    synapse_kwargs = dict(NOCAPS_KWARGS)
+    if scale_invariant:
+        synapse_kwargs["scale_invariant"] = True
+
     model = ToyTileRecurrenceRMT(
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=dense, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=NOCAPS_KWARGS, scale_rank=effective_rank, rng=model_rng)
+        synapse_kwargs=synapse_kwargs, scale_rank=effective_rank, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -120,8 +140,46 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
     t0 = time.time()
     recent_query_loss = []
     trajectory = []
+    loss_ema = None
+    acc_ema = None
     for step in range(1, train_steps + 1):
-        lr = lr_schedule(step, train_steps, peak_lr, WARMUP_STEPS)
+        if lr_mode in ("quality", "accuracy"):
+            # LR as a function of ACHIEVED QUALITY, not step count -- no
+            # dependence on a pre-committed training horizon, and RISES
+            # BACK if quality degrades later (e.g. a distribution shift
+            # in a lifelong-learning setting). Two variants:
+            #   "quality":  quality = loss_ema/LOSS_CHANCE. Found to be
+            #     GAMEABLE -- fp8 discovered a shortcut where the readout
+            #     goes fully input-independent (same fixed top-5 logits
+            #     regardless of the actual query content, confirmed via
+            #     direct diagnostic dump) and just models the marginal
+            #     token distribution, which lowers average loss without
+            #     any real per-key retrieval, tricking this metric into
+            #     decaying LR before the model escapes the shortcut. See
+            #     conversation.
+            #   "accuracy": quality = acc_ema (EMA of argmax-correctness
+            #     on live training queries, not a separate eval pass).
+            #     Can't be satisfied by the input-independent shortcut
+            #     above since that shortcut's accuracy is near the
+            #     chance floor (~1/64 for MQAR's key/value-half split),
+            #     so LR stays high until the model is actually solving
+            #     the task, not just modeling its marginals.
+            if step <= WARMUP_STEPS:
+                lr = peak_lr * step / WARMUP_STEPS
+            elif lr_mode == "accuracy":
+                if acc_ema is None:
+                    lr = peak_lr
+                else:
+                    frac = max(min_lr_frac, min(1.0, 1.0 - acc_ema))
+                    lr = peak_lr * frac
+            else:
+                if loss_ema is None:
+                    lr = peak_lr
+                else:
+                    frac = max(min_lr_frac, min(1.0, loss_ema / LOSS_CHANCE))
+                    lr = peak_lr * frac
+        else:
+            lr = lr_schedule(step, train_steps, peak_lr, WARMUP_STEPS)
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
         query_positions = set(pos for pos, _ in mqar_pairs)
@@ -133,6 +191,11 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                 loss = cross_entropy_sum(logits, [(num_tiles - 1, targets[i])])
                 if i in query_positions:
                     recent_query_loss.append(float(loss.data))
+                    loss_ema = float(loss.data) if loss_ema is None else (
+                        loss_ema_decay * loss_ema + (1.0 - loss_ema_decay) * float(loss.data))
+                    correct = float(predicted_token(logits, num_tiles - 1) == targets[i])
+                    acc_ema = correct if acc_ema is None else (
+                        acc_ema_decay * acc_ema + (1.0 - acc_ema_decay) * correct)
                 if aux is not None:
                     loss = loss + aux
                 loss.backward()
@@ -145,9 +208,9 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
             mean_q_loss = float(np.mean(recent_query_loss)) if recent_query_loss else float("nan")
             recent_query_loss = []
             quick_acc = _quick_eval(40)
-            trajectory.append((step, mean_q_loss, quick_acc))
+            trajectory.append((step, mean_q_loss, quick_acc, lr))
             if log_fn is not None:
-                log_fn(step, train_steps, time.time() - t0, mean_q_loss, quick_acc)
+                log_fn(step, train_steps, time.time() - t0, mean_q_loss, quick_acc, lr)
 
     correct, total = 0, 0
     for _ in range(EVAL_SEQUENCES):
@@ -174,17 +237,20 @@ def main():
     train_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 10000
     seed = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
     peak_lr = float(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_PEAK_LR
+    scale_invariant = bool(int(sys.argv[7])) if len(sys.argv) > 7 else False
+    lr_mode = sys.argv[8] if len(sys.argv) > 8 else "step"
 
     print(f"# MQAR precision sweep precision={precision} scale_rank={scale_rank} "
           f"magnitude_scale={magnitude_scale} train_steps={train_steps} seed={seed} "
-          f"peak_lr={peak_lr} config=nocaps", flush=True)
+          f"peak_lr={peak_lr} scale_invariant={scale_invariant} lr_mode={lr_mode} config=nocaps", flush=True)
 
-    def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc):
+    def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc, lr):
         print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
-              f"quick_acc={quick_acc:.4f}  ({elapsed:.0f}s elapsed)", flush=True)
+              f"quick_acc={quick_acc:.4f}  lr={lr:.5f}  ({elapsed:.0f}s elapsed)", flush=True)
 
     r = train_and_eval(precision, scale_rank, magnitude_scale, 1, seed, train_steps,
-                       peak_lr=peak_lr, log_fn=log_fn)
+                       peak_lr=peak_lr, log_fn=log_fn, scale_invariant=scale_invariant,
+                       lr_mode=lr_mode)
     print(f"\nFINAL precision={precision} scale_rank={r['scale_rank']} "
           f"magnitude_scale={r['magnitude_scale']} acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)",
           flush=True)
