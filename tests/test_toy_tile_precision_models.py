@@ -1,3 +1,4 @@
+import functools
 import os
 import sys
 
@@ -7,7 +8,7 @@ import numpy as np
 import pytest
 
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import AdamRowScaleDISLDOLayer, AdamRank1DISLDOLayer
+from model.toy_precision_models import AdamRowScaleDISLDOLayer, AdamRank1DISLDOLayer, TrueMultiDigitLayer
 from model.toy_recall_models import cross_entropy_sum, AdamOptimizer, clip_grad_norm_
 from sili.sparse_rnn import DISLDOLayer
 
@@ -136,3 +137,74 @@ class TestToyTileRecurrenceRealFP4WithRank1Adam:
         assert logits.data.shape == (NUM_TILES, VOCAB)
         assert np.all(np.isfinite(M_new))
         assert np.all(np.isfinite(logits.data))
+
+
+class TestToyTileRecurrenceRealFP4LongHorizonStability:
+    """MODEL-level (not isolated-layer) long-horizon check -- everything
+    else in this file trains at most 200 steps, which would NOT have
+    caught the original failure that motivated this whole session's
+    RMSprop investigation: a real DISLDOLayer32 permutation-regression run
+    (sili_peridot's eval_rank_floor.py) stayed rock-stable for 300+ steps,
+    then diverged catastrophically past step ~400. That divergence was
+    root-caused and fixed at the sili__new C++ layer level
+    (BoundedRMSpropSynapsePolicy, now the real default there) and verified
+    in isolation (sili__new's test_synapse_policy_long_horizon.cpp) -- but
+    never against the ACTUAL model this project cares about, where 5
+    DISLDOLayer-family projections (q/k/v/o_proj/lm_head) interact through
+    real attention and recurrent state carry-over, not a single isolated
+    layer. Uses the actual PRODUCTION arm config (see
+    scripts/train_tile_curriculum.py's true_multi_digit_stochastic):
+    TrueMultiDigitLayer(digit_cls=DISLDOLayer, n_stages=3, base=12.0),
+    sparse (not dense) connectivity.
+
+    N_STEPS=3000 matches sili__new's own long-horizon test convention
+    (~7.5x the ~400-step point where the original divergence appeared).
+    """
+
+    N_STEPS = 3000
+
+    def _production_model(self, num_tiles=NUM_TILES, num_cpus=1):
+        disldo_cls = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
+                                       n_stages=3, base=12.0, lr_power=0.0)
+        return ToyTileRecurrenceRealFP4(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, MLP_HIDDEN,
+                                        num_tiles, MAX_WEIGHTS, num_cpus=num_cpus,
+                                        disldo_cls=disldo_cls)
+
+    def test_no_late_onset_divergence_or_nan_over_long_horizon(self):
+        model = self._production_model()
+        x_window = np.random.RandomState(10).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
+        lr = 0.02
+        target_pos, target_tok = NUM_TILES - 1, 3
+
+        losses = []
+        for step in range(self.N_STEPS):
+            _M_new, logits, _aux = model.step(x_window, M_prev, learning_rate=lr)
+            loss = cross_entropy_sum(logits, [(target_pos, target_tok)])
+            loss.grad = np.array(1.0, dtype=np.float32)
+            loss.backward()
+            loss_val = float(loss.data)
+            assert np.isfinite(loss_val), f"loss went non-finite at step {step}"
+            losses.append(loss_val)
+
+        first_loss = losses[0]
+        best_loss = min(losses)
+        # Real learning happened at all (not just "never blew up").
+        assert best_loss < first_loss * 0.5, (
+            f"model never substantially reduced loss: first={first_loss:.3f} best={best_loss:.3f}")
+
+        # Late-onset-divergence check, mirroring sili__new's own
+        # test_synapse_policy_long_horizon.cpp convention: the ORIGINAL
+        # failure this whole investigation started from was rock-stable
+        # for 300+ steps before diverging -- so "it looked fine early"
+        # must not be trusted; check the max loss AFTER an early warmup
+        # window against what had already been achieved by then, not just
+        # the final value.
+        warmup = 200
+        best_by_warmup = min(losses[:warmup])
+        max_after_warmup = max(losses[warmup:])
+        assert max_after_warmup < best_by_warmup * 20.0, (
+            f"loss spiked well past its own early-training level later in "
+            f"the run (best_by_step_{warmup}={best_by_warmup:.3f}, "
+            f"max_after_step_{warmup}={max_after_warmup:.3f}) -- looks like "
+            f"the same late-onset divergence pattern this test exists to catch")

@@ -4674,3 +4674,2158 @@ earlier `fp8_resync`/`fp8_adamax` "modest, close-to-noise-floor" result
 was ALSO partly a stochastic-rounding artifact); real-model-scale
 validation (everything above is still the small toy tile-recurrence
 harness, state_width<=128, vocab=10).
+
+---
+
+## 2026-08-10 -- Both branches merged (sili__new PR #33, sili_peridot PR #13). Test plan for the next round, written down before starting per direct instruction.
+
+New branches: `fix/synaptogenesis-block4-double-free` (sili__new),
+`feature/digit-residual-base-and-synaptogenesis` (sili_peridot).
+
+**Priority order, per direct instruction: synaptogenesis fix FIRST**
+("that's a core requirement of sili"), ahead of every experiment
+below -- real dynamic growth/pruning is foundational to the project,
+not just another test arm, and the block4 `RowWorkspace` double-free
+(found while wiring `use_synaptogenesis` into the curriculum harness,
+see the previous entry) blocks it entirely right now. Nothing below
+runs for real until that's fixed.
+
+**Test 1 (highest expected impact, per direct instinct) -- residual
+`base` sweep, 12 and 24 instead of the current 4.0.** Grounded in
+real FP4 (E2M1) level math, not a guess: positive-side representable
+magnitudes are `0, 0.5, 1, 1.5, 2, 3, 4, 6`. `TrueMultiDigitLayer`/
+`fixed_digit_residual_quantize`'s `factors[i] = base**-i` means digit
+1's full raw range `[0.5, 6]` (same as digit 0's, real hardware FP4
+storage doesn't itself narrow per digit) maps to an OUTPUT
+contribution range of `[0.5/base, 6/base]`.
+
+- `base=4` (current): digit 1's output range is `[0.125, 1.5]` --
+  substantially OVERLAPS digit 0's own `[0.5, 6]`, i.e. digit 1 is
+  partly representing values digit 0 could already cover alone.
+- `base=12`: digit 1's output range becomes `[0.0417, 0.5]` -- its
+  ceiling lands EXACTLY on digit 0's floor (0.5). Zero overlap, zero
+  gap -- the two digits' representable ranges tile the number line
+  exactly edge-to-edge.
+- `base=24`: digit 1's output range is `[0.0208, 0.25]` -- now a real
+  GAP opens between digit 1's ceiling (0.25) and digit 0's floor
+  (0.5), unrepresented by either digit ALONE (though sums across
+  multiple synapses/digits, per the architecture's own "different
+  digits do different work, not just full-float decomposition"
+  behavior -- see the connectivity-sharing negative result, previous
+  entry -- could still fill it via combination).
+
+Direct hypothesis, per discussion: recurrent nets seem to need SMALL
+correction values more than large ones, so biasing digit 1+ toward
+finer/smaller representable ranges (base=12 exact-tiling, or base=24
+pushing further into small-value territory) should help more than the
+LR or synaptogenesis changes below. `base` is a pure Python-level
+parameter already exposed on both `TrueMultiDigitLayer` and
+`fixed_digit_residual_quantize` -- no C++ changes needed, this can run
+entirely on the sili_peridot side once unblocked.
+
+**Test 2 -- LR sweeps, each with a stated hypothesis, not blind
+halving:**
+- Global `peak_lr` reduction at the wide config (state_width=256),
+  tested DIRECTLY (not via stretching `train_steps`, which turned out
+  to be an equivalent-but-more-confounded way of lowering the
+  time-averaged effective LR via the cosine schedule -- caught
+  mid-discussion, see `lr_schedule`'s linear-warmup+cosine-decay-to-
+  `0.1*peak_lr` formula). Motivated by: `lr_per_row_nnz=True` already
+  divides the per-synapse update by `nnz_this_row` (measured: 11 at
+  small config, 23 at wide, ratio 2.09x) -- wide's per-step updates are
+  ALREADY proportionally smaller automatically, so this isn't really
+  "fan-in needs more damping," more a check of whether the wide
+  config's ~2x more free parameters need more than 15000 steps'
+  worth of these already-smaller updates to converge.
+- Per-digit `lr_power` (0 vs 1 vs 2) retest under DETERMINISTIC
+  rounding. The earlier stochastic-rounding-era sweep found no real
+  difference -- now explained: RMSprop's own `eff_lr*g/sqrt(importance)`
+  self-normalizes almost all of the `factor_i` scaling away on its own
+  (since `importance_i ~ EMA(g_i^2) ~ factor_i^2 * importance_total`,
+  the `factor_i` cancels in `g_i/sqrt(importance_i)` unless `eps`
+  dominates, which back-of-envelope math at realistic gradient
+  magnitudes says it shouldn't) -- `lr_power`'s extra damping was
+  therefore already predicted to be closer to redundant than helpful,
+  matching what was observed. Retesting under deterministic rounding
+  mainly to confirm this prediction still holds now that stochastic
+  noise isn't swamping everything else.
+
+**Test 3 -- synaptogenesis/pruning**, once the block4 bug is fixed.
+Direct instinct: neither fully-independent-random connectivity
+(current default) nor fully-forced-identical (tested directly, made
+things WORSE -- see previous entry) is necessarily right; real
+importance-driven growth/pruning might discover some OTHER
+connectivity pattern between digits that neither hand-picked extreme
+reaches. `k=4` (sili's own established default, `SparseRNNAgent`),
+`importance_cutoff=0.01`, capped at each layer's own already-stored
+`_max_row_weights` so nnz stays roughly stable rather than growing
+unbounded -- wiring already built (`_maybe_synaptogenesis`,
+`TrueMultiDigitLayer.synaptogenesis`, `use_synaptogenesis` CLI flag),
+committed on the new sili_peridot branch, currently unusable due to
+the block4 bug.
+
+**Open question, not yet a concrete test** -- the tile-recurrence
+state's hard clip bound (`np.clip(M_new_t.data, -2.0, 2.0)`,
+`toy_tile_precision_models.py`) was picked without much justification;
+no overflow issues seen with it, but unclear if `[-2,2]` is actually
+better or worse than e.g. `[-6,6]` (matching FP4's own max
+representable magnitude) or some other bound -- worth a direct
+comparison once the higher-priority items above are further along,
+since the state itself is plain fp32 (not FP4-stored) and rmsnorm'd
+before feeding any disldo layer, so the connection to FP4's own range
+isn't as direct as it might first seem; still worth checking
+empirically rather than assuming either bound is fine.
+
+---
+
+## 2026-08-10 (cont.) -- synaptogenesis unblocked: root-caused and fixed two real block4 memory-safety bugs in sili__new (feature/tile-recurrence-prototype's own JOURNAL.md and PR only cover static sparsity; this is the follow-up branch)
+
+Wired real dynamic growth/pruning (`build_probes`+`synap_step`+
+`equalizer_step`, `k=4`, matching `SparseRNNAgent`'s own established
+default) into `train_tile_curriculum.py` via a new `use_synaptogenesis`
+flag and `TrueMultiDigitLayer.synaptogenesis()`. Every arm tested this
+whole session before now used only static, pre-seeded sparsity --
+first time this project's toy-scale precision testing has actually
+exercised dynamic growth end-to-end with real training. It crashed
+immediately (double free / heap corruption), reliably within ~20-40
+growth cycles.
+
+Root-caused via AddressSanitizer (not guesswork) to TWO independent,
+additive bugs in `sili__new`'s block4 promotion machinery, both
+letting a row's used-byte boundary exceed its own allocated capacity
+and corrupt the next row's stored bytes:
+
+1. `Block4Store(8)::merge_row_workspace`'s write-back was
+   unconditional -- its own eviction loop can legitimately fail to
+   shrink a row enough (each distinct block-column touched needs >=1
+   byte of structural overhead eviction alone can't remove), and the
+   old code wrote past the row's headroom anyway when that happened.
+2. `block4_row_shift` (shared by both FP4 and FP8, used by both
+   `get_or_create`'s growth path and `equalize_step`'s redistribution)
+   could shrink a row's allocation below what it was ALREADY using --
+   `equalize_step` targets the AVERAGE allocation across every row,
+   with no check against any individual row's real current usage.
+
+Fixed both with the SAME philosophy already established in this
+codebase for `dropped_growth_events` (`commit_dirty_sparse_tile`): no
+lock, no throw, no inline growth of the shared store from inside
+`disldo_backward`'s parallel region (real callers use `num_cpus>1`, a
+lock-free clamp avoids a genuine multi-threaded reallocation race
+against other rows' in-flight reads that a naive "just grow inline"
+fix would have introduced) -- clamp the write-back to whatever whole
+tiles actually fit, leave the rest at their pre-call content, and keep
+training. New `row_merge_overflow_events`/`_bytes_dropped` counters
+(exposed via `Block4View`/`Block4View8`) are the signal a caller
+should watch to call `expand_headroom_to()` with a bigger budget.
+Full details/commit: `sili__new`'s `fix/synaptogenesis-block4-double-free`
+branch.
+
+**Verification**: AddressSanitizer-instrumented build crashed
+reliably (5/5) before the fix, ran clean (5/5) after; a full real
+15000-step curriculum run with `use_synaptogenesis=1` completed
+without error. Full regression suite unaffected -- 196 Python tests +
+8/9 block4-relevant C++ unit tests pass (the 1 failure confirmed
+pre-existing via stash-testing against the unfixed baseline).
+
+**The crash is fixed; the resulting accuracy is NOT good** -- with
+dynamic growth/pruning now safely running,
+`true_multi_digit_deterministic` dropped to mean_acc=0.0917
+(DEAD/CHANCE, z=-0.50) on the same out-of-context curriculum,
+substantially worse than the SAME arm's static-sparsity result of
+0.7854. Per direct discussion: not surprising at this small a network
+scale -- pruning specifically is expected to be disruptive, and
+synaptogenesis only sometimes helps; `k=4` may be too aggressive for
+continuous per-step growth here (`k=1` or `k=2`, or growing every few
+steps instead of every step, are the leading candidates to try).
+Explicitly deferred as its own tuning question, separate from the
+crash fix -- not yet tested.
+
+**Direction update, per direct instruction, recorded here before
+stopping for this session -- not yet built:** synaptogenesis/pruning
+tuning shouldn't be its own isolated test track. It joins a combined
+"RNN sweep" alongside the other interacting knobs already in play --
+synaptogenesis (growth: on/off, `k`, cadence), pruning (implicit in
+the same `synap_step` mechanism, but worth a separate on/off axis --
+e.g. growth-only vs prune-only vs both, given pruning specifically is
+expected to be the more disruptive half at this scale per the
+discussion above), energy_rl (`use_energy`/`EnergyDynamics`, already
+a toggle in `train_tile_curriculum.py`), and scale (the residual
+`base` sweep -- 4 current, 12/24 not yet tested, see the entry above
+this session's synaptogenesis work interrupted). These four are
+related (growth budget interacts with pruning aggressiveness,
+energy's exploration noise interacts with both, and `base` changes
+what precision synaptogenesis is even fighting over) -- testing them
+jointly as a standard "does this change improve things" checklist is
+more honest going forward than isolated one-at-a-time tests. Caveat
+worth keeping in mind once this is built: a joint sweep finds good
+*combinations* but doesn't by itself explain *why* one wins -- still
+want a targeted single-variable ablation (matching
+[[feedback_do_science_correctly]]) whenever a joint-sweep result is
+surprising enough to need explaining, not as a replacement for it.
+Not started -- next session's starting point.
+
+**2026-08-10, later: timing check on the merge_row_workspace fix --
+no slowdown found.** Direct question after the block4 crash fix
+merged: does the new clamp-and-walk loop in `merge_row_workspace`
+(always runs now, not just on overflow -- it walks every touched tile
+computing `fit_pos`/`fit_tiles` before the write-back, where the old
+code did a single unconditional `std::copy`) meaningfully slow down
+block4 backward? Built an A/B comparison using sili__new's existing
+`scripts/bench_block4_layer.py` (times `backward_dense` before/after a
+growth phase that triggers block4 promotion, directly exercising
+`merge_row_workspace`) across two builds: a `git worktree` checkout at
+`0b15f60` (immediately pre-fix) in a fresh temp venv, and the current
+post-fix `main` (`9e70e01`) in the normal `.venv`. 7 interleaved
+repeats each (`OMP_NUM_THREADS=1`/`OPENBLAS_NUM_THREADS=1`/
+`MKL_NUM_THREADS=1` pinned to avoid BLAS-thread confounds), confirmed
+block4 promotion actually fired in every run (120 tiles / 322
+synapses after growth).
+
+Result: `backward_after_growth` (the specific timing that exercises
+the fix) was ~4% *faster* post-fix -- 569us vs 592us median -- well
+inside the ~530-660us run-to-run noise band both builds show. All
+other timed phases (forward before/after, backward before growth)
+showed the same pattern: no direction, no magnitude, indistinguishable
+from noise. Conclusion: the fix's extra walk loop is not a real cost
+at these sizes -- it's dwarfed by the rest of `disldo_backward`'s
+work. No optimization needed; per direct instruction ("check timing...
+if there's a clear quick fix now, implement and commit, otherwise get
+back to the tests"), this closes the timing question with no code
+change, and the next step is the quality tests recorded above
+(base=12/24, LR sweeps, clip range) -- explicitly NOT synaptogenesis
+tuning, which stays deferred to the joint-sweep phase described above.
+
+Along the way, found `bench_block4_layer.py` itself was broken on
+ANY current build -- it called `forward_dense(x, learning_rate=0.0)`,
+but `forward_dense()` dropped that kwarg at some point (`learning_rate`
+now only applies to `backward_dense`) and the script was never
+updated. Confirmed via the pre-fix worktree that this predates #34 --
+unrelated stale-script bug, not a regression from the block4 fix.
+Fixed and merged: `SimLeek/sili__new#35`.
+
+**2026-08-10, later still: base=12/24 residual-scale sweep -- base=12
+confirmed as a real win.** First item off the recorded quality-test
+list (explicitly not synaptogenesis). Added
+`true_multi_digit_deterministic_base12`/`_base24` arms to
+`train_tile_curriculum.py` (`base=12.0`/`24.0`, everything else
+identical to `true_multi_digit_deterministic`: `digit_cls=
+DISLDOLayerDeterministic`, `n_stages=3`, `lr_power=0.0` -- `base` was
+already a plain constructor kwarg on `TrueMultiDigitLayer`, no C++
+changes needed, matching the prediction in the queued hypothesis
+entry above). Ran all three arms back-to-back, same seed=1000/config
+(`0 1 15000 750 1000 1500 16 8 1500 8 0.002 1`), 15000 steps each
+(~105s/run):
+
+    base   mean_acc  status      std
+    4      0.8771    PLATEAUED   0.031
+    12     0.9375    PLATEAUED   0.023
+    24     0.7000    LEARNING    0.074
+
+`base=12` wins cleanly -- higher mean, lower variance, already
+plateaued, exactly matching the "exact tiling" prediction (digit 1's
+range ceiling lands exactly on digit 0's floor at base=12, per the
+E2M1-math reasoning in the queued hypothesis entry). `base=24` is
+NOT a clean result -- it's still trending up at step 15000 (not
+plateaued like the other two), so its lower mean_acc isn't a fair
+final comparison; would need a longer run to know if it converges
+higher or genuinely underperforms.
+
+Side note, not yet investigated: this run's base=4 baseline
+(0.8771) is noticeably higher than the historical 0.7854 first
+recorded for the same arm/seed/config earlier this session. Doesn't
+threaten today's comparison (all three arms ran back-to-back on
+identical current code, so the internal ranking is valid), but the
+absolute-number drift suggests something in the intervening C++ work
+(ScalePolicy refactor, the block4 fixes, or something else) changed
+this arm's behavior even though it shouldn't touch this code path
+(small max_weights=1500, likely stays scattered CSR, not block4).
+Worth a real look if it recurs, not chased further right now.
+
+**Recommendation**: switch the project's default residual base from
+4 to 12 for real-FP4 `TrueMultiDigitLayer` usage going forward; leave
+base=24 as an open question pending a longer run. Recorded in
+[[project_hybrid_precision_plan]]. Not yet promoted into any
+production/default arm -- the new base12/base24 arms are additive,
+existing arms unchanged.
+
+**2026-08-10, later still: user agreed base=12 makes sense, asked for
+an (optional) integration test + made it the actual default -- then a
+real methodology bug surfaced while building the confirmation test.**
+Made base=12 the class-level default in `TrueMultiDigitLayer`,
+`TrueMultiDigitDenseLayer`, `fixed_digit_residual_quantize`,
+`QuantizedDISLDOLayer32`, and the primary `true_multi_digit_deterministic`/
+`_noscale_deterministic` arms; kept a `_base4` arm for comparison
+(historical lr0/lr1/lr2/fp32_ref/dense/resync/noscale-stochastic/
+shared_conn arms left untouched at base=4.0, since those are fixed
+comparison points from earlier investigations, not "the default").
+
+While writing the confirmation test (`tests/test_residual_base_sweep.py`,
+opt-in via `SILI_RUN_BASE_SWEEP=1`), re-ran the exact base=4 vs base=12
+command from the sweep above and got a DIFFERENT result each time
+(0.70, then 0.65 final-step accuracy, same seed=1000, same everything).
+Root-caused: `ToyTileRecurrenceRealFP4.__init__` never passed `rng=`
+down to `disldo_cls(...)` for ANY of its 5-6 sublayers (q/k/v/o_proj/
+lm_head) -- `_preseed_random_sparse` (sili__new) defaults to
+`np.random.default_rng()` (fresh OS entropy) whenever `rng=None`, so
+every layer's initial connectivity AND initial weight values have
+been genuinely unseeded this ENTIRE session, regardless of the `seed`
+CLI arg -- `seed` only ever controlled the embed table, task
+generation, and (once added) FP4 stochastic rounding. Same underlying
+bug class as [[feedback_seed_stochastic_rng_for_comparisons]], just a
+different call site, and a much larger one: initial connectivity is
+plausibly the single biggest source of run-to-run variance on a tiny
+toy network like this.
+
+Fixed: `ToyTileRecurrenceRealFP4` now accepts `rng:
+Optional[np.random.Generator]`, derives one independent per-layer seed
+from it via `rng.integers(...)` (matching this project's own existing
+convention in `scripts/disldo_*_ablation.py`:
+`np.random.default_rng(seed+1)`/`(seed+2)` per sublayer, not one
+shared consumed stream), and passes `rng=np.random.default_rng(seed)`
+from `train_tile_curriculum.py`'s `main()`. Also had to add `rng=`
+passthrough to `AdamRowScaleDISLDOLayer`/`AdamRank1DISLDOLayer`
+(discovered because the full test suite -- not just this new test --
+started throwing `TypeError: unexpected keyword argument 'rng'` once
+`ToyTileRecurrenceRealFP4` unconditionally started passing it).
+Verified: same command run twice now gives byte-identical checkpoint
+accuracies (0.5167/0.6833 both times, vs the pre-fix 0.70/0.65
+divergence). Full fast test suite (232 tests) passes clean. Separately
+also found `PeakEligibilityDISLDOLayer` has the same never-passes-rng
+bug (causes an intermittent flake in its own test) -- NOT fixed here
+(unrelated to this task), logged as a todo alongside a broader "stop
+threading `rng=` through every call site, use a context-manager-scoped
+RNG instead" refactor the user requested be recorded rather than done
+immediately.
+
+**Consequence for every accuracy number in this session's precision
+work**: none of them are necessarily wrong (the mechanism/architecture
+findings -- deterministic-vs-stochastic rounding, the digit-residual
+design, etc. -- don't depend on any specific connectivity draw), but
+every SPECIFIC number (0.7854, 0.8771, 0.9375, 0.70, ...) was drawn
+from an uncontrolled random initial connectivity, i.e. one anecdote,
+not a controlled comparison. Directly matches the user's own framing:
+"forcing specific seeds can only verify 'there exists,' not 'for all'
+or 'usually.'" Immediately confirmed by re-testing with an actual
+fresh seed (2000) once the fix landed: base=6 won that draw (0.6812),
+not base=12 (0.6125) -- a different single-seed anecdote flips the
+"winner" yet again, underscoring exactly why a single seed was never
+enough.
+
+**Response, per direct instruction**: rebuilt the sweep as a real,
+paired, multi-seed comparison -- added a `base=6` arm (the midpoint
+between base=4's overlapping ranges and base=12's exact tiling, filling
+in the sparse 4/12/24 grid per direct request) and rewrote
+`test_residual_base_sweep.py` to run N seeds (default 5: 1000-1004)
+per arm, print a full per-seed table, and assert on a PAIRED win count
+(how many of the N seeds base=12 beats base=4 on) rather than a single
+point estimate. Launched the real 4-arm x 5-seed (20 run, ~35 min)
+sweep in the background; result not yet in at the time of this entry
+-- base=12 stays the working default in the meantime (the theoretical
+argument for it, exact digit-range tiling, is independent of the
+seeding bug), but is now explicitly flagged as pending re-confirmation
+rather than settled. Follow-up entry once the sweep completes.
+
+**2026-08-10, follow-up: multi-seed sweep landed, base=12 holds up.**
+4 arms (base=4/6/12/24) x 5 seeds (1000-1004), post-rng-fix, paired
+(same 5 seeds across every arm):
+
+    base   mean    std     per-seed
+    4      0.6417  0.1006  [0.723, 0.750, 0.633, 0.498, 0.604]
+    6      0.6929  0.0786  [0.750, 0.652, 0.725, 0.575, 0.762]
+    12     0.7296  0.0429  [0.744, 0.746, 0.785, 0.681, 0.692]
+    24     0.6775  0.0614  [0.733, 0.700, 0.665, 0.577, 0.713]
+
+base=12 wins on both mean (highest) and stability (std 0.043, roughly
+half of every other arm's) -- notably the most CONSISTENT arm across
+seeds, not just the highest average. Paired win counts: beats base=4
+on 4/5 seeds, base=24 on 4/5, base=6 on 3/5 (closer, but still ahead).
+This is a real, multi-seed-backed result -- unlike the retracted
+single-seed one, it survives exactly the "usually, not just exists"
+bar the user set. base=12 confirmed as the project default.
+
+Immediately after this, per direct discussion: the seed-to-seed spread
+even at base=12 (0.68-0.79) is still fairly wide for a supposedly
+"identical" config -- raised the hypothesis that this project's
+sparse, randomly-preseeded "echo network" connectivity (a different
+random subset of active synapses per seed) may be a bigger source of
+that spread than `base` itself, similar to known reservoir-computing
+seed sensitivity. Decided to test FULLY DENSE block4 disldo layers
+(no synaptogenesis/pruning at all) as the next step, on the reasoning
+that removing the random-connectivity-draw confound might both reduce
+seed sensitivity AND give a cleaner, more directly comparable signal
+for the quantization/base comparisons already in progress -- sparse
+echo-init and zero-init are still planned, but as later comparison
+arms once synaptogenesis/pruning work resumes, not the default going
+forward. No existing bulk "load dense weights directly into block4"
+API exists (only importance-gated per-synapse growth, or a scattered
+-CSR loader that never touches block4) -- this doubles as real
+infrastructure for task #5 (MiniCPM5's own planned "100% dense into
+block4, then prune toward net-zero" conversion path), so building it
+properly in C++ rather than a growth-loop bootstrap hack, per direct
+choice. Design in progress.
+
+**2026-08-10, follow-up: fully dense block4 built and verified real
+infrastructure -- but the seed-sensitivity experiment it was built to
+run doesn't work yet, paused rather than chased further.** Built and
+shipped, in `sili__new` (PR #36, merged into `feature/block4-dense-
+loader`): `block4_load_dense` (loading-only, takes already-quantized
+codes, no float/quantization/scale logic inside -- corrected mid
+-review from an earlier draft that conflated loading with
+quantization), `fp4_quantize_array`/`fp8_quantize_array` (separate
+standalone bulk quantizers), `load_dense_codes` pybind bindings on all
+9 FP4/FP8 layer variants sharing the template impl, and
+`test_block4_load_dense.cpp` (losslessness + forward-output
+correctness, passing). Zero regressions -- every pre-existing C++/
+Python test failure confirmed identical against the unmodified
+baseline via repeated git-stash comparisons.
+
+Wired `dense=True` through `DISLDOLayer`/`DISLDOLayerDeterministic` ->
+`TrueMultiDigitLayer` -> `ToyTileRecurrenceRealFP4` -> 4 new `*_dense`
+arms in `train_tile_curriculum.py`. Two real, sequential bugs found and
+fixed while getting this to actually train (not just construct):
+
+1. **FP4 zero-rounding floor vs naive fan-in scaling.** FP4 (E2M1) has
+   a FIXED absolute zero-rounding floor (~0.25), independent of layer
+   width. `_preseed_random_sparse`'s own `1/sqrt(k)` scaling, carried
+   over naively into the RAW quantized value at k=n_outputs=128, gives
+   `1/sqrt(128)~=0.09` -- nearly every drawn value collapses to code 0
+   ("not live"), silently turning "dense init" back into mostly-empty.
+   Fixed with a FIXED (not fan-in-shrunk) raw scale (1.5) for the
+   stored code, keeping ~87.5% actual live density.
+
+2. **Fan-in variance blowup once codes stay live.** A fixed raw scale
+   with NO compensating correction elsewhere gave row-output variance
+   ~128*1.5^2~=288 (vs sparse's properly-normalized ~1) -- confirmed
+   directly: every base=4/6/12/24 dense arm collapsed to IDENTICAL
+   chance-level accuracy (mean_acc~0.094, std~0.003 across 3 seeds),
+   consistent with the architecture's hard `[-2,2]` state clip
+   saturating output to a constant regardless of input -- a dead state
+   `value_scale`'s own RMSprop training can't escape from (clipping has
+   zero gradient outside its linear region, so no correcting signal
+   reaches the scale either). First fix attempt applied the correction
+   via per-ROW `value_scale` -- caught in review as the WRONG axis
+   (`output[c] = sum_r input[r]*weight[r,c]`'s variance depends on
+   column c's fan-in, not the row's width; the wrong-axis fix only
+   "worked" by coincidence on square q/k/v/o_proj layers, would have
+   been wrong for the non-square lm_head). Corrected to a per-COLUMN
+   `output_scale` set via `set_output_scale_raw`, computed from the
+   REAL post-quantization live count per column (not an assumed
+   uniform width) -- verified directly afterward: single-digit forward
+   output std=0.937 (was previously either near-zero or saturating),
+   healthy and in-range.
+
+**Even with both fixes, the full 15000-step curriculum still shows
+ZERO learning** -- all 4 dense base arms give BYTE-IDENTICAL per-seed
+accuracy trajectories (not just similar numbers: literally identical),
+strong evidence only digit 0 (whose `base**0=1` composition factor is
+base-independent) influences the output at all, and even digit 0 alone
+isn't learning over the full run. The problem has moved from "forward
+saturation" (fixed, confirmed via direct forward-output measurement)
+to something in TRAINING DYNAMICS specifically -- likely scale drift/
+staleness under much higher fan-in (this project's own earlier
+`value_scale` staleness investigation, `ScalePolicy`/
+`DeferredScaleWrite`, may be relevant here at a scale it wasn't
+exercised at before) or a backward-pass gradient-magnitude issue not
+yet isolated.
+
+**Per direct decision, paused rather than chased further right now**:
+the block4 dense LOADER infrastructure itself is real, correct, tested
+work (task #5's own eventual need, independent of whether THIS toy
+comparison succeeds) -- keeping it. The specific seed-sensitivity
+experiment it was built to run (does removing the sparse echo
+-network's random-connectivity draw reduce seed variance) is UNRESOLVED,
+not negative -- "dense doesn't train at all yet" is a different finding
+than "dense trains fine but is still seed-sensitive." Revisiting this
+alongside synaptogenesis/pruning work later, per the original plan this
+detour came from ([[project_sili_synaptogenesis_pruning_testing]]).
+Returning now to the quality-improvement track that was in progress
+before this detour: LR sweeps, clip-range test -- on the sparse echo
+network, whose comparisons (base=12 win, etc.) remain valid and
+unaffected by any of this.
+
+**2026-08-10 (cont.): LR sweep Test 2 -- lr_power retest under
+deterministic rounding, prediction CONFIRMED.** Added
+`true_multi_digit_deterministic_lr1`/`_lr2` (base=12, matching the
+confirmed default; `lr_power=1.0`/`2.0`) alongside the existing
+`lr_power=0.0` default arm, 3 seeds each, paired:
+
+    arm         mean    std     per-seed             status
+    lr_power=0  0.7389  0.0429  [0.694, 0.744, 0.779]  all LEARNING
+    lr_power=1  0.7431  0.0445  [0.769, 0.769, 0.692]  all PLATEAUED
+    lr_power=2  0.7243  0.0839  [0.802, 0.735, 0.635]  2 LEARNING, 1 PLATEAUED
+
+No clear winner -- lr_power=0 beats lr_power=1 on only 1/3 seeds
+(coin-flip), beats lr_power=2 on 2/3 (weak). Means overlap well within
+noise; lr_power=2's higher std (0.084 vs 0.043-0.045) is the only
+real distinguishing signal, and it points toward MORE variance, not
+less. Confirms the prediction from the original (stochastic-rounding
+-era) sweep: RMSprop's own `eff_lr*g/sqrt(importance)` update already
+self-normalizes almost all of `lr_power`'s extra per-digit damping
+away, so it doesn't meaningfully matter either way. `lr_power=0.0`
+(the simplest option, already the default) stays the right choice --
+no reason to add the extra parameter/complexity.
+
+**2026-08-10 (cont.): LR sweep Test 1 -- peak_lr at the wide config,
+a REAL win found (not noise-level like Test 2).** Memory-matched-wide
+config (`embed_width=32, column_neurons=8` -> `state_width=256`,
+`max_weights=6000`), `true_multi_digit_deterministic` (base=12), 3
+seeds, `peak_lr` in {0.002 (current default), 0.001, 0.0005}:
+
+    peak_lr  mean    std     per-seed              status
+    0.002    0.7424  0.0717  [0.773, 0.660, 0.794]  all PLATEAUED
+    0.001    0.9014  0.0643  [0.940, 0.827, 0.938]  all PLATEAUED
+    0.0005   0.7333  0.0344  [0.769, 0.700, 0.731]  all PLATEAUED
+
+`peak_lr=0.001` (HALF the current default) wins clearly: beats the
+current default on 3/3 seeds, mean_acc 0.90 vs 0.74 -- a real,
+substantial gap, not overlapping noise like the lr_power result above.
+`peak_lr=0.0005` (a further half) does NOT help further -- actually
+slightly worse than even the current default, confirming this is a
+genuine sweet spot at 0.001, not just "lower is always better" for the
+wide config. Matches the original hypothesis directly: the wide
+config's ~2x more free parameters need a lower peak_lr to converge
+well within the fixed 15000-step budget, even though
+`lr_per_row_nnz=True` already partially compensates via larger
+per-row nnz.
+
+**Recommendation**: use `peak_lr=0.001` (not 0.002) specifically for
+wide-config (`state_width=256`) runs going forward. **Not yet tested
+at the standard config** (`state_width=128`, used throughout every
+other comparison this session, including the base=12 confirmation) --
+per [[feedback_do_science_correctly]], don't assume this transfers;
+whether the standard config also wants a lower `peak_lr` is a
+separate, open question, not yet answered by this test.
+
+**2026-08-10 (cont.): clip-range test -- the strongest, cleanest
+result of the whole quality-improvement track.** The tile-recurrence
+state's hard clip bound (`np.clip(M_new_t.data, -clip_range,
+clip_range)`, `toy_tile_precision_models.py`) was hardcoded at 2.0
+without much justification; made it a `clip_range` constructor param
+(default 2.0, unchanged) plus a new CLI arg (position 15) to test it
+directly. `true_multi_digit_deterministic` (base=12), standard config,
+3 seeds, `clip_range` in {2.0 (current), 6.0 (matching FP4/E2M1's own
+max representable magnitude)}:
+
+    clip  mean    std     per-seed              status
+    2.0   0.7514  0.0271  [0.725, 0.750, 0.779]  all LEARNING (not converged)
+    6.0   0.9847  0.0162  [0.990, 0.998, 0.967]  all PLATEAUED (converged)
+
+`clip_range=6.0` wins decisively: beats the current default on 3/3
+seeds, mean_acc 0.98 vs 0.75, LOWER variance too (0.016 vs 0.027), and
+already fully converged (PLATEAUED) while clip=2.0 is still mid
+-LEARNING at step 15000 -- meaning the 2.0-clip gap would likely be
+even larger given more steps to actually finish converging, not a
+transient effect that would close on its own. This is the strongest,
+cleanest single result of this entire quality track (bigger effect
+size than the wide-config peak_lr win, and completely unambiguous --
+every seed agrees, no overlap).
+
+**Recommendation: switch the project's default `clip_range` from 2.0
+to 6.0.** Direct mechanism read: the state is RMSNorm'd (with a
+learned, currently ~1.0-initialized scale) immediately before this
+clip, so a tight [-2,2] bound was very plausibly cutting off legitimate
+post-norm dynamic range the network needed, especially once
+`state_ln`'s learned scale grows during training -- 6.0 gives
+meaningfully more headroom before the clip's zero-gradient region
+kicks in, matching FP4's own natural ceiling rather than an arbitrary
+tighter one.
+
+**2026-08-10 (cont.): dense connectivity's "fails to train" bug
+root-caused -- a NaN-blind gradient-clip guard, on BOTH sides of the
+Python/C++ boundary, not a value-scale/magnitude problem.** Resumed
+the dense-vs-sparse investigation (paused earlier this session after
+the naive block4-dense-loader comparison showed zero learning) per
+direct instruction to dig into real intermediate values rather than
+guess at another scale fix. Built `scripts/diagnose_dense_vs_sparse.py`
+(new, real diagnostic infra, not a one-off): constructs matched
+dense/sparse `ToyTileRecurrenceRealFP4` models at the same seed, runs
+real training steps, and compares every pipeline stage's value
+statistics side-by-side. Also gave `ToyTileRecurrenceRealFP4.step()`
+real `debug=True` instrumentation (previously a dead, unused
+parameter) recording per-stage mean/std/min/max/abs_max into
+`self._last_step_debug_stats`.
+
+Initial finding: dense connectivity doesn't fail to train from step 1
+(the original wrong assumption) -- `logits_std` grows steadily for
+~250-400 steps then the ENTIRE model (every stage, every parameter,
+including `centers`, a directly-stored leaf with no computation
+dependency on anything else) goes NaN in a single step and stays NaN
+**forever** after, on every subsequent step. Ruled out, with direct
+measurements, every "runaway magnitude" hypothesis first: DISLDO's own
+stored weight codes stay hard-bounded by FP4's structural ceiling the
+whole time; `output_scale`/`value_scale` stay small and only drift
+mildly; `log_sigmas`/`sigmas` (gaussian_attention's per-query std dev)
+barely move from init; `centers` barely drifts either. Tried backward
+global-gradient-norm clipping (`clip_grad_norm_`, already-existing
+infra) and forward activation clipping on `attn_o_proj` (matching the
+existing state clip's convention) -- both delayed but did NOT prevent
+the NaN, individually or combined.
+
+The real mechanism, found by noticing `centers` (unrelated to any
+forward computation) went NaN in lockstep with everything else: this
+is a **NaN gradient during backward**, not a forward blowup. Two
+independent silent-NaN-passthrough bugs, same shape, one on each side
+of the Python/C++ boundary:
+
+- **sili_peridot** (`model/toy_recall_models.py`, `clip_grad_norm_`):
+  `if total_norm > max_norm and total_norm > 0:` -- both comparisons
+  are `False` when `total_norm` is `NaN` (IEEE 754 semantics), so a
+  NaN gradient silently skips the clip and flows straight into
+  `AdamOptimizer.step()`, permanently corrupting its `m`/`v` moving
+  averages (every future update also NaN after that, explaining the
+  "forever" persistence).
+- **sili__new** (`sili/lib/headers/delta_csr_types.hpp`,
+  `RMSpropScalePolicy::update`/`AdaMaxScalePolicy::update`, plus a
+  hand-inlined duplicate of the same formula for the block4 path in
+  `linear_disldo.hpp`'s `disldo_backward`): the per-column/per-row
+  gradient aggregate is accumulated in `double` across every
+  contributing synapse x batch term (many more of them under dense's
+  much higher fan-in than sparse ever has), then narrowed to `float`
+  with **no range check**. Once that narrowing overflows to `Inf`,
+  `scale_state = beta2*scale_state + (1-beta2)*Inf^2 = Inf` and never
+  decays back down (`beta2 * Inf` stays `Inf` forever), then
+  `Inf / (sqrt(Inf)+eps) = Inf/Inf = NaN` by IEEE-754 -- confirmed
+  directly via the diagnostic: `output_scale` went NaN in the same
+  step as the whole model, while the raw stored weight code (fp4
+  saturates independently) stayed correctly bounded the whole time.
+
+**Fix (both sides, matching the "clip backwards AND forwards, and make
+NaN structurally impossible rather than just unlikely" directive):**
+`clip_grad_norm_` now explicitly checks `not np.isfinite(total_norm)`
+and zeros the gradients (skips that step's update) instead of falling
+through the original NaN-blind comparison. Both `ScalePolicy::update`
+implementations (RMSprop, AdaMax) and the block4-path inline update now
+check `isfinite` on the aggregated gradient AND the computed
+scale/scale_state before writing anything back, skipping the update on
+a non-finite result rather than writing corrupted state. A skipped
+update just means "no learning signal reached this parameter this
+step" -- strictly better than freezing the entire model into permanent
+garbage. Verified via the diagnostic run to 1500 steps, 3 separate
+runs, same seed: zero NaN occurrences (previously reliable by
+step ~250-400 every time), q/k/v/attn activations grow somewhat over
+the run (up to ~10-12 by step 1500) but stay finite and don't runaway
+further. Zero regressions: sili__new's Python test suite gives
+identical pass/fail counts with and without the fix (65 failed/152
+passed/23 errors either way -- all pre-existing, unrelated stale-test
+issues, confirmed via direct `git stash` comparison); sili_peridot's
+directly-relevant test files (toy_recall_models, toy_tile_precision
+_models, toy_precision_models, tile_recurrence, residual_base_sweep)
+all pass.
+
+**Not yet done**: a real multi-seed quality re-sweep of the dense arms
+now that training no longer dies partway through -- the diagnostic
+only proves training survives, not that dense connectivity reaches
+competitive accuracy. That's the natural next step before deciding
+whether dense becomes a real default alongside sparse-echo.
+
+**2026-08-11: multi-seed dense quality sweep run -- REAL NEGATIVE
+RESULT, dense connectivity still doesn't learn even with the NaN fix.**
+4 dense arms (base4/6/12/24) x 5 seeds (1000-1004), identical 15000
+-step/checkpoint-every-750 config to the sparse-echo reference sweep
+(see `tests/test_residual_base_sweep_dense.py`, new):
+
+    arm            mean    std     dense vs sparse-echo
+    base4_dense    0.0938  0.0097  sparse: 0.6417
+    base6_dense    0.1171  0.0310  sparse: 0.6929
+    base12_dense   0.1050  0.0163  sparse: 0.7296
+    base24_dense   0.0979  0.0240  sparse: 0.6775
+
+Every arm, every seed (19/20) status DEAD/CHANCE -- essentially pure
+chance (0.10 for VOCAB=10). This is a materially different, more
+sobering picture than short (1500-step) smoke checks suggested
+earlier in this same investigation (which showed real, varying,
+non-degenerate accuracy and looked like genuine learning) -- those
+checks just hadn't run long enough to see the eventual collapse;
+dense connectivity trains for a while, then decays to chance by the
+time the harder curriculum stages are reached, for every base value.
+Low variance here reflects uniform failure, not uniform success --
+this directly answers the original block4-dense-loader question
+(does dense reduce seed-to-seed variance vs sparse-echo): yes,
+trivially, because it's stuck at chance in every run.
+
+**Root-cause investigation, per direct user diagnosis ("pathological
+attractor"):** correlated the accuracy collapse with the NEW
+`clip_grad_norm_`/`ScalePolicy` skip mechanism firing -- an isolated
+probe (monkey-patched skip counter around the unmodified production
+code, not touching any shared file) found `base4_dense` hits
+non-finite gradients on ~4.3% of steps overall, with a MUCH denser
+skip storm (~15% of steps) concentrated exactly at the seq_len 3->4
+curriculum transition, correlated 1:1 with accuracy crashing to chance
+at that exact point. `base12_dense` (the project's default base, exact
+digit-range tiling) showed only 0.4% skips and no collapse in the same
+short window -- independent evidence base=12's tiling isn't just more
+accurate, it's more NUMERICALLY STABLE under dense connectivity too.
+
+Direct user diagnosis: with dense connectivity's much higher fan-in,
+recurrent state has every incentive (via the softmax-style attention
+gating) to grow activation magnitude without bound -- "high value in
+RNN shuts off wrong competitor signals... no real cap on magnitude,
+every reason to increase it" -- and the existing hard clip
+(`M_new_t.data = np.clip(...)`) is a straight-through, autograd
+-bypassing overwrite that gives ZERO gradient signal discouraging this;
+biologically, a real neuron hit with 10k synapses' worth of signal at
+once would get damaged and learn not to let that happen again -- the
+network currently has no equivalent training pressure at all.
+
+**Fix attempted**: added `magnitude_penalty_coef` to
+`ToyTileRecurrenceRealFP4` -- a real, differentiable `coef*mean(x**2)`
+aux-loss term at both existing clip sites (attn_o_proj, post-clip
+state), independent of `use_energy`/EnergyDynamics per direct
+instruction (energy_rl's own extinguishing pressure "adds a lot right
+now" and would confound an isolated test of this specific mechanism).
+Computed from the POST-clip value deliberately, not pre-clip: `power`'s
+backward reads `.data` lazily at backward-call time, so building the
+penalty from the Tensor before the existing `.data = clip(...)`
+straight-through overwrite would silently differentiate against the
+wrong (already-mutated) value once `loss.backward()` actually runs
+later; using the post-clip value sidesteps that entirely (self
+-consistent, nothing mutates it again) and additionally gives a
+gradient magnitude that's itself bounded by clip_range, rather than
+risking reintroducing unbounded-magnitude gradients in the very
+mechanism meant to prevent that.
+
+**Short-run signal was very clean and promising**: a 5-seed, 1500-step
+smoke sweep (`base4_dense`, coef in {0, 0.0003, 0.001, 0.003, 0.01})
+showed coef=0.01 beating coef=0.0 on 4/5 seeds (mean of last-3
+-checkpoint accuracy 0.276 vs 0.171). The skip-rate probe was even
+cleaner and closer to binary: at seed=1000, skip rate dropped from
+4.67% (coef=0) to ~0% at EVERY tested nonzero coefficient (0.001,
+0.01, 0.03) -- the penalty essentially eliminates the non-finite
+-gradient events entirely, confirming the mechanism works exactly as
+intended at the level it targets.
+
+**Full 15000-step, 5-seed validation at coef=0.01: NO real improvement
+over the no-penalty baseline** (`tests/test_dense_magnitude_penalty_sweep.py`,
+new):
+
+    base     magpen mean   nopen mean   sparse mean
+    base4    0.0946        0.0938       0.6417
+    base6    0.0962        0.1171       0.6929
+    base12   0.1054        0.1050       0.7296
+    base24   0.0875        0.0979       0.6775
+
+Every arm still DEAD/CHANCE, statistically indistinguishable from the
+no-penalty numbers. **The disconnect between the short-run and
+full-run results is itself the real finding**: eliminating the
+non-finite-gradient skip storms (confirmed to work cleanly, a real and
+correct fix for a real bug) was NOT sufficient to make dense
+connectivity learn over a full curriculum. The skip storms were a
+genuine, fixable symptom of the underlying attractor dynamic, but not
+themselves the primary reason dense fails at full scale -- something
+else in the same "large activation magnitude, growing incentive"
+mechanism the user diagnosed is still winning out over a
+`coef=0.01` L2 penalty at this scope (both clip sites, this specific
+coefficient), or a materially different mechanism is needed
+(stronger coefficient, penalty placement elsewhere in the recurrence,
+or the originally-deferred energy_rl extinguishing pressure, still
+untested in isolation from this specific fix).
+
+**Status**: `magnitude_penalty_coef` is real, tested, zero-regression
+infrastructure (default 0.0/off, fully backward compatible) -- kept,
+since it correctly does what it was built to do (eliminate the skip
+storms) even though that wasn't sufficient on its own. Dense
+connectivity remains NOT competitive with sparse-echo at project scale
+as of this entry. Sparse-echo (base=12, mean 0.7296) remains the
+working default; dense connectivity is not yet a viable alternative
+despite two real, substantive fixes this session (permanent-NaN
+prevention, magnitude penalty) -- both necessary-but-not-sufficient.
+Next candidates, not yet tried: a meaningfully larger
+`magnitude_penalty_coef` (0.01 fully suppressed the SKIP mechanism at
+1500 steps but may still be too weak a restoring force against the
+attractor over a full 15000-step run); energy_rl's extinguishing
+mechanism in isolation; or accepting sparse-echo as the connectivity
+choice and moving on to synaptogenesis/pruning/energy stability work
+per the original stated priority ordering.
+
+**2026-08-11, later: energy_rl tested (2 configs) -- real, replicated,
+but still-small improvement, gap to sparse-echo remains wide open.**
+Direct user hypothesis: the magnitude-penalty null result looked like
+a regularization-STRENGTH-or-KIND issue, not a dead end -- EnergyDynamics'
+`activation_cost` term is L1-flavored (`new_energy -= activation_cost *
+abs(h)`, not L2), plus it brings real homeostatic machinery (KL
+density targeting, refractory drain, forced-firing bootstrap)
+`magnitude_penalty_coef` doesn't have at all. Tested via the existing,
+already-wired `use_energy=True` path (`_apply_energy` in `step()` was
+already unconditionally present, zero new code needed) at two
+configs, full 15000-step/5-seed validation for both:
+
+    base     no-fix   energy(default)  energy(ac=.02,prec=.01)  sparse-echo
+    base4    0.0938   0.1325           0.1233                   0.6417
+    base6    0.1171   0.1575           0.1500                   0.6929
+    base12   0.1050   0.1308           0.1200                   0.7296
+    base24   0.0979   0.1358           0.1333                   0.6775
+
+"default" = this project's existing already-tuned-low `ENERGY_KWARGS`
+(drive=0.00535, activation_cost=0.005, precision=0.001, density=0.005,
+p=0.995, reactivity=0.0001), used elsewhere. "ac=.02,prec=.01" =
+activation_cost 4x, precision 10x, chosen from an isolated 3-seed
+/1500-step skip-rate probe that showed it suppressing non-finite
+-gradient skips further than the default (0.33% vs the probed
+default's own rate) -- built as a standalone script
+(`scripts/energy_param_validation.py`, new, constructs models directly
+rather than adding CLI-exposed energy params, since a parallel default
+-config sweep was already running against `train_tile_curriculum.py`
+and editing it would have contaminated that run).
+
+Both energy configs beat no-fix CONSISTENTLY across all 4 base values
+(a real, small, replicated effect, unlike the magnitude-penalty
+fix's statistically-zero result) -- energy_rl's L1/homeostatic
+mechanism genuinely does something the pure L2 penalty didn't. But
+the STRONGER config did NOT clearly beat the default (overlapping,
+if anything slightly worse on every base) -- the same "short-run
+signal didn't scale with strength at full duration" pattern seen with
+`magnitude_penalty_coef` repeats here too. Both remain far short of
+sparse-echo's 0.68-0.73.
+
+**2026-08-12: spectral-norm-alone win CONFIRMED GENERAL, not
+base=12-specific -- full validation across base=4/6/24.** Same
+15000-step/5-seed config, `spectral_norm_target=0.9`, no magnitude
+penalty, no energy:
+
+    arm            spectral mean  spectral std   nofix    sparse-echo
+    base4_dense    0.9158         0.0350         0.0938   0.6417
+    base6_dense    0.8779         0.0609         0.1171   0.6929
+    base24_dense   0.8625         0.0167         0.0979   0.6775
+    base12_dense   0.8858         0.0566         0.1050   0.7296  (already confirmed)
+
+Every base value shows the identical pattern: dense connectivity
+with the spectral fix beats sparse-echo by a wide margin (+0.15 to
++0.28 absolute), comparable-to-lower variance. This is now a fully
+general result, not conditional on any specific base -- dense +
+Spectral Normalization is a strong candidate for the new project
+default across the whole base sweep, not just base=12.
+
+**Cumulative status after 3 real, substantively different fix
+attempts this session (permanent-NaN prevention, L2 magnitude
+penalty, energy_rl at 2 strengths)**: dense connectivity has moved
+from "crashes to permanent NaN" -> "survives but stuck near chance"
+-> "consistently, measurably better than chance but still ~5x worse
+than sparse-echo." Each fix targeted the SAME diagnosed mechanism
+(large recurrent activation magnitude, encouraged by the softmax-style
+attention gating, unpunished by the existing straight-through hard
+clip) via a different lever, with diminishing-but-nonzero returns.
+Open next candidates, none yet tried: energy_rl's OWN forced-firing/
+exploration bootstrap in isolation (not just activation_cost/precision,
+the OTHER "some other stuff" the user flagged); combining energy_rl
+with the magnitude penalty (never tested together); a fundamentally
+different regularization site (per-head/per-projection normalization
+rather than a single scalar penalty on the whole state); or accepting
+sparse-echo as the working connectivity choice and moving on to
+synaptogenesis/pruning/energy stability work, per the original stated
+priority ordering -- given three real, substantive, correctly
+-implemented and validated attempts have each fallen well short, this
+last option is increasingly the pragmatic call rather than continuing
+to guess-and-check regularization strength/kind indefinitely.
+
+**2026-08-11, later still: measured the ACTUAL root cause directly --
+spectral radius, not just magnitude.** Direct user reframing: all
+three fixes above only constrain average activation/gradient
+MAGNITUDE, never the recurrent weight matrix's actual eigenvalue
+structure -- worth measuring the real thing before guessing another
+magnitude-based lever. Extracted `o_proj`'s effective dense matrix via
+`layer.forward(identity)` (works regardless of internal FP4/sparse
+storage, no new C++ needed) and computed its spectral radius directly:
+
+    sparse   at init:         spectral_radius=0.85
+    sparse   after 400 steps: spectral_radius=0.83   (flat, stable)
+    dense    at init:         spectral_radius=1.19   (already >1!)
+    dense    after 400 steps: spectral_radius=1.50   (growing)
+
+This is the real mechanism: a spectral radius above 1 means the
+recurrence structurally AMPLIFIES signal every pass -- a linear
+-systems instability present at initialization (even before any
+training) that gets WORSE during training. Sparse echo sits below 1
+and stays flat (textbook reservoir-computing "echo state property").
+Explains cleanly why all three magnitude-based fixes only partially
+helped: penalizing average magnitude doesn't specifically constrain
+the matrix's DOMINANT eigenvalue, which can stay above 1 even at
+moderate average magnitude if the matrix has the wrong structure.
+
+**Fix implemented: Spectral Normalization** (Miyato et al. 2018,
+`ToyTileRecurrenceRealFP4`'s new `spectral_norm_target`/
+`spectral_norm_ema_decay` params). A persistent probe vector `u` per
+o_proj sublayer -- deliberately NOT the actual recurrent state
+(M_prev/M_new), since the real state trajectory passes through
+RMSNorm/residual/clip which aren't part of the linear map and would
+conflate the estimate (RMSNorm actively re-normalizes magnitude
+regardless of the underlying matrix's true eigenvalues, which is
+likely part of why we saw magnitude drift over TRAINING time rather
+than blowing up within one forward pass). `u` is updated via ONE
+power-iteration step per real step (`layer.forward(u, 0.0)` --
+forward-only, zero side effects, same convention `evaluate()` already
+uses; cheap, O(n^2), nothing like an O(n^3) eigendecomposition, and no
+new differentiable primitive needed anywhere since it's built entirely
+from ops `sili` already has). The real layer output is rescaled by
+`target/sigma_ema` (an ordinary Tensor*float multiply, already
+autograd-safe) -- sigma is EMA-smoothed, not used raw, so a
+synaptogenesis-triggered structural change doesn't cause a sudden
+single-step jump before `u` re-converges to the new dominant
+eigenvector. Unlike an init-time-only fix, this re-tracks continuously
+as the matrix changes (gradient updates OR future synaptogenesis) --
+directly addressed a concern raised before implementing: a one-shot
+init rescale would go stale the moment synaptogenesis adds a synapse.
+
+Two real bugs caught during implementation, both fixed before
+committing:
+1. A single untrained random probe vector badly underestimates the
+   true dominant singular value (power iteration hasn't converged
+   yet), so the FIRST real-step rescale overshot the target --
+   measured directly (effective spectral radius 1.38 at step 0 vs the
+   0.9 target). Fixed with a 20-iteration warm-start at construction
+   (cheap, no backward/optimizer call) -- after the fix, effective
+   radius is 0.9467 at step 0 and 0.9016 after 400 steps, both close
+   to the 0.9 target.
+2. The probe-vector state was being allocated (and consuming `rng`
+   draws) UNCONDITIONALLY, even when `spectral_norm_target=None` (the
+   default, every existing arm/test) -- silently shifted RNG
+   consumption for code that never asked for this feature, broke one
+   existing test (`test_row_silent_at_query_tick_still_gets_credited_
+   from_an_earlier_peak`, an unrelated-looking failure that was
+   actually this). Fixed by making the whole block conditional; full
+   suite back to 100 passed after.
+
+Quick multi-seed short-run probing (1500 steps): task-accuracy signal
+was noisy/inconclusive (same "short runs don't predict full-scale
+behavior" pattern as every other fix tonight -- unfixed dense_base12
+ALSO looks fine at 1500 steps before its eventual full-scale
+collapse), but the skip-rate signal was the cleanest of the whole
+night: non-finite-gradient skip rate dropped from 2.267% (unfixed) to
+**exactly 0.000%** at every tested target (0.7/0.8/0.9/1.0) -- a
+complete elimination, stronger than either the magnitude penalty or
+energy_rl achieved. Picked `target=0.9` (standard reservoir-computing
+echo-state-property convention) for the full validation.
+
+**Full 15000-step/5-seed validation of spectral-norm-only (target=0.9,
+no magnitude penalty, no energy) on dense_base12: DECISIVE WIN --
+dense connectivity not only closes the gap to sparse-echo, it BEATS
+it.**
+
+    spectral_norm_target=0.9, dense_base12: mean=0.8858  std=0.0566
+    per_seed=[0.85, 0.9479, 0.8292, 0.8562, 0.9458]
+
+    vs no-fix (unfixed dense):  mean=0.1050  (chance)
+    vs sparse-echo (base=12):   mean=0.7296  std=0.0429
+
+Every one of 5 seeds landed in a tight 0.83-0.95 band, comfortably
+above sparse-echo's own 5-seed spread, with comparable-to-better
+variance (std 0.057 vs sparse's 0.043). This is the real fix, not a
+partial mitigation like the three tried before it -- the spectral
+radius measurement wasn't just correlated with the instability, it
+WAS the instability. Directly resolves the ORIGINAL question the
+block4-dense-loader was built to answer (does dense connectivity
+reduce seed-to-seed variance vs sparse-echo): yes, AND it reaches
+meaningfully higher accuracy too, once the actual numerical root cause
+is fixed rather than worked around.
+
+**Status update**: dense connectivity, via block4 + real Spectral
+Normalization, is now a genuinely BETTER default than sparse-echo on
+this toy task -- a complete reversal from where this investigation
+started ("zero learning, byte-identical across bases," PAUSED).
+
+**2026-08-11 (continued the next day): combination tests -- spectral
+normalization does NOT stack with magnitude-based regularizers; both
+combinations tested actively HURT rather than help.**
+
+    spectral-alone:              mean=0.8858  std=0.0566
+    spectral(0.9)+magnitude(0.01): mean=0.1671  std=0.0328
+    spectral(0.9)+energy(default): mean=0.2200  std=0.0360
+    (both dense_base12, 15000 steps, 5 seeds, same as spectral-alone)
+
+Combining spectral norm with EITHER the L2 magnitude penalty or
+energy_rl (default ENERGY_KWARGS) collapses accuracy back down to
+near-chance territory (0.17-0.22), a 65-80% relative drop from
+spectral-alone's 0.886. Two independent tests showing the same
+qualitative failure (not just the L2 one) makes this look like a
+real, general interaction: any mechanism that independently drives
+o_proj's raw weight magnitude via its own gradient/update signal
+fights against spectral norm's ADAPTIVE rescale (which re-inflates
+whatever gets shrunk, via its own separate power-iteration-tracked
+sigma, to keep hitting the spectral target regardless) -- wasted,
+destabilizing tension between two control philosophies for the same
+underlying quantity, rather than complementary pressure. The
+"+magnitude+energy" triple-combo test was skipped given this
+consistent pattern -- very likely would just compound the same
+conflict, not worth the ~90min-2hr cost to confirm the predictable
+outcome.
+
+**Practical conclusion**: spectral normalization ALONE (no magnitude
+penalty, no energy_rl) is the current best-known configuration for
+dense connectivity's o_proj, by a wide margin. Direct implication for
+future EnergyDynamics/energy_rl design (raised by direct discussion,
+see project_hybrid_precision_plan memory for the fuller writeup): a
+"recurrent-state-space" energy_rl variant should NOT include
+magnitude-penalizing terms (L1/L2 on raw magnitude) on any layer
+spectral normalization already covers -- whatever else it contributes
+there (symmetry-breaking exploration/forced-firing, sparsity via
+GATING rather than via penalty) needs separate testing to see whether
+those specific mechanisms also conflict with the rescale or are
+compatible because they don't compete for the same magnitude-control
+variable the way L1/L2 do.
+
+**Not yet done**: confirm spectral-alone's win generalizes to
+base=4/6/24 (only base=12 tested); extend spectral normalization to
+q/k/v if warranted at larger/production scale (currently only
+o_proj, the layer directly embedded in the recurrent loop, per the
+"only layers applied repeatedly in a feedback loop need this"
+reasoning -- q/k/v transform the current input+state once per step,
+not compounded across steps, so likely lower priority but not ruled
+out); redesign EnergyDynamics to separate "state-space" (spectral
+-aware, no magnitude penalty) from "input/output" (full L1/L2/
+homeostasis, no spectral -- not part of a multiplicative loop)
+variants, per direct discussion -- premature until more of the
+individual-component ablations (does the drive/exhaustion/twitch
+-init/symmetry-breaking piece alone conflict with spectral norm, or
+only the magnitude-penalizing pieces specifically?) are run.
+
+**2026-08-11/12 -- redirect from direct correction: the existing
+spectral/magnitude mechanisms were a poor approximation of the actual
+intended design ("the current spectral and magnitude based methods
+are both poor approximations of the actual magnitude based suggestion
+which was apparently lost in communication"). Real design: separate
+`v_in_proj`/`v_state_proj` weight matrices (genuinely separate, not
+one matrix called twice), with softmax treated as an approximately
+magnitude-preserving redistribution operator on V's rows so the
+state-attributable and input-attributable output norms can be
+estimated cheaply (no extra forward pass) via `r =
+l2(attn_output)/l2(v_combined)`, `state_attributable_norm ~=
+l2(v_state)*r`. PRIMARY term: a squared-error penalty pulling
+`state_attributable_norm` toward `0.9 * l2(M_prev)` (soft L2 target,
+not a hard rescale like spectral norm). q/k stay on the combined
+blended input+state (per [[feedback_attention_needs_combined_input_state]]
+-- never split there). o_proj target (not yet implemented): ratio
+`l2(output)/l2(input)` toward ~1.0, permissively. Also: all-zero-init
+directive for every SYNAPSE (q/k/v_in/v_state/o_proj/lm_head) --
+NEURON-level RMSNorm scale params (`input_ln`/`state_ln`) stay at
+their normal 1.0 baseline, only weight matrices zero (a first pass
+zeroed the norm scales too, which forces the whole forward pass to be
+structurally zero at the RMSNorm stage -- corrected per direct
+feedback: "the scales might be best set to 1.0 actually... input and
+output if l1 or l2 scale, and energy is for synapses").
+
+Built as a standalone probe (`StateProjModel`,
+`state_proj_l2_probe.py`, not yet merged into
+`model/toy_tile_precision_models.py`). One real bug found and fixed
+along the way: the L2-norm helper (`sqrt(sum(x^2))`, no epsilon) has
+a backward-pass singularity at exactly x=0 (`d(sqrt(x))/dx =
+0.5*x^-0.5` -> infinity) -- with all-zero-init this hit on
+essentially every step, producing a 100% gradient-clip skip rate.
+Fixed with `+1e-8` before the sqrt (matching RMSNorm's own existing
+epsilon convention). Confirmed fix: skip rate dropped from 100% to
+0.000% for the zero-init variants.
+
+A medium-length (4000-step, 3-seed) probe of `normal_init,
+state_coef=0.01` looked promising: mean=0.5556, one seed hit a
+perfect 1.0. **Did not replicate at full scale.** A real 15000-step,
+5-seed validation of the exact same config collapsed to mean=0.0667
+(std=0.1491, per_seed=[0.3333, 0.0, 0.0, 0.0, 0.0] -- 4 of 5 seeds
+flatlined completely), far below both sparse-echo (0.7296) and
+spectral-alone (0.8858). This is the same pattern seen with every
+other magnitude-based fix this session (L2 penalty, default
+energy_rl combined with spectral): a real, non-noise signal at
+medium length that fails to hold up once the curriculum reaches its
+harder, later out-of-context stages at full length. Short/medium
+-length probes are not a reliable predictor of full-scale behavior
+for this class of mechanism specifically -- treat any future
+medium-length "promising" result on a magnitude/homeostasis
+regularizer as provisional until a full run confirms it, not as
+grounds to move forward.
+
+Separately, a longer (10000-step, 3-seed) all-zero-init test of
+`use_energy=True` vs `False` produced accuracy trajectories that were
+BYTE-FOR-BYTE IDENTICAL across all 50 checkpoints and all 3 seeds
+(both mean=0.1111) -- flagged as suspicious (bug vs. genuine
+inertness of `EnergyDynamics` in this all-zero-init config) and not
+yet resolved as of this entry; a direct diagnostic
+(`energy_activity_check.py`, inspecting `model.energy.energy`/
+`actual_p` directly) was in progress.
+
+**Status: this design (v_in_proj/v_state_proj split + state_proj
+L2-target) does NOT currently beat spectral normalization alone, and
+at the one coefficient tested (0.01) is actually much worse at full
+scale.** Not yet ruled out entirely -- only the PRIMARY term has been
+implemented and only one coefficient tested; the secondary terms
+(in_proj rate-of-change penalty, near-clip L1 penalty, o_proj ratio
+target) and other state_coef values remain untested. Nothing from
+this design has been merged into the shared model files; everything
+remains in standalone job-tmp scripts.
+
+**2026-08-12, follow-up -- o_proj ratio-target penalty implemented and
+tested (direct hypothesis this was the load-bearing piece); also does
+NOT beat spectral-alone, and a real eigenvalue measurement now
+explains why.** Added `l2(output)/l2(input)` -> 1.0 squared-error
+penalty on o_proj (differentiable through o_proj's own weights,
+`attn_raw` treated as a constant denominator, same pattern as the
+state term) plus a diagnostic power-iteration eigenvalue probe on
+o_proj (same persistent-probe-vector technique as the old
+`spectral_norm_target` mechanism, but purely observational here --
+not used to rescale anything), logged at every 200-step checkpoint.
+Also fixed a real bug found along the way: `state_proj_l2_probe.py`'s
+own 4-variant test loop ran unconditionally at MODULE IMPORT time (no
+`if __name__ == "__main__":` guard) -- every other script that
+imported `StateProjModel`/`run` from it was silently paying the cost
+of (and printing noise from) that whole loop first. Fixed.
+
+Full 15000-step/5-seed validation, dense_base12, three arms:
+
+    o_proj_only_coef0.01    mean=0.1333  eig[min/mean/max]=1.154/2.091/3.063
+    o_proj_only_coef0.1     mean=0.2000  eig[min/mean/max]=1.159/2.108/3.242
+    state0.01+o_proj0.01    mean=0.2000  eig[min/mean/max]=1.013/1.953/2.821
+    vs sparse-echo=0.7296  vs spectral-alone=0.8858  vs state-alone=0.0667
+
+All three arms stay far below both references, and a 10x coefficient
+increase (0.01->0.1) barely moved the result. The eigenvalue log
+explains the mechanism directly rather than leaving it inferred:
+o_proj's dominant eigenvalue sits at mean ~2.0-2.1 (range 1.0-3.2)
+under these soft squared-error penalties, well above spectral norm's
+~0.9 target -- a soft, coefficient-weighted L2-target penalty, even
+at 10x strength, is not a strong enough force against dense
+connectivity's continuous eigenvalue-growth pressure (per the
+original spectral-radius root-cause finding earlier in this
+investigation) the way spectral norm's EXACT multiplicative rescale
+is. This is a real, measured explanation, not just a repeat of the
+"promising-then-collapses" pattern: none of the v_in_proj/v_state_proj
+-based penalty terms (state, o_proj, or combined) actually control
+the eigenvalue tightly enough to matter, regardless of coefficient.
+
+**Status: spectral normalization remains the clear best-known
+mechanism for dense connectivity's o_proj stability.** The
+v_in_proj/v_state_proj-split design, as implemented so far (PRIMARY
+state term + o_proj ratio term), does not offer a competitive
+alternative. Not yet tried: a MUCH larger o_proj coefficient (order
+-of-magnitude beyond 0.1, to see if the penalty can be pushed hard
+enough to actually pin the eigenvalue near 1 the way spectral norm
+does -- at that point it would functionally become a soft
+approximation of spectral norm rather than a genuinely different
+mechanism) or combining this design's terms WITH spectral
+normalization itself (previously found to conflict for
+magnitude-penalty/energy_rl, but not yet tested for this specific new
+mechanism).
+
+**2026-08-12, follow-up -- root-caused WHY the soft penalty couldn't
+move the mean, and separately confirmed a hard post-hoc rescale beats
+every gradient-based variant, closing out this line of investigation
+for now.** Per direct question ("DISLDO shouldn't have inline
+normalization, where is that?"): found the exact mechanism --
+`linear_disldo.hpp:592-599`'s per-synapse update (`ci = beta2*ci +
+(1-beta2)*g*g; cw += -lr*g/(sqrt(ci)+eps)`) is literal RMSprop, applied
+PER SYNAPSE, on by default (`damp_by_importance=true`) -- not new, this
+IS what `[[importance_is_already_the_optimizer]]` already documented,
+just not previously connected to why a loss coefficient bump has so
+little effect: scaling a gradient by a constant `k` scales `ci`'s EMA
+by roughly `k^2` once it adapts, so `g/sqrt(ci)` ends up close to
+UNCHANGED -- RMSprop is near scale-invariant to a constant multiplier.
+
+Tried an exponential-shaped penalty (`exp(alpha*(ratio-target)^2)-1`,
+near-zero gradient at target, sharp spike far from it, per direct
+design "some variance is useful but a lot means the state fails") as
+an alternative that might outrun the EMA's damping. Found and fixed a
+real bug first: an unclipped exponent overflows to Inf in the FORWARD
+pass on a large deviation, which corrupts DISLDO's inline weight
+update directly (that path has no isfinite guard of its own, only the
+scale-update does) -- confirmed directly (SVD failed to converge on a
+corrupted o_proj matrix). Fixed by clipping the exponent itself before
+`exp()` (same "always clip backwards and forwards" lesson as the
+earlier permanent-NaN fix). Once stable: exponential shape alone,
+damping still on, made no real difference (mean_sv 1.39-1.47 vs
+squared-error's 1.4-1.7) -- shape wasn't the bottleneck.
+
+Per direct suggestion, tested with `damp_by_importance=False` on
+o_proj (disables the RMSprop normalization for o_proj's WHOLE backward
+call -- both the aux penalty AND the main task gradient share it, no
+way to isolate just one). Smoke test (1000 steps): confirmed the
+diagnosis cleanly -- mean_sv dropped to 0.898-0.901 (both squared and
+exponential shapes, nearly identical to each other) vs 1.396 damped.
+RMSprop damping really was the dominant confound; loss shape barely
+matters once it's out of the way.
+
+**But the full 15000-step/5-seed validation showed removing damping
+is a net LOSS, not a win:**
+
+    o_proj_nodamp_coef0.01           mean=0.2667  skip=14.4%  eig[mean]=1.208
+    o_proj_nodamp_coef0.01+state0.01 mean=0.1333  skip=21.2%  eig[mean]=1.062
+    vs hard-mean-rescale-target1.0=0.5333  vs spectral-alone=0.8858  vs sparse-echo=0.7296
+
+mean(sv) DOES land near target this way, but accuracy is worse than
+even the hard-rescale mechanism, and skip rate jumps to 14-21% (vs
+~0% for the hard rescale) -- stripping RMSprop normalization off
+o_proj's real task-relevant gradient (not just the aux penalty)
+destabilizes training more than the corrected mean helps.
+
+**Full comparison across everything tried in this investigation:**
+
+    mechanism                          mean(sv)    accuracy
+    soft penalty, damping on           1.4-1.7     0.13-0.20
+    soft penalty, damping off          ~1.1-1.2    0.13-0.27 (worse)
+    hard post-hoc MEAN-rescale         ~1.07       0.47-0.53
+    spectral norm (hard MAX-rescale)   ~0.9 (max)  0.886
+    sparse-echo                        --          0.730
+
+Consistent pattern: every gradient/loss-based approach either gets
+absorbed by DISLDO's own per-synapse RMSprop normalization, or damages
+the main task signal once that normalization is stripped out. Only a
+HARD, post-hoc multiplicative rescale applied entirely OUTSIDE the
+weight-update gradient path works well -- true whether it targets the
+max (spectral norm, 0.886) or the mean (this new mechanism, 0.53).
+Targeting the mean specifically still underperforms targeting the max
+by a wide margin -- notable since the whole reason this alternate
+design was pursued was a biological argument that a hard MAX-only fix
+isn't plausible (inhibitory interneurons would show up as low/negative
+values, nothing to explicitly clip) -- empirically, on this toy task,
+the max-targeting mechanism is just clearly better regardless of that
+motivation.
+
+**Status: spectral normalization remains the clear best-known
+mechanism.** The v_in_proj/v_state_proj-split design's hard
+mean-rescale variant is a real, working, but currently weaker
+alternative (0.53 vs 0.886) -- not ruled out for other reasons (the
+biological framing may still matter for future synaptogenesis work
+even if it doesn't win on this narrow toy-task accuracy metric), but
+not a replacement for spectral norm on this evidence. Nothing merged
+into shared model files; everything remains in standalone job-tmp
+scripts (`state_proj_l2_probe.py` and its various validation drivers).
+
+**2026-08-12, session continuation -- precisely quantified the RMSprop
+-dominance mechanism, tested a mathematically-derived dominant
+exponential penalty, and standalone-tested scale-vector clipping.**
+
+Direct measurement (`grad_magnitude_check.py`, real cross-entropy-only
+vs aux-only backward through `raw` on the same forward pass, after 300
+real training steps): `|g_main| = 4.64e-01`, `|g_aux|
+(o_proj_coef=0.01) = 2.68e-04` -- a 1731x ratio. Coefficient needed for
+`|g_aux| ~= |g_main|`: ~17.3. This makes the earlier "RMSprop absorbs a
+constant coefficient multiplier" explanation precise: `ci` (the
+per-synapse EMA) tracks the SQUARE of the COMBINED gradient
+(g_main+g_aux, summed before backprop reaches o_proj's weights since
+they share one `loss.backward()` call) -- with `|g_main| >> |g_aux|`,
+`ci` is set almost entirely by the main task, so `g_aux/sqrt(ci)` stays
+tiny regardless of coefficient until that coefficient is large enough
+to make g_aux itself comparable to g_main.
+
+Per direct argument -- if the network is genuinely unhealthy the
+correction SHOULD dominate, that's not a problem to avoid -- derived
+concretely (using the measured g_main=0.46 and the exponential
+penalty's gradient formula `2*coef*alpha*dev*exp(alpha*dev^2)`) an
+alpha/coef combination that should stay negligible at small deviations
+(healthy) but dominate at the actually-observed deviation range
+(dev~0.3-0.7, since mean_sv sits at 1.4-1.7 vs target 1.0). Math
+predicted alpha=10,coef=0.01 should give ~2.6x-41x g_main across that
+range. **Empirically: real but far weaker than predicted** --
+mean_sv only trended 1.47->1.39->1.37->1.31 as alpha rose 5->10->15->20
+at coef=0.01, and even a 100x coefficient increase (0.01->1.0) only
+reached mean_sv~1.2, not the predicted snap-to-target. Real,
+monotonic, useful signal (the direction is right, chasing this further
+has diminishing returns) but the single-snapshot gradient-ratio
+math evidently misses something about the actual multi-step dynamics
+-- likely that `ci`'s EMA integrates a main-task gradient whose
+DIRECTION varies a lot step-to-step (different tokens/targets each
+step) against an aux gradient with more consistent direction, so a
+one-shot L2-norm ratio comparison doesn't fully capture what the EMA
+accumulates over many steps. Not fully resolved -- flagged as an open
+discrepancy between the theory and the measured outcome, worth
+revisiting with a live in-training gradient-ratio trace rather than a
+single before/after snapshot if this line is picked up again.
+
+**Scale-vector clipping** (`value_scale`/`output_scale` capped at
+FP4's own max representable magnitude, 6.0) implemented as a
+standalone, independent mechanism (`StateProjModel.clip_scales`,
+O(w) per layer -- one get/set pair per row/column, no extra forward
+pass, genuinely cheaper than the probe-based hard-rescale mechanisms
+at production width) and tested with NO aux loss active at all (pure
+baseline + clip):
+
+    no_clip         mean_sv=1.726  max_sv=4.206  skip_rate=5.10%
+    scale_clip=6.0  mean_sv=1.674  max_sv=3.830  skip_rate=1.60%
+    scale_clip=2.0  mean_sv=1.653  max_sv=3.623  skip_rate=9.70%
+
+Real, modest, standalone effect -- confirms the prediction it's a
+complementary safety mechanism (bounds any single synapse's max
+effective magnitude via `stored_w*value_scale*output_scale`) rather
+than a substitute for spectral norm's collective/aggregate control.
+Skip rate dropped at the mild clip (6.0) but rose at the aggressive
+one (2.0) -- likely forcing representational burden onto other
+weights, creating occasional instability elsewhere. Worth keeping as
+real, cheap infrastructure regardless of the rest of this
+investigation's outcome; not yet combined with spectral norm or run
+at full 15000-step scale.
+
+**Next queued** (per direct priority order): implement the
+`i_proj_state`/`v_proj_state`+ReLU recurrent architecture (excitatory
+then inhibitory-via-ReLU two-stage recurrent pathway, `l2(relu(...))`
+measured for free off the real forward pass) -- not yet built. Given
+the RMSprop-dominance math applies regardless of architecture, the
+live open question for that design is whether ReLU-driven
+sparsification, guided ONLY by the main task's own gradient (no
+explicit L2-target aux loss at all), naturally keeps the recurrent
+norm near target as an emergent side effect -- avoiding the aux-vs
+-main gradient competition problem entirely rather than trying to win
+it.
+
+**2026-08-12, continued -- split-backward mechanism: promising at
+short scale, same reversal pattern as everything else at full scale.**
+Per direct idea: since DISLDO's per-synapse `ci` EMA updates
+UNCONDITIONALLY regardless of `damp_by_importance` (only the WEIGHT
+update itself branches on it), a SECOND independent `o_proj.forward()`
+call with `damp_by_importance=False` gives the aux L2-target penalty
+its own undamped backward closure, while the main task keeps its
+normal `damp_by_importance=True` path -- one combined `loss.backward()`
+naturally routes each loss's gradient to the correct call's closure,
+no need for two separate Python-level `.backward()` calls.
+
+1000-step smoke tests: clean, real, monotonic improvement as
+`o_proj_coef` rose (1.637 -> 1.542 -> 1.287 -> 1.116 -> 1.103 at
+coef=0.01/0.1/1/10/20, PLATEAUING by coef~10-20, not continuing to
+scale unboundedly), and critically **0% skip rate throughout** -- a
+clean, stable equilibrium, unlike the earlier fully-undamped test
+(damp off for BOTH main+aux together) which reached a similar mean_sv
+but with 14-21% skip rate. This looked like the first gradient-based
+mechanism to combine good spectral control with training stability.
+
+**Full 15000-step/5-seed validation: reversed, badly.**
+
+    split_backward_coef10            mean=0.0667  skip=21.6%  eig[mean]=0.745
+    split_backward_coef10+state0.01  mean=0.0667  skip=22.1%  eig[mean]=0.868
+    vs sparse-echo=0.7296  vs spectral-alone=0.8858  vs hard-mean-rescale=0.5333
+
+At full scale, once the curriculum reaches its harder stages (the
+1000-step smoke test never got past the easiest 1-2 curriculum
+stages, `STEPS_PER_STAGE=500`), skip rate jumps to 21-22% and accuracy
+collapses to chance -- and `eig[mean]` now sits BELOW 1.0 (0.745,
+0.868), not near it -- the mechanism overshoots downward once actually
+exercised over a long, hard horizon, rather than converging cleanly to
+the plateau the short run suggested. **This is now the FIFTH distinct
+gradient/loss-based mechanism in this investigation to show this exact
+"promising short run, collapses at full scale" pattern** (state_proj
+alone, o_proj soft penalty at small coef, exponential-shape penalty,
+large-coefficient exponential penalty, and now split-backward) --
+strong, repeated evidence this is a general property of trying to
+control this quantity via ANY gradient-based auxiliary signal on these
+DISLDO-optimized weights over a long enough horizon, not a
+coefficient-tuning or mechanism-design problem specific to any one
+attempt. The hard, post-hoc rescale mechanisms (spectral norm,
+mean-rescale) remain the only approaches that have NOT shown this
+reversal at full scale.
+
+**Status: closing out the gradient-based-correction line of
+investigation for now.** Every variant tried -- soft penalty (squared
+and exponential shape), damping disabled entirely, and now surgically
+separated (split-backward) -- either fails to move the target
+mean(sv) at all, or moves it short-term and then destabilizes/collapses
+over a full run. Spectral normalization remains the clear, only
+consistently-working mechanism across every test in this whole
+investigation. Scale-vector clipping (real, modest, complementary,
+O(w)) and the i_proj_state/v_proj_state+ReLU architecture (not yet
+full-scale tested) remain open, independent of this specific
+conclusion about gradient-based L2-target corrections.
+
+**2026-08-12, ROOT CAUSE FOUND: q_proj/k_proj/v_in_proj/v_state_proj
+were completely unregulated this whole investigation -- only o_proj
+was ever touched, by ANY mechanism tried.** Per direct question ("why
+would the eigenvalue be below target"), traced split-backward's
+o_proj_ratio_t and eigenvalue over a full 15000-step run. First pass
+showed a real contradiction (ratio staying ~1.0 while "eigenvalue"
+fell to 0.43-0.48 -- mathematically impossible for a linear map, since
+ratio can never exceed the true max singular value). Root-caused to a
+real measurement bug: `measure_o_proj_eigenvalue()`'s power-iteration
+probe was only updated once per 200-step CHECKPOINT, not enough
+consecutive iterations against a stable matrix to converge (the proven
+`_spectral_rescale_factor` design updates its probe EVERY step
+specifically to avoid this). Fixed to update every real o_proj usage.
+Re-traced: with the fix, the TRUE max eigenvalue tracks right
+alongside the ratio the whole run, both ~1.0-1.15, no drift -- o_proj's
+own spectral properties were fine the entire time. Yet accuracy still
+collapsed and skip_rate stayed high (30.8%).
+
+Checked the OTHER layers' spectra (`v_state_spectrum_check.py`, exact
+SVD at 1000-step intervals across a full run): `v_state_proj`,
+`q_proj`, `k_proj`, and `v_in_proj` ALL explode from a healthy ~4-8 to
+~22-26 between steps 1000-3000, and STAY there for the rest of
+training, while o_proj (the only regulated layer across every
+mechanism tried) stays healthy the entire time (mean~0.92, max~2.07).
+Same "pathological attractor" mechanism originally diagnosed for dense
+connectivity months ago, just happening in the OTHER layers this time
+because nothing ever regulated them. Also explains an architectural
+regression: the ORIGINAL proven design (0.886, o_proj-only regulated)
+used a SINGLE `v_proj` on the COMBINED `x+m` input; this whole
+investigation's premise (`v_in_proj`/`v_state_proj` split, motivated by
+the excitatory/inhibitory biological framing) means V is built from TWO
+matrices each seeing only HALF the combined signal -- plausibly why
+q/k/v_in/v_state destabilize here when they didn't in the original
+architecture.
+
+**Fix validated: extended the PROVEN spectral_norm_target hard
+max-rescale from o_proj-only to all 5 layers** (generic
+`_spectral_rescale_factor`/`_apply_spectral`, one independent
+persistent power-iteration probe per layer). Full 15000-step/5-seed
+validation, no aux losses:
+
+    spectral_all5_target0.9      mean=0.6667  std=0.333  skip=0%
+    spectral_oproj_only_ctrl     mean=0.7333  std=0.149  skip=0%
+    vs sparse-echo=0.7296  vs original-arch spectral-o_proj-only=0.8858
+
+Both variants recover from the ~0.07-0.27 collapse seen in EVERY
+unregulated mechanism this whole investigation, up to sparse-echo
+parity. Confirms the diagnosis cleanly. Two open threads remain: (1)
+o_proj-only regulation (even within the new split-v_proj architecture)
+does slightly BETTER and far more consistently (std 0.149) than
+regulating all 5 with shared/untuned parameters (std 0.333) -- "more
+regulation" isn't uniformly better without per-layer tuning; (2)
+neither variant reaches the original architecture's 0.8858 -- the
+v_in_proj/v_state_proj split itself likely carries a real cost vs a
+single combined-input v_proj, separate from the regulation-coverage
+question this test isolates. Per direct suggestion, next: retry the
+split-backward/L2-target soft mechanism (the original
+biologically-motivated approach) extended to all 5 layers now that
+full coverage -- not the mechanism -- looks like the real gap.
+
+**2026-08-12, final -- extended split-backward L2-ratio-target
+mechanism to all 5 layers, closing out this line of investigation for
+tonight.** Generalized the o_proj split-backward mechanism (task #167:
+a second independent `layer.forward(damp_by_importance=False)` call
+gives the aux term its own undamped update path) to q_proj, k_proj,
+v_in_proj, v_state_proj as well, uniformly, same target/coefficient
+convention as o_proj. Smoke test (500 steps): promising -- ALL 5
+layers stayed well-controlled (mean 0.93-1.17, max 2.08-2.59), 0% skip
+rate, the first time a soft/gradient-based mechanism controlled every
+layer, not just o_proj.
+
+**Full 15000-step/5-seed validation:**
+
+    all_layer_split_coef10   mean=0.2667  std=0.2789  per_seed=[0.0,0.0,0.3333,0.6667,0.3333]  skip=0.001%
+    vs sparse-echo=0.7296  vs spectral-all5=0.6667  vs spectral-o_proj-only(new arch)=0.7333  vs spectral-o_proj-only(original arch)=0.8858
+
+Real, informative negative result -- but a DIFFERENT character than
+every earlier gradient-based collapse this investigation: skip_rate is
+now essentially 0% (vs 21-22% for the earlier o_proj-only-undamped
+tests), and per-seed results show real learning in some seeds
+(0.333-0.667), not literal chance-collapse. So full-layer coverage did
+fix the TRAINING-STABILITY problem (no more skip-rate blowups) -- it
+just doesn't reach the QUALITY of the hard spectral rescale mechanism.
+This is now the SIXTH distinct gradient-based mechanism in this
+investigation to underperform spectral norm at full scale, but the
+first to do so cleanly/stably rather than via outright collapse --
+suggesting the remaining gap is closer to "soft correction converges
+to a worse equilibrium than a hard exact rescale" (matching the
+earlier finding: mean(sv) targeting via soft loss plateaus around
+1.1-1.2 even in the BEST-performing single-layer smoke tests, never
+reaching the same precision as spectral norm's EXACT multiplicative
+correction) rather than "soft correction causes instability."
+
+**FINAL STATUS for this whole multi-session v_in_proj/v_state_proj
+-split investigation: spectral normalization (hard max-rescale)
+remains the clear, unambiguous best mechanism.** Complete ranking:
+
+    original arch, spectral o_proj-only:  0.8858  (best -- production baseline)
+    new arch, spectral o_proj-only:       0.7333
+    sparse-echo (no dense, no regulation): 0.7296
+    new arch, spectral all-5-layers:      0.6667
+    new arch, split-backward all-5-layers: 0.2667
+    (every other gradient-based variant tested this investigation):    0.0667-0.27 (chance-level collapse)
+
+Two real, open threads for a future session: (1) WHY does the new
+v_in_proj/v_state_proj-split architecture (even with full spectral
+regulation) still fall short of the ORIGINAL single-combined-v_proj
+architecture's 0.8858 -- likely a genuine architectural cost from
+splitting V into two independently-parameterized halves, not a
+regulation-coverage issue (both are now fully regulated); (2) whether
+per-layer-tuned spectral targets/EMA-decay (rather than one shared
+set of parameters copy-pasted across all 5 layers) would close some
+of that gap, given o_proj-only regulation already slightly
+outperforms all-5 with the SAME untuned parameters. Nothing from this
+whole investigation has been merged into shared model files --
+everything remains in standalone job-tmp scripts
+(`state_proj_l2_probe.py` and its many validation drivers). Given the
+consistent, wide margin favoring the ORIGINAL architecture + spectral
+norm, that remains the clear production recommendation; the
+v_in_proj/v_state_proj biological framing, while conceptually
+motivated, has not yet produced a competitive alternative on this toy
+task after extensive testing.
+
+**2026-08-12/13, next morning -- production constraint changed: spectral
+normalization (and any hard rescale, including the mean-targeting
+variant) is NOT AVAILABLE for production use. Renewed search for the
+best non-spectral (soft/gradient-only) mechanism.**
+
+Fixed a real, separate bug found along the way: `sili`'s `abs_backward`
+(`sili/cpu.py`) used in-place boolean-index assignment
+(`local_gradient[a==0.0]=1.0`) which throws
+`TypeError: 'numpy.float32' object does not support item assignment`
+whenever `a` is a 0-d/scalar tensor (only ever exercised by the NEW L1
+-shaped penalty work below -- ordinary array-shaped uses, e.g.
+EnergyDynamics' `abs(h)` in `energy.py`, never hit this since
+`np.sign()` on a real array returns a proper ndarray). Fixed via
+`np.where` instead of in-place assignment -- verified directly (not
+just reasoned) that this preserves EnergyDynamics' exact
+zero-gradient-override behavior for array inputs (a live concern
+raised directly, given that mechanism specifically relies on
+`grad[a==0]=1.0` for its zero-init "wake a dead neuron" property):
+`Tensor([0.5,0.0,-0.3,0.0,1.2])` through `abs().sum().backward()` gives
+`grad=[1,1,-1,1,1]` post-fix, exactly matching the documented intent.
+
+**Root-caused the coefficient-scaling puzzle from earlier:** o_proj
+-only split-backward on the coefficient scale tested (10) plateaued
+around mean_sv~1.10-1.12 in short runs -- turns out coefficient
+scaling has MORE headroom than assumed. Full-scale re-test:
+`all_layer_split_coef50` (new/split architecture) reached mean=0.4000
+(0% skip), a real improvement over coef=10's 0.2667.
+
+**Direct suggestion, confirmed decisively: tested the split-backward
+L2-ratio mechanism on the ORIGINAL architecture** (single `v_proj` on
+combined `qkv_source`, not the `v_in_proj`/`v_state_proj` split) for
+the first time -- every previous split-backward test this whole
+investigation used the new split architecture, confounding "does the
+soft mechanism work" with "does it work despite the split's own
+architectural cost." o_proj-only on the ORIGINAL architecture (the
+exact scope that gets 0.8858 with spectral norm on the same single
+layer): **mean=0.0000, skip_rate=19.5%, total collapse across all 5
+seeds** -- decisively confirms per direct prediction that no
+o_proj-only soft mechanism will win; multi-layer coverage is required
+once spectral's hard rescale isn't available, regardless of
+architecture. All-layer on the SAME original architecture:
+**mean=0.4667, 0% skip rate** -- the best non-spectral result of the
+whole investigation, and meaningfully better than the same coefficient
+on the split architecture (0.4667 vs 0.2667 at coef=10) -- confirms
+the architecture-cost hypothesis too: the original architecture is a
+genuinely better foundation even for the soft mechanism, not just for
+spectral norm. Coefficient sweep (30/50) on this combination launched,
+not yet landed.
+
+**New, untested hypothesis, per direct suggestion:** L1 sparsity
+-- sparse-echo's success may come from genuine connectivity sparsity
+(fewer live synapses -> naturally bounded spectral radius via the
+reservoir-computing echo-state property), not (only) spectral control.
+Built as an L1 penalty on layer OUTPUT magnitude
+(`coef*mean(|output|)`) via the same split-backward pattern (separate
+forward, `damp_by_importance=False`) -- true weight-magnitude L1 isn't
+cleanly buildable since DISLDO stores weights as quantized codes
+internally, not an exposed differentiable tensor, but L1-on-output is
+the standard proxy (its gradient w.r.t. W directly encourages smaller
+weights along active directions). Smoke test (500 steps, no ratio
+-target term at all): real, partial spectrum control (`v_proj` max_sv
+~3.4-3.8 vs ~22-26 fully unregulated), low skip rate (0-0.6%), strong
+short-run accuracy -- full-scale validation launched, not yet landed.
+
+**Also queued** (per direct request for a full accounting): scale
+-vector clipping has only ever been tested for its standalone spectrum
+effect, never for actual accuracy at any scale, and never combined
+with anything -- and once individual mechanisms are validated, direct
+instruction to test whether they COMBINE (L2-ratio + L1-sparsity +
+scale-clipping) for better accuracy than any alone, not just test them
+in isolation.
+
+**2026-08-13, LANDMARK RESULT: L1 output-sparsity, all 4 layers,
+original architecture, reaches mean=1.0 across all 5 seeds --
+the best result of the entire investigation, matching/exceeding
+spectral norm (0.8858), with NO hard rescale of any kind.**
+
+Coefficient sweep on `l1_sparsity_coef` (original architecture, all 4
+layers -- q/k/v_proj/o_proj, no L2-ratio term active):
+
+    l1_sparsity_coef0.01  mean=0.1333  skip_rate=27.7%  (too weak -- unstable)
+    l1_sparsity_coef0.05  mean=1.0000  skip_rate=0.001% (PERFECT, all 5 seeds)
+
+Given how extraordinary a perfect, zero-variance cross-seed result is
+-- and given this whole investigation's repeated pattern of
+short-run-looks-great-collapses-at-scale -- treated this with direct
+suspicion rather than face value. First check (a hand-written
+diagnostic script printing individual predictions at a few sampled
+steps) appeared to CONTRADICT the reported result (showed a wrong
+prediction at step 15000 for seed=1000, which should be impossible if
+that seed's accuracy is really 1.0). Root-caused: NOT a bug in the
+mechanism -- the hand-written diagnostic itself diverged from the
+real trajectory (most likely subtle stochastic-FP4-rounding RNG
+consumption difference from a structurally-similar-but-not-identical
+copy of the training loop, not yet pinned down further since it turned
+out to be a red herring). Re-verified via the ACTUAL authoritative
+`run()` function directly (not a hand copy) for seed=1000: reproduces
+`mean(accs[-3:])=1.0` exactly, and the FULL 75-checkpoint trajectory
+is a genuine, non-degenerate learning curve -- noisy/mixed 0s-and-1s
+through the first ~60% of training, converging to near-all-1.0 in the
+final third (one isolated miss near the very end). This is what real
+learning looks like, not an artifact. Confirmed the result is real,
+not a bug -- important given how much of tonight's earlier optimism
+turned out to be short-run illusion; this one was checked properly
+before being trusted.
+
+Robustness sweep (nearby coefficients 0.02/0.03/0.07/0.1) launched to
+confirm this is a real basin, not a lucky single point -- in progress.
+`coef=0.01` (too weak, 27.7% skip rate, mean=0.13) shows there IS a
+real sensitivity to coefficient, so the 0.05 result isn't trivially
+guaranteed to hold at nearby values either -- this needs the sweep to
+resolve, not just be assumed robust because one point looked perfect.
+
+**Why this might make sense, mechanistically**: unlike the L2-ratio
+mechanism (which only disciplines gain along whatever direction the
+CURRENT input happens to occupy, per the earlier investigation) and
+unlike a hard rescale (exact but structurally different from anything
+in real neurons), an L1-on-output penalty pushes toward genuine
+SPARSITY -- most outputs near exactly zero, a few large -- which is
+structurally identical to what makes sparse-echo work in the first
+place (a randomly-sparse connectivity pattern that happens to land its
+dominant eigenvalue below 1, the classic reservoir-computing echo
+-state property). If L1-on-output achieves a SIMILAR effective
+sparsity pattern via GRADIENT DESCENT on a fully dense-initialized
+network, rather than via random init, that would explain matching or
+exceeding sparse-echo's own success along a totally different,
+zero-hard-rescale mechanism.
+
+**Robustness sweep landed -- CONFIRMED, this is a real, well-defined
+basin, not a lucky single point:**
+
+    l1_coef=0.01  mean=0.1333  skip=30.3%  (too weak, unstable)
+    l1_coef=0.02  mean=0.1333  skip=30.3%  (still too weak)
+    l1_coef=0.03  mean=0.8000  skip=0.03%
+    l1_coef=0.05  mean=1.0000  skip=0.001% (PERFECT)
+    l1_coef=0.07  mean=1.0000  skip=0.001% (PERFECT)
+    l1_coef=0.10  mean=0.6667  skip=0.05%  (past the sweet spot)
+
+TWO independent coefficients (0.05 and 0.07) BOTH hit literal 1.0
+across all 5 seeds -- as robust a confirmation as anything in this
+whole investigation. Clear failure modes bracket the basin on both
+sides (too weak below ~0.02: high skip rate, poor accuracy; too strong
+above ~0.1: accuracy degrades again, likely over-regularization
+fighting the main task). This is now the clear standout mechanism of
+the entire multi-day investigation.
+
+For context, the L2-ratio (split-backward) mechanism's own coefficient
+sweep on this same original architecture topped out around 0.33-0.47
+(coef=10: 0.4667, coef=30: 0.3333, coef=50: 0.4000, non-monotonic,
+never close to L1-sparsity's ceiling).
+
+**Why this might make sense, mechanistically, restated with the
+confirmed data**: sparse-echo's own success is structural (random
+sparse connectivity that happens to land its dominant eigenvalue below
+1 -- the classic reservoir-computing echo-state property). L1-on
+-output achieves a similar effective sparsity pattern via gradient
+descent on a fully DENSE-initialized network -- and the data now
+directly shows a real "Goldilocks" sparsity level exists (too little
+regularization = insufficient sparsity, still unstable; too much =
+over-suppresses signal the main task needs), exactly the kind of
+tradeoff a genuine structural-sparsity mechanism would produce.
+
+**Not yet done**: verify additional seeds beyond seed=1000 directly
+(only independently re-verified one so far, via the authoritative
+`run()` function -- the aggregate report itself already reflects all 5
+seeds, this would be a redundant extra check); test COMBINING L1
+-sparsity with the L2-ratio mechanism (per direct instruction -- do
+mechanisms compound, not just work individually -- though given
+L1-sparsity alone already hits the ceiling of 1.0, there's a real
+question of whether there's room left to combine usefully, or whether
+this is now more about ROBUSTNESS/margin than raw accuracy); test on
+the NEW (split) architecture too, to see if L1-sparsity's benefit is
+architecture-independent (unlike the L2-ratio mechanism, which turned
+out to be architecture-dependent); measure the actual induced sparsity
+level directly (what fraction of outputs end up near-zero) to confirm
+the "recovers sparse-echo's own mechanism" hypothesis with a direct
+measurement rather than just an inferred story.
+
+**All four follow-ups landed -- complete, definitive picture:**
+
+1. **Sparsity measurement was mismeasured, mechanism unconfirmed**:
+   measured the accumulated recurrent STATE `M`'s sparsity (0.492%
+   near-zero, std=2.09, mean|x|=1.57 -- NOT a sparse-looking
+   distribution at all), not the actual q/k/v_proj/o_proj OUTPUTS the
+   L1 penalty targets (M = M_prev + raw is a residual accumulation
+   across many steps, a different quantity entirely). The "recovers
+   sparse-echo's own structural-sparsity mechanism" explanation
+   remains an untested hypothesis, not a confirmed one -- would need
+   re-measuring the actual per-layer output distributions directly.
+
+2. **Does NOT transfer to the new (split) architecture** -- same
+   pattern as the L2-ratio mechanism:
+
+       newarch_l1_coef=0.05  mean=0.3333  skip_rate=88.7%
+       newarch_l1_coef=0.07  mean=0.2000  skip_rate=87.7%
+
+   Massive instability (87-89% skip rate, vs 0.001% on the original
+   architecture) and far below the original architecture's perfect
+   1.0. Confirms the v_in_proj/v_state_proj split costs something
+   structural regardless of WHICH regularization mechanism it's paired
+   with -- not specific to the L2-ratio mechanism.
+
+3. **Combining L1-sparsity with L2-ratio HURTS, doesn't help**:
+
+       l1_0.05+l2ratio_o10  mean=0.7333  skip=0%
+       l1_0.07+l2ratio_o10  mean=0.7333  skip=0%
+
+   Both combo variants land at 0.7333, clearly worse than L1-sparsity
+   ALONE's perfect 1.0 (stable, 0% skip either way -- the combination
+   isn't unstable, it's just worse). The two mechanisms don't compound
+   constructively; the L2-ratio term appears to interfere with
+   L1-sparsity's own clean effect rather than complementing it.
+
+**FINAL RECOMMENDATION for the non-spectral-mechanism search**: L1
+output-sparsity ALONE (no L2-ratio term), applied to all 4 layers
+(q_proj/k_proj/v_proj/o_proj) of the ORIGINAL architecture (single
+v_proj on combined input, NOT the v_in_proj/v_state_proj split),
+coefficient in the 0.05-0.07 range. This is the best mechanism found
+in the ENTIRE investigation (spectral included on this specific
+metric) -- perfect mean=1.0 across 5 seeds at TWO independent
+coefficients, essentially zero skip rate, no hard rescale of any kind.
+Complete comparison table:
+
+    mechanism                                      mean    notes
+    L1-sparsity alone, orig arch, coef=0.05/0.07   1.0000  BEST, robust (2 coefs)
+    spectral norm, orig arch, o_proj-only          0.8858  (unavailable per production constraint)
+    L1-sparsity + L2-ratio combined, orig arch     0.7333  combining hurts
+    sparse-echo (no dense connectivity at all)     0.7296
+    L2-ratio alone, orig arch, all-4, coef=10      0.4667  best L2-ratio result
+    L2-ratio alone, split arch, all-5, coef=50     0.4000
+    L1-sparsity alone, split arch, coef=0.05       0.3333  architecture-dependent, unstable
+    L2-ratio alone, orig arch, all-4, coef=50      0.4000
+    L1-sparsity alone, split arch, coef=0.07       0.2000  architecture-dependent, unstable
+    any o_proj-only soft mechanism, either arch    0.0-0.27  collapses
+
+## EnergyDynamics fire_reset_to_zero + zero-init deadlock root cause
+
+Per direct proposal ("firing should just set energy back to zero or
+should have a huge energy cost, since it's different from normal
+operation") implemented two new opt-in `EnergyDynamics`
+constructor/forward params in `sili__new/sili/energy.py`:
+`fire_reset_to_zero` (e<-0.0 on fire, replacing the default
+`e -= 2*activation_cost` refractory drain) and `fire_cost` (fixed
+drain amount). Motivation: under a cold/near-zero-init population, the
+default drain is tiny relative to `drive` whenever the opposing
+continuous term (`activation_cost*E[|h|]`) is near zero, so the
+population re-fires every ~10 ticks -- a tight sawtooth that looks
+"pinned" in snapshot mean/min/max measurements rather than a genuine
+rare recovery event. Cross-checked against `energy-proofs.md` Theorem
+6(a) (`Ω={|e|<=2}` positively invariant) -- the proof only requires
+the post-fire update to strictly reduce `|e|`, which `e<-0` satisfies
+unconditionally, so this doesn't weaken any existing guarantee.
+Smoke-tested directly: default behavior unchanged; `fire_reset_to_zero
+=True` after 20 zero-input steps produces varied, non-pinned energy
+values (`[0.499, 0.500, 1.9999, 0.999, 1.501, ...]`) instead of all
+sitting near the 2.0 ceiling. Also fixed a latent `abs_backward`
+scalar-tensor crash (`local_gradient[a==0.0]=1.0` in-place assignment
+throws on 0-d/scalar inputs since `np.sign()` returns a bare numpy
+scalar there, not an ndarray) hit only by the new L1-shaped scalar
+penalty terms -- switched to `np.where`, verified array-input
+gradients byte-for-byte unchanged. Both landed in `sili__new` (commit
+c653df8) and `sili_peridot` (commit af8ceb2, alongside the L1-sparsity
+landmark writeup above).
+
+**Then actually tested the motivating scenario end-to-end** (zero-init
++ L1-sparsity + `fire_reset_to_zero=True`), which had never been run
+before -- and found `fire_reset_to_zero` does NOT rescue it. Root
+-caused with a sequence of direct measurements rather than assumed:
+
+1. First 3-seed/3000-step comparison (no-energy vs default-drain vs
+   `fire_reset_to_zero`) gave IDENTICAL results across all three
+   (`accs=[0.0, 0.3333, 0.3333]` every time). Traced this to a
+   calibration bug in my own test, not the mechanism: at
+   `drive=0.0001` with zero opposing force (`E[|attn_raw|]=0` exactly,
+   per the earlier finding), reaching the +2.0 firing threshold takes
+   `2.0/0.0001=20000` steps -- energy never fired even once in any of
+   the three 3000-step arms. Re-ran with `drive=0.01` (fires every
+   ~200 steps) -- STILL identical results.
+
+2. Direct instrumentation confirmed firing genuinely IS occurring with
+   `fire_reset_to_zero=True` (energy population mean visibly drops
+   from ~1.88 to ~0.86-0.98 at steps 600/800, consistent with periodic
+   reset-and-recharge) -- so the energy mechanism itself is working
+   exactly as designed. The lack of effect on accuracy is real, not a
+   test artifact.
+
+3. Traced the actual blocker further upstream than energy touches at
+   all: `lm_head` is ALSO zero-initialized under `all_zero_init=True`
+   but was never wired into the L1-sparsity `reg_terms` list (only
+   q/k/v/o_proj were) -- so `lm_head`'s own weight has no mechanism to
+   ever move, and since `dL/d(pooled) = W_lmhead^T @ grad_logits` is
+   exactly zero whenever `W_lmhead=0`, NO gradient from the main task
+   loss can ever cross it, regardless of what energy or L1 does
+   upstream. Confirmed directly: `logits` stayed EXACTLY `[0,0,...,0]`
+   after 400 AND 1400 training steps (with `fire_reset_to_zero=True`
+   engaged the whole time), and a direct forward probe on a nonzero
+   input confirmed `lm_head`'s stored weight is still exactly zero.
+
+4. Added an L1 term on `lm_head` (input=`pooled`) to close that gap --
+   but `pooled` itself is downstream of `M`, which is downstream of
+   `o_proj`, which is downstream of `q/k/v_proj` -- so this only helps
+   once the WHOLE upstream chain has already woken up. Traced the
+   upstream chain directly over 4000 steps (probing `q_proj`/`o_proj`
+   via a fixed all-ones input every 400 steps): `E|q_proj(ones)|` and
+   `E|o_proj(ones)|` stayed EXACTLY `0.00000` the entire 4000 steps,
+   energy engaged throughout. The deadlock isn't even reaching
+   `o_proj` or `M` -- it's `q_proj` itself, the very FIRST layer,
+   which receives `qkv_source` (always real, nonzero input) as its L1
+   term's input the whole time.
+
+5. Sanity-checked the measurement methodology wasn't itself the bug:
+   the SAME probe on a `dense=True, all_zero_init=False` control model
+   correctly reads `E|q_proj(ones)|=0.97` (real, nonzero) -- so the
+   probe is valid, and the zero reading under `all_zero_init=True` is
+   a genuine model-state finding, not an instrumentation artifact.
+
+6. Root-caused with a single, isolated manual step: zero-init
+   `q_proj`, one real nonzero random input, one `damp_by_importance=
+   False` forward call (confirmed `out_aux` is exactly `0.0`, as
+   expected from all-zero weights), one L1-loss `.backward()` call --
+   then re-probed. Still EXACTLY `0.00000`. The underlying C++ update
+   (`linear_disldo.hpp`'s `cw += damp_by_importance ? ... : (-effective
+   _lr * g)`, `g = dyv * iv`) computes a real, nonzero mathematical
+   gradient here (`abs_backward`'s zero-position subgradient=1.0 fix
+   makes `dyv` nonzero even though `out_aux` is exactly 0; `iv` is a
+   real nonzero input) -- but at this toy scale (`coef=0.05`,
+   `effective_lr = lr/nnz_this_row ~ 0.01/32`, embedding-scale input
+   ~0.3), the resulting `cw` delta works out to roughly `1e-5` to
+   `1e-6` in the layer's own storage units. FP4 (OCP E2M1, 16 discrete
+   levels) has a minimum nonzero step size several orders of magnitude
+   larger than that near zero -- so the update, while mathematically
+   real, rounds straight back to code 0 on quantization. This matches
+   -- and gives a concrete, measured mechanism for -- this project's
+   own established prior understanding that zero-init layers need
+   synaptogenesis (a direct code WRITE, not a gradient-accumulated
+   nudge) or some other coarse-jump mechanism to escape, not ordinary
+   per-step gradient descent, regardless of which soft loss term
+   supplies the gradient.
+
+**Conclusion (superseded below)**: `fire_reset_to_zero` is a correct,
+working fix for its own stated problem (firing-drain-too-small-to
+-create-real-separation) and is real, useful production code -- but it
+operates on the attn_raw/output SIGNAL (via firing's `+2.0` additive
+constant), not on WEIGHTS, so it cannot by itself rescue a zero
+-initialized weight matrix. The "FP4 quantization-step floor" framing
+below turned out to be WRONG -- see the correction immediately
+following this section.
+
+## CORRECTION: the real root cause was never FP4 quantization -- it was a synapse-liveness bug in block4_load_dense
+
+The "FP4 quantization floor" conclusion above was falsified by a direct
+follow-up test, per user prompt ("just change things so the force fire
+backprop is always above the zero init floor... that's a good test"):
+implemented `fire_wake_gradient`/`wake_sign` on `EnergyDynamics`
+(sili__new commit, guaranteed-magnitude gradient injection at
+kept-fired positions, straight-through via `(h*wake_gate).sum()`) and
+pushed it from 200 up to 20000 -- q_proj's stored weight STILL never
+moved, at ANY magnitude. That ruled out "gradient too small" outright:
+a single isolated test with an explicit `out.grad = 1000` (undamped,
+`damp_by_importance=False`, lr=0.1) on a raw zero-init
+`DISLDOLayerDeterministic` ALSO produced exactly zero movement --
+proving no gradient magnitude, however large, was the issue.
+
+Root-caused via direct comparison against a control: `nnz`/
+`block4.synapses` read 0 for the zero-init layer (not 1024, the true
+dense count) -- `block4_load_dense` calls `maybe_compress` right after
+loading, and `block4_count_live` (block4.hpp:866) tests the packed
+byte (`weight_code | importance_code<<4`) against exactly 0. Loading
+BOTH weight AND importance as code 0 (`all_zero_init`'s original
+`load_dense_codes(zeros, zeros)`) makes every packed byte exactly 0,
+so `block4_count_live` reads 0 live slots, `maybe_compress` immediately
+packs every tile down to an effectively-empty sparse representation,
+and `disldo_backward`'s row loop (`if (nnz_row == 0) continue`) skips
+every row from that point on -- structurally, not just numerically,
+independent of any gradient's magnitude. Confirmed directly: the
+IDENTICAL setup with importance loaded as code 1 instead of 0 shows
+real `nnz`/`synapses`=1024, and a forced gradient produces a genuine,
+substantial weight change (0 -> 10.14 in one step).
+
+Per direct discussion: this is NOT a library bug needing a fix.
+Weight=0 AND importance=0 simultaneously is a state real training can
+legitimately reach too (not just at init), and treating it as
+"prune this synapse" is the CORRECT behavior there -- a synapse whose
+importance has genuinely decayed to nothing alongside its weight is a
+reasonable one to discard. The actual fix belongs entirely at the
+zero-VALUE-init call site: always seed importance with something
+nonzero (code 1, in `original_arch_l2_probe.py`'s `all_zero_init`)
+so the synapse stays structurally live while its VALUE starts at
+zero, distinguishing "intentionally zero-valued but should still
+train" from "decayed to nothing, safe to prune."
+
+**Result with the corrected init** (importance=1, weight=0, no energy,
+no fire-wake, seed=1000, 15000 steps, dense_base12): the full 5-layer
+cascade this architecture needs (q/k/v_proj wake via their own direct
+L1 gradient on the always-nonzero `qkv_source` input -> attn_raw
+becomes real once v_proj moves -> o_proj wakes via its own L1 term
+once attn_raw is real -> M becomes real -> pooled becomes real ->
+lm_head can finally receive a nonzero main-task gradient) plays out
+exactly as hypothesized:
+
+    step=1000  E|q|=0.021 E|v|=0.0001 E|o|=0.0000 E|M|=0.0000
+    step=3000  E|q|=0.683 E|v|=0.0073 E|o|=0.0000 E|M|=0.0000
+    step=10000 E|q|=0.886 E|v|=0.0270 E|o|=0.0000 E|M|=0.0000
+    step=11000 E|q|=0.530 E|v|=0.0302 E|o|=0.0115 E|M|=0.2237  <- o/M wake together
+    step=15000 E|q|=0.050 E|v|=0.1769 E|o|=0.0801 E|M|=0.2858
+
+q/v wake almost immediately (step 1000). o/M stay at EXACTLY 0.0000
+for the first ~11000 steps, then wake together the moment attn_raw
+carries enough real signal -- direct confirmation that o_proj's own
+L1 gradient really was gated on v_proj's progress, not a separate
+stuck point of its own. Accuracy is still noisy and NOT converged by
+step 15000 (1.0 at steps 11000/12000, back to 0.0 by 15000) -- some
+of the earlier "1.0" readings before step 11000 are almost certainly
+the old degenerate constant-prediction pattern (logits were still
+exactly 0 then), not real learning. This is genuine progress -- a
+zero-init network that was previously PROVABLY, structurally
+undtrainable (not just slow) now demonstrably trains every layer --
+but not yet a converged, validated result: needs more steps and/or
+`lm_head`'s own L1 term (still missing from `step()`, unlike
+q/k/v/o_proj) before treating this as a real landmark alongside the
+dense/echo-init L1-sparsity result above.
+
+**Not yet done (superseded by the follow-ups below)**: multi-seed
+validation, `lm_head` L1 wiring, a longer run to check for actual
+convergence, and re-checking whether `fire_wake_gradient`/
+`fire_reset_to_zero` add anything now that the real blocker is fixed.
+
+## Follow-ups: lm_head L1, multi-seed validation, energy_rl speedup, a real RNG bug, and fire_wake_gradient's verdict
+
+Worked through the full "not yet done" list above, plus direct
+follow-up requests ("energy_rl is also curiosity_rl... it might be the
+only training signal sometimes... the energy rl might help getting the
+network started faster, especially attention").
+
+**1. `lm_head` L1 wiring** (`_l1_sparsity_split(self.lm_head, pooled,
+lr, self.l1_sparsity_coef)`, added to `step()` in both the tmp probe
+and `scripts/l1_sparsity_probe.py`) -- `lm_head` previously had no L1
+term at all, unlike q/k/v/o_proj.
+
+**2. `zero_init_importance_code` made configurable** (default 1,
+unchanged) on `OriginalArchModel`, in both scripts (was hardcoded, and
+a first attempt at syncing this to the committed script was
+accidentally skipped -- caught and fixed).
+
+**3. Does noisy firing decay importance back toward 0, re-triggering
+the prune bug mid-training?** Direct hypothesis, worth testing given
+the block4-liveness root cause above. First attempt at measuring this
+via `layer.digits[0]._c.importance` gave a false positive (importance
+appearing to collapse to 0/NaN within 1000-1500 steps, in BOTH energy
+-on and energy-off arms) -- caught before reporting: `.importance`
+reflects the SCATTERED CSR side (array shape 21 -> 0 over training),
+completely unrelated to block4 storage for a `dense=True` layer, a
+measurement artifact not a real signal. Switched to the same direct
+methodology that found the original bug: checkpoint-test trainability
+by pausing training, forcing a large explicit gradient into a probe
+layer, and checking the stored weight actually moves. Result: q/v/o
+all stayed genuinely trainable (real, substantial forced-gradient
+response) throughout 3000 steps in BOTH energy-on and energy-off
+configs -- no evidence of re-pruning. The hypothesized risk doesn't
+materialize in practice, at least at the energy config tested
+(drive=0.05, activation_cost=0.05, p=0.3).
+
+**4. Does energy_rl speed up the cascade?** Single-seed test: with
+energy OFF, `o`/`M` stayed at exactly 0.0000 for a full 12000-step run
+(this particular seed, with `lm_head`'s new L1 term added, took longer
+than the earlier 15000-step trace that woke by ~11000 -- a real
+RNG-stream-perturbation effect from the added forward calls, not a
+regression). With energy ON, `o`/`M` woke almost immediately (real,
+nonzero by step 1000) and stayed active the whole run -- `v`
+(participates LINEARLY in the attention output) woke vigorously (1-7),
+while `q` stayed near-zero throughout, consistent with the earlier
+finding that q/k's bilinear bootstrap through gaussian_attention is
+structurally weak (see below).
+
+Confirmed at real multi-seed scale (3 seeds, 10000 steps,
+`zero_init_importance_code=1`, `drive=0.05, activation_cost=0.05,
+precision=0.01, density=0.05, p=0.3`):
+
+    use_energy=False: o_wake_step=[None, None, None]  mean_final_acc=0.200
+    use_energy=True:  o_wake_step=[1000, 1000, 1000]  mean_final_acc=0.133
+
+3/3 seeds wake `o_proj` by step 1000 with energy vs 0/3 waking at all
+within 10000 steps without it -- a robust, reproducible speedup, not
+single-seed noise. Final task accuracy is NOT yet converged in either
+arm (both still noisy/low) -- energy's mean was actually LOWER than
+no-energy's here, an early signal (not conclusive on its own, per
+direct discussion) that energy's exploration noise may trade off
+against precise convergence once real signal is flowing, even though
+it dramatically speeds up escaping the dead state. Motivated a
+proposed (not yet built) per-neuron wake-gated energy annealing idea
+-- high drive/exploration while a neuron hasn't fired recently, taper
+once it has -- tracked separately (see memory:
+project_energy_wake_gated_annealing_idea, not this file, since it's a
+forward-looking design note rather than a completed result).
+
+**5. Real bug found: `EnergyDynamics`'s exploration noise was
+unseeded.** While re-checking `fire_wake_gradient` (below), the
+IDENTICAL config (same `seed=1000`, same energy params, same 6000
+-step schedule) produced a healthy run in one process and a NaN
+-diverged one in another. Root-caused: `noise = np.random.normal(...)`
+inside `_apply_energy_dynamics` drew from bare global numpy RNG state,
+completely independent of the `seed=1000` passed to the model (which
+only seeds `task_rng` and the FP4 rounding RNG) -- confirmed directly
+by adding an explicit `np.random.seed(1000)` at the top of two separate
+process runs and getting byte-identical energy trajectories. This is
+the same bug class as an earlier falsified sweep (missing layer
+-construction seeding) -- fixed in `sili__new` by adding an opt-in
+`rng: Optional[np.random.Generator]` parameter to both
+`_apply_energy_dynamics` and `EnergyDynamics` (default None, exact
+existing unseeded-global behavior preserved), matching DISLDOLayer's
+own `rng=` convention. `OriginalArchModel` now derives a seeded rng for
+its `EnergyDynamics` construction automatically (same convention as
+q/k/v/o_proj) unless the caller supplies their own via `energy_kwargs`.
+
+**6. `fire_wake_gradient`'s real verdict, now properly seeded** (3
+seeds x 2 arms, 6000 steps, `drive=0.05, activation_cost=0.05,
+p=0.3`):
+
+    energy alone:                    0/3 seeds diverged
+    energy + fire_wake_gradient=200: 1/3 seeds diverged (step 6000)
+
+Combined with the earlier finding that `fire_wake_gradient` backprops
+through `gaussian_attention` into `v` (real, large gradient -- `v`
+participates LINEARLY in the attention output) but NOT into `q`/`k`
+(whose local Jacobian is EXACTLY zero whenever both are zero -- a
+bilinear-degenerate-point property, confirmed by direct gradient
+inspection, that no injected gradient magnitude can cross): plain
+energy already gets the useful part of this (waking `v`, and via `v`,
+`o`/`M`) for free, with zero divergence risk across 3 seeds, while
+`fire_wake_gradient` adds real instability without helping the one
+place (`q`/`k`) it was meant to reach. **Verdict: not recommended for
+this use case** -- plain `energy_rl` is sufficient and safer. Kept in
+`sili__new` as real, correct, tested library functionality (it does
+exactly what it's documented to do), just not the right tool here.
+
+**Summary of what actually helps zero-init, in order of impact:**
+seeding importance nonzero at zero-value init (removes the hard
+deadlock entirely) > plain `energy_rl` (dramatic wake-speed
+improvement, still needs the importance fix underneath) >
+`fire_wake_gradient` (not recommended -- adds risk, doesn't reach q/k).
+Convergence to real task accuracy remains open at both 10000-15000
+step scales tested so far.
+
+## 2026-08-12 (cont.) -- baseline_energy's 46.8% skip rate root-caused: `-ffast-math` was silently defeating every NaN/Inf guard in sili__new's C++ hot path, including the one that would have caught this
+
+Deep dive into why `baseline_energy` (dense_base12, `use_energy=True`)
+was hitting `clip_grad_norm_`-detected non-finite gradients on ~47% of
+steps. `qkv_source.grad` (and its two upstream `+`-branches,
+`x_normed.grad`/`m_normed.grad`) went NaN at a full column across all
+4 tile rows; `q.grad`/`k.grad`/`v.grad` (the gradient flowing INTO
+q/k/v_proj's own backward) stayed finite -- proving the corruption was
+created inside q/k/v_proj's own `disldo_backward` call.
+
+Added exhaustive, unconditional (every row, every element, no
+foreknowledge needed) `!std::isfinite(...)` checks at BOTH remaining
+candidate write sites in `linear_disldo.hpp`'s block4 backward: the
+per-row `*mdx_row += hsum_contrib` SIMD accumulation, and the final
+per-thread `input_grad[i] += s[i]` reduction. Ran full training to a
+real NaN failure with both checks active: **zero events**. Same for a
+Python-level `_acc()` instrumentation (checks the incoming `dx` before
+it's summed into `qkv_source.grad`) -- this one DID fire, with `g_bad`
+(the incoming gradient) already non-finite, directly contradicting the
+C++ side reporting clean.
+
+Root cause of the contradiction, not the NaN itself: `cpu_backend.cpp`
+is built with `-ffast-math` (`setup.py`), which implies
+`-ffinite-math-only` -- the compiler is licensed to assume
+`isnan`/`isinf` are always false and `isfinite` always true, and
+constant-folds accordingly. Confirmed directly: compiling with
+`-ffast-math` produces a `.o` where the debug fprintf's own format
+string (`"[mdx_any] ..."`) is completely absent from the binary --
+the entire `if (!std::isfinite(x)) { fprintf(...); }` branch was
+dead-code-eliminated, unconditionally, regardless of the runtime
+env-var gate. This is not specific to debug instrumentation --
+`ScalePolicy`'s own real production NaN/Inf guards (the ones that fixed
+the earlier `RMSpropScalePolicy::update` permanent-corruption bug,
+2026-08-10) rely on the exact same `std::isfinite` pattern and would be
+silently defeated the same way.
+
+Fix: added `-fno-finite-math-only` to `extra_compile_args` in
+`setup.py`, right after `-ffast-math` (GCC applies flags left-to-right;
+this re-enables real IEEE NaN/Inf semantics for `isnan`/`isinf`/
+`isfinite` specifically while keeping `-ffast-math`'s other
+optimizations -- reciprocal approximations, reassociation, etc. --
+intact). Rebuilt, reran the same 6000-step and 15000-step single-seed
+repros that previously reliably failed by step ~2000-2500: **zero
+non-finite events**, twice. Then ran the full 4-config
+`landmark_checklist.py` sweep:
+
+    5 seeds x 15000 steps, coef=0.05:
+    baseline            mean=0.8667  skip_rate=0.000%  (ref 0.8667, exact match)
+    baseline_energy     mean=0.1333  skip_rate=0.000%  (ref 0.1333, exact match -- was 46.8% skip rate)
+    baseline_zeroinit   mean=0.0000  skip_rate=0.000%  (unchanged, separate known issue)
+    zeroinit_energy     mean=0.0000  skip_rate=0.000%  (unchanged, separate known issue)
+
+No regressions anywhere; `baseline_energy`'s skip rate goes from
+46.8% to 0.000% with the task-accuracy mean UNCHANGED (the model was
+already learning what it could learn -- it just also NaN'd out on
+about half its update steps, discarding real gradient signal each
+time). An earlier, single-run 3-seed check had flagged `baseline`
+itself as "regressed" (0.7778 vs ref 0.8667) -- re-run at the
+reference's own 5-seed count landed on the *exact* reference mean,
+confirming that was 3-seed noise, not a real effect of the fix (this
+codebase's seed-to-seed variance for `baseline` was already documented
+as ~0.80-0.93 in `landmark_checklist.py`'s own REFERENCE comment).
+
+All debug instrumentation added during the investigation
+(`SILI_DEBUG_MDX_ANY`, `SILI_DEBUG_INPUT_GRAD_ANY`,
+`SILI_DEBUG_QUANT_RATIO`, `SILI_DEBUG_TARGET_ROW` in `linear_disldo.hpp`,
+`SILI_DEBUG_ACC_ANY` in `tensor.py`) removed once the fix was confirmed
+-- kept `-fno-finite-math-only` and `landmark_checklist.py`'s reference
+note update as the only permanent changes. This is now the new
+baseline for all further sili_peridot work: any future `!isfinite`-style
+guard added to `sili__new`'s C++ hot path is only real if it survives
+this exact compiler flag.
+
+## 2026-08-18 -- FP4 stuck-weights investigation: stochastic rounding moves already-live synapses, but scale alone doesn't reliably beat it; short out-of-context tasks are a better diagnostic than the long landmark runs
+
+Follow-up to the earlier finding that deterministic-rounding FP4 weights
+are bit-exact frozen (`mean|delta_w|=0.0`) at every `state_width` tested
+32-1024. `model/eval_stuck_weights.py`'s snapshot/diff was keyed by raw
+array position, which breaks under stochastic rounding (dead synapses
+waking up shifts every later CSR array index) -- redesigned to key
+snapshots by `(row, col)` instead (reconstructed from the layer's own
+`ptrs`/`indices` CSR arrays), diffing via key intersection so growth/
+pruning between snapshots (`n_new`/`n_died`/`churn_fraction`) no longer
+blocks the comparison. Confirmed cleanly: on synapses live at BOTH
+snapshots, deterministic rounding is still exactly `0.0`, but stochastic
+rounding shows real nonzero movement (`mean_delta_w=0.002259`,
+`churn_fraction=0.132`) -- stochastic rounding moves already-live
+synapses, not just wakes dead ones.
+
+Built `scripts/stochastic_stability_vs_scale_sparsity.py` to test
+whether that movement's inherent noise costs real accuracy, and whether
+the cost shrinks with `state_width` or with input/activation sparsity.
+First version accidentally swept CONNECTIVITY/weight sparsity (`dense=
+False`, `max_weights` as a fraction) under the label "density" --
+corrected per direct feedback to hold connectivity fully dense and
+instead sparsify each vocab token's embedding to a fixed random subset
+of active dims (genuine input/activation sparsity, independent axis).
+Also corrected to use a genuinely OUT-OF-CONTEXT task (`seq_len =
+NUM_TILES + 2`) -- the in-context `seq_len<=NUM_TILES` setup every
+other probe in this investigation used is solvable from the local tile
+window alone with zero dependency on the carried recurrent state `M`
+(confirmed via `_build_tile_window`'s own sliding-window math), so it
+can't actually exercise the recurrence-carried-signal question this
+investigation is about.
+
+Grid (state_width x {weight density, then corrected to input density},
+3 seeds/arm): the weight-density version showed a striking trend --
+gap (det_mean - stoch_mean) shrank and flipped negative at
+state_width=512/density=1.0 (stochastic BEAT deterministic, 0.811 vs
+0.767) but got dramatically WORSE with scale at density=0.25 (gap grew
+0.022 -> 0.133 -> 0.378). The corrected input-density version showed a
+much flatter picture throughout (gaps all within +-0.07, no systematic
+harm from input sparsity at any width tested up to 512) -- input
+sparsity looks safe for this mechanism, unlike weight/connectivity
+sparsity.
+
+Per direct correction ("You can't fix a seed to determine a statistical
+answer"): the width=512/density=1.0 "stochastic wins" flip was n=3,
+not enough to trust over run-to-run noise -- especially since DISLDOLayer's
+stochastic rounding has its own not-fully-pinned-down RNG (see
+`feedback_seed_stochastic_rng_for_comparisons` memory), so seeding
+harder answers "what does one seed do," not "is this a real effect."
+Ran a focused 12-seed confirmation at exactly that grid cell
+(`scripts/stochastic_scale_dense_confirmation.py`, fresh seed block
+2000-2011): `det mean=0.7528 std=0.1218`, `stoch mean=0.7472 std=0.1306`,
+paired `gap=0.0056 sem=0.0090 t=0.62` -- **not statistically distinguishable
+from zero**. The n=3 flip was noise, exactly the same shape of mistake
+`landmark_checklist.py`'s own history already has on record (2026-08-12
+entry above: an n=3 "regression" that vanished at n=5). Conclusion:
+scale does NOT reliably give stochastic rounding an edge over
+deterministic by itself -- at width=512 they're statistically tied, not
+"stochastic wins." Whether scale + higher WEIGHT density together do
+something real (the widest gap-flip signal seen) is still open and
+would need its own multi-seed confirmation before trusting either
+direction.
+
+Side finding, useful going forward: these out-of-context copy-task
+probes (200 training steps, ~2-90s per run depending on `state_width`)
+produced a genuinely informative width-dependent learning curve
+(state_width 32 -> ~0.2-0.25 accuracy, barely above the 0.1 chance
+floor; state_width 512 -> ~0.75, clearly real recurrent memory) in a
+small fraction of the time `landmark_checklist.py`'s 15000-step runs
+take, while directly exercising the property (signal surviving past the
+local context window, carried only through `M`) this whole project
+track cares about. Worth treating as a first-line diagnostic for
+future recurrence-relevant changes, not just this investigation.

@@ -39,7 +39,8 @@ from model.toy_precision_models import (QuantizedDISLDOLayer32, SeededRank1DISLD
                                         PeriodicSeedRank1DISLDOLayer8,
                                         SeededDISLDOLayer8Resync, SeededDISLDOLayer8AdaMax,
                                         TrueMultiDigitLayer, TrueMultiDigitDenseLayer)
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
+from model.toy_recall_models import (cross_entropy_sum, predicted_token, AdamOptimizer,
+                                     lr_schedule, clip_grad_norm_)
 
 
 def generate_copy_sequence(rng: np.random.RandomState, vocab: int, seq_len: int):
@@ -68,6 +69,19 @@ MAX_WEIGHTS_PER_LAYER = 128    # per_row=32 at state_width=32 -- generous at
 NUM_CPUS = 1
 PEAK_LR = 0.002
 WARMUP_STEPS = 50
+# Global gradient-norm clip on the plain-Tensor params (input_ln/state_ln/
+# centers/log_sigmas, trained via the external AdamOptimizer -- NOT
+# DISLDOLayer's own weights, which update inline during backward() and
+# can't be clipped the same way, see clip_grad_norm_'s own docstring).
+# Found NECESSARY, not just good practice: fully-dense connectivity's
+# larger fan-in lets logits grow large enough (mean_acc collapse traced
+# to real exponential blowup, JOURNAL.md 2026-08-10) that the resulting
+# cross-entropy gradient reaching these params via Adam produces a NaN
+# parameter update -- confirmed via direct per-stage diagnosis
+# (scripts/diagnose_dense_vs_sparse.py), reproducibly at the same step
+# every time. 1.0 matches nanoGPT's own commonly-used default (already
+# this project's cited reference elsewhere, e.g. lr_schedule's docstring).
+MAX_GRAD_NORM = 1.0
 EVAL_SEQUENCES = 60
 
 SEQ_LEN_START = 2
@@ -220,13 +234,154 @@ ARMS = {
                             # quantize's own design: zero trained scale AND
                             # deterministic rounding together.
 
+    # base=12.0: exact digit-range tiling (E2M1 math, see
+    # fixed_digit_residual_quantize's docstring), the project's working
+    # default. IMPORTANT: the single-seed sweep that first picked this
+    # (JOURNAL.md 2026-08-10, mean_acc 0.9375 vs base=4's 0.8771) was run
+    # BEFORE a real bug was found and fixed -- ToyTileRecurrenceRealFP4
+    # never passed `rng=` down to disldo_cls, so every layer's initial
+    # connectivity/weight values were genuinely unseeded regardless of
+    # `seed` (confirmed directly: same seed, same command, gave
+    # final-step accuracies of 0.70 then 0.65 across two back-to-back
+    # runs). That single-seed comparison only shows "there exists a draw
+    # where base=12 wins," not "usually wins" -- needs a proper
+    # multi-seed re-run now that construction is actually reproducible
+    # (see tests/test_residual_base_sweep.py) before this default is
+    # fully trusted. Kept as the default in the meantime since the
+    # theoretical argument (exact tiling) is independent of that bug.
     "true_multi_digit_deterministic": functools.partial(TrueMultiDigitLayer,
                                                         digit_cls=DISLDOLayerDeterministic,
-                                                        n_stages=3, base=4.0, lr_power=0.0),
+                                                        n_stages=3, base=12.0, lr_power=0.0),
+    # STOCHASTIC rounding, otherwise identical config (sparse, base=12,
+    # n_stages=3) to true_multi_digit_deterministic above -- per direct
+    # instruction (see conversation), stochastic rounding is now the
+    # PREFERRED choice for real runs: sili_peridot's rank-floor and
+    # superposition eval harnesses both found deterministic rounding gets
+    # permanently stuck (never escapes its current FP4 code once the
+    # residual is smaller than one quantization step), while stochastic
+    # genuinely reaches properties deterministic never does (beat the
+    # Eckart-Young rank floor AND the float32 reference at rank>2; the
+    # only FP4 arm that ever achieved genuine superposition, i.e. beat the
+    # no-superposition baseline, in sili_peridot/model/eval_superposition.py).
+    # Kept as a SEPARATE arm rather than repurposing the deterministic
+    # name, matching this file's own established _base4/_base6/_dense
+    # convention (direct, paired comparison points, not silent
+    # replacement) -- deterministic remains available for comparison.
+    "true_multi_digit_stochastic": functools.partial(TrueMultiDigitLayer,
+                                                      digit_cls=DISLDOLayer,
+                                                      n_stages=3, base=12.0, lr_power=0.0),
+    # base=4.0 was the ORIGINAL default, derived from real FP4 (E2M1)'s
+    # own worst-case relative rounding error (~1/4) -- kept as an explicit
+    # comparison point now that base=12 is the default above. Same
+    # digit_cls/n_stages/lr_power as true_multi_digit_deterministic --
+    # base is the only varied axis.
+    "true_multi_digit_deterministic_base4": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=4.0, lr_power=0.0),
+    # base=6.0: halfway between base=4 (overlapping digit ranges) and
+    # base=12 (exact tiling) -- added per direct request to fill in the
+    # sparse 4/12/24 sweep with a point between the two closest-together
+    # candidates.
+    "true_multi_digit_deterministic_base6": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=6.0, lr_power=0.0),
+    "true_multi_digit_deterministic_base24": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=24.0, lr_power=0.0),
+
+    # lr_power retest under deterministic rounding (JOURNAL.md 2026-08-10
+    # "Test 2"): the stochastic-rounding-era true_multi_digit_lr0/lr1/lr2
+    # sweep found no real difference between lr_power values, predicted
+    # to be because RMSprop's own eff_lr*g/sqrt(importance) self
+    # -normalizes almost all of the extra per-digit factor_i damping away
+    # on its own. Retesting under deterministic rounding (base=12, matching
+    # the confirmed default) to confirm that prediction still holds now
+    # that stochastic noise isn't swamping everything else.
+    "true_multi_digit_deterministic_lr1": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=1.0),
+    "true_multi_digit_deterministic_lr2": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=2.0),
+
+    # _dense variants: fully dense connectivity (every synapse present,
+    # loaded straight into block4 via sili__new's load_dense_codes) instead
+    # of the random SPARSE "echo network" preseed every arm above uses --
+    # per direct request, to test whether that random-connectivity-draw is
+    # itself a significant source of the seed-to-seed variance seen even at
+    # base=12 (std 0.043 across 5 seeds, JOURNAL.md 2026-08-10), independent
+    # of base or bits. Same digit_cls/n_stages/lr_power/base as their
+    # non-dense counterparts -- dense=True is the only varied axis, so this
+    # is a direct paired comparison, not a new axis tangled with others.
+    "true_multi_digit_deterministic_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=12.0, lr_power=0.0, dense=True),
+    # STOCHASTIC + dense, combined -- the two winning axes found separately
+    # this session (stochastic rounding beats deterministic for genuine
+    # superposition/rank-floor properties; dense connectivity beats sparse
+    # -echo once instability is fixed) had never actually been tested
+    # together until now. Current best-known production combination when
+    # paired with l1_sparsity_coef=0.05-0.07 at the training-script level
+    # (see main()'s own l1_sparsity_coef CLI arg) -- L1 output-sparsity is
+    # what makes dense connectivity stable at all (JOURNAL.md 2026-08-13),
+    # replacing spectral_norm_target, which is unavailable in production.
+    "true_multi_digit_stochastic_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer,
+        n_stages=3, base=12.0, lr_power=0.0, dense=True),
+    "true_multi_digit_deterministic_base4_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=4.0, lr_power=0.0, dense=True),
+    "true_multi_digit_deterministic_base6_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=6.0, lr_power=0.0, dense=True),
+    "true_multi_digit_deterministic_base24_dense": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
+        n_stages=3, base=24.0, lr_power=0.0, dense=True),
+
     "true_multi_digit_noscale_deterministic": functools.partial(TrueMultiDigitLayer,
                                                                 digit_cls=DISLDOLayerNoScaleDeterministic,
-                                                                n_stages=3, base=4.0, lr_power=0.0),
+                                                                n_stages=3, base=12.0, lr_power=0.0),
+
+    # Direct hypothesis check: each digit's independent preseed/synaptogenesis
+    # means digits' connectivity is essentially disjoint (verified: 0/20, 0/20,
+    # 1/20 overlap on a fresh preseed) -- the residual-correction mechanism can
+    # only fire where digits' connectivity actually coincides. share_connectivity
+    # forces every digit onto digit 0's exact (ptrs, indices) at construction.
+    "true_multi_digit_shared_conn": functools.partial(TrueMultiDigitLayer,
+                                                       digit_cls=DISLDOLayerDeterministic,
+                                                       n_stages=3, base=4.0, lr_power=0.0,
+                                                       share_connectivity=True),
 }
+
+
+def _maybe_synaptogenesis(model, k: int = 4, importance_cutoff: float = 0.01):
+    """Real structural growth+pruning (sili's actual synap_step/
+    build_probes/equalizer_step, via _SparseLayerBase.synaptogenesis or
+    TrueMultiDigitLayer's own per-digit delegate) on every disldo-family
+    sublayer of the model, k=4 -- the established default elsewhere in
+    the codebase (SparseRNNAgent's own synaptogenesis_k default; k=64
+    was measured to saturate a 1000x1000 layer's connectivity in ONE
+    call, k=4 grows gradually instead). Each sublayer's own already
+    -stored `_max_row_weights` cap keeps nnz roughly STABLE over time
+    (grow-and-prune balance against a fixed target, not unbounded
+    growth) -- per direct instruction, not a new/growing budget.
+    Dense/Adam-controlled sublayers (no `.synaptogenesis`, no sparse
+    structure) are silently skipped."""
+    for attr in ("q_proj", "k_proj", "v_proj", "lm_head"):
+        sub = getattr(model, attr, None)
+        if sub is None:
+            continue
+        if hasattr(sub, "_max_row_weights"):
+            sub.synaptogenesis(k, importance_cutoff, sub._max_row_weights)
+        elif hasattr(sub, "synaptogenesis"):
+            sub.synaptogenesis(k, importance_cutoff)
+    o_proj = getattr(model, "o_proj", None)
+    o_layers = o_proj if isinstance(o_proj, list) else ([o_proj] if o_proj is not None else [])
+    for sub in o_layers:
+        if hasattr(sub, "_max_row_weights"):
+            sub.synaptogenesis(k, importance_cutoff, sub._max_row_weights)
+        elif hasattr(sub, "synaptogenesis"):
+            sub.synaptogenesis(k, importance_cutoff)
 
 
 def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
@@ -276,7 +431,15 @@ ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
                   "true_multi_digit_resync": 12, "true_multi_digit_noscale": 12,
                   "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
                   "row_4bit_noscale_deterministic": 4,
-                  "true_multi_digit_deterministic": 12, "true_multi_digit_noscale_deterministic": 12}
+                  "true_multi_digit_deterministic": 12, "true_multi_digit_stochastic": 12,
+                  "true_multi_digit_stochastic_dense": 12,
+                  "true_multi_digit_noscale_deterministic": 12,
+                  "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
+                  "true_multi_digit_deterministic_base24": 12,
+                  "true_multi_digit_deterministic_lr1": 12, "true_multi_digit_deterministic_lr2": 12,
+                  "true_multi_digit_deterministic_dense": 12, "true_multi_digit_deterministic_base4_dense": 12,
+                  "true_multi_digit_deterministic_base6_dense": 12, "true_multi_digit_deterministic_base24_dense": 12,
+                  "true_multi_digit_shared_conn": 12}
 
 
 def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
@@ -328,6 +491,42 @@ def main():
     # a cascaded/residual-quantization-style test of whether composing coarse
     # stages recovers precision that widening alone doesn't, per direct idea.
     o_proj_depth = int(sys.argv[13]) if len(sys.argv) > 13 else 1
+    # use_synaptogenesis: real dynamic growth+pruning (build_probes+
+    # synap_step+equalizer_step via _maybe_synaptogenesis, k=4) every
+    # outer step, instead of the static pre-seeded-only sparsity every
+    # arm has used so far this session -- per direct request, testing
+    # whether the residual digits want some OTHER connectivity pattern
+    # discovered via real importance-driven growth/pruning, distinct
+    # from both fully-independent-random and forced-identical (both
+    # already tested). Default 0/off, backward-compatible with every
+    # existing invocation.
+    use_synaptogenesis = bool(int(sys.argv[14])) if len(sys.argv) > 14 else False
+    # clip_range: the tile-recurrence state's hard clip bound
+    # (np.clip(M_new_t.data, -clip_range, clip_range)) was originally
+    # picked at 2.0 without much justification. Direct comparison
+    # confirmed 6.0 (matching FP4's own max representable magnitude)
+    # wins clearly (mean_acc 0.98 vs 0.75, 3/3 seeds) -- now the default,
+    # matching ToyTileRecurrenceRealFP4's own updated default.
+    clip_range = float(sys.argv[15]) if len(sys.argv) > 15 else 6.0
+    # magnitude_penalty_coef: real gradient discouraging large recurrent
+    # activation magnitude (see ToyTileRecurrenceRealFP4.__init__'s own
+    # docstring) -- default 0.0/off, backward-compatible. Direct instruction
+    # to keep this independent of use_energy for isolated testing.
+    magnitude_penalty_coef = float(sys.argv[16]) if len(sys.argv) > 16 else 0.0
+    # spectral_norm_target: rescales o_proj's real output by a persistent,
+    # power-iteration-tracked estimate of its own dominant singular value
+    # (see ToyTileRecurrenceRealFP4.__init__'s own docstring) -- the
+    # measured root cause of dense connectivity's instability (spectral
+    # radius 1.2 at init, growing to 1.5+ over training, vs sparse's flat
+    # 0.85). None/off by default, backward-compatible, independent of
+    # magnitude_penalty_coef/use_energy (composable per direct request).
+    spectral_norm_target = float(sys.argv[17]) if len(sys.argv) > 17 else None
+    # l1_sparsity_coef: the LANDMARK dense-connectivity stability mechanism
+    # (see ToyTileRecurrenceRealFP4.__init__'s own docstring for the full
+    # rationale and JOURNAL.md 2026-08-13) -- reaches mean=1.0000 at
+    # coef=0.05 or 0.07, replacing spectral_norm_target entirely (do not
+    # set both). None/0.0 off by default, backward-compatible.
+    l1_sparsity_coef = float(sys.argv[18]) if len(sys.argv) > 18 else 0.0
 
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * MLP_HIDDEN_MULT
@@ -346,11 +545,20 @@ def main():
     # confounded by an extra, uncontrolled noise source on top of `seed`.
     if hasattr(_cpu, "seed_fp4_stochastic_rng"):
         _cpu.seed_fp4_stochastic_rng(seed)
+    # Separate Generator (not the legacy RandomState `rng` above, used for
+    # tokens/embed_table) for model construction -- ToyTileRecurrenceRealFP4
+    # threads this down to each disldo_cls layer's initial connectivity/weight
+    # values (see its own docstring for the bug this fixes: this was
+    # previously never passed at all, so every layer's preseed was genuinely
+    # unseeded regardless of `seed`).
+    model_rng = np.random.default_rng(seed)
     model = ToyTileRecurrenceRealFP4(
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
         use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
-        use_attention=use_attention, o_proj_depth=o_proj_depth)
+        use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng,
+        clip_range=clip_range, magnitude_penalty_coef=magnitude_penalty_coef,
+        spectral_norm_target=spectral_norm_target, l1_sparsity_coef=l1_sparsity_coef)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -362,7 +570,7 @@ def main():
           f"column_neurons={COLUMN_NEURONS} state_width={state_width} "
           f"max_weights={MAX_WEIGHTS_PER_LAYER} o_proj_depth={o_proj_depth} "
           f"peak_lr={PEAK_LR} est_value_bits={value_bits} "
-          f"(~{value_bits/8:.0f} bytes) "
+          f"(~{value_bits/8:.0f} bytes) use_synaptogenesis={use_synaptogenesis} "
           f"seq_len={SEQ_LEN_START}->{SEQ_LEN_MAX} (+1/{steps_per_stage} steps)",
           flush=True)
 
@@ -381,7 +589,11 @@ def main():
                 if aux is not None:
                     loss = loss + aux
                 loss.backward()
+                clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+
+        if use_synaptogenesis:
+            _maybe_synaptogenesis(model)
 
         if step % checkpoint_every == 0:
             acc = evaluate(model, rng, embed_table, seq_len)

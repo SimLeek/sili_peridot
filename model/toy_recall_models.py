@@ -236,6 +236,20 @@ def clip_grad_norm_(params: List[Tensor], max_norm: float) -> float:
         if p.grad is not None:
             total_sq += float(np.sum(np.asarray(p.grad, dtype=np.float64) ** 2))
     total_norm = total_sq ** 0.5
+    if not np.isfinite(total_norm):
+        # `total_norm > max_norm` and `total_norm > 0` are BOTH False when
+        # total_norm is NaN (IEEE 754) -- a NaN/Inf gradient would silently
+        # skip the clip below and sail straight into opt.step(), permanently
+        # poisoning Adam's m/v moving averages (every future step also NaN
+        # after that). Confirmed as the real, direct cause of dense
+        # connectivity's permanent NaN divergence via the C++-side analog
+        # of this exact bug (sili__new's ScalePolicy::update, see its own
+        # docstring; JOURNAL.md 2026-08-10). Zero the gradient instead --
+        # skips this step's update rather than corrupting all future ones.
+        for p in params:
+            if p.grad is not None:
+                p.grad = np.zeros_like(np.asarray(p.grad, dtype=np.float32))
+        return total_norm
     if total_norm > max_norm and total_norm > 0:
         scale = max_norm / (total_norm + 1e-6)
         for p in params:
