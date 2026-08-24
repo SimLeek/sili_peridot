@@ -6829,3 +6829,24 @@ take, while directly exercising the property (signal surviving past the
 local context window, carried only through `M`) this whole project
 track cares about. Worth treating as a first-line diagnostic for
 future recurrence-relevant changes, not just this investigation.
+
+## 2026-08-20 -- "fp4+fp4 dual" arm: TrueMultiDigitLayer at n_stages=2, replacing the 3-stage scheme as the arm used going forward
+
+Added `true_multi_digit_dual`/`true_multi_digit_dual_dense`
+(`scripts/train_tile_curriculum.py`) -- `TrueMultiDigitLayer(digit_cls=
+DISLDOLayer, n_stages=2, base=12.0)`, i.e. exactly two independently
+-trained real stochastic-FP4 sub-layers instead of the current
+production three (`true_multi_digit_stochastic`/`_dense`). base=12's
+exact-tiling rationale is a pairwise adjacent-digit condition, not
+stage-count-dependent, so it carries over unchanged -- not re-tuned.
+This is the `fp4+fp4-dual` arm for the upcoming real-engine MQAR test
+matrix ({fp4, fp4+fp4-dual, fp8} x {rank1, rank2} x {magnitude-scale
+on/off}).
+
+Single-seed smoke run (seed=1000, 1500 steps, same config for both):
+dual (8 bits/weight, est_value_bits=49280) reached acc=0.75 at step
+1500 vs the 3-stage arm's (12 bits/weight, est_value_bits=73920)
+acc=0.6333 -- dual also ran faster (7s vs 9s total). Single seed, short
+run -- not a validated result, just confirms the new arm forwards/
+trains/backpropagates correctly end-to-end with no crashes before
+handing it to the real multi-seed sweep.

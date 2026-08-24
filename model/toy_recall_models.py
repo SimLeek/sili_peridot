@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from sili.tensor import (
-    Tensor, banded_attention, gaussian_attention, exp, log, reduce_sum, silu, gather, _topo_sort,
+    Tensor, banded_attention, gaussian_attention, exp, log, neg, power, reduce_sum, silu, gather, _topo_sort,
 )
 
 
@@ -62,6 +62,15 @@ def rmsnorm_tensor(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     mean_sq = mean_sq.reshape((x.data.shape[0], 1))          # [T, 1]
     rrms = (mean_sq + eps) ** -0.5                           # [T, 1]
     return (x * rrms) * weight
+
+
+def sigmoid_tensor(x: Tensor) -> Tensor:
+    """1/(1+e^-x), built from existing Tensor primitives (no new op
+    needed) -- NOT `bounded_gate` (defined elsewhere in sili.tensor),
+    which is a different shape (f(0)=0, domain [0,inf)) meant for
+    energy-gated non-negative activations, not a symmetric LSTM-style
+    gate (f(0)=0.5, all reals) for mixing two signals."""
+    return power(exp(neg(x)) + 1.0, -1.0)
 
 
 def cross_entropy_sum(logits: Tensor, row_target_pairs: List[Tuple[int, int]]) -> Tensor:

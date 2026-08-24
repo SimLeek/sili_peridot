@@ -27,7 +27,7 @@ def _model(disldo_cls=DISLDOLayer, num_tiles=NUM_TILES, num_cpus=2):
 class TestToyTileRecurrenceRealFP4:
     def test_shapes_and_finite(self):
         model = _model()
-        x_window = np.random.RandomState(1).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         M_new, logits, aux_loss = model.step(x_window, M_prev, learning_rate=0.01)
         assert M_new.shape == (NUM_TILES, STATE_WIDTH)
@@ -38,11 +38,11 @@ class TestToyTileRecurrenceRealFP4:
 
     def test_big_weights_change_after_a_step_with_no_external_optimizer(self):
         model = _model()
-        probe_window = np.random.RandomState(3).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        probe_window = np.random.RandomState(3).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         probe_M = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         before = model.step(probe_window, probe_M, learning_rate=0.0)[1].data.copy()
 
-        train_window = np.random.RandomState(4).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        train_window = np.random.RandomState(4).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         train_M = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         _M_new, logits, _aux = model.step(train_window, train_M, learning_rate=0.05)
         loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 2)])
@@ -66,7 +66,7 @@ class TestToyTileRecurrenceRealFP4:
 
     def test_resetting_M_prev_changes_logits(self):
         model = _model()
-        x_window = np.random.RandomState(6).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(6).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_real = np.random.RandomState(7).randn(NUM_TILES, STATE_WIDTH).astype(np.float32)
         M_zero = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
 
@@ -79,7 +79,7 @@ class TestToyTileRecurrenceRealFP4:
     def test_loss_decreases_on_a_single_repeated_example(self):
         model = _model()
         opt = AdamOptimizer()
-        x_window = np.random.RandomState(5).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(5).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         lr = 0.02
 
@@ -104,7 +104,7 @@ class TestToyTileRecurrenceRealFP4WithEnergy:
         model = ToyTileRecurrenceRealFP4(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, MLP_HIDDEN,
                                          NUM_TILES, MAX_WEIGHTS, num_cpus=2,
                                          disldo_cls=DISLDOLayer, use_energy=True)
-        x_window = np.random.RandomState(1).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         M_new, logits, aux_loss = model.step(x_window, M_prev, learning_rate=0.01)
         assert M_new.shape == (NUM_TILES, STATE_WIDTH)
@@ -118,7 +118,7 @@ class TestToyTileRecurrenceRealFP4WithEnergy:
 class TestToyTileRecurrenceRealFP4WithRowScaleAdam:
     def test_shapes_and_finite(self):
         model = _model(disldo_cls=AdamRowScaleDISLDOLayer)
-        x_window = np.random.RandomState(1).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         M_new, logits, aux_loss = model.step(x_window, M_prev, learning_rate=0.01)
         assert M_new.shape == (NUM_TILES, STATE_WIDTH)
@@ -130,7 +130,7 @@ class TestToyTileRecurrenceRealFP4WithRowScaleAdam:
 class TestToyTileRecurrenceRealFP4WithRank1Adam:
     def test_shapes_and_finite(self):
         model = _model(disldo_cls=AdamRank1DISLDOLayer)
-        x_window = np.random.RandomState(1).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         M_new, logits, aux_loss = model.step(x_window, M_prev, learning_rate=0.01)
         assert M_new.shape == (NUM_TILES, STATE_WIDTH)
@@ -172,7 +172,7 @@ class TestToyTileRecurrenceRealFP4LongHorizonStability:
 
     def test_no_late_onset_divergence_or_nan_over_long_horizon(self):
         model = self._production_model()
-        x_window = np.random.RandomState(10).randn(NUM_TILES, STATE_WIDTH).astype(np.float32) * 0.1
+        x_window = np.random.RandomState(10).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         M_prev = np.zeros((NUM_TILES, STATE_WIDTH), dtype=np.float32)
         lr = 0.02
         target_pos, target_tok = NUM_TILES - 1, 3
