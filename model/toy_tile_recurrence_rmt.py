@@ -49,6 +49,7 @@ class ToyTileRecurrenceRMT:
                  synapse_kwargs: Optional[dict] = None,
                  scale_rank: int = 1,
                  additive_rank: int = 0,
+                 dynamic_rank_control: bool = False,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -96,7 +97,13 @@ class ToyTileRecurrenceRMT:
         # above, only DISLDOLayer/DISLDOLayerDeterministic/DISLDOLayer8
         # accept additive_rank at all.
         additive_kwargs = {"additive_rank": additive_rank} if additive_rank != 0 else {}
-        layer_kwargs = {**dense_kwargs, **rank_kwargs, **additive_kwargs}
+        # Same conditional-forwarding convention: only
+        # DISLDOLayer/DISLDOLayerDeterministic/DISLDOLayer8 accept this
+        # kwarg. Requires additive_rank>=1 to have any effect -- gamma
+        # tracking's own neurogenesis trigger can't fire from rank 0
+        # (see sili__new sparse_rnn.py _activate_gamma_tracking).
+        dynamic_kwargs = {"dynamic_rank_control": True} if dynamic_rank_control else {}
+        layer_kwargs = {**dense_kwargs, **rank_kwargs, **additive_kwargs, **dynamic_kwargs}
 
         self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
                                      rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
@@ -142,6 +149,48 @@ class ToyTileRecurrenceRMT:
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
             elif hasattr(layer, "magnitude_rescale_output") and hasattr(layer, "digits"):
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
+    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
+                                   theta: float = 0.02, seed_scale: float = 0.05,
+                                   grace_period_steps: int = 50) -> dict:
+        """Runs AQRS Theorem 10 dynamic rank control (task #292, see
+        sili__new's delta_csr_types.hpp/DISLDOLayer.apply_dynamic_rank_
+        control) on every real disldo_cls weight layer independently --
+        same iteration pattern as magnitude_rescale_output above, same
+        "skip a layer whose backend has no scale concept" guard (fp32
+        DISLDOLayerV has no scale_rank/additive_rank at all). Meant to be
+        called once per training step, after backward -- the EMA state
+        driving the triggers is updated automatically inside each layer's
+        own backward call, so calling this less often just means the
+        triggers get evaluated on stale-but-still-accumulating EMA state,
+        not that anything breaks; calling it MORE often than once/step
+        has no effect since nothing new has been computed between calls.
+
+        Returns {layer_name: mutated_bool} for every real layer -- lets a
+        caller log/count real rank-mutation events per layer without
+        needing to know the same layer-name tuple again itself.
+        """
+        results = {}
+        for name, layer in (("input_proj", self.input_proj), ("q_proj", self.q_proj),
+                            ("k_proj", self.k_proj), ("v_proj", self.v_proj),
+                            ("o_proj", self.o_proj), ("lm_head", self.lm_head)):
+            if hasattr(layer, "apply_dynamic_rank_control"):
+                results[name] = layer.apply_dynamic_rank_control(
+                    tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        return results
+
+    def report_ranks(self) -> dict:
+        """{layer_name: (scale_rank, additive_rank)} for every real layer
+        with a C++ backend -- the answer to "what best rank numbers does
+        dynamic control end up with" (task #292)."""
+        results = {}
+        for name, layer in (("input_proj", self.input_proj), ("q_proj", self.q_proj),
+                            ("k_proj", self.k_proj), ("v_proj", self.v_proj),
+                            ("o_proj", self.o_proj), ("lm_head", self.lm_head)):
+            c = getattr(layer, "_c", None)
+            if c is not None and hasattr(c, "get_scale_rank"):
+                results[name] = (c.get_scale_rank(), c.get_additive_rank())
+        return results
 
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float) -> Tensor:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its

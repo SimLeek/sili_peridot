@@ -105,7 +105,8 @@ def _stage_key(stage: dict) -> tuple:
 
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
-                     log_fn=None, additive_rank: int = 0) -> dict:
+                     log_fn=None, additive_rank: int = 0,
+                     dynamic_rank_control: bool = False) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -123,7 +124,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
         synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
-        additive_rank=additive_rank, rng=model_rng)
+        additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
+        rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -138,6 +140,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     stage_history = []
     peak_key = _stage_key(stage_stack[0])
     peak_stage = dict(stage_stack[0])
+    rank_mutation_count = 0
 
     def _current():
         s = stage_stack[-1]
@@ -240,6 +243,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 loss.backward()
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+                if dynamic_rank_control:
+                    mutated = model.apply_dynamic_rank_control()
+                    rank_mutation_count += sum(1 for m in mutated.values() if m)
 
         if streak >= STREAK_THRESHOLD:
             _advance_stage(step)
@@ -262,6 +268,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         "final_phase": final_phase, "peak_stage": peak_stage,
         "graduated": final_phase == "k" and final_k > k_max, "total_steps": step,
         "elapsed_s": time.time() - t0, "stage_history": stage_history,
+        "dynamic_rank_control": dynamic_rank_control,
+        "rank_mutation_count": rank_mutation_count,
+        "final_ranks": model.report_ranks() if hasattr(model, "report_ranks") else {},
     }
 
 
@@ -273,9 +282,11 @@ def main():
     num_tiles = int(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_NUM_TILES
     k_max = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_K_MAX
     additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 0
+    dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else False
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
+          f"dynamic_rank_control={dynamic_rank_control} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -287,12 +298,16 @@ def main():
               f"loss_ema={loss_s}  acc_ema={acc_s}{tag}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
-                         additive_rank=additive_rank)
+                         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)
     print(f"PEAK precision={precision} peak_vocab={r['peak_stage']['vocab']} "
           f"peak_k={r['peak_stage']['k']} peak_phase={r['peak_stage']['phase']}", flush=True)
+    if r["dynamic_rank_control"]:
+        print(f"RANK_MUTATIONS precision={precision} count={r['rank_mutation_count']}", flush=True)
+        for name, (scale_r, add_r) in r["final_ranks"].items():
+            print(f"  {name:<12} scale_rank={scale_r}  additive_rank={add_r}", flush=True)
     print("STAGE_HISTORY_JSON " + json.dumps(r["stage_history"]), flush=True)
 
 
