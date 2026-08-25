@@ -141,10 +141,24 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     peak_key = _stage_key(stage_stack[0])
     peak_stage = dict(stage_stack[0])
     rank_mutation_count = 0
+    rank_history = []
 
     def _current():
         s = stage_stack[-1]
         return s["vocab"], s["k"], s["phase"]
+
+    def _log_ranks(step):
+        # Records a (scale_rank, additive_rank) snapshot per layer at
+        # this step -- called at every periodic log point AND every
+        # level transition, not just once at the end, so a run's rank
+        # trajectory (growth/shrink timing relative to curriculum
+        # progress) can be read back even if the run is killed early or
+        # takes far longer than expected (direct instruction).
+        if not dynamic_rank_control:
+            return None
+        ranks = model.report_ranks()
+        rank_history.append({"step": step, "ranks": ranks})
+        return ranks
 
     def _advance_stage(step):
         nonlocal streak, wrong_streak, stage_step, queries_since_level_change
@@ -166,9 +180,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         stage_step = 0
         queries_since_level_change = 0
         pending_level_token = LEVEL_UP_TOKEN
+        ranks = _log_ranks(step)
         if log_fn is not None:
             v, k, ph = _current()
-            log_fn(step, v, k, ph, "LEVEL_UP", loss_ema, acc_ema)
+            log_fn(step, v, k, ph, "LEVEL_UP", loss_ema, acc_ema, ranks=ranks)
 
     def _regress_stage(step):
         nonlocal streak, wrong_streak, stage_step, queries_since_level_change, pending_level_token
@@ -187,9 +202,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         stage_step = 0
         queries_since_level_change = 0
         pending_level_token = LEVEL_DOWN_TOKEN
+        ranks = _log_ranks(step)
         if log_fn is not None:
             v, k, ph = _current()
-            log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema)
+            log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
     t0 = time.time()
     step = 0
@@ -251,16 +267,19 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             _advance_stage(step)
             _, k_now, phase_now = _current()
             if phase_now == "k" and k_now > k_max:
+                # _advance_stage already logged ranks for this exact step
+                ranks = model.report_ranks() if dynamic_rank_control else None
                 if log_fn is not None:
-                    log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema)
+                    log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema, ranks=ranks)
                 break
         elif (wrong_streak >= WRONG_STREAK_THRESHOLD
               and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS):
             _regress_stage(step)
 
         if step % log_every == 0:
+            ranks = _log_ranks(step)
             if log_fn is not None:
-                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema)
+                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks)
 
     final_vocab, final_k, final_phase = _current()
     return {
@@ -271,6 +290,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         "dynamic_rank_control": dynamic_rank_control,
         "rank_mutation_count": rank_mutation_count,
         "final_ranks": model.report_ranks() if hasattr(model, "report_ranks") else {},
+        "rank_history": rank_history,
     }
 
 
@@ -290,12 +310,21 @@ def main():
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
-    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema):
+    _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
+                   "v_proj": "v", "o_proj": "o", "lm_head": "lm"}
+
+    def _ranks_str(ranks):
+        if not ranks:
+            return ""
+        parts = [f"{_SHORT_NAME.get(n, n)}={s}/{a}" for n, (s, a) in ranks.items()]
+        return "  ranks[" + " ".join(parts) + "]"
+
+    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}", flush=True)
+              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{_ranks_str(ranks)}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control)
@@ -308,6 +337,13 @@ def main():
         print(f"RANK_MUTATIONS precision={precision} count={r['rank_mutation_count']}", flush=True)
         for name, (scale_r, add_r) in r["final_ranks"].items():
             print(f"  {name:<12} scale_rank={scale_r}  additive_rank={add_r}", flush=True)
+        # Full per-step (well, per-log_every/per-transition) rank trace as
+        # JSON, same convention as STAGE_HISTORY_JSON -- lets the growth/
+        # shrink timing be read back and cross-referenced against
+        # stage_history even if a run is killed early or takes far
+        # longer than expected (direct instruction: log this to a file
+        # as we go, not just report a final snapshot).
+        print("RANK_HISTORY_JSON " + json.dumps(r["rank_history"]), flush=True)
     print("STAGE_HISTORY_JSON " + json.dumps(r["stage_history"]), flush=True)
 
 
