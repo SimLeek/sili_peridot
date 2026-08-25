@@ -48,6 +48,7 @@ class ToyTileRecurrenceRMT:
                  l1_sparsity_coef: float = 0.0,
                  synapse_kwargs: Optional[dict] = None,
                  scale_rank: int = 1,
+                 additive_rank: int = 0,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -89,7 +90,13 @@ class ToyTileRecurrenceRMT:
         # accept scale_rank at all; unconditionally splatting it would
         # TypeError any disldo_cls that doesn't (e.g. DISLDOLayer32).
         rank_kwargs = {"scale_rank": scale_rank} if scale_rank != 1 else {}
-        layer_kwargs = {**dense_kwargs, **rank_kwargs}
+        # AQRS additive branch (task #280 -- re-validates the fp8 MQAR
+        # "input-independent collapse" case, see AQRS_DESIGN.md Theorem
+        # 3/4): same conditional-forwarding convention as rank_kwargs
+        # above, only DISLDOLayer/DISLDOLayerDeterministic/DISLDOLayer8
+        # accept additive_rank at all.
+        additive_kwargs = {"additive_rank": additive_rank} if additive_rank != 0 else {}
+        layer_kwargs = {**dense_kwargs, **rank_kwargs, **additive_kwargs}
 
         self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
                                      rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)

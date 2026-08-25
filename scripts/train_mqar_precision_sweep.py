@@ -85,7 +85,8 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                    lr_mode: str = "step",
                    min_lr_frac: float = 0.05,
                    loss_ema_decay: float = 0.98,
-                   acc_ema_decay: float = 0.98) -> dict:
+                   acc_ema_decay: float = 0.98,
+                   additive_rank: int = 0) -> dict:
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -99,6 +100,11 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
     dense = True
     effective_rank = scale_rank if precision != "fp32" else 1
     use_magscale = magnitude_scale and precision != "fp32"
+    # additive_rank (task #280): AQRS's additive low-rank branch, only
+    # meaningful for the real-quantized precisions (fp32's DISLDOLayer32
+    # has no additive_rank concept, same reasoning as effective_rank
+    # above).
+    effective_additive_rank = additive_rank if precision != "fp32" else 0
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
@@ -118,7 +124,8 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=dense, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=synapse_kwargs, scale_rank=effective_rank, rng=model_rng)
+        synapse_kwargs=synapse_kwargs, scale_rank=effective_rank,
+        additive_rank=effective_additive_rank, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -213,6 +220,7 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                 log_fn(step, train_steps, time.time() - t0, mean_q_loss, quick_acc, lr)
 
     correct, total = 0, 0
+    query_logit_top5 = []
     for _ in range(EVAL_SEQUENCES):
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         mqar_by_pos = dict(mqar_pairs)
@@ -224,9 +232,26 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                 pred = predicted_token(logits, num_tiles - 1)
                 correct += int(pred == mqar_by_pos[i])
                 total += 1
+                if len(query_logit_top5) < 20:
+                    logit_vals = np.asarray(logits.data[num_tiles - 1], dtype=np.float32)
+                    top5 = tuple(np.argsort(logit_vals)[-5:][::-1].tolist())
+                    query_logit_top5.append(top5)
+
+    # Input-independent-collapse diagnostic (AQRS_DESIGN.md's own
+    # "byte-identical top-5 logits" finding, found via direct logit dump):
+    # if every sampled query position's top-5 prediction set is IDENTICAL
+    # regardless of the actual query content, the model has collapsed to
+    # modeling the marginal token distribution instead of doing real
+    # per-key retrieval -- exactly the fp8 failure mode the additive
+    # branch (Theorem 3/4) is meant to structurally fix, since it's the
+    # only way to write a nonzero value where a quantized weight has
+    # landed on the zero sentinel code.
+    collapse_detected = len(query_logit_top5) >= 2 and len(set(query_logit_top5)) == 1
 
     return {"precision": precision, "scale_rank": effective_rank, "magnitude_scale": use_magscale,
+            "additive_rank": effective_additive_rank,
             "acc": correct / total if total else 0.0,
+            "collapse_detected": collapse_detected,
             "elapsed_s": time.time() - t0, "trajectory": trajectory}
 
 
@@ -239,10 +264,12 @@ def main():
     peak_lr = float(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_PEAK_LR
     scale_invariant = bool(int(sys.argv[7])) if len(sys.argv) > 7 else False
     lr_mode = sys.argv[8] if len(sys.argv) > 8 else "step"
+    additive_rank = int(sys.argv[9]) if len(sys.argv) > 9 else 0
 
     print(f"# MQAR precision sweep precision={precision} scale_rank={scale_rank} "
           f"magnitude_scale={magnitude_scale} train_steps={train_steps} seed={seed} "
-          f"peak_lr={peak_lr} scale_invariant={scale_invariant} lr_mode={lr_mode} config=nocaps", flush=True)
+          f"peak_lr={peak_lr} scale_invariant={scale_invariant} lr_mode={lr_mode} "
+          f"additive_rank={additive_rank} config=nocaps", flush=True)
 
     def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc, lr):
         print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
@@ -250,9 +277,10 @@ def main():
 
     r = train_and_eval(precision, scale_rank, magnitude_scale, 1, seed, train_steps,
                        peak_lr=peak_lr, log_fn=log_fn, scale_invariant=scale_invariant,
-                       lr_mode=lr_mode)
+                       lr_mode=lr_mode, additive_rank=additive_rank)
     print(f"\nFINAL precision={precision} scale_rank={r['scale_rank']} "
-          f"magnitude_scale={r['magnitude_scale']} acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)",
+          f"magnitude_scale={r['magnitude_scale']} additive_rank={r['additive_rank']} "
+          f"acc={r['acc']:.4f} collapse_detected={r['collapse_detected']} ({r['elapsed_s']:.0f}s)",
           flush=True)
     print("TRAJECTORY_JSON " + json.dumps(r["trajectory"]), flush=True)
 
