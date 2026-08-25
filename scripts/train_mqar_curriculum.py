@@ -105,7 +105,7 @@ def _stage_key(stage: dict) -> tuple:
 
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
-                     log_fn=None) -> dict:
+                     log_fn=None, additive_rank: int = 0) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -122,7 +122,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1, rng=model_rng)
+        synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
+        additive_rank=additive_rank, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -271,9 +272,10 @@ def main():
     peak_lr = float(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_PEAK_LR
     num_tiles = int(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_NUM_TILES
     k_max = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_K_MAX
+    additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
-          f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} "
+          f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -284,7 +286,8 @@ def main():
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
               f"loss_ema={loss_s}  acc_ema={acc_s}{tag}", flush=True)
 
-    r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn)
+    r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
+                         additive_rank=additive_rank)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)
