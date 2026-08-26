@@ -106,7 +106,8 @@ def _stage_key(stage: dict) -> tuple:
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
                      log_fn=None, additive_rank: int = 0,
-                     dynamic_rank_control: bool = False) -> dict:
+                     dynamic_rank_control: bool = False,
+                     rank_grace_period_steps: int = 50) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -260,7 +261,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
                 if dynamic_rank_control:
-                    mutated = model.apply_dynamic_rank_control()
+                    mutated = model.apply_dynamic_rank_control(grace_period_steps=rank_grace_period_steps)
                     rank_mutation_count += sum(1 for m in mutated.values() if m)
 
         if streak >= STREAK_THRESHOLD:
@@ -303,10 +304,19 @@ def main():
     k_max = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_K_MAX
     additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 0
     dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else False
+    # AQRS rank-mutation cooldown (task #292 fix): interim "age-gate"
+    # refractory period, not yet tied to a real resource/energy cost
+    # model -- see sili__new delta_csr_types.hpp's
+    # apply_dynamic_rank_control_generic docstring. Kept as a real
+    # tunable per direct instruction, not hardcoded -- a real 60k-step
+    # run showed the default (50) still allows frequent churn since 12
+    # independent per-branch cooldowns (6 layers x 2 branches) all reset
+    # on their own schedule; raise this for a calmer run.
+    rank_grace_period_steps = int(sys.argv[9]) if len(sys.argv) > 9 else 50
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
-          f"dynamic_rank_control={dynamic_rank_control} "
+          f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -327,7 +337,8 @@ def main():
               f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{_ranks_str(ranks)}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
-                         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control)
+                         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
+                         rank_grace_period_steps=rank_grace_period_steps)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)
