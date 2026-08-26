@@ -151,7 +151,7 @@ class ToyTileRecurrenceRMT:
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
-                                   theta: float = 0.02, seed_scale: float = 0.05,
+                                   theta: float = 1e-4, seed_scale: float = 0.05,
                                    grace_period_steps: int = 50) -> dict:
         """Runs AQRS Theorem 10 dynamic rank control (task #292, see
         sili__new's delta_csr_types.hpp/DISLDOLayer.apply_dynamic_rank_
