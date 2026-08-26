@@ -6850,3 +6850,55 @@ acc=0.6333 -- dual also ran faster (7s vs 9s total). Single seed, short
 run -- not a validated result, just confirms the new arm forwards/
 trains/backpropagates correctly end-to-end with no crashes before
 handing it to the real multi-seed sweep.
+
+## 2026-08-25 -- AQRS dynamic rank control wired into the real MQAR curriculum; fp4 reaches K=2 for the first time
+
+Task #292 wired `apply_dynamic_rank_control` (previously only validated
+on a synthetic 4x4 layer, see `project_aqrs_dynamic_rank_control_complete`
+memory) into `train_mqar_curriculum.py`'s real training loop. First real
+60k-step run showed **0 rank mutations in either fp8 or fp4** -- traced
+to `set_scale_gamma_raw_k`/`set_additive_gamma_raw_k` never actually
+being exposed through pybind, so `_activate_gamma_tracking`'s
+`hasattr`-guarded call was silently a no-op the whole run. Fixed
+(sili__new PR branch `feature/block4-dense-loader`).
+
+Once gamma tracking was actually live, mutations thrashed instead --
+1464 in 3000 steps, some channels flipping grow/shrink every ~5-13
+calls. Root cause: `grace_period_steps` only gated apoptosis (protects
+a freshly-grown channel from immediate death), nothing gated
+neurogenesis itself, so a channel could regrow the instant it died.
+Added a symmetric branch-level cooldown (`scale_rank_calls_since_
+mutation`/`additive_rank_calls_since_mutation`) gating BOTH directions
+-- cut it to 475/3000.
+
+A full 60k-step re-run with both fixes showed the real payoff: **fp4
+reached peak_vocab=126 for the first time** (previously stalled at 16
+under a fixed additive_rank=1), matching fp8's own reach. But mutation
+counts stayed high (fp8: 12363, fp4: 5001/60k) -- traced to `dgamma_k`
+(both branches) being a raw, unnormalized gradient sum whose magnitude
+scales with layer width (P sums over n_in terms, dP over n_out terms
+for the additive branch). A real diagnostic showed `grad_ema` on a
+128x128 layer (q/k/v/o_proj) running ~9 orders of magnitude larger than
+a 16x128 layer's (lm_head/input_proj) for comparable real signal --
+`theta` (a single global constant) was meaningless across differently
+-shaped layers, explaining the near-constant growth pressure on the
+wide square layers specifically.
+
+Fixed by normalizing the gradient fed to the EMA trigger (not gamma's
+own ScalePolicy step, which already self-normalizes) by `n_in*n_out`.
+`theta`'s effective units shifted with this -- swept 1e-4/3e-5/1e-5 on
+the same 3000-step diagnostic, `1e-4` gave the calmest result (216
+mutations, real per-layer rank variation instead of everything pinned
+to floor/ceiling); updated as the new Python-level default (was 0.02).
+
+**Final 60k-step result with every fix applied**: fp8 peak_vocab=126,
+k=2 (10209 mutations); **fp4 ALSO reached k=2 for the first time**
+(2399 mutations, more than half the pre-normalization count). Final
+ranks show real per-layer differentiation for `scale_rank` (1-4 across
+layers) but `additive_rank` pinned at the max (4) on every single layer
+in both precisions -- strong signal the additive branch's own
+`ADDITIVE_RANK_MAX=4`/`SCALE_RANK_MAX=4` hardcoded caps (not the
+trigger) are now the binding constraint, worth raising next.
+
+See `project_aqrs_rank_control_real_deployment_bugs` memory for the
+full technical writeup of all three bugs.
