@@ -263,6 +263,14 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(grace_period_steps=rank_grace_period_steps)
                     rank_mutation_count += sum(1 for m in mutated.values() if m)
+                    # AQRS scale/additive channel numerical-safety pass
+                    # (task #295 follow-up): only relevant once rank can
+                    # genuinely exceed the old hardcoded cap=4, i.e. only
+                    # under dynamic_rank_control -- see conversation for
+                    # the real fp8 NaN collapse this fixes (get_scale()'s
+                    # combined envelope has no clamp, and rank growing
+                    # past 4 let it overflow in a real curriculum run).
+                    model.apply_scale_overflow_guard()
 
         if streak >= STREAK_THRESHOLD:
             _advance_stage(step)

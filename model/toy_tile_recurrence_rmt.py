@@ -179,6 +179,29 @@ class ToyTileRecurrenceRMT:
                     tau_death, tau_active, theta, seed_scale, grace_period_steps)
         return results
 
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
+                                   coef: float = 0.1) -> None:
+        """AQRS scale/additive channel numerical-safety pass (task #295
+        follow-up, see sili__new's sparse_rnn.py DISLDOLayer.apply_
+        scale_overflow_guard) on every real disldo_cls weight layer --
+        same iteration pattern/guard convention as apply_dynamic_rank_
+        control above. Root cause this fixes: raising scale_rank_max/
+        additive_rank_max past the old hardcoded 4 let a real fp8 MQAR
+        curriculum run's per-channel value_scale_k/output_scale_k grow
+        unbounded, overflowing the combined scale envelope S(row,col)
+        in the forward pass and NaN-collapsing the whole run (see
+        conversation) -- clip is deliberately NOT a plain hard clip
+        (would give zero/wrong backward signal once a channel is
+        pinned at the boundary); see _overflow_guard_array's own
+        docstring for the full auto-correcting-shrink derivation. Meant
+        to be called once per training step, any time after backward
+        (independent of apply_dynamic_rank_control -- that mutates
+        RANK, this corrects VALUES)."""
+        for layer in (self.input_proj, self.q_proj, self.k_proj,
+                     self.v_proj, self.o_proj, self.lm_head):
+            if hasattr(layer, "apply_scale_overflow_guard"):
+                layer.apply_scale_overflow_guard(clip, near, coef)
+
     def report_ranks(self) -> dict:
         """{layer_name: (scale_rank, additive_rank)} for every real layer
         with a C++ backend -- the answer to "what best rank numbers does
