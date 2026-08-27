@@ -263,6 +263,20 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(grace_period_steps=rank_grace_period_steps)
                     rank_mutation_count += sum(1 for m in mutated.values() if m)
+                    # AQRS channel-diversity pass (task #295 follow-up,
+                    # chosen over residual-targeted growth -- direct
+                    # instruction): stops rank channels converging to
+                    # duplicate directions during training, which
+                    # nothing else here catches (neurogenesis's own
+                    # health check is magnitude-only; l1_sparsity_coef
+                    # only sees the summed output). Deliberately called
+                    # BEFORE the overflow guard below, not after --
+                    # found via a real fp8 run (see conversation): this
+                    # pass's own correction can in principle still be
+                    # large, so the overflow guard must always run LAST
+                    # as the actual numerical-safety net, not have
+                    # something unguarded applied on top of it.
+                    model.apply_channel_orthogonality_penalty()
                     # AQRS scale/additive channel numerical-safety pass
                     # (task #295 follow-up): only relevant once rank can
                     # genuinely exceed the old hardcoded cap=4, i.e. only
@@ -271,15 +285,6 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     # combined envelope has no clamp, and rank growing
                     # past 4 let it overflow in a real curriculum run).
                     model.apply_scale_overflow_guard()
-                    # AQRS channel-diversity pass (task #295 follow-up,
-                    # chosen over residual-targeted growth -- direct
-                    # instruction): stops rank channels converging to
-                    # duplicate directions during training, which
-                    # nothing else here catches (neurogenesis's own
-                    # health check is magnitude-only; l1_sparsity_coef
-                    # only sees the summed output). Same "only relevant
-                    # once rank>1" gating as the overflow guard above.
-                    model.apply_channel_orthogonality_penalty()
 
         if streak >= STREAK_THRESHOLD:
             _advance_stage(step)
