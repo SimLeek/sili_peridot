@@ -6902,3 +6902,121 @@ trigger) are now the binding constraint, worth raising next.
 
 See `project_aqrs_rank_control_real_deployment_bugs` memory for the
 full technical writeup of all three bugs.
+
+## 2026-08-26 -- AQRS runtime rank caps, a real NaN overflow bug, and a channel-orthogonality penalty
+
+Picking up directly from "additive_rank pinned at max(4) on every
+layer -- worth raising next" above.
+
+**Runtime rank caps (task #295)**: `SCALE_RANK_MAX`/`ADDITIVE_RANK_MAX`
+were compile-time constants (hardcoded 4) with fixed-size stack arrays
+in block4's SIMD backward path. Replaced with per-instance heap
+scratch (grows via `ensure()`, or explicit grow/shrink via
+`reserve_scale_rank_scratch()`), and `scale_rank_max`/`additive_rank_max`
+became real runtime-settable policy caps (default 4, backward
+compatible). Python's `DISLDOLayer`/`DISLDOLayer8` now compute a
+sensible default automatically: `min(n_in,n_out)//4` -- the rank at
+which the AQRS envelope's own parameter count matches one dense fp32
+matrix of the same shape (direct instruction's own worked example,
+32x32 -> 8).
+
+**Raising the caps immediately found a real bug**: a 45k-step fp8
+curriculum re-run with the new caps active NaN-collapsed at step
+38166, exactly when `q_proj`'s `scale_rank` mutated 2->3 (crossing
+past the old hardcoded ceiling for the first time). Root cause:
+`get_scale()`'s combined envelope `S(row,col) = sum_k gamma_k*
+value_scale_k*output_scale_k` has NO clamp anywhere in
+`delta_csr_types.hpp`, and `disldo_forward` uses it directly -- the
+old cap=4 implicitly bounded this; raising it let real RMSprop-driven
+training grow individual channels without limit. Traced further: the
+model's own `np.clip(attn.data,...)` (in `ToyTileRecurrenceRMT.step`)
+only fires after `o_proj` and after the residual+RMSNorm, not after
+`q_proj`/`k_proj`/`v_proj` individually, and `np.clip` never sanitizes
+an already-NaN value anyway -- so once one layer's envelope overflowed,
+nothing caught it before it propagated.
+
+Fixed via bulk raw-vector accessors on
+`value_scale`/`output_scale`/`additive_u`/`additive_v` (one call
+reads/writes the whole per-channel array instead of n*rank individual
+calls -- reuses the exact same plumbing `apply_dynamic_rank_control`
+already needed) plus a Python-side auto-correcting guard
+(`apply_scale_overflow_guard`): passes through unchanged within a
+threshold, subtracts a shrink-toward-zero nudge proportional to how
+far past it a channel drifts (deliberately NOT a plain hard clip,
+which gives zero/wrong backward signal once a channel is pinned at a
+boundary), then hard-clips with `nan_to_num` as the final safety net.
+**Validated against the exact failure**: re-ran the crashed config
+(45000 steps) with the guard active -- zero NaN throughout, several
+channels growing far past the old cap (`v_proj` hit its new cap
+32/32) with no instability.
+
+**Channel-orthogonality penalty**: reviewing the fix raised a sharper
+question -- does anything stop two AQRS rank channels from converging
+to *duplicate* directions, i.e. a newly-grown channel siphoning
+capacity instead of adding it? Answer: no. `l1_sparsity_coef` only
+penalizes the SUMMED layer output after every channel's already
+combined, blind to the per-channel decomposition; neurogenesis's own
+health check (`abs_gamma_k`/`grad_ema`) is purely magnitude-based, so
+a redundant channel still reads as "healthy." Considered
+residual-targeted growth (seed a new channel from the gradient
+direction existing channels don't already cover) but rejected it: an
+init-time fix doesn't stop channels drifting back toward redundancy as
+training continues. Chose an ONGOING per-step soft-orthogonality
+regularizer instead -- and it needed zero new C++ state, since it only
+depends on the CURRENT parameter values (not any batch's `dy`/`x`), so
+it reuses the overflow guard's own bulk accessors.
+
+**First version had a real bug too**, found the same way: a live fp8
+run NaN-collapsed at step 12650 -- *earlier* than the original
+unguarded-envelope bug. The correction was computed in raw
+(non-normalized) space (`M -= coef*M@(M^TM)_offdiag`), which scales
+CUBICALLY with channel magnitude; every synthetic test used
+near-unit-magnitude vectors where that's invisible, but real channel
+magnitudes sit in the 10s-100s (exactly the range the overflow guard's
+own thresholds exist to handle). Worse, the penalty was called AFTER
+the overflow guard in the training loop, so nothing sanitized its own
+output. Fixed by reformulating in normalized (unit-direction) space --
+also the conceptually correct fix, not just a numerical patch, since
+the whole point was "penalize direction, not magnitude" (the
+diagonal identity term that would additionally constrain magnitude is
+deliberately excluded -- `gamma_k` already owns that job). `u_k =
+M_k/||M_k||`, cosine-similarity Gram matrix bounded in [-1,1], so the
+correction direction is bounded by ~rank regardless of raw scale; the
+actual step rescales that bounded direction by each channel's OWN
+norm, keeping the update linear in magnitude instead of cubic. Also
+swapped the training-loop call order (orthogonality now runs BEFORE
+the overflow guard, not after) as defense in depth.
+
+**Real validation, both precisions, 45k steps, identical config to the
+crashed runs**: zero NaN in either. fp8 showed a clear, striking
+result:
+
+| | no orthogonality | with orthogonality (fixed) |
+|---|---|---|
+| final_vocab/k | 16/1 (regressed) | 126/2 (held) |
+| peak_vocab/k | 126/1 | 126/2 |
+| mutations | 9878 | 4007 |
+| v_proj ranks | 32/32 (maxed) | 1/3 |
+| o_proj ranks | 1/32 (additive maxed) | 1/1 |
+| k_proj ranks | 2/22 | 1/1 |
+
+Ranks that were pinned at the cap without the penalty settled to
+near-trivial values with it, and the model reached a HIGHER peak_k and
+-- unlike the no-penalty run -- actually held there instead of
+regressing back down. Real evidence the maxed-out ranks were redundant
+capacity, not genuine need.
+
+fp4 was mixed: `q_proj`/`k_proj` matched fp8's pattern (settled small),
+but `v_proj`/`o_proj`'s `additive_rank` still maxed at 32, and its own
+`peak_vocab=64` came in lower than an earlier fp4 run's 126 -- though
+that used a longer step budget (60k vs 45k), so not a clean
+comparison. Also worth remembering: this curriculum's own level-up/
+level-down mechanism is reward-hackable (a student can rest at an easy
+stage for cheap streak credit), and MQAR's loss has several signals
+competing at once (per-key retrieval vs. marginal-distribution
+shortcuts) -- fp4's partial result may reflect that noise rather than
+a real per-layer difference. Not resolved; a longer, matched-budget
+fp4 run is the natural follow-up, not treated as a blocker.
+
+Both fixes + the full validation are in sili__new PR #38 and
+sili_peridot PR #16.
