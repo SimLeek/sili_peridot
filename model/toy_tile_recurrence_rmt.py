@@ -202,6 +202,30 @@ class ToyTileRecurrenceRMT:
             if hasattr(layer, "apply_scale_overflow_guard"):
                 layer.apply_scale_overflow_guard(clip, near, coef)
 
+    def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
+        """AQRS channel-diversity pass (see sili__new's sparse_rnn.py
+        DISLDOLayer.apply_channel_orthogonality_penalty) on every real
+        disldo_cls weight layer -- same iteration pattern as
+        apply_scale_overflow_guard above. Real problem this addresses:
+        nothing else in the AQRS design stops two rank channels from
+        converging to duplicate directions during training -- the
+        neurogenesis health check is purely magnitude-based (a
+        redundant channel still shows real gradient/magnitude), and
+        l1_sparsity_coef only sees the SUMMED output after every
+        channel's already combined. Chosen over residual-targeted
+        growth (direct instruction): that only fixes it at init time,
+        this is an ongoing per-step force that keeps channels diverse
+        throughout training, and needed no sili__new kernel changes at
+        all (see _orthogonality_penalty_array's own docstring). Meant
+        to be called once per training step, independent of
+        apply_scale_overflow_guard/apply_dynamic_rank_control --
+        diversity, numerical safety, and rank mutation are three
+        separate concerns."""
+        for layer in (self.input_proj, self.q_proj, self.k_proj,
+                     self.v_proj, self.o_proj, self.lm_head):
+            if hasattr(layer, "apply_channel_orthogonality_penalty"):
+                layer.apply_channel_orthogonality_penalty(coef)
+
     def report_ranks(self) -> dict:
         """{layer_name: (scale_rank, additive_rank)} for every real layer
         with a C++ backend -- the answer to "what best rank numbers does

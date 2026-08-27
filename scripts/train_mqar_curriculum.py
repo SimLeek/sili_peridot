@@ -271,6 +271,15 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     # combined envelope has no clamp, and rank growing
                     # past 4 let it overflow in a real curriculum run).
                     model.apply_scale_overflow_guard()
+                    # AQRS channel-diversity pass (task #295 follow-up,
+                    # chosen over residual-targeted growth -- direct
+                    # instruction): stops rank channels converging to
+                    # duplicate directions during training, which
+                    # nothing else here catches (neurogenesis's own
+                    # health check is magnitude-only; l1_sparsity_coef
+                    # only sees the summed output). Same "only relevant
+                    # once rank>1" gating as the overflow guard above.
+                    model.apply_channel_orthogonality_penalty()
 
         if streak >= STREAK_THRESHOLD:
             _advance_stage(step)
