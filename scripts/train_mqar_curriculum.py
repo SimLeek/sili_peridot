@@ -105,7 +105,9 @@ def _stage_key(stage: dict) -> tuple:
 
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
-                     log_fn=None) -> dict:
+                     log_fn=None, additive_rank: int = 0,
+                     dynamic_rank_control: bool = False,
+                     rank_grace_period_steps: int = 50) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -122,7 +124,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1, rng=model_rng)
+        synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
+        additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
+        rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -137,10 +141,25 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     stage_history = []
     peak_key = _stage_key(stage_stack[0])
     peak_stage = dict(stage_stack[0])
+    rank_mutation_count = 0
+    rank_history = []
 
     def _current():
         s = stage_stack[-1]
         return s["vocab"], s["k"], s["phase"]
+
+    def _log_ranks(step):
+        # Records a (scale_rank, additive_rank) snapshot per layer at
+        # this step -- called at every periodic log point AND every
+        # level transition, not just once at the end, so a run's rank
+        # trajectory (growth/shrink timing relative to curriculum
+        # progress) can be read back even if the run is killed early or
+        # takes far longer than expected (direct instruction).
+        if not dynamic_rank_control:
+            return None
+        ranks = model.report_ranks()
+        rank_history.append({"step": step, "ranks": ranks})
+        return ranks
 
     def _advance_stage(step):
         nonlocal streak, wrong_streak, stage_step, queries_since_level_change
@@ -162,9 +181,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         stage_step = 0
         queries_since_level_change = 0
         pending_level_token = LEVEL_UP_TOKEN
+        ranks = _log_ranks(step)
         if log_fn is not None:
             v, k, ph = _current()
-            log_fn(step, v, k, ph, "LEVEL_UP", loss_ema, acc_ema)
+            log_fn(step, v, k, ph, "LEVEL_UP", loss_ema, acc_ema, ranks=ranks)
 
     def _regress_stage(step):
         nonlocal streak, wrong_streak, stage_step, queries_since_level_change, pending_level_token
@@ -183,9 +203,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         stage_step = 0
         queries_since_level_change = 0
         pending_level_token = LEVEL_DOWN_TOKEN
+        ranks = _log_ranks(step)
         if log_fn is not None:
             v, k, ph = _current()
-            log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema)
+            log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
     t0 = time.time()
     step = 0
@@ -239,21 +260,49 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 loss.backward()
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+                if dynamic_rank_control:
+                    mutated = model.apply_dynamic_rank_control(grace_period_steps=rank_grace_period_steps)
+                    rank_mutation_count += sum(1 for m in mutated.values() if m)
+                    # AQRS channel-diversity pass (task #295 follow-up,
+                    # chosen over residual-targeted growth -- direct
+                    # instruction): stops rank channels converging to
+                    # duplicate directions during training, which
+                    # nothing else here catches (neurogenesis's own
+                    # health check is magnitude-only; l1_sparsity_coef
+                    # only sees the summed output). Deliberately called
+                    # BEFORE the overflow guard below, not after --
+                    # found via a real fp8 run (see conversation): this
+                    # pass's own correction can in principle still be
+                    # large, so the overflow guard must always run LAST
+                    # as the actual numerical-safety net, not have
+                    # something unguarded applied on top of it.
+                    model.apply_channel_orthogonality_penalty()
+                    # AQRS scale/additive channel numerical-safety pass
+                    # (task #295 follow-up): only relevant once rank can
+                    # genuinely exceed the old hardcoded cap=4, i.e. only
+                    # under dynamic_rank_control -- see conversation for
+                    # the real fp8 NaN collapse this fixes (get_scale()'s
+                    # combined envelope has no clamp, and rank growing
+                    # past 4 let it overflow in a real curriculum run).
+                    model.apply_scale_overflow_guard()
 
         if streak >= STREAK_THRESHOLD:
             _advance_stage(step)
             _, k_now, phase_now = _current()
             if phase_now == "k" and k_now > k_max:
+                # _advance_stage already logged ranks for this exact step
+                ranks = model.report_ranks() if dynamic_rank_control else None
                 if log_fn is not None:
-                    log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema)
+                    log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema, ranks=ranks)
                 break
         elif (wrong_streak >= WRONG_STREAK_THRESHOLD
               and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS):
             _regress_stage(step)
 
         if step % log_every == 0:
+            ranks = _log_ranks(step)
             if log_fn is not None:
-                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema)
+                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks)
 
     final_vocab, final_k, final_phase = _current()
     return {
@@ -261,6 +310,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         "final_phase": final_phase, "peak_stage": peak_stage,
         "graduated": final_phase == "k" and final_k > k_max, "total_steps": step,
         "elapsed_s": time.time() - t0, "stage_history": stage_history,
+        "dynamic_rank_control": dynamic_rank_control,
+        "rank_mutation_count": rank_mutation_count,
+        "final_ranks": model.report_ranks() if hasattr(model, "report_ranks") else {},
+        "rank_history": rank_history,
     }
 
 
@@ -271,25 +324,59 @@ def main():
     peak_lr = float(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_PEAK_LR
     num_tiles = int(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_NUM_TILES
     k_max = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_K_MAX
+    additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 0
+    dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else False
+    # AQRS rank-mutation cooldown (task #292 fix): interim "age-gate"
+    # refractory period, not yet tied to a real resource/energy cost
+    # model -- see sili__new delta_csr_types.hpp's
+    # apply_dynamic_rank_control_generic docstring. Kept as a real
+    # tunable per direct instruction, not hardcoded -- a real 60k-step
+    # run showed the default (50) still allows frequent churn since 12
+    # independent per-branch cooldowns (6 layers x 2 branches) all reset
+    # on their own schedule; raise this for a calmer run.
+    rank_grace_period_steps = int(sys.argv[9]) if len(sys.argv) > 9 else 50
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
-          f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} "
+          f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
+          f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
-    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema):
+    _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
+                   "v_proj": "v", "o_proj": "o", "lm_head": "lm"}
+
+    def _ranks_str(ranks):
+        if not ranks:
+            return ""
+        parts = [f"{_SHORT_NAME.get(n, n)}={s}/{a}" for n, (s, a) in ranks.items()]
+        return "  ranks[" + " ".join(parts) + "]"
+
+    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}", flush=True)
+              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{_ranks_str(ranks)}", flush=True)
 
-    r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn)
+    r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
+                         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
+                         rank_grace_period_steps=rank_grace_period_steps)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)
     print(f"PEAK precision={precision} peak_vocab={r['peak_stage']['vocab']} "
           f"peak_k={r['peak_stage']['k']} peak_phase={r['peak_stage']['phase']}", flush=True)
+    if r["dynamic_rank_control"]:
+        print(f"RANK_MUTATIONS precision={precision} count={r['rank_mutation_count']}", flush=True)
+        for name, (scale_r, add_r) in r["final_ranks"].items():
+            print(f"  {name:<12} scale_rank={scale_r}  additive_rank={add_r}", flush=True)
+        # Full per-step (well, per-log_every/per-transition) rank trace as
+        # JSON, same convention as STAGE_HISTORY_JSON -- lets the growth/
+        # shrink timing be read back and cross-referenced against
+        # stage_history even if a run is killed early or takes far
+        # longer than expected (direct instruction: log this to a file
+        # as we go, not just report a final snapshot).
+        print("RANK_HISTORY_JSON " + json.dumps(r["rank_history"]), flush=True)
     print("STAGE_HISTORY_JSON " + json.dumps(r["stage_history"]), flush=True)
 
 
