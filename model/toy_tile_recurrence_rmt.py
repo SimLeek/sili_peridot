@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, tensor_abs, gather, concat
+from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, tensor_abs, gather, concat, relu, power
 from sili.sparse_rnn import DISLDOLayer
 
 from .toy_recall_models import rmsnorm_tensor
@@ -46,10 +46,13 @@ class ToyTileRecurrenceRMT:
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
                  dense: bool = False, clip_range: float = 6.0,
                  l1_sparsity_coef: float = 0.0,
+                 magnitude_clip_penalty_coef: float = 0.0,
+                 min_sigma: float = 1e-3,
                  synapse_kwargs: Optional[dict] = None,
                  scale_rank: int = 1,
                  additive_rank: int = 0,
                  dynamic_rank_control: bool = False,
+                 use_critic: bool = False,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -60,7 +63,43 @@ class ToyTileRecurrenceRMT:
         conventions exactly (embed_width/column_neurons/state_width,
         disldo_cls/dense/l1_sparsity_coef, per-layer independent rng
         seeding) so a comparison between the two isolates the
-        architecture question, not incidental convention differences."""
+        architecture question, not incidental convention differences.
+
+        use_critic: adds a critic_head (same shape as lm_head, embed_width
+        -> vocab_size) predicting the per-vocab-neuron squared error the
+        actor's own logits will incur -- a real advantage-actor-critic
+        value head, not a shortcut for the (exactly known) true loss
+        itself. Default off, so every existing caller is byte-identical
+        (same first 6 layer-construction RNG draws either way -- the
+        critic's own seed is drawn separately, after).
+
+        magnitude_clip_penalty_coef (task #303/#304): a plain hard clip
+        on q/k/v/attn/combined_new gives ZERO backward gradient past the
+        boundary (np.clip's own derivative is 0 there), so a layer whose
+        output keeps getting clipped never learns to stop producing that
+        magnitude in the first place -- direct instruction, confirmed via
+        real diagnostics: v_proj's output ran unclipped into the
+        1000s-2000s for hundreds of steps (masked downstream by the
+        existing hard clips on attn/combined_new) before an unscaled dot
+        product inside gaussian_attention finally overflowed to NaN. This
+        adds a differentiable hinge-squared penalty
+        (coef*mean(relu(|x|-clip_range)**2)) on q/k/v/attn/combined_new,
+        so the layers themselves get gradient pressure to shrink whenever
+        they exceed clip_range, on top of (not instead of) the existing
+        hard clip on the VALUES. Default off (0.0), matching
+        l1_sparsity_coef's own opt-in convention.
+
+        min_sigma (task #305): gaussian_attention's Gaussian bias term is
+        1/(2*sigma**2) -- as sigma trains toward 0 (exactly what learning
+        to attend sharply to one position looks like), that term can hit
+        Inf, and 0*Inf=NaN if a key lands exactly on the query's center.
+        Always-on floor (matching rms_eps's own always-on convention, not
+        l1_sparsity_coef's opt-in-off one), applied to sigmas.data right
+        after exp(log_sigmas). 1e-3 is deliberately generous: at that
+        floor, one integer position away from center already gives
+        exp(-1/(2*1e-3**2)) = exp(-500000) -- functionally a one-hot --
+        so this can't meaningfully constrain how sharply the model can
+        attend, only prevent the literal division-by-near-zero case."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -70,6 +109,8 @@ class ToyTileRecurrenceRMT:
         self.rms_eps = rms_eps
         self.clip_range = clip_range
         self.l1_sparsity_coef = l1_sparsity_coef
+        self.magnitude_clip_penalty_coef = magnitude_clip_penalty_coef
+        self.min_sigma = min_sigma
         self.num_cpus = num_cpus
         # min_decay_frac/max_abs_delta/max_ci passthrough (see
         # sili.sparse_rnn.DISLDOLayer.forward's own docstring) -- lets a
@@ -118,6 +159,17 @@ class ToyTileRecurrenceRMT:
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
                                   rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
 
+        # Drawn from `rng` AFTER the fixed size=6 draw above completes, so
+        # the first 6 layers' seeds are byte-identical whether or not
+        # use_critic is set -- existing callers (use_critic defaults False)
+        # see zero behavior change.
+        self.use_critic = use_critic
+        self.critic_head = None
+        if use_critic:
+            critic_seed = int(rng.integers(0, 2**31 - 1))
+            self.critic_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
+                                          rng=np.random.default_rng(critic_seed), **layer_kwargs)
+
         # Separate RMSNorm gains for memory vs content tokens -- unlike
         # ToyTileRecurrenceRealFP4 (which reuses one input_ln for both
         # sides of an additive combine), memory and content are now
@@ -131,6 +183,23 @@ class ToyTileRecurrenceRMT:
         self.centers = Tensor(np.array([i + 0.5 for i in range(self.total_slots)], dtype=np.float32))
         self.log_sigmas = Tensor(np.zeros(self.total_slots, dtype=np.float32))
 
+    def _named_real_layers(self):
+        """(name, layer) for every real disldo_cls weight layer, INCLUDING
+        critic_head when use_critic is set -- the single source of truth
+        every per-layer maintenance pass (rank control, overflow guard,
+        orthogonality penalty, rank reporting, magnitude rescale) iterates,
+        so critic_head automatically gets the same treatment as every
+        other layer rather than being special-cased at each call site."""
+        layers = [("input_proj", self.input_proj), ("q_proj", self.q_proj),
+                  ("k_proj", self.k_proj), ("v_proj", self.v_proj),
+                  ("o_proj", self.o_proj), ("lm_head", self.lm_head)]
+        if self.use_critic:
+            layers.append(("critic_head", self.critic_head))
+        return layers
+
+    def _real_layers(self):
+        return [layer for _name, layer in self._named_real_layers()]
+
     def parameters_for_optimizer(self) -> List[Tensor]:
         return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
 
@@ -143,8 +212,7 @@ class ToyTileRecurrenceRMT:
         own guard convention. Meant to be called periodically from the
         training loop, not every step (see delta_csr_types.hpp's own
         magnitude_rescale_output docstring for its intended cadence)."""
-        for layer in (self.input_proj, self.q_proj, self.k_proj,
-                     self.v_proj, self.o_proj, self.lm_head):
+        for layer in self._real_layers():
             if hasattr(layer, "_c") and hasattr(layer._c, "magnitude_rescale_output"):
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
             elif hasattr(layer, "magnitude_rescale_output") and hasattr(layer, "digits"):
@@ -171,9 +239,7 @@ class ToyTileRecurrenceRMT:
         needing to know the same layer-name tuple again itself.
         """
         results = {}
-        for name, layer in (("input_proj", self.input_proj), ("q_proj", self.q_proj),
-                            ("k_proj", self.k_proj), ("v_proj", self.v_proj),
-                            ("o_proj", self.o_proj), ("lm_head", self.lm_head)):
+        for name, layer in self._named_real_layers():
             if hasattr(layer, "apply_dynamic_rank_control"):
                 results[name] = layer.apply_dynamic_rank_control(
                     tau_death, tau_active, theta, seed_scale, grace_period_steps)
@@ -197,8 +263,7 @@ class ToyTileRecurrenceRMT:
         to be called once per training step, any time after backward
         (independent of apply_dynamic_rank_control -- that mutates
         RANK, this corrects VALUES)."""
-        for layer in (self.input_proj, self.q_proj, self.k_proj,
-                     self.v_proj, self.o_proj, self.lm_head):
+        for layer in self._real_layers():
             if hasattr(layer, "apply_scale_overflow_guard"):
                 layer.apply_scale_overflow_guard(clip, near, coef)
 
@@ -221,8 +286,7 @@ class ToyTileRecurrenceRMT:
         apply_scale_overflow_guard/apply_dynamic_rank_control --
         diversity, numerical safety, and rank mutation are three
         separate concerns."""
-        for layer in (self.input_proj, self.q_proj, self.k_proj,
-                     self.v_proj, self.o_proj, self.lm_head):
+        for layer in self._real_layers():
             if hasattr(layer, "apply_channel_orthogonality_penalty"):
                 layer.apply_channel_orthogonality_penalty(coef)
 
@@ -231,9 +295,7 @@ class ToyTileRecurrenceRMT:
         with a C++ backend -- the answer to "what best rank numbers does
         dynamic control end up with" (task #292)."""
         results = {}
-        for name, layer in (("input_proj", self.input_proj), ("q_proj", self.q_proj),
-                            ("k_proj", self.k_proj), ("v_proj", self.v_proj),
-                            ("o_proj", self.o_proj), ("lm_head", self.lm_head)):
+        for name, layer in self._named_real_layers():
             c = getattr(layer, "_c", None)
             if c is not None and hasattr(c, "get_scale_rank"):
                 results[name] = (c.get_scale_rank(), c.get_additive_rank())
@@ -245,6 +307,16 @@ class ToyTileRecurrenceRMT:
         out_aux = layer.forward(input_t, lr, damp_by_importance=False, **self.synapse_kwargs)
         n = float(np.asarray(out_aux.data).size)
         return reduce_sum(tensor_abs(out_aux)) * (coef / n)
+
+    def _magnitude_clip_penalty(self, out_tensor: Tensor) -> Tensor:
+        """See magnitude_clip_penalty_coef's own __init__ docstring.
+        Hinge-squared (not a plain L2 penalty like toy_tile_precision_
+        models.py's own magnitude_penalty_coef) -- only pushes back once
+        |x| actually exceeds clip_range, so it doesn't fight ordinary
+        in-range activity the way a uniform L2 term would."""
+        excess = relu(tensor_abs(out_tensor) - self.clip_range)
+        n = float(np.asarray(out_tensor.data).size)
+        return reduce_sum(power(excess, 2)) * (self.magnitude_clip_penalty_coef / n)
 
     def step(self, x_window: np.ndarray, memory_prev: np.ndarray,
              learning_rate: float) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
@@ -272,13 +344,63 @@ class ToyTileRecurrenceRMT:
         q = self.q_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
         k = self.k_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
         v = self.v_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
-        sigmas = exp(self.log_sigmas)
-        attn = gaussian_attention(q, k, v, self.centers, sigmas,
-                                  num_cpus=self.num_cpus, causal=False)
-        attn = self.o_proj.forward(attn, learning_rate, **self.synapse_kwargs)
-        attn.data = np.clip(attn.data, -self.clip_range, self.clip_range)
 
         aux_loss = None
+
+        def _accumulate_penalty(t: Tensor) -> None:
+            nonlocal aux_loss
+            if self.magnitude_clip_penalty_coef > 0.0:
+                term = self._magnitude_clip_penalty(t)
+                aux_loss = term if aux_loss is None else aux_loss + term
+
+        # Penalty MUST be built from the PRE-clip value -- _magnitude_
+        # clip_penalty's own intermediate tensors (tensor_abs(t)-
+        # clip_range, relu(...), power(...)) each snapshot their own
+        # .data at construction time, so building the penalty graph here
+        # (before the in-place clip below overwrites t.data) captures the
+        # real excess. Building it AFTER the clip would read the already-
+        # clipped value, where |x|-clip_range is never positive -- the
+        # penalty would silently never fire.
+        _accumulate_penalty(q)
+        _accumulate_penalty(k)
+        _accumulate_penalty(v)
+
+        # Clip q/k/v BEFORE they enter gaussian_attention (task #303/#304,
+        # direct instruction): previously only attn/combined_new were
+        # clipped, AFTER attention's own internal dot-product/exp math had
+        # already run on unbounded q/k/v -- confirmed via real diagnostics
+        # that v_proj's output alone reached 1000s-2000s magnitude for
+        # hundreds of steps, invisible externally because the existing
+        # downstream clips masked it, until an unscaled dot product
+        # inside gaussian_attention finally overflowed to NaN.
+        q.data = np.clip(q.data, -self.clip_range, self.clip_range)
+        k.data = np.clip(k.data, -self.clip_range, self.clip_range)
+        v.data = np.clip(v.data, -self.clip_range, self.clip_range)
+        sigmas = exp(self.log_sigmas)
+        # Floor BEFORE gaussian_attention uses it -- see min_sigma's own
+        # __init__ docstring for the 1/(2*sigma**2)->Inf mechanism this
+        # closes. Same in-place-mutation convention as q/k/v/attn/
+        # combined_new's own clips above (forward and any later backward
+        # read both see the same, already-floored value).
+        sigmas.data = np.maximum(sigmas.data, self.min_sigma)
+        attn_pre_o = gaussian_attention(q, k, v, self.centers, sigmas,
+                                        num_cpus=self.num_cpus, causal=False)
+        attn = self.o_proj.forward(attn_pre_o, learning_rate, **self.synapse_kwargs)
+        _accumulate_penalty(attn)  # pre-clip, same reasoning as q/k/v above
+        attn.data = np.clip(attn.data, -self.clip_range, self.clip_range)
+
+        # Debug instrumentation (task #303): cheap reference-only capture
+        # (no copies) of every stage between the input embedding and the
+        # readout, for bisecting exactly where a NaN/Inf first appears in
+        # the forward chain -- np.clip does NOT sanitize NaN (clip(nan)==
+        # nan), so the clip calls in this function are not themselves
+        # proof any given stage is finite.
+        self.last_debug = {
+            "x_wide": x_wide.data, "q": q.data, "k": k.data, "v": v.data,
+            "attn_pre_o": attn_pre_o.data, "attn_post_o": attn.data,
+            "sigmas": sigmas.data, "log_sigmas": self.log_sigmas.data,
+        }
+
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [
                 self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef),
@@ -296,9 +418,13 @@ class ToyTileRecurrenceRMT:
         # matching ToyTileRecurrenceRealFP4's own convention (residual
         # from raw M_prev, not the normed qkv_source).
         raw_combined = concat([memory_prev_t, x_wide], axis=0)
-        combined_new = raw_combined + attn
-        combined_new = rmsnorm_tensor(combined_new, self.state_ln, self.rms_eps)
+        pre_norm_combined = raw_combined + attn
+        combined_new = rmsnorm_tensor(pre_norm_combined, self.state_ln, self.rms_eps)
+        _accumulate_penalty(combined_new)  # pre-clip, same reasoning as above
         combined_new.data = np.clip(combined_new.data, -self.clip_range, self.clip_range)
+        self.last_debug["raw_combined"] = raw_combined.data
+        self.last_debug["pre_norm_combined"] = pre_norm_combined.data
+        self.last_debug["combined_new"] = combined_new.data
 
         # Split back into memory (next step's carry, plain numpy -- no
         # BPTT across steps, matching this project's convention) and
@@ -312,9 +438,21 @@ class ToyTileRecurrenceRMT:
 
         pooled = content_out.reshape((n_content, self.embed_width, self.column_neurons))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)
+        self.last_debug["pooled"] = pooled.data
         if self.l1_sparsity_coef > 0.0:
             lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate, **self.synapse_kwargs)
+
+        # Advantage-actor-critic value head (opt-in, see __init__'s
+        # use_critic docstring): exposed via an attribute rather than a
+        # 4th return value, since step()'s 3-tuple return is unpacked by
+        # dozens of existing call sites across both repos and a return-
+        # arity change would break every one of them. Caller (e.g.
+        # scripts/train_mqar_curriculum.py) reads model.last_critic_pred
+        # right after this call.
+        self.last_critic_pred = (
+            self.critic_head.forward(pooled, learning_rate, **self.synapse_kwargs)
+            if self.use_critic else None)
 
         return memory_new, logits, aux_loss
