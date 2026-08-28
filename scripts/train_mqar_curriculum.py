@@ -54,6 +54,7 @@ from sili import _cpu
 from model.toy_recall_task import generate_mqar_sequence
 from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, clip_grad_norm_
 from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from sili.tensor import combine_losses
 from scripts.train_tile_curriculum import _build_tile_window
 from scripts.train_mqar_rmt_reference import (
     seq_len_for_k, _build_targets,
@@ -88,6 +89,141 @@ MIN_LR_FRAC = 0.05
 LOSS_EMA_DECAY = 0.98          # kept for logging only; LR itself is accuracy-driven
 ACC_EMA_DECAY = 0.98
 
+# Advantage actor-critic (task #272): the critic predicts the per-vocab-
+# neuron squared error the actor's own logits will incur; since the true
+# target token is known the same step, its regression target
+# (softmax(logits) - onehot)**2 is exact, not estimated. advantage =
+# true - predicted then reweights the actor's own cross-entropy gradient
+# per vocab neuron (bigger correction where the critic was most
+# surprised). Clipped to keep the (1+advantage) multiplier bounded --
+# true_loss_vec entries are bounded in [0,1], but a diverging critic
+# prediction early in training could otherwise blow this up unguarded.
+ADVANTAGE_CLIP = 5.0
+
+# Reward/punish asymmetry -- REMOVED (task #302/#306, direct instruction,
+# after a real 3-arm ablation isolated it as the cause of a genuine
+# training regression, distinct from the NaN investigation): scaling every
+# wrong-class neuron's gradient by a uniform punish_scale < 1 introduces a
+# systematic, one-directional bias into the aggregate gradient flowing
+# into the shared trunk -- the one-hot structure means there's exactly ONE
+# full-strength reward term per query but (vocab_size-1) DAMPENED
+# punishment terms, so the two no longer cancel in aggregate the way
+# softmax's own math guarantees they do when both sides are unscaled. This
+# isn't a per-step sign flip visible in the formula -- it's a slow,
+# compounding drift, confirmed directly: a 3-arm ablation (same seed) held
+# BOTH "neither mechanism" and "magnitude penalty only" stable (loss
+# bounded ~3-30 through 3000 steps) while "reward/punish asymmetry only"
+# diverged smoothly from ~5 to ~4400 over the same window -- the gradual
+# ramp is the signature of a compounding bias, not a numerical edge case.
+# Tried twice (1/((vocab_size-1)*STREAK_THRESHOLD) and 1/STREAK_THRESHOLD)
+# and failed differently each time; not reintroduced without a redesign
+# that doesn't rely on a single uniform per-wrong-neuron scale.
+
+# Diagnostics (task #303): when True, checks logits.data/critic_pred.data
+# for non-finite values EVERY step (not just every log_every), right
+# after model.step() returns -- i.e. checks the raw forward output BEFORE
+# any of _backward_with_critic's own processing touches it. On first
+# failure, dumps a full per-layer weight health scan (raw value_scale/
+# output_scale/additive_u/additive_v vectors) and raises immediately, so
+# the exact step and the exact layer/branch that went non-finite first
+# are both known -- rather than only knowing "somewhere before the next
+# periodic log line."
+DEBUG_FINITE_CHECK = False
+
+
+def _layer_health(model) -> dict:
+    """{layer_name: {array_name: (n_nonfinite, n_total)}} for every real
+    disldo_cls weight layer with a C++ backend exposing the raw-vector
+    accessors (fp32's DISLDOLayerV has no scale concept -- skipped, same
+    guard convention as report_ranks/apply_scale_overflow_guard)."""
+    health = {}
+    for name, layer in model._named_real_layers():
+        c = getattr(layer, "_c", None)
+        if c is None or not hasattr(c, "get_value_scale_raw_vector"):
+            continue
+        arrays = {
+            "value_scale": np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32),
+            "output_scale": np.asarray(c.get_output_scale_raw_vector(), dtype=np.float32),
+            "additive_u": np.asarray(c.get_additive_u_raw_vector(), dtype=np.float32),
+            "additive_v": np.asarray(c.get_additive_v_raw_vector(), dtype=np.float32),
+        }
+        health[name] = {k: (int((~np.isfinite(v)).sum()), int(v.size)) for k, v in arrays.items()}
+    return health
+
+
+def _describe(name: str, arr: np.ndarray) -> str:
+    finite = arr[np.isfinite(arr)]
+    n_nan = int(np.isnan(arr).sum())
+    n_inf = int(np.isinf(arr).sum())
+    rng = f"[{finite.min():.4g}, {finite.max():.4g}]" if finite.size else "n/a"
+    return f"{name}: size={arr.size} nan={n_nan} inf={n_inf} finite_range={rng}"
+
+
+# Rolling per-position magnitude trace (task #303, direct instruction --
+# "why isn't there some extremely strong loss before outputs get NaN, or
+# are the outputs not large but the in-between kernel values large
+# instead"): records max(|x|) over every last_debug array at EVERY
+# position (not just the one that eventually fails), capped so memory
+# doesn't grow unbounded on a long run. On failure, the tail of this is
+# included in the report -- direct evidence of whether the blow-up is a
+# gradual ramp visible from the OUTSIDE (finite activations climbing over
+# many steps) or a one-position cliff (everything looks normal, then the
+# very next position is already fully NaN with no warning).
+_MAGNITUDE_TRACE_MAXLEN = 40
+_magnitude_trace = []
+
+
+def _record_magnitude_trace(model, step: int, i: int, loss_ema) -> None:
+    entry = {"step": step, "i": i, "loss_ema": loss_ema}
+    for name, arr in getattr(model, "last_debug", {}).items():
+        finite = arr[np.isfinite(arr)]
+        entry[name] = float(np.abs(finite).max()) if finite.size else float("nan")
+        # sigmas specifically: the failure mode we're chasing is UNDERFLOW
+        # toward 0 (1/(2*sigma**2) -> Inf inside gaussian_attention), so
+        # max|x| alone would hide it -- record the min too, only for this
+        # array, rather than doubling every entry's size for no reason.
+        if name == "sigmas":
+            entry["sigmas_min"] = float(finite.min()) if finite.size else float("nan")
+    _magnitude_trace.append(entry)
+    if len(_magnitude_trace) > _MAGNITUDE_TRACE_MAXLEN:
+        _magnitude_trace.pop(0)
+
+
+def _check_finite_or_raise(model, logits, step: int, i: int, loss_ema) -> None:
+    _record_magnitude_trace(model, step, i, loss_ema)
+    bad = []
+    if not np.isfinite(logits.data).all():
+        bad.append(_describe("logits.data", logits.data))
+    cp = model.last_critic_pred
+    if cp is not None and not np.isfinite(cp.data).all():
+        bad.append(_describe("critic_pred.data", cp.data))
+    # Bisect through the forward chain (task #303) -- x_wide -> q/k/v ->
+    # attn (pre/post o_proj) -> raw_combined/pre_norm_combined/
+    # combined_new -> pooled -- to find the EARLIEST stage that's already
+    # non-finite, not just that the final output is.
+    for name, arr in getattr(model, "last_debug", {}).items():
+        if not np.isfinite(arr).all():
+            bad.append(_describe(f"model.last_debug[{name!r}]", arr))
+    if not bad:
+        return
+    health = _layer_health(model)
+    health_lines = []
+    for lname, arrs in health.items():
+        bad_arrs = {k: v for k, v in arrs.items() if v[0] > 0}
+        if bad_arrs:
+            health_lines.append(f"  {lname}: {bad_arrs}")
+    trace_lines = [f"  step={e['step']} i={e['i']} loss_ema={e['loss_ema']} " +
+                   " ".join(f"{k}={v:.4g}" for k, v in e.items()
+                           if k not in ("step", "i", "loss_ema"))
+                  for e in _magnitude_trace]
+    report = (f"NON-FINITE at step={step} i={i}\n  " + "\n  ".join(bad) +
+             "\nLayer weight health (nonfinite_count, total) for layers with issues:\n" +
+             ("\n".join(health_lines) if health_lines else "  (none -- corruption is in activations only, not stored weights)") +
+             f"\nranks={model.report_ranks()}" +
+             f"\nMagnitude trace, last {len(_magnitude_trace)} positions (max|finite value| per stage):\n" +
+             "\n".join(trace_lines))
+    raise RuntimeError(report)
+
 
 def next_vocab(vocab_size: int) -> int:
     return min(TASK_VOCAB_MAX, int(round(vocab_size * VOCAB_GROWTH_FACTOR)))
@@ -95,6 +231,52 @@ def next_vocab(vocab_size: int) -> int:
 
 def prev_vocab(vocab_size: int) -> int:
     return max(VOCAB_START, int(round(vocab_size / VOCAB_GROWTH_FACTOR)))
+
+
+def _backward_with_critic(model, logits, target_token: int, num_tiles: int, aux) -> None:
+    """Advantage-actor-critic backward for one query position (task #272).
+    logits: [num_tiles, vocab_size] Tensor, query row = num_tiles-1.
+    Replaces the plain unweighted cross-entropy backward with a critic-
+    reweighted one -- see ADVANTAGE_CLIP's own comment for the formula.
+    The critic itself trains via plain one-step MSE regression against
+    the EXACT per-vocab squared error (known immediately since the
+    target token is known this same step -- no TD/bootstrap/target-net
+    needed, unlike sili__new's mandelbrot RTAC, which needs those because
+    its reward isn't known until later)."""
+    row = num_tiles - 1
+    vocab_size = logits.data.shape[-1]
+    row_logits = logits.data[row]
+    shifted = row_logits - row_logits.max()
+    exp_l = np.exp(shifted)
+    probs = exp_l / exp_l.sum()
+    onehot = np.zeros(vocab_size, dtype=np.float32)
+    onehot[target_token] = 1.0
+    true_loss_vec = (probs - onehot) ** 2
+
+    critic_pred = model.last_critic_pred
+    # nan_to_num FIRST: np.clip does NOT sanitize NaN (clip(nan, lo, hi) ==
+    # nan), so an unguarded critic divergence would flow straight through
+    # into g_logits below and corrupt the whole model -- found via a real
+    # 45k-step fp8 run that NaN-collapsed by step 3400 (far earlier than
+    # any prior curriculum run), matching this codebase's own established
+    # pattern (see _overflow_guard_array in sili__new's sparse_rnn.py).
+    # Treating a non-finite prediction as "no correction" (advantage=0)
+    # rather than propagating it also protects the critic's OWN gradient
+    # below, since g_critic reuses this same sanitized pred_row.
+    pred_row = np.nan_to_num(np.asarray(critic_pred.data[row], dtype=np.float32),
+                             nan=0.0, posinf=ADVANTAGE_CLIP, neginf=-ADVANTAGE_CLIP)
+    advantage = np.clip(true_loss_vec - pred_row, -ADVANTAGE_CLIP, ADVANTAGE_CLIP)
+
+    g_logits = np.zeros_like(logits.data)
+    g_logits[row] = (1.0 + advantage) * (probs - onehot)
+
+    g_critic = np.zeros_like(critic_pred.data)
+    g_critic[row] = 2.0 * (pred_row - true_loss_vec)
+
+    terms = [(logits, g_logits), (critic_pred, g_critic)]
+    if aux is not None:
+        terms.append(aux)
+    combine_losses(*terms).backward()
 
 
 def _stage_key(stage: dict) -> tuple:
@@ -107,7 +289,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
                      log_fn=None, additive_rank: int = 0,
                      dynamic_rank_control: bool = False,
-                     rank_grace_period_steps: int = 50) -> dict:
+                     rank_grace_period_steps: int = 50,
+                     use_critic: bool = False,
+                     magnitude_clip_penalty_coef: float = 0.0) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -126,7 +310,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
         synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
-        rng=model_rng)
+        use_critic=use_critic,
+        magnitude_clip_penalty_coef=magnitude_clip_penalty_coef, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -240,6 +425,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         for i in range(seq_len + offset):
             window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
             memory, logits, aux = model.step(window, memory, lr)
+            if DEBUG_FINITE_CHECK and use_critic:
+                _check_finite_or_raise(model, logits, step, i, loss_ema)
             if i in targets:
                 loss = cross_entropy_sum(logits, [(num_tiles - 1, targets[i])])
                 loss_ema = float(loss.data) if loss_ema is None else (
@@ -255,9 +442,12 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     else:
                         wrong_streak += 1
                         streak = 0
-                if aux is not None:
-                    loss = loss + aux
-                loss.backward()
+                if use_critic:
+                    _backward_with_critic(model, logits, targets[i], num_tiles, aux)
+                else:
+                    if aux is not None:
+                        loss = loss + aux
+                    loss.backward()
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
                 if dynamic_rank_control:
@@ -335,10 +525,16 @@ def main():
     # independent per-branch cooldowns (6 layers x 2 branches) all reset
     # on their own schedule; raise this for a calmer run.
     rank_grace_period_steps = int(sys.argv[9]) if len(sys.argv) > 9 else 50
+    # Advantage actor-critic (task #272): curriculum leveling itself is
+    # UNCHANGED (still the streak heuristic above) -- this only swaps how
+    # the model's own per-step gradient is computed, see
+    # _backward_with_critic's own docstring.
+    use_critic = bool(int(sys.argv[10])) if len(sys.argv) > 10 else False
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
+          f"use_critic={use_critic} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -360,7 +556,7 @@ def main():
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
-                         rank_grace_period_steps=rank_grace_period_steps)
+                         rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)
