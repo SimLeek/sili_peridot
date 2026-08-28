@@ -64,6 +64,28 @@ from scripts.train_mqar_rmt_reference import (
 
 PRECISION_CLS = {"fp4": DISLDOLayer, "fp8": DISLDOLayer8, "fp32": DISLDOLayer32}
 NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
+# FP8 needs a real (non-infinite) max_abs_delta -- see conversation/
+# sili__new's linear_disldo.hpp fix: FP4's block4 backward computed cw
+# in CODE-SPACE with S properly threaded through SynapsePolicy::update_cw,
+# so its own quantization ceiling (raw code magnitude <=6) gave it an
+# IMPLICIT per-step safety margin even under an uncapped max_abs_delta.
+# FP8's block4 backward used to compute cw in TRUE-WEIGHT space with
+# S hardcoded to 1, which on its own was a real, separate bug (fixed:
+# an S-independent RMSprop step divided by a small output_scale at
+# write time amplified every update by ~1/S, up to ~287x for a wide
+# fan-in-corrected layer). Once that's fixed to match FP4's convention,
+# FP8's REMAINING difference from FP4 is purely its much wider code
+# range (E4M3 max ~448 vs FP4's ~6) -- an uncapped cold-start delta
+# that FP4's narrow range self-limits harmlessly can still drift FP8
+# noticeably before its own (much later) natural ceiling kicks in.
+# Confirmed directly: FP8 is fully stable (40-step diagnostic, loss
+# steady ~4.2-5.1) under the library's own tuned production default
+# (kSynapsePolicyMaxAbsDelta=2.0, sili/cpu_backend.cpp), so reuse that
+# exact value here rather than guessing a new one -- gives FP8 the same
+# kind of per-step code-space ceiling FP4 gets for free, while FP4/FP32
+# stay on the deliberately uncapped NOCAPS_KWARGS unchanged.
+NOCAPS_KWARGS_FP8 = {"max_abs_delta": 2.0, "max_ci": 1e30}
+PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS}
 
 DEFAULT_PEAK_LR = 0.015
 DEFAULT_NUM_TILES = 16         # fixed local-attention window (model param, not a task param)
@@ -309,7 +331,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
+        synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]), scale_rank=1,
         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
         use_critic=use_critic,
         magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
