@@ -291,7 +291,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      dynamic_rank_control: bool = False,
                      rank_grace_period_steps: int = 50,
                      use_critic: bool = False,
-                     magnitude_clip_penalty_coef: float = 0.0) -> dict:
+                     magnitude_clip_penalty_coef: float = 0.0,
+                     recurrent_only_output: bool = False) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -311,7 +312,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
         use_critic=use_critic,
-        magnitude_clip_penalty_coef=magnitude_clip_penalty_coef, rng=model_rng)
+        magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
+        recurrent_only_output=recurrent_only_output, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -424,7 +426,16 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         for i in range(seq_len + offset):
             window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
-            memory, logits, aux = model.step(window, memory, lr)
+            # requires_grad=False for non-query steps (direct instruction):
+            # the sequential write-then-read design (see step()'s own
+            # docstring) makes k_proj/v_proj/o_proj forward()-run TWICE per
+            # step, and most steps never get a loss.backward() at all (only
+            # `i in targets` does) -- building a backward graph for those is
+            # both wasted work and, more importantly, would leave the C++
+            # engine's DenseInputStack accumulating never-popped entries
+            # across every non-query step in the sequence until it hits its
+            # cap and throws.
+            memory, logits, aux = model.step(window, memory, lr, requires_grad=(i in targets))
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
             if i in targets:
@@ -530,11 +541,20 @@ def main():
     # the model's own per-step gradient is computed, see
     # _backward_with_critic's own docstring.
     use_critic = bool(int(sys.argv[10])) if len(sys.argv) > 10 else False
+    # RNN validation ablation (direct instruction): when set, the model's
+    # content-row (this step's readout) queries can only attend memory-row
+    # keys/values, and the direct x_wide->content_out residual is zeroed --
+    # see ToyTileRecurrenceRMT.step()'s own docstring for the full
+    # rationale. If MQAR still learns SOMETHING under this restriction,
+    # the recurrent state itself is doing real work, not just riding along
+    # while content-content attention silently solves the task within a
+    # single window.
+    recurrent_only_output = bool(int(sys.argv[11])) if len(sys.argv) > 11 else False
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
-          f"use_critic={use_critic} "
+          f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -556,7 +576,8 @@ def main():
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
-                         rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic)
+                         rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
+                         recurrent_only_output=recurrent_only_output)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)

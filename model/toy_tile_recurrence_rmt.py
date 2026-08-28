@@ -53,6 +53,7 @@ class ToyTileRecurrenceRMT:
                  additive_rank: int = 0,
                  dynamic_rank_control: bool = False,
                  use_critic: bool = False,
+                 recurrent_only_output: bool = False,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -99,7 +100,36 @@ class ToyTileRecurrenceRMT:
         floor, one integer position away from center already gives
         exp(-1/(2*1e-3**2)) = exp(-500000) -- functionally a one-hot --
         so this can't meaningfully constrain how sharply the model can
-        attend, only prevent the literal division-by-near-zero case."""
+        attend, only prevent the literal division-by-near-zero case.
+
+        recurrent_only_output (RNN validation ablation, direct
+        instruction): when True, content-row queries (this step's
+        readout) are masked to attend ONLY memory-row keys/values --
+        never their own or another content row's. Memory-row queries
+        stay unrestricted (read the full window, i.e. in_proj->recurrent
+        "write" stays allowed). The net effect: the ATTENTION-derived
+        portion of the output at step t can only carry information that
+        was already written into memory at some step <t.
+
+        Does NOT zero the direct x_wide residual skip into content_out
+        (task #315 follow-up, direct instruction, post-validation): an
+        earlier version of this ablation ALSO zeroed that residual, to
+        fully isolate memory's contribution for a distance-sweep
+        verification (confirmed genuine cross-detach recurrent
+        persistence -- accuracy well above chance at distances requiring
+        the value to survive step() boundaries no same-step gradient
+        path can reach across). That isolation already did its job; the
+        residual doesn't need to stay zeroed going forward. x_wide is
+        the QUERY token's own embedding, which never correlates with
+        MQAR's correct recall value (the task is information-
+        theoretically undecidable from the query token alone), so
+        leaving the residual live can't reintroduce a "cheat" path for
+        this task -- it just avoids needlessly handicapping the model
+        with a residual connection removed.
+
+        Default off -- existing callers see zero behavior change (same
+        6+1 layer-seed draws either way, this doesn't touch construction
+        at all, only step())."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -111,6 +141,7 @@ class ToyTileRecurrenceRMT:
         self.l1_sparsity_coef = l1_sparsity_coef
         self.magnitude_clip_penalty_coef = magnitude_clip_penalty_coef
         self.min_sigma = min_sigma
+        self.recurrent_only_output = recurrent_only_output
         self.num_cpus = num_cpus
         # min_decay_frac/max_abs_delta/max_ci passthrough (see
         # sili.sparse_rnn.DISLDOLayer.forward's own docstring) -- lets a
@@ -180,8 +211,111 @@ class ToyTileRecurrenceRMT:
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.memory_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.state_ln = Tensor(np.ones(state_width, dtype=np.float32))
-        self.centers = Tensor(np.array([i + 0.5 for i in range(self.total_slots)], dtype=np.float32))
-        self.log_sigmas = Tensor(np.zeros(self.total_slots, dtype=np.float32))
+
+        # Interleaved position layout + widened cold-start sigma (direct
+        # instruction, from real diagnostics run during the RNN-validation
+        # ablation -- see conversation): the OLD layout put all n_mem
+        # memory rows at physical positions [0, n_mem) and all content
+        # rows at [n_mem, total_slots), i.e. two separate contiguous
+        # blocks -- so memory sat maximally far (~total_slots) from the
+        # live input/output position (always the LAST content row,
+        # _build_tile_window's own convention). Combined with the OLD
+        # sigma=1 cold-start default, this is a real, confirmed bug: the
+        # Gaussian bias exp(-diff**2/(2*sigma**2)) at diff~16.5 is
+        # ~1e-59, below float32's smallest representable value -- an
+        # EXACT zero attention weight, and since d(score)/d(sigma) is
+        # itself scaled by that same zero weight, ALSO exactly zero
+        # backward gradient. A genuine dead end the model could never
+        # train its way out of, symmetric in both directions (memory
+        # could never read fresh input, and the output position could
+        # never read memory back) -- silently unexercised until now
+        # because every real curriculum run so far stayed in the K<=4
+        # in-context phase, solvable via content-content attention alone
+        # (nearby array indices, no large-distance underflow), never
+        # actually forcing reliance on memory.
+        #
+        # Fix has two parts:
+        #  1) Spread the n_mem memory slots evenly across the position
+        #     range instead of clustering them at one end, so no content
+        #     tile is structurally privileged (nearest to memory) over
+        #     any other -- every tile should have a real shot at
+        #     supplying/receiving recurrent detail, not just whichever
+        #     one happens to sit next to memory's block.
+        #  2) Widen the cold-start sigma so distance alone can't
+        #     underflow the attention weight to a hard, gradient-dead
+        #     zero -- total_slots/4 keeps even the single farthest
+        #     possible pair (distance ~= total_slots) at a representable,
+        #     if weak, weight (exp(-4**2/2)~=3e-4), so real training
+        #     signal can reach every position from the start and sharpen
+        #     (or widen further) from there as the data actually wants.
+        #
+        # Implementation: `centers` values (which position each LOGICAL
+        # row -- 0..n_mem-1 memory, n_mem..total_slots-1 content -- is
+        # labeled as occupying) are reassigned to the interleaved
+        # physical layout; the row DATA itself stays in logical order
+        # (no need to move memory_normed/x_normed's own concat order).
+        # What genuinely must move is K/V's ARRAY order when they're fed
+        # into gaussian_attention, since the C++ kernel has no separate
+        # per-key position input -- it uses the key's raw array index j
+        # directly as its position (see attention.hpp's
+        # gaussian_attention_forward: `diff = float(j) - c`). See
+        # step()'s own comment at the k_phys/v_phys gather for the other
+        # half of this. NOTE: this reordering assumes causal=False
+        # (matches this model's only usage) -- if causal attention were
+        # ever added here, Q and K would need to share the SAME index
+        # space for the j>t mask to mean anything, which this
+        # Q-stays-logical/K-goes-physical split deliberately breaks.
+        n_mem, n_content = self.num_memory_slots, self.num_tiles
+        if n_mem > 0:
+            raw_positions = [int(round((m + 0.5) * self.total_slots / n_mem)) for m in range(n_mem)]
+            used = set()
+            mem_phys = []
+            for p in raw_positions:
+                while p in used:
+                    p = (p + 1) % self.total_slots
+                used.add(p)
+                mem_phys.append(p)
+            mem_phys = sorted(mem_phys)
+        else:
+            mem_phys = []
+        mem_phys_set = set(mem_phys)
+        content_phys = [p for p in range(self.total_slots) if p not in mem_phys_set]
+        self._mem_phys = mem_phys
+        self._content_phys = content_phys
+
+        # Gather indices to reorder a LOGICAL-order [total_slots, sw]
+        # tensor (k or v) into PHYSICAL-order (array index == true
+        # interleaved position) -- precomputed once since state_width is
+        # fixed for the life of the model, reused every step() call.
+        phys_to_log = [0] * self.total_slots
+        for i, p in enumerate(mem_phys):
+            phys_to_log[p] = i
+        for t, p in enumerate(content_phys):
+            phys_to_log[p] = n_mem + t
+        self._kv_phys_gather_idx = [
+            phys_to_log[p] * state_width + c
+            for p in range(self.total_slots) for c in range(state_width)]
+
+        # Value-mask for the recurrent_only_output ablation: 1.0 at
+        # memory physical rows, 0.0 at content physical rows -- applied
+        # to v_phys (elementwise, differentiable) so a content query's
+        # attention WEIGHTS are still computed from the correct,
+        # genuinely-interleaved distances (keys stay the real, full
+        # array), but only memory rows can ever contribute actual VALUE
+        # to the output. Deliberately NOT implemented by slicing K/V down
+        # to memory-only rows -- that would collapse their array index
+        # back to a local 0..n_mem-1 range, silently reintroducing the
+        # exact clustered-position underflow this fix just closed.
+        mem_only_mask = np.zeros((self.total_slots, state_width), dtype=np.float32)
+        for p in mem_phys:
+            mem_only_mask[p, :] = 1.0
+        self._mem_only_value_mask = Tensor(mem_only_mask)
+
+        self.centers = Tensor(np.array(
+            [mem_phys[i] + 0.5 for i in range(n_mem)] +
+            [content_phys[t] + 0.5 for t in range(n_content)], dtype=np.float32))
+        sigma_init = max(self.total_slots / 4.0, 1.0)
+        self.log_sigmas = Tensor(np.full(self.total_slots, np.log(sigma_init), dtype=np.float32))
 
     def _named_real_layers(self):
         """(name, layer) for every real disldo_cls weight layer, INCLUDING
@@ -301,10 +435,27 @@ class ToyTileRecurrenceRMT:
                 results[name] = (c.get_scale_rank(), c.get_additive_rank())
         return results
 
-    def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float) -> Tensor:
+    def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float,
+                           requires_grad: bool = True) -> Tensor:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its
-        l1_sparsity_coef docstring for the full split-backward rationale."""
-        out_aux = layer.forward(input_t, lr, damp_by_importance=False, **self.synapse_kwargs)
+        l1_sparsity_coef docstring for the full split-backward rationale.
+
+        use_explicit_token=True (direct instruction, task #314): this
+        probe forward()-calls the SAME layer instance a SECOND (or
+        third, for q/k/v/o_proj under the sequential write-then-read
+        design) time within one step() -- a genuinely PARALLEL branch
+        that only merges back into the loss via simple addition, not a
+        dependency of the main pass's own output. Confirmed via a real
+        shape-mismatch crash that plain LIFO stack popping (sili__new's
+        DenseInputStack) can hand this closure a DIFFERENT call's entry
+        when visit order doesn't match push order, which is only
+        guaranteed for a true nested dependency chain -- see
+        DenseInputStack::push's own docstring (cpu_backend.cpp) and
+        DISLDOLayer.forward's own use_explicit_token docstring
+        (sili__new sparse_rnn.py)."""
+        out_aux = layer.forward(input_t, lr, requires_grad=requires_grad,
+                                use_explicit_token=True,
+                                damp_by_importance=False, **self.synapse_kwargs)
         n = float(np.asarray(out_aux.data).size)
         return reduce_sum(tensor_abs(out_aux)) * (coef / n)
 
@@ -319,7 +470,8 @@ class ToyTileRecurrenceRMT:
         return reduce_sum(power(excess, 2)) * (self.magnitude_clip_penalty_coef / n)
 
     def step(self, x_window: np.ndarray, memory_prev: np.ndarray,
-             learning_rate: float) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
+             learning_rate: float, requires_grad: bool = True
+             ) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
         """x_window: [num_tiles, embed_width] -- same convention as
         ToyTileRecurrenceRealFP4 (a real per-tile embedding, zeros for
         "nothing here yet"). memory_prev: [num_memory_slots, state_width]
@@ -328,12 +480,31 @@ class ToyTileRecurrenceRMT:
         ToyTileRecurrenceRealFP4's ambiguous per-window-slot rolling
         state (see its own docstring item 4). Returns (memory_new numpy
         [num_memory_slots, state_width], logits Tensor [num_tiles,
-        vocab_size], aux_loss)."""
+        vocab_size], aux_loss).
+
+        requires_grad=False (direct instruction): the sequential write-
+        then-read design (see the k_mem_fresh/v_mem_fresh block below)
+        means k_proj/v_proj/o_proj each get forward()'d TWICE per step
+        (once for the write, once for the read) -- the underlying C++
+        engine can only have a bounded number of pending forward() calls
+        without a matching backward() before it throws (DenseInputStack,
+        sili__new cpu_backend.cpp), and MOST step() calls in a real
+        training loop are NOT query positions (no loss ever gets
+        computed for them, so backward() never runs). Pass
+        requires_grad=False for those -- it skips building the backward
+        graph entirely (no C++-side bookkeeping pushed at all), matching
+        train_mqar_curriculum.py's own `i in targets` check. The
+        detached memory_new handoff to the NEXT step() call is
+        completely unaffected either way -- this only controls whether
+        THIS step's own forward pass is backprop-able, not what values
+        it computes."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
         x_window_t = Tensor(x_window.astype(np.float32))
-        x_wide = self.input_proj.forward(x_window_t, learning_rate, **self.synapse_kwargs)  # [n_content, sw]
+        x_wide = self.input_proj.forward(x_window_t, learning_rate, requires_grad=requires_grad,
+                                         use_explicit_token=True,
+                                         **self.synapse_kwargs)  # [n_content, sw]
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -341,9 +512,12 @@ class ToyTileRecurrenceRMT:
 
         combined_normed = concat([memory_normed, x_normed], axis=0)          # [total_slots, sw]
 
-        q = self.q_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
-        k = self.k_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
-        v = self.v_proj.forward(combined_normed, learning_rate, **self.synapse_kwargs)
+        q = self.q_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
+                                use_explicit_token=True, **self.synapse_kwargs)
+        k = self.k_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
+                                use_explicit_token=True, **self.synapse_kwargs)
+        v = self.v_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
+                                use_explicit_token=True, **self.synapse_kwargs)
 
         aux_loss = None
 
@@ -383,11 +557,104 @@ class ToyTileRecurrenceRMT:
         # combined_new's own clips above (forward and any later backward
         # read both see the same, already-floored value).
         sigmas.data = np.maximum(sigmas.data, self.min_sigma)
-        attn_pre_o = gaussian_attention(q, k, v, self.centers, sigmas,
-                                        num_cpus=self.num_cpus, causal=False)
-        attn = self.o_proj.forward(attn_pre_o, learning_rate, **self.synapse_kwargs)
-        _accumulate_penalty(attn)  # pre-clip, same reasoning as q/k/v above
-        attn.data = np.clip(attn.data, -self.clip_range, self.clip_range)
+
+        # Reorder k/v into PHYSICAL (genuinely interleaved) position
+        # order before they act as attention KEYS -- see __init__'s own
+        # centers/_kv_phys_gather_idx docstring for the full rationale.
+        # q stays in LOGICAL order untouched: each query row's bias
+        # center is looked up from self.centers, which already holds the
+        # correct physical-position VALUE per logical row, so only K/V's
+        # ARRAY order (which gaussian_attention implicitly reads as
+        # position via raw index j) needs to move.
+        k_phys = gather(k, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v_phys = gather(v, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+
+        mem_idx = [m * sw + c for m in range(n_mem) for c in range(sw)]
+        content_idx = [(n_mem + t) * sw + c for t in range(n_content) for c in range(sw)]
+
+        # --- PASS 1: WRITE. Memory reads the (stale) full window, live --
+        # unrestricted regardless of recurrent_only_output (memory always
+        # reads everything; "write" stays allowed per the ablation's own
+        # design), producing memory_new.
+        q_mem = gather(q, mem_idx).reshape((n_mem, sw))
+        centers_mem = gather(self.centers, list(range(n_mem)))
+        sigmas_mem = gather(sigmas, list(range(n_mem)))
+        attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
+                                            num_cpus=self.num_cpus, causal=False)
+        attn_mem = self.o_proj.forward(attn_pre_o_mem, learning_rate, requires_grad=requires_grad,
+                                       use_explicit_token=True, **self.synapse_kwargs)
+        _accumulate_penalty(attn_mem)
+        attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
+
+        # --- PASS 2: READ. Content queries attend memory AS IT STANDS
+        # AFTER pass 1's write, not the stale memory_prev (direct
+        # instruction: "input_proj->state_update->recurrent->state_update
+        # in one step, not BPTT" -- two sequential layers run one after
+        # the other WITHIN this same step() call). Backprop from
+        # content_out/logits walks straight through memory_new_t, through
+        # attn_mem/attn_pre_o_mem, through q_mem/k_phys/v_phys, into
+        # x_wide/input_proj -- a real, live, undetached gradient path
+        # entirely WITHIN this one call, NOT BPTT (nothing here crosses a
+        # step() call boundary; only the numpy memory_new returned at the
+        # very end, after this whole graph is already built, gets
+        # detached, matching every other step()'s own convention). Before
+        # this, input_proj's only live signal was the thin "which memory
+        # slot does my query pick" channel (confirmed via direct
+        # measurement: input_proj abs-grad-sum 0.037 vs v_proj/o_proj's
+        # 2.89/19.4, both of which get real credit only because their
+        # SAME shared weights are also exercised, abundantly, by the
+        # read side every step) -- this pass gives it a real path for
+        # "did this write end up useful," without ever needing gradient
+        # to survive the hard-detach between step() calls.
+        memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
+        k_mem_fresh = self.k_proj.forward(memory_new_normed, learning_rate, requires_grad=requires_grad,
+                                          use_explicit_token=True, **self.synapse_kwargs)
+        v_mem_fresh = self.v_proj.forward(memory_new_normed, learning_rate, requires_grad=requires_grad,
+                                          use_explicit_token=True, **self.synapse_kwargs)
+        _accumulate_penalty(k_mem_fresh)
+        _accumulate_penalty(v_mem_fresh)
+        k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
+        v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
+
+        # Content's OWN k/v (from pass 1, i.e. this step's raw input) stay
+        # unchanged -- only the memory portion is refreshed. Rebuilt
+        # through the SAME interleaved-physical gather as k_phys/v_phys
+        # (see __init__'s own centers docstring) so the Gaussian bias math
+        # still sees the correct, genuinely-spread positions -- collapsing
+        # back to a bare [n_mem, sw] slice here would silently reintroduce
+        # the exact clustered-position underflow the interleave fix
+        # closed.
+        k_content_only = gather(k, content_idx).reshape((n_content, sw))
+        v_content_only = gather(v, content_idx).reshape((n_content, sw))
+        k2 = concat([k_mem_fresh, k_content_only], axis=0)
+        v2 = concat([v_mem_fresh, v_content_only], axis=0)
+        k2_phys = gather(k2, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v2_phys = gather(v2, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+
+        q_content = gather(q, content_idx).reshape((n_content, sw))
+        centers_content = gather(self.centers, list(range(n_mem, n_mem + n_content)))
+        sigmas_content = gather(sigmas, list(range(n_mem, n_mem + n_content)))
+        if self.recurrent_only_output:
+            # Same value-masking approach as before (see __init__'s
+            # _mem_only_value_mask docstring): keys stay the full,
+            # correctly-interleaved array (content's own key still
+            # competes in the softmax), only content's VALUE contribution
+            # is zeroed -- now against the FRESH (pass-1-updated) memory
+            # values rather than the stale ones.
+            v2_phys_mem_only = v2_phys * self._mem_only_value_mask
+            attn_pre_o_content = gaussian_attention(q_content, k2_phys, v2_phys_mem_only,
+                                                     centers_content, sigmas_content,
+                                                     num_cpus=self.num_cpus, causal=False)
+        else:
+            attn_pre_o_content = gaussian_attention(q_content, k2_phys, v2_phys,
+                                                     centers_content, sigmas_content,
+                                                     num_cpus=self.num_cpus, causal=False)
+        attn_content = self.o_proj.forward(attn_pre_o_content, learning_rate, requires_grad=requires_grad,
+                                           use_explicit_token=True, **self.synapse_kwargs)
+        _accumulate_penalty(attn_content)
+        attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
 
         # Debug instrumentation (task #303): cheap reference-only capture
         # (no copies) of every stage between the input embedding and the
@@ -397,52 +664,73 @@ class ToyTileRecurrenceRMT:
         # proof any given stage is finite.
         self.last_debug = {
             "x_wide": x_wide.data, "q": q.data, "k": k.data, "v": v.data,
-            "attn_pre_o": attn_pre_o.data, "attn_post_o": attn.data,
+            "attn_pre_o_mem": attn_pre_o_mem.data, "attn_pre_o_content": attn_pre_o_content.data,
+            "attn_mem": attn_mem.data, "attn_content": attn_content.data,
             "sigmas": sigmas.data, "log_sigmas": self.log_sigmas.data,
         }
 
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [
-                self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef),
-                self._l1_sparsity_split(self.q_proj, combined_normed, learning_rate, self.l1_sparsity_coef),
-                self._l1_sparsity_split(self.k_proj, combined_normed, learning_rate, self.l1_sparsity_coef),
-                self._l1_sparsity_split(self.v_proj, combined_normed, learning_rate, self.l1_sparsity_coef),
+                self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad),
+                self._l1_sparsity_split(self.q_proj, combined_normed, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad),
+                self._l1_sparsity_split(self.k_proj, combined_normed, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad),
+                self._l1_sparsity_split(self.v_proj, combined_normed, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad),
                 self._l1_sparsity_split(self.o_proj, gaussian_attention(
-                    q, k, v, self.centers, sigmas, num_cpus=self.num_cpus, causal=False),
-                    learning_rate, self.l1_sparsity_coef),
+                    q, k_phys, v_phys, self.centers, sigmas, num_cpus=self.num_cpus, causal=False),
+                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad),
             ]
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
 
-        # Residual against the RAW (pre-RMSNorm) memory/content values,
-        # matching ToyTileRecurrenceRealFP4's own convention (residual
-        # from raw M_prev, not the normed qkv_source).
-        raw_combined = concat([memory_prev_t, x_wide], axis=0)
-        pre_norm_combined = raw_combined + attn
-        combined_new = rmsnorm_tensor(pre_norm_combined, self.state_ln, self.rms_eps)
-        _accumulate_penalty(combined_new)  # pre-clip, same reasoning as above
-        combined_new.data = np.clip(combined_new.data, -self.clip_range, self.clip_range)
-        self.last_debug["raw_combined"] = raw_combined.data
-        self.last_debug["pre_norm_combined"] = pre_norm_combined.data
-        self.last_debug["combined_new"] = combined_new.data
+        # Residual against the RAW (pre-RMSNorm) content value, matching
+        # ToyTileRecurrenceRealFP4's own convention -- kept live
+        # regardless of recurrent_only_output (direct instruction,
+        # post-validation task #315): the strict ablation used to ALSO
+        # zero this residual, on top of blocking content-content
+        # attention, to fully isolate memory's contribution for the
+        # distance-sweep verification. That isolation already did its
+        # job -- confirmed genuine cross-detach recurrent persistence
+        # (accuracy well above chance at distances requiring the value
+        # to survive step() boundaries the sequential write-then-read
+        # design's own gradient can't reach across). Zeroing this
+        # residual isn't needed for correctness going forward: x_wide is
+        # the QUERY token's own embedding, which never correlates with
+        # MQAR's correct recall value (the task is information-
+        # theoretically undecidable from the query token alone), so
+        # leaving it live can't reintroduce a "cheat" path for this
+        # task -- it just restores an ordinary residual connection
+        # instead of needlessly handicapping the model. recurrent_only_
+        # output now ONLY blocks content-content attention (the actual
+        # "recurrent only" property); it no longer touches this residual.
+        pre_norm_content = x_wide + attn_content
+        content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
+        _accumulate_penalty(content_out)  # pre-clip, same reasoning as above
+        content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)
+        self.last_debug["pre_norm_content"] = pre_norm_content.data
+        self.last_debug["content_out"] = content_out.data
 
-        # Split back into memory (next step's carry, plain numpy -- no
-        # BPTT across steps, matching this project's convention) and
-        # content (stays differentiable, feeds the readout below) via
-        # gather+reshape (no slicing op exists on Tensor -- see
-        # cross_entropy_sum's own docstring for why gather is this
-        # codebase's established workaround).
-        memory_new = combined_new.data[:n_mem].copy()
-        content_flat_idx = [(n_mem + t) * sw + c for t in range(n_content) for c in range(sw)]
-        content_out = gather(combined_new, content_flat_idx).reshape((n_content, sw))
+        # memory_new is the plain numpy carry to the NEXT step() call --
+        # no BPTT across steps, matching this project's convention (see
+        # this function's own docstring). Everything above it is still a
+        # live Tensor at this point (memory_new_t), which is exactly what
+        # lets pass 2's gradient reach back through pass 1 into
+        # input_proj within THIS call; the detach happens only here, at
+        # the very last moment before crossing the step() boundary.
+        memory_new = memory_new_t.data.copy()
 
         pooled = content_out.reshape((n_content, self.embed_width, self.column_neurons))
         pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)
         self.last_debug["pooled"] = pooled.data
         if self.l1_sparsity_coef > 0.0:
-            lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef)
+            lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef,
+                                            requires_grad=requires_grad)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
-        logits = self.lm_head.forward(pooled, learning_rate, **self.synapse_kwargs)
+        logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                      use_explicit_token=(self.l1_sparsity_coef > 0.0), **self.synapse_kwargs)
 
         # Advantage-actor-critic value head (opt-in, see __init__'s
         # use_critic docstring): exposed via an attribute rather than a
@@ -452,7 +740,7 @@ class ToyTileRecurrenceRMT:
         # scripts/train_mqar_curriculum.py) reads model.last_critic_pred
         # right after this call.
         self.last_critic_pred = (
-            self.critic_head.forward(pooled, learning_rate, **self.synapse_kwargs)
+            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs)
             if self.use_critic else None)
 
         return memory_new, logits, aux_loss
