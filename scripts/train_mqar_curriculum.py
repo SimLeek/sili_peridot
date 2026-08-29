@@ -309,8 +309,8 @@ def _stage_key(stage: dict) -> tuple:
 
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
-                     log_fn=None, additive_rank: int = 0,
-                     dynamic_rank_control: bool = False,
+                     log_fn=None, additive_rank: int = 1,
+                     dynamic_rank_control: bool = True,
                      rank_grace_period_steps: int = 50,
                      use_critic: bool = False,
                      magnitude_clip_penalty_coef: float = 0.0,
@@ -547,8 +547,18 @@ def main():
     peak_lr = float(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_PEAK_LR
     num_tiles = int(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_NUM_TILES
     k_max = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_K_MAX
-    additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 0
-    dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else False
+    # additive_rank=1 + dynamic_rank_control=True is the validated AQRS
+    # config (sili__new PR #38 / sili_peridot PR #16, JOURNAL.md): fp8
+    # reached final/peak vocab=126,k=2 with the channel-orthogonality fix,
+    # vs peak_vocab=64 for the plain (additive_rank=0) arm. The rank cap
+    # itself is NOT set here -- DISLDOLayer's own constructor already
+    # defaults scale_rank_max/additive_rank_max to
+    # max(1, min(n_in,n_out)//4) (sili__new sparse_rnn.py
+    # _default_rank_cap), which for these state_width=128 square layers
+    # is exactly 32, matching the validated run without needing an
+    # explicit override.
+    additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 1
+    dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else True
     # AQRS rank-mutation cooldown (task #292 fix): interim "age-gate"
     # refractory period, not yet tied to a real resource/energy cost
     # model -- see sili__new delta_csr_types.hpp's
