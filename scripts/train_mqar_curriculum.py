@@ -64,6 +64,28 @@ from scripts.train_mqar_rmt_reference import (
 
 PRECISION_CLS = {"fp4": DISLDOLayer, "fp8": DISLDOLayer8, "fp32": DISLDOLayer32}
 NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
+# FP8 needs a real (non-infinite) max_abs_delta -- see conversation/
+# sili__new's linear_disldo.hpp fix: FP4's block4 backward computed cw
+# in CODE-SPACE with S properly threaded through SynapsePolicy::update_cw,
+# so its own quantization ceiling (raw code magnitude <=6) gave it an
+# IMPLICIT per-step safety margin even under an uncapped max_abs_delta.
+# FP8's block4 backward used to compute cw in TRUE-WEIGHT space with
+# S hardcoded to 1, which on its own was a real, separate bug (fixed:
+# an S-independent RMSprop step divided by a small output_scale at
+# write time amplified every update by ~1/S, up to ~287x for a wide
+# fan-in-corrected layer). Once that's fixed to match FP4's convention,
+# FP8's REMAINING difference from FP4 is purely its much wider code
+# range (E4M3 max ~448 vs FP4's ~6) -- an uncapped cold-start delta
+# that FP4's narrow range self-limits harmlessly can still drift FP8
+# noticeably before its own (much later) natural ceiling kicks in.
+# Confirmed directly: FP8 is fully stable (40-step diagnostic, loss
+# steady ~4.2-5.1) under the library's own tuned production default
+# (kSynapsePolicyMaxAbsDelta=2.0, sili/cpu_backend.cpp), so reuse that
+# exact value here rather than guessing a new one -- gives FP8 the same
+# kind of per-step code-space ceiling FP4 gets for free, while FP4/FP32
+# stay on the deliberately uncapped NOCAPS_KWARGS unchanged.
+NOCAPS_KWARGS_FP8 = {"max_abs_delta": 2.0, "max_ci": 1e30}
+PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS}
 
 DEFAULT_PEAK_LR = 0.015
 DEFAULT_NUM_TILES = 16         # fixed local-attention window (model param, not a task param)
@@ -287,11 +309,12 @@ def _stage_key(stage: dict) -> tuple:
 
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
-                     log_fn=None, additive_rank: int = 0,
-                     dynamic_rank_control: bool = False,
+                     log_fn=None, additive_rank: int = 1,
+                     dynamic_rank_control: bool = True,
                      rank_grace_period_steps: int = 50,
                      use_critic: bool = False,
-                     magnitude_clip_penalty_coef: float = 0.0) -> dict:
+                     magnitude_clip_penalty_coef: float = 0.0,
+                     recurrent_only_output: bool = False) -> dict:
     disldo_cls = PRECISION_CLS[precision]
     state_width = EMBED_WIDTH * COLUMN_NEURONS
 
@@ -308,10 +331,11 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=dict(NOCAPS_KWARGS), scale_rank=1,
+        synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]), scale_rank=1,
         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
         use_critic=use_critic,
-        magnitude_clip_penalty_coef=magnitude_clip_penalty_coef, rng=model_rng)
+        magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
+        recurrent_only_output=recurrent_only_output, rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -424,7 +448,16 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         for i in range(seq_len + offset):
             window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
-            memory, logits, aux = model.step(window, memory, lr)
+            # requires_grad=False for non-query steps (direct instruction):
+            # the sequential write-then-read design (see step()'s own
+            # docstring) makes k_proj/v_proj/o_proj forward()-run TWICE per
+            # step, and most steps never get a loss.backward() at all (only
+            # `i in targets` does) -- building a backward graph for those is
+            # both wasted work and, more importantly, would leave the C++
+            # engine's DenseInputStack accumulating never-popped entries
+            # across every non-query step in the sequence until it hits its
+            # cap and throws.
+            memory, logits, aux = model.step(window, memory, lr, requires_grad=(i in targets))
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
             if i in targets:
@@ -514,8 +547,18 @@ def main():
     peak_lr = float(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_PEAK_LR
     num_tiles = int(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_NUM_TILES
     k_max = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_K_MAX
-    additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 0
-    dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else False
+    # additive_rank=1 + dynamic_rank_control=True is the validated AQRS
+    # config (sili__new PR #38 / sili_peridot PR #16, JOURNAL.md): fp8
+    # reached final/peak vocab=126,k=2 with the channel-orthogonality fix,
+    # vs peak_vocab=64 for the plain (additive_rank=0) arm. The rank cap
+    # itself is NOT set here -- DISLDOLayer's own constructor already
+    # defaults scale_rank_max/additive_rank_max to
+    # max(1, min(n_in,n_out)//4) (sili__new sparse_rnn.py
+    # _default_rank_cap), which for these state_width=128 square layers
+    # is exactly 32, matching the validated run without needing an
+    # explicit override.
+    additive_rank = int(sys.argv[7]) if len(sys.argv) > 7 else 1
+    dynamic_rank_control = bool(int(sys.argv[8])) if len(sys.argv) > 8 else True
     # AQRS rank-mutation cooldown (task #292 fix): interim "age-gate"
     # refractory period, not yet tied to a real resource/energy cost
     # model -- see sili__new delta_csr_types.hpp's
@@ -530,11 +573,20 @@ def main():
     # the model's own per-step gradient is computed, see
     # _backward_with_critic's own docstring.
     use_critic = bool(int(sys.argv[10])) if len(sys.argv) > 10 else False
+    # RNN validation ablation (direct instruction): when set, the model's
+    # content-row (this step's readout) queries can only attend memory-row
+    # keys/values, and the direct x_wide->content_out residual is zeroed --
+    # see ToyTileRecurrenceRMT.step()'s own docstring for the full
+    # rationale. If MQAR still learns SOMETHING under this restriction,
+    # the recurrent state itself is doing real work, not just riding along
+    # while content-content attention silently solves the task within a
+    # single window.
+    recurrent_only_output = bool(int(sys.argv[11])) if len(sys.argv) > 11 else False
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
-          f"use_critic={use_critic} "
+          f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -556,7 +608,8 @@ def main():
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
-                         rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic)
+                         rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
+                         recurrent_only_output=recurrent_only_output)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)

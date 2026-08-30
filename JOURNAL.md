@@ -7020,3 +7020,114 @@ fp4 run is the natural follow-up, not treated as a blocker.
 
 Both fixes + the full validation are in sili__new PR #38 and
 sili_peridot PR #16.
+
+## 2026-08-29 -- RNN recurrence validated as genuine (not a deep-net effect), an FP8 block4 scale bug fixed, and AQRS re-tested post-changes: it now costs capacity instead of helping
+
+Three pieces of work landed together, in causal order.
+
+**1. RNN recurrence validation** (direct request: verify `ToyTileRecurrenceRMT`'s
+recurrent state is doing real cross-step work, not riding along while
+content-content attention silently solves MQAR within a window).
+`recurrent_only_output` ablation (opt-in, masks content-row queries to
+attend ONLY memory-row keys/values) found two real bugs on the way:
+memory positions clustered at one physical extreme while content sat at
+the other, so the Gaussian positional bias underflowed to an exact
+float32 zero (and zero gradient) at cold-start sigma -- fixed by
+interleaving memory/content physical positions and widening
+`sigma_init` to `total_slots/4`. Separately, strict no-BPTT meant
+`input_proj` had almost no live gradient teaching it to write anything
+USEFUL into memory (0.037 vs `v_proj`/`o_proj`'s 2.89/19.4) -- fixed
+(direct instruction, explicitly NOT BPTT) by restructuring `step()`
+into a write pass (live) then a read pass that re-projects K/V from the
+JUST-written memory, so gradient flows content_out->memory_new_t->
+input_proj entirely within one call; `input_proj`'s gradient jumped
+32,000x. A distance-sweep (varying how many separate, hard-detached
+`step()` calls separate a write from its query) confirmed genuine
+persistence: accuracy 0.22-0.44 at the trained distances 1-4 (chance
+0.125), decaying toward chance beyond the untrained range -- structurally
+impossible for a same-step mechanism to produce, since `memory_new` is
+unconditionally detached every call. `recurrent_only_output` stays
+opt-in/default-off; its residual-zeroing was removed once validated
+(x_wide can't leak the answer, so leaving it live just stops needlessly
+handicapping the model).
+
+**2. sili__new engine bug, found along the way**: the write-then-read
+redesign calls `k_proj`/`v_proj`/`o_proj.forward()` TWICE per step, and
+`forward_dense`/`backward_dense`'s single-slot input cache silently
+corrupted gradients whenever that happened (no crash, just wrong
+numbers). Fixed with `DenseInputStack` -- LIFO by default (matches
+ordinary nested forward/backward, zero API change), `requires_grad=False`
+skips the push for inference-only calls, `use_explicit_token=True` for
+genuinely parallel (non-nested) reuse. sili__new PR #39.
+
+**3. FP8 block4 scale bug**, found running a long default-parameter fp8
+curriculum for the first time on the validated architecture: fp8
+diverged explosively (q/k/v/o_proj/lm_head saturating within 1-2
+gradient steps) while identical fp4 stayed stable. Root cause: FP4's
+block4 backward keeps its weight accumulator in CODE-SPACE (S threaded
+through `SynapsePolicy::update_cw`); FP8's was kept in TRUE-WEIGHT space
+with `S` hardcoded to 1, but storage still divided by the real scale to
+re-encode -- an RMSprop-normalized step of size `~eff_lr` divided by a
+small `output_scale` (typical for a wide fan-in-corrected layer, ~0.06)
+moves the code by `~eff_lr/S` instead of FP4's `~eff_lr*S`, a ~287x
+amplification for `S~0.06`. Fixed by switching FP8 to FP4's own
+code-space convention. Verified two ways: a new
+`test_fp8_block4_scattered_divergence.cpp` (FP4 already had this parity
+test, task #207 -- FP8 never did, which is exactly why the bug went
+unnoticed) fails with 17 divergences against the old code and passes
+clean against the fix; and FP8 is now fully stable under the library's
+own tuned default (`kSynapsePolicyMaxAbsDelta=2.0`) -- `NOCAPS_KWARGS`
+(uncapped `max_abs_delta`) still shows residual drift for FP8 specifically,
+since FP4's narrow code range gives it an implicit safety margin FP8's
+much wider E4M3 range doesn't have until much later. sili_peridot's
+curriculum now gives FP8 a real `max_abs_delta=2.0` instead of NOCAPS;
+FP4/FP32 unchanged. sili__new PR #40.
+
+**Long 200k-step runs, default (non-AQRS) config, all three precisions**:
+
+| precision | final vocab/k | peak vocab/k |
+|---|---|---|
+| fp4 | 16/1 | 64/1 |
+| fp8 (post-fix) | 16/1 | 64/1 |
+| fp32 | 126/2 (held) | 126/2 |
+
+fp8 now behaves identically to fp4 (same peak, same oscillation pattern)
+-- the fix brought it to parity with fp4's real learning behavior, not
+just "stopped crashing." fp32's large lead over both quantized arms was
+flagged as worth investigating.
+
+**Then discovered the runs used the wrong curriculum defaults**:
+`additive_rank=0`/`dynamic_rank_control=False` (the plain arm), not the
+validated AQRS config (`additive_rank=1`, `dynamic_rank_control=True`,
+rank cap 32 -- already automatic via `_default_rank_cap`, see
+2026-08-26's entry) that reached fp8 vocab=126/k=2 in an earlier session.
+Fixed the curriculum script's own defaults to match. Re-ran fp4/fp8 with
+AQRS on:
+
+| precision | config | final vocab/k | peak vocab/k | rank mutations |
+|---|---|---|---|---|
+| fp4 | AQRS | 16/1 | **32/1** | 3605 |
+| fp8 | AQRS | 16/1 | 64/1 | 782 |
+
+AQRS did NOT reproduce its old win on this architecture -- fp8 tied the
+plain arm, fp4 came in WORSE than its own plain arm (32 vs 64). Confirmed
+the mechanism is genuinely active in both runs (`apply_channel_
+orthogonality_penalty`/`apply_scale_overflow_guard` correctly gated on
+`dynamic_rank_control` and firing every query step, real nonzero
+mutation counts), so this isn't a wiring bug.
+
+**Direct instruction on how to read this**: expected, not a regression.
+Now that the recurrent state is genuinely used (not skipped), it has a
+real cost in curriculum vocab-growth speed -- the model has to learn to
+use its internal state productively (not just a feedforward mapping) on
+the SAME re-used layers, and a genuinely-used state gives the streak-based
+curriculum's own known reward-hackability more surface area. Having
+working recurrent layers matters more than the peak_vocab number chasing
+a stale pre-recurrence-validation baseline. AQRS/curriculum
+hyperparameter re-tuning is explicitly NOT the next step -- that's
+increasing network size while increasing sparsity, so total compute cost
+stays roughly flat while capacity grows.
+
+sili__new PR #39 (DenseInputStack) + PR #40 (FP8 scale fix), sili_peridot
+PR #18 (RNN validation, default-recurrence-unblank, FP8 max_abs_delta,
+AQRS curriculum defaults).
