@@ -7213,3 +7213,66 @@ set the p~=0.1 floor.
 
 sili__new PR (feature/sisldo-sparsity-parity, commit dbac746), sili_peridot
 commit 440d6a2 (peak RSS instrumentation) on feature/rnn-recurrence-validation.
+
+## 2026-08-30 (cont'd) -- backward's real cost profiled to per-synapse update math, not snapshot/merge; dy_sparsity_p tuned as a genuine free speedup
+
+Followed up on "what is the bulk of backward's time going into" with direct
+C++ chrono instrumentation of `disldo_backward_sparse_grad`'s block4 write
+path (state_width=2048, dy density~0.1, num_cpus=1, standalone benchmark
+outside the Python pipeline). Two hypotheses tested and REJECTED before
+landing on the real answer -- both caught by measuring before touching
+code, not by reasoning alone:
+
+1. Hoisting AQRS's `get_scale(row,col)` out of the inner loop (per the
+   "redundant recompute" idea) gave no real speedup at scale_rank 1, 2, 8,
+   or 32 -- tested all four, all within noise or slightly worse. Not
+   landed.
+2. `snapshot_row`/`merge_row_workspace` (suspected O(state_width^2)
+   unconditional full-row copy) measured at only ~5%/~1% of per-call time
+   -- NOT the bottleneck. Real breakdown of the per-tile loop: any-check
+   ~17%, walk-past-inactive-tile ~15%, **active-tile real synapse-update
+   math ~68%** (dominant). Backward is fundamentally more expensive than
+   forward per synapse actually touched (richer per-synapse work: `get_scale`,
+   importance tracking, `SynapsePolicy::update_ci`/`update_cw`, two FP4
+   quantize calls, rank-N gradient accumulation), not because it's
+   wastefully re-visiting things it shouldn't -- the existing
+   `dy_local[lj]==0` gradient-side zero-skip is already doing its job
+   structurally.
+
+User explicitly directed: skip on the GRADIENT axis, never the INPUT axis
+for this -- confirmed why directly: `SynapsePolicy::update_ci`'s formula
+is `ema = beta2*ci + (1-beta2)*(g^2+contrib^2)`, which is `beta2*ci` (a
+real decay), NOT a no-op, at `g=0`. An input-side skip would freeze that
+decay for topk-dropped positions instead of matching the dense
+reference's own behavior -- a genuine behavior change, not a pure
+speedup, and would break `test_sisldo_disldo_parity.cpp`'s explicit
+"sparsifying is mathematically a no-op vs dense" invariant. Never
+implemented for exactly this reason.
+
+Given backward's real per-call cost scales with how many (row,
+active-dy-column) pairs survive the EXISTING gradient-sparsity gate,
+`dy_sparsity_p` (already a genuinely independent axis in
+`ToyTileRecurrenceRMT`, just previously defaulting to match
+`input_sparsity_p` with no CLI override) was exposed as its own CLI arg
+and swept independently, holding `input_sparsity_p=0.1` and `embed_width`
+fixed, fixed step count both times (2000 @ width=32, 1000 @ width=128,
+avoiding the earlier wall-time-adaptive-step-budget confound):
+
+| embed_width | dy_sparsity_p=-1 (matches input) | dy_sparsity_p=0.02 | dy_sparsity_p=0.005 | quality |
+|---|---|---|---|---|
+| 32  | 23.9 sps | 27.7 sps | 27.3 sps | peak_vocab=16 throughout, no degradation |
+| 128 | 7.0 sps  | 8.2 sps  | 8.5 sps  | peak_vocab=16 throughout, no degradation |
+
+~15-27% real end-to-end speedup, plateauing after ~dy_sparsity_p=0.02,
+with ZERO measured quality cost down to 0.5% density at either width
+tested. Smaller than the raw kernel-level 7-8x backward-vs-forward gap
+because backward is only one part of a real step (forward, attention,
+Python/numpy overhead, AQRS diagnostics all still cost the same) -- but
+it's a real, zero-risk, already-wired win (no C++ changes, no
+correctness questions). `dy_sparsity_p~=0.02` looks like the practical
+sweet spot at both widths tested. Not yet made the new default (still
+defaults to matching `input_sparsity_p`) -- that's the natural next step
+if this holds up at wider models too.
+
+sili_peridot commit (feature/rnn-recurrence-validation): dy_sparsity_p
+CLI wiring in train_mqar_curriculum.py.
