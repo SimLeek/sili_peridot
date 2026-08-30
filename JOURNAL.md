@@ -7131,3 +7131,85 @@ stays roughly flat while capacity grows.
 sili__new PR #39 (DenseInputStack) + PR #40 (FP8 scale fix), sili_peridot
 PR #18 (RNN validation, default-recurrence-unblank, FP8 max_abs_delta,
 AQRS curriculum defaults).
+
+## 2026-08-30 -- sisldo sparsity-parity plan complete; OpenMP small-array fix flips sparse from 4x-slower to faster-than-dense; width x input_sparsity_p sweep finds compute time, not RAM, is the real ceiling
+
+sisldo sparsity-parity plan (top-k activation sparsification + block4
+zero-skip wired into `ToyTileRecurrenceRMT`, full AQRS parity in the
+sparse-input C++ path) landed complete: sili__new `feature/sisldo-sparsity-parity`
+@ `dbac746`, sili_peridot `feature/rnn-recurrence-validation` @ `50d5305`.
+
+**OpenMP regression found and fixed on the first real end-to-end run**:
+the widened+sparsified arm (`embed_width=32`, `input_sparsity_p=0.5`) ran
+1.8 steps/sec vs the 128-wide dense baseline's 7.5-7.6 -- 4x slower,
+contradicting block4's historical speed advantage. Root cause:
+`CSR.from_dense`'s top-k conversion (`csr.hpp`'s `top_k_indices`/
+`top_k_csr`/`to_csr`) paid `#pragma omp parallel`'s thread-team
+rendezvous cost (measured 403us @ num_cpus=4 vs 53us serial, even with a
+warmed pool) on arrays far too small (256 elements) to amortize it, on
+every one of ~13 per-step calls. Fixed via `SILI_OMP_SMALL_THRESHOLD`
+(4096 elements): below it, a serial fast-path; above it, unchanged.
+Verified byte-identical output across thread counts (new
+`test_top_k_csr_small_array_fast_path.cpp`), full C++ (149/149, 5
+pre-existing unrelated failures) and Python suites clean. Real re-run:
+1.8 -> 15.5-15.8 steps/sec, flipping to ~1.7x FASTER than the 128-wide
+dense baseline.
+
+**Width x input_sparsity_p sweep** (`train_mqar_curriculum.py`'s
+`embed_width`/`input_sparsity_p`/`wide_max_weights` args, `dense=True`
+so `wide_max_weights` only affects capacity bookkeeping, not real
+connectivity or memory footprint under fp4/fp8): the real deployment
+target is running near 60Hz while using 70-90% of available system RAM,
+not minimizing density for its own sake. Doubled `embed_width` from 32
+up while sweeping `input_sparsity_p` in {dense control, 0.5, 0.25/0.2,
+0.1, 0.05, 0.02} at each width, first slice used a wall-time-adaptive
+step budget (target ~90s/run):
+
+| embed_width | steps used | p=dense | p=0.5 | p=0.2/0.25 | p=0.1 | p=0.05 | p=0.02 |
+|---|---|---|---|---|---|---|---|
+| 32 | 2500 | peak=16, 2.9 sps | peak=32, 18.5 sps | peak=16, 22.6 sps | peak=16, 26.3 sps | peak=8, 27.5 sps | peak=8, 28.0 sps |
+| 64 | 1179 | -- | peak=16, 8.4 sps | peak=16, 12.5 sps | peak=16, 15.2 sps | peak=8, 16.7 sps | -- |
+| 128 | 585 | -- | peak=16, 2.9 sps | peak=16, 4.9 sps | peak=16, 6.8 sps | peak=8, 8.3 sps | -- |
+| 256 | 216 | -- | peak=16, 0.8 sps | peak=8, 1.6 sps | peak=8, 2.4 sps | peak=8, 3.1 sps | -- |
+
+Widths 32/64/128 agree: quality floor sits at p~=0.1, dropping to
+peak_vocab=8 at p=0.05. Width=256 looks worse across the board, but
+**this comparison is confounded**: the step budget targeted constant
+wall-clock time, not constant step count, so step count fell
+2500->1179->585->216 as compute cost grew with width -- width=256 may
+simply have had too few training steps to reach the same curriculum
+level, independent of density. Peak RSS stayed trivial throughout
+(107-357MB across all four widths) -- nowhere near the 70-90%-of-15GiB
+target (10.5-13.5GB); real memory for the 5 sparsified block4-resident
+layers scales as `state_width^2` (`state_width = 8*embed_width`) at
+~1.2 bytes/synapse (fp4), but interpreter/scratch overhead dominates at
+these small widths.
+
+Switched to a **fixed 600-step budget** (comparable across widths,
+sacrificing wall-clock-per-run instead) and resumed at `embed_width=512`:
+calibration (100 steps) measured 0.7 steps/sec and 637MB RSS, projecting
+~857s for a full 600-step run. The real run never finished -- killed at
+the 1800s hard timeout. **Compute time, not memory, is the practical
+ceiling on this task/hardware**: steps/sec fell ~3-3.6x per width
+doubling (roughly `state_width^2` cost as expected), while RSS grew far
+slower than projected available headroom (11GB free the whole time, no
+OOM watchdog trigger at any width tested). Never got remotely close to
+the 70-90%-RAM target -- compute cost makes it impractical to reach that
+width at a step count worth training on this hardware.
+
+**Open follow-ups, not yet done**: (1) re-run the width>=256 comparison
+with the fixed-step methodology to separate "step-starved" from "density
+too low" as the cause of width=256's apparent quality drop; (2) profile
+whether AQRS's rank-N scale/additive-branch computation is being
+redundantly recomputed per-tile instead of cached+reused, flagged as a
+plausible speed lever given steps/sec fell faster than pure
+`state_width^2` storage growth would predict; (3) `input_proj`'s input
+width is `embed_width` while `q/k/v/o_proj`'s is `state_width` (8x
+larger) -- a single scalar `input_sparsity_p` applied uniformly means
+`input_proj` always runs ~8x sparser in absolute terms for the same `p`;
+this ratio is constant across widths so it likely doesn't explain the
+width-trend, but per-layer `p` is needed to tell which layer(s) actually
+set the p~=0.1 floor.
+
+sili__new PR (feature/sisldo-sparsity-parity, commit dbac746), sili_peridot
+commit 440d6a2 (peak RSS instrumentation) on feature/rnn-recurrence-validation.
