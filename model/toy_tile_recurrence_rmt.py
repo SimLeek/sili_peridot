@@ -440,21 +440,17 @@ class ToyTileRecurrenceRMT:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its
         l1_sparsity_coef docstring for the full split-backward rationale.
 
-        use_explicit_token=True (direct instruction, task #314): this
-        probe forward()-calls the SAME layer instance a SECOND (or
+        This probe forward()-calls the SAME layer instance a SECOND (or
         third, for q/k/v/o_proj under the sequential write-then-read
         design) time within one step() -- a genuinely PARALLEL branch
         that only merges back into the loss via simple addition, not a
-        dependency of the main pass's own output. Confirmed via a real
-        shape-mismatch crash that plain LIFO stack popping (sili__new's
-        DenseInputStack) can hand this closure a DIFFERENT call's entry
-        when visit order doesn't match push order, which is only
-        guaranteed for a true nested dependency chain -- see
-        DenseInputStack::push's own docstring (cpu_backend.cpp) and
-        DISLDOLayer.forward's own use_explicit_token docstring
-        (sili__new sparse_rnn.py)."""
+        dependency of the main pass's own output. sili__new's
+        backward_dense/backward now take `x` as an explicit argument
+        (each Python closure holds its own input directly, same as
+        every other Tensor op), so this is no longer order-sensitive at
+        all -- previously needed use_explicit_token to avoid a real
+        engine-side LIFO-cache bug, now simply not a concern."""
         out_aux = layer.forward(input_t, lr, requires_grad=requires_grad,
-                                use_explicit_token=True,
                                 damp_by_importance=False, **self.synapse_kwargs)
         n = float(np.asarray(out_aux.data).size)
         return reduce_sum(tensor_abs(out_aux)) * (coef / n)
@@ -482,28 +478,25 @@ class ToyTileRecurrenceRMT:
         [num_memory_slots, state_width], logits Tensor [num_tiles,
         vocab_size], aux_loss).
 
-        requires_grad=False (direct instruction): the sequential write-
-        then-read design (see the k_mem_fresh/v_mem_fresh block below)
-        means k_proj/v_proj/o_proj each get forward()'d TWICE per step
-        (once for the write, once for the read) -- the underlying C++
-        engine can only have a bounded number of pending forward() calls
-        without a matching backward() before it throws (DenseInputStack,
-        sili__new cpu_backend.cpp), and MOST step() calls in a real
-        training loop are NOT query positions (no loss ever gets
-        computed for them, so backward() never runs). Pass
-        requires_grad=False for those -- it skips building the backward
-        graph entirely (no C++-side bookkeeping pushed at all), matching
-        train_mqar_curriculum.py's own `i in targets` check. The
-        detached memory_new handoff to the NEXT step() call is
-        completely unaffected either way -- this only controls whether
-        THIS step's own forward pass is backprop-able, not what values
-        it computes."""
+        requires_grad=False (direct instruction): most step() calls in a
+        real training loop are NOT query positions (no loss ever gets
+        computed for them, so backward() never runs) -- pass
+        requires_grad=False for those to skip building the backward
+        graph entirely, matching train_mqar_curriculum.py's own
+        `i in targets` check. The detached memory_new handoff to the
+        NEXT step() call is completely unaffected either way -- this
+        only controls whether THIS step's own forward pass is
+        backprop-able, not what values it computes. (The sequential
+        write-then-read design below calls k_proj/v_proj/o_proj TWICE
+        per step -- once for the write, once for the read -- but
+        sili__new's backward_dense/backward now take `x` explicitly, so
+        there's no engine-side call-ordering concern to manage either
+        way.)"""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
         x_window_t = Tensor(x_window.astype(np.float32))
         x_wide = self.input_proj.forward(x_window_t, learning_rate, requires_grad=requires_grad,
-                                         use_explicit_token=True,
                                          **self.synapse_kwargs)  # [n_content, sw]
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
@@ -513,11 +506,11 @@ class ToyTileRecurrenceRMT:
         combined_normed = concat([memory_normed, x_normed], axis=0)          # [total_slots, sw]
 
         q = self.q_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
-                                use_explicit_token=True, **self.synapse_kwargs)
+                                **self.synapse_kwargs)
         k = self.k_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
-                                use_explicit_token=True, **self.synapse_kwargs)
+                                **self.synapse_kwargs)
         v = self.v_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
-                                use_explicit_token=True, **self.synapse_kwargs)
+                                **self.synapse_kwargs)
 
         aux_loss = None
 
@@ -582,7 +575,7 @@ class ToyTileRecurrenceRMT:
         attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
                                             num_cpus=self.num_cpus, causal=False)
         attn_mem = self.o_proj.forward(attn_pre_o_mem, learning_rate, requires_grad=requires_grad,
-                                       use_explicit_token=True, **self.synapse_kwargs)
+                                       **self.synapse_kwargs)
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
@@ -610,9 +603,9 @@ class ToyTileRecurrenceRMT:
         # to survive the hard-detach between step() calls.
         memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
         k_mem_fresh = self.k_proj.forward(memory_new_normed, learning_rate, requires_grad=requires_grad,
-                                          use_explicit_token=True, **self.synapse_kwargs)
+                                          **self.synapse_kwargs)
         v_mem_fresh = self.v_proj.forward(memory_new_normed, learning_rate, requires_grad=requires_grad,
-                                          use_explicit_token=True, **self.synapse_kwargs)
+                                          **self.synapse_kwargs)
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
@@ -652,7 +645,7 @@ class ToyTileRecurrenceRMT:
                                                      centers_content, sigmas_content,
                                                      num_cpus=self.num_cpus, causal=False)
         attn_content = self.o_proj.forward(attn_pre_o_content, learning_rate, requires_grad=requires_grad,
-                                           use_explicit_token=True, **self.synapse_kwargs)
+                                           **self.synapse_kwargs)
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
 
@@ -730,7 +723,7 @@ class ToyTileRecurrenceRMT:
                                             requires_grad=requires_grad)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
-                                      use_explicit_token=(self.l1_sparsity_coef > 0.0), **self.synapse_kwargs)
+                                      **self.synapse_kwargs)
 
         # Advantage-actor-critic value head (opt-in, see __init__'s
         # use_critic docstring): exposed via an attribute rather than a
