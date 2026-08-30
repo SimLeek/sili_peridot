@@ -52,6 +52,7 @@ from __future__ import annotations
 import sys
 import time
 import json
+import resource
 from typing import Optional
 
 import numpy as np
@@ -554,8 +555,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
 
     elapsed_s = time.time() - t0
     final_vocab, final_k, final_phase = _current()
+    peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
     return {
         "steps_per_sec": (step / elapsed_s) if elapsed_s > 0 else 0.0,
+        "peak_rss_mb": peak_rss_mb,
         "precision": precision, "final_vocab": final_vocab, "final_k": final_k,
         "final_phase": final_phase, "peak_stage": peak_stage,
         "graduated": final_phase == "k" and final_k > k_max, "total_steps": step,
@@ -656,6 +659,7 @@ def main():
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
+          f"peak_rss_mb={r['peak_rss_mb']:.1f} "
           f"({r['elapsed_s']:.0f}s)", flush=True)
     print(f"PEAK precision={precision} peak_vocab={r['peak_stage']['vocab']} "
           f"peak_k={r['peak_stage']['k']} peak_phase={r['peak_stage']['phase']}", flush=True)
