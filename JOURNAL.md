@@ -7276,3 +7276,80 @@ if this holds up at wider models too.
 
 sili_peridot commit (feature/rnn-recurrence-validation): dy_sparsity_p
 CLI wiring in train_mqar_curriculum.py.
+
+## 2026-08-30 (cont'd 2) -- 256/512 floor sweep: dy_sparsity_p win holds at width=256 (0.5% density, zero cost); dense is now impractical; width=512 quality inconclusive (step-budget confound recurs)
+
+Ran a clean (fixed-step, non-wall-time-adaptive) floor sweep covering both
+axes at embed_width=256 (800 steps) and embed_width=512 (400 steps), 20min
+per-run timeout, following directly from the width=32/128 dy_sparsity_p
+result above.
+
+**Dense baseline is no longer even completable in budget**: `input_sparsity_p=-1`
+(fully dense) TIMED OUT at 1200s at width=256 (never finished 800 steps),
+and BOTH `input_sparsity_p=-1` and `=0.5` timed out at width=512. Sparsity
+has crossed from "nice speedup" to "required to finish a run at all" at
+these widths.
+
+**input_sparsity_p floor, width=256** (dy_sparsity_p left at -1, i.e.
+matches input): peak_vocab=16 held through p=0.1, dropped to peak_vocab=8
+at p=0.05 and p=0.02. **Same floor location (~0.1) as widths 32/64/128** --
+confirms, with a clean (non-confounded) run this time, that the floor
+really is flat across width in the tested range, not shrinking. This is
+the unfavorable-for-scaling result already flagged in
+`project_sili_sparsity_deployment_target` -- now confirmed at width=256
+specifically instead of relying on the earlier confounded data point.
+
+| embed_width=256, input_sparsity_p | steps/sec | peak_vocab |
+|---|---|---|
+| dense (-1) | -- | TIMEOUT, no result |
+| 0.5 | 0.9 | 16 |
+| 0.25 | 1.4 | 16 |
+| 0.1 | 2.4 | 16 |
+| 0.05 | 3.2 | 8 |
+| 0.02 | 4.0 | 8 |
+
+**dy_sparsity_p floor, width=256** (input_sparsity_p=0.1 fixed): peak_vocab
+held at 16 all the way down to dy_sparsity_p=0.005 (0.5% gradient density)
+-- zero measured quality cost, extending the width=32/128 result to
+width=256. Speed: 2.4 -> 3.2 sps (~33% real end-to-end speedup) from
+dy_sparsity_p=-1 down to 0.005.
+
+| embed_width=256, dy_sparsity_p (input_sparsity_p=0.1 fixed) | steps/sec | peak_vocab |
+|---|---|---|
+| -1 (matches input) | 2.4 | 16 |
+| 0.1 | 2.4 | 16 |
+| 0.05 | 2.8 | 16 |
+| 0.02 | 3.0 | 16 |
+| 0.01 | 3.2 | 16 |
+| 0.005 | 3.2 | 16 |
+
+**width=512: inconclusive on quality, confirms speed win, hits the same
+step-budget confound flagged before at width=256**. Every single arm at
+width=512 (both the input_sparsity_p sweep and the dy_sparsity_p sweep,
+6+6 configs) plateaued at peak_vocab=8 -- including the highest-density
+completable arm (p=0.25). Since even the LEAST-sparse tested arm caps at
+vocab=8, this looks like 400 steps simply isn't enough real training at
+this width (matches the exact confound already flagged in
+`feedback_per_layer_width_disparity_uniform_p` for the first, discarded
+width=256 attempt) rather than evidence of a lower quality floor. Not
+trusting this as a floor result. Speed data is still real and consistent
+though: dy_sparsity_p again gives ~43% speedup (0.7 -> 1.0 sps, -1 to
+0.005) with no visible quality change (weak evidence given the flat
+vocab=8 ceiling, but directionally consistent with 32/128/256).
+
+**Width-doubling slowdown, extended**: at matched input_sparsity_p=0.1,
+dy_sparsity_p=-1: 128-width 7.0 sps -> 256-width 2.4 sps (2.92x) ->
+512-width 0.7 sps (3.43x). Continues the previously observed trend
+(1.73, 2.24, 2.83, 3.43x for widths 32->64->128->256->512) trending toward
+the theoretical O(p*state_width^2) 4x/doubling ceiling.
+
+**Conclusion**: `dy_sparsity_p~=0.005-0.02` is now validated at 3 widths
+(32, 128, 256) with zero quality cost and a real ~15-43% speedup -- strong
+enough to consider making it the new default over "match input_sparsity_p".
+`input_sparsity_p`'s own floor stays flat (~0.1) through width=256, still
+no evidence sparsity fraction can shrink with width to offset the width^2
+compute cost -- if anything this makes the eventual 64GB-scale extrapolation
+worse, not better. width=512 needs a bigger step budget (or a
+loss-based/quality-gated stopping condition instead of a fixed count) before
+its floor question can be answered cleanly; not re-running blind with more
+steps without deciding that first.
