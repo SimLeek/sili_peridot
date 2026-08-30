@@ -39,6 +39,7 @@ curriculum run, not run as two separate experiments.
 Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [peak_lr] [num_tiles] [k_max]
   [additive_rank] [dynamic_rank_control] [rank_grace_period_steps] [use_critic]
   [recurrent_only_output] [embed_width] [input_sparsity_p] [wide_max_weights]
+  [dy_sparsity_p]
   precision: fp4 | fp8 | fp32
   embed_width: model width (sparsity plan Phase 6/7, task #335/#336) --
     default EMBED_WIDTH (16); pass 32 to widen input_proj/q/k/v/o_proj
@@ -46,6 +47,12 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     input; -1 (default) = unset/dense (today's exact behavior)
   wide_max_weights: per-layer synapse budget override for those same 5
     layers; -1 (default) = unset (shares max_weights with lm_head)
+  dy_sparsity_p: density fraction (0..1) for those same 5 layers'
+    backward gradient; -1 (default) = unset, meaning it matches
+    input_sparsity_p. Independent axis -- set lower than
+    input_sparsity_p to cut backward's real per-call cost (profiled as
+    the dominant cost driver, not snapshot/merge overhead) at whatever
+    quality tradeoff that implies.
 """
 from __future__ import annotations
 
@@ -327,7 +334,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      recurrent_only_output: bool = False,
                      embed_width: int = EMBED_WIDTH,
                      input_sparsity_p: Optional[float] = None,
-                     wide_max_weights: Optional[int] = None) -> dict:
+                     wide_max_weights: Optional[int] = None,
+                     dy_sparsity_p: Optional[float] = None) -> dict:
     # embed_width/input_sparsity_p/wide_max_weights (sparsity plan Phase
     # 7, task #336): real values threaded straight through to
     # ToyTileRecurrenceRMT's own identically-named constructor args (see
@@ -337,6 +345,15 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     # unwidened/dense behavior). COLUMN_NEURONS is NOT parameterized
     # here (stays the fixed numenta reference value, per direct
     # instruction) -- only embed_width varies.
+    # dy_sparsity_p: independent axis from input_sparsity_p (backward's
+    # weight-update work scales with how many (row, active-dy-column)
+    # pairs survive the gradient-side zero-skip -- profiled directly,
+    # see conversation, this is the real per-call cost driver, not
+    # snapshot/merge overhead). Defaults to None, meaning
+    # ToyTileRecurrenceRMT's own internal default (dy_sparsity_p ==
+    # input_sparsity_p) applies unchanged -- explicit values here let a
+    # caller push dy sparser than the input for a pure speed lever, at
+    # whatever quality cost that turns out to have.
     disldo_cls = PRECISION_CLS[precision]
     state_width = embed_width * COLUMN_NEURONS
 
@@ -359,6 +376,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
         recurrent_only_output=recurrent_only_output,
         input_sparsity_p=input_sparsity_p, wide_max_weights=wide_max_weights,
+        dy_sparsity_p=dy_sparsity_p,
         rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, embed_width).astype(np.float32) * 0.3
@@ -624,12 +642,22 @@ def main():
     input_sparsity_p = _input_sparsity_p_arg if _input_sparsity_p_arg >= 0 else None
     _wide_max_weights_arg = int(sys.argv[14]) if len(sys.argv) > 14 else -1
     wide_max_weights = _wide_max_weights_arg if _wide_max_weights_arg >= 0 else None
+    # dy_sparsity_p: same -1 sentinel convention. Left unset (-1), defaults
+    # to matching input_sparsity_p (ToyTileRecurrenceRMT's own internal
+    # default) -- an explicit value here overrides independently, e.g.
+    # pushing dy sparser than the input as a pure backward-speed lever
+    # (see conversation: backward's real per-call cost scales with how
+    # many (row, active-dy-column) pairs survive this gate, not with
+    # snapshot/merge overhead).
+    _dy_sparsity_p_arg = float(sys.argv[15]) if len(sys.argv) > 15 else -1.0
+    dy_sparsity_p = _dy_sparsity_p_arg if _dy_sparsity_p_arg >= 0 else None
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
           f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
           f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
+          f"dy_sparsity_p={dy_sparsity_p} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -655,7 +683,7 @@ def main():
                          rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
                          recurrent_only_output=recurrent_only_output,
                          embed_width=embed_width, input_sparsity_p=input_sparsity_p,
-                         wide_max_weights=wide_max_weights)
+                         wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
