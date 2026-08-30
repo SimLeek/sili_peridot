@@ -37,13 +37,22 @@ transition is left to happen naturally within one continuous
 curriculum run, not run as two separate experiments.
 
 Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [peak_lr] [num_tiles] [k_max]
+  [additive_rank] [dynamic_rank_control] [rank_grace_period_steps] [use_critic]
+  [recurrent_only_output] [embed_width] [input_sparsity_p] [wide_max_weights]
   precision: fp4 | fp8 | fp32
+  embed_width: model width (sparsity plan Phase 6/7, task #335/#336) --
+    default EMBED_WIDTH (16); pass 32 to widen input_proj/q/k/v/o_proj
+  input_sparsity_p: density fraction (0..1) for those 5 layers' forward
+    input; -1 (default) = unset/dense (today's exact behavior)
+  wide_max_weights: per-layer synapse budget override for those same 5
+    layers; -1 (default) = unset (shares max_weights with lm_head)
 """
 from __future__ import annotations
 
 import sys
 import time
 import json
+from typing import Optional
 
 import numpy as np
 
@@ -314,9 +323,21 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      rank_grace_period_steps: int = 50,
                      use_critic: bool = False,
                      magnitude_clip_penalty_coef: float = 0.0,
-                     recurrent_only_output: bool = False) -> dict:
+                     recurrent_only_output: bool = False,
+                     embed_width: int = EMBED_WIDTH,
+                     input_sparsity_p: Optional[float] = None,
+                     wide_max_weights: Optional[int] = None) -> dict:
+    # embed_width/input_sparsity_p/wide_max_weights (sparsity plan Phase
+    # 7, task #336): real values threaded straight through to
+    # ToyTileRecurrenceRMT's own identically-named constructor args (see
+    # its own docstring for the full rationale) -- embed_width defaults
+    # to the module-level EMBED_WIDTH constant (today's exact value,
+    # unchanged), the other two default to None (today's exact
+    # unwidened/dense behavior). COLUMN_NEURONS is NOT parameterized
+    # here (stays the fixed numenta reference value, per direct
+    # instruction) -- only embed_width varies.
     disldo_cls = PRECISION_CLS[precision]
-    state_width = EMBED_WIDTH * COLUMN_NEURONS
+    state_width = embed_width * COLUMN_NEURONS
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
@@ -328,16 +349,18 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     # curriculum's vocab/K stage grows -- this is the whole point of
     # decoupling the model's local window from the task.
     model = ToyTileRecurrenceRMT(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
+        VOCAB, embed_width, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
         dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
         synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]), scale_rank=1,
         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
         use_critic=use_critic,
         magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
-        recurrent_only_output=recurrent_only_output, rng=model_rng)
+        recurrent_only_output=recurrent_only_output,
+        input_sparsity_p=input_sparsity_p, wide_max_weights=wide_max_weights,
+        rng=model_rng)
     opt = AdamOptimizer()
-    embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
+    embed_table = rng.randn(VOCAB, embed_width).astype(np.float32) * 0.3
 
     stage_stack = [{"vocab": VOCAB_START, "k": K_START, "phase": "vocab"}]
     streak = 0
@@ -524,15 +547,19 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
 
         if step % log_every == 0:
             ranks = _log_ranks(step)
+            steps_per_sec = step / (time.time() - t0)
             if log_fn is not None:
-                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks)
+                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks,
+                      steps_per_sec=steps_per_sec)
 
+    elapsed_s = time.time() - t0
     final_vocab, final_k, final_phase = _current()
     return {
+        "steps_per_sec": (step / elapsed_s) if elapsed_s > 0 else 0.0,
         "precision": precision, "final_vocab": final_vocab, "final_k": final_k,
         "final_phase": final_phase, "peak_stage": peak_stage,
         "graduated": final_phase == "k" and final_k > k_max, "total_steps": step,
-        "elapsed_s": time.time() - t0, "stage_history": stage_history,
+        "elapsed_s": elapsed_s, "stage_history": stage_history,
         "dynamic_rank_control": dynamic_rank_control,
         "rank_mutation_count": rank_mutation_count,
         "final_ranks": model.report_ranks() if hasattr(model, "report_ranks") else {},
@@ -582,11 +609,24 @@ def main():
     # while content-content attention silently solves the task within a
     # single window.
     recurrent_only_output = bool(int(sys.argv[11])) if len(sys.argv) > 11 else False
+    # Sparsity plan Phase 7 (task #336): real values, no bool -- embed_width
+    # defaults to the module-level EMBED_WIDTH constant (today's exact
+    # value, pass 32 directly to widen). input_sparsity_p/wide_max_weights
+    # use -1 as this script's own "unset" sentinel (its argv convention is
+    # plain positional args, not None-able flags) -- translated to Python
+    # None below before being passed through, matching
+    # ToyTileRecurrenceRMT's own None-means-unwidened convention.
+    embed_width = int(sys.argv[12]) if len(sys.argv) > 12 else EMBED_WIDTH
+    _input_sparsity_p_arg = float(sys.argv[13]) if len(sys.argv) > 13 else -1.0
+    input_sparsity_p = _input_sparsity_p_arg if _input_sparsity_p_arg >= 0 else None
+    _wide_max_weights_arg = int(sys.argv[14]) if len(sys.argv) > 14 else -1
+    wide_max_weights = _wide_max_weights_arg if _wide_max_weights_arg >= 0 else None
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
           f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
+          f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -599,20 +639,24 @@ def main():
         parts = [f"{_SHORT_NAME.get(n, n)}={s}/{a}" for n, (s, a) in ranks.items()]
         return "  ranks[" + " ".join(parts) + "]"
 
-    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None):
+    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None, steps_per_sec=None):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
+        sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{_ranks_str(ranks)}", flush=True)
+              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{_ranks_str(ranks)}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
                          rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
-                         recurrent_only_output=recurrent_only_output)
+                         recurrent_only_output=recurrent_only_output,
+                         embed_width=embed_width, input_sparsity_p=input_sparsity_p,
+                         wide_max_weights=wide_max_weights)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
-          f"total_steps={r['total_steps']} ({r['elapsed_s']:.0f}s)", flush=True)
+          f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
+          f"({r['elapsed_s']:.0f}s)", flush=True)
     print(f"PEAK precision={precision} peak_vocab={r['peak_stage']['vocab']} "
           f"peak_k={r['peak_stage']['k']} peak_phase={r['peak_stage']['phase']}", flush=True)
     if r["dynamic_rank_control"]:
