@@ -353,7 +353,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      wide_max_weights: Optional[int] = None,
                      dy_sparsity_p: Optional[float] = None,
                      use_tile_cache: bool = False,
-                     output_dy_sparsity_p: Optional[float] = None) -> dict:
+                     output_dy_sparsity_p: Optional[float] = None,
+                     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD) -> dict:
     # embed_width/input_sparsity_p/wide_max_weights (sparsity plan Phase
     # 7, task #336): real values threaded straight through to
     # ToyTileRecurrenceRMT's own identically-named constructor args (see
@@ -638,7 +639,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 if log_fn is not None:
                     log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema, ranks=ranks)
                 break
-        elif (wrong_streak >= WRONG_STREAK_THRESHOLD
+        elif (wrong_streak >= wrong_streak_threshold
               and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS):
             _regress_stage(step)
 
@@ -741,6 +742,19 @@ def main():
     # positional, not None-able flags).
     _output_dy_sparsity_p_arg = float(sys.argv[17]) if len(sys.argv) > 17 else -1.0
     output_dy_sparsity_p = _output_dy_sparsity_p_arg if _output_dy_sparsity_p_arg >= 0 else None
+    # wrong_streak_threshold (direct instruction, reward-hacking concern):
+    # the default WRONG_STREAK_THRESHOLD=5 vs STREAK_THRESHOLD=10 asymmetry
+    # means a model can reach the (easier, lower-loss) previous vocab stage
+    # via only 5 consecutive wrong answers, but needs 10 consecutive right
+    # answers to leave it -- a real diagnostic run (embed_width=32, see
+    # JOURNAL.md) showed max_streak plateaued hard at 7/10 for 2000+ steps,
+    # never crossing to level up, which is consistent with the model
+    # finding it cheaper (lower average loss) to hover near the boundary
+    # and get bounced back to easy data than to commit to genuinely harder
+    # representations. -1 sentinel keeps today's default (5) unchanged.
+    _wrong_streak_threshold_arg = int(sys.argv[18]) if len(sys.argv) > 18 else -1
+    wrong_streak_threshold = (_wrong_streak_threshold_arg if _wrong_streak_threshold_arg >= 0
+                              else WRONG_STREAK_THRESHOLD)
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
@@ -749,7 +763,7 @@ def main():
           f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
           f"dy_sparsity_p={dy_sparsity_p} use_tile_cache={use_tile_cache} "
           f"output_dy_sparsity_p={output_dy_sparsity_p} "
-          f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
+          f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold}",
           flush=True)
 
     _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
@@ -778,7 +792,8 @@ def main():
                          embed_width=embed_width, input_sparsity_p=input_sparsity_p,
                          wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p,
                          use_tile_cache=use_tile_cache,
-                         output_dy_sparsity_p=output_dy_sparsity_p)
+                         output_dy_sparsity_p=output_dy_sparsity_p,
+                         wrong_streak_threshold=wrong_streak_threshold)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
