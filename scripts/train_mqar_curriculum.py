@@ -416,6 +416,13 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     stage_stack = [{"vocab": VOCAB_START, "k": K_START, "phase": "vocab"}]
     streak = 0
     wrong_streak = 0
+    # Diagnostic (direct instruction): LEVEL_UP needs STREAK_THRESHOLD
+    # CONSECUTIVE correct queries, not just a high acc_ema -- tracks the
+    # best streak actually reached between periodic log points, so a run
+    # that's "close" (streak often hits 7-9 then breaks) reads differently
+    # from one that's structurally capped much lower, even at matching
+    # acc_ema.
+    max_streak_seen = 0
     stage_step = 0
     queries_since_level_change = 0
     pending_level_token = None
@@ -584,6 +591,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     if correct:
                         streak += 1
                         wrong_streak = 0
+                        max_streak_seen = max(max_streak_seen, streak)
                     else:
                         wrong_streak += 1
                         streak = 0
@@ -639,7 +647,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             steps_per_sec = step / (time.time() - t0)
             if log_fn is not None:
                 log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks,
-                      steps_per_sec=steps_per_sec)
+                      steps_per_sec=steps_per_sec, max_streak=max_streak_seen)
+            max_streak_seen = 0
 
     elapsed_s = time.time() - t0
     final_vocab, final_k, final_phase = _current()
@@ -752,13 +761,15 @@ def main():
         parts = [f"{_SHORT_NAME.get(n, n)}={s}/{a}" for n, (s, a) in ranks.items()]
         return "  ranks[" + " ".join(parts) + "]"
 
-    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None, steps_per_sec=None):
+    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None, steps_per_sec=None,
+               max_streak=None):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
+        streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{_ranks_str(ranks)}", flush=True)
+              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{_ranks_str(ranks)}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
