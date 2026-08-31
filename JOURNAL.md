@@ -7449,3 +7449,19 @@ resolved here -- good candidate to pick up on the next machine.
 sili_peridot commits (feature/tile-window-caching): `64db814` (graded
 schedule + tests). sili__new commit (feature/graded-dy-sparsity-schedule):
 `4e12812` (dy_sparsity_schedule primitive + tests).
+
+## 2026-08-30 (cont'd 5) -- correction: 1200-step comparisons were too short, not primarily a non-determinism problem
+
+Direct correction: this project's MQAR curriculum normally oscillates for
+~2k-20k steps before locking in a stable vocabulary level. The earlier
+"step() held peak_vocab=16, step_cached regressed to 8" comparison ran
+only 1200 steps -- well inside that normal noisy window for both arms, so
+it was very likely just sampling each arm at a different point in its own
+expected oscillation, not a real quality difference. Run length, not the
+separately-confirmed pipeline non-determinism, was the actual problem
+with that comparison -- even a perfectly deterministic pipeline would
+have made a 1200-step single read meaningless here. The non-determinism
+itself is still real (git stash confirmed literally-identical seeded
+reruns diverge) but is now correctly lower priority: fix run length
+first (2k-20k+ steps, per direct instruction), THEN multi-seed statistics
+matter for whatever's left. Memory updated (project_tile_window_kv_cache.md).
