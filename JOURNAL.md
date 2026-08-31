@@ -7402,3 +7402,50 @@ primitive, already prototyped as `_graded_top_k_csr` in sili__new's
 explicitly compensating `p` by `num_rows` at each call site) without
 picking one, pending the graded-schedule redesign settling which
 semantics it actually wants.
+
+## 2026-08-30 (cont'd 4) -- graded query-step credit design implemented + a real methodology finding: this pipeline is non-deterministic run-to-run at fixed seed
+
+Following up on step_cached's open stability question: implemented the
+fallback design flagged earlier. `step()` gained `content_dy_sparsity_
+schedule` (per-position graded gradient density, dense for the newest
+content position, sparser further back) -- on query/backward steps
+(where weights actually move), the curriculum loop now uses `step()`'s
+full-window recompute with this graded schedule instead of `step_cached`'s
+zero-credit-for-older-rows default; non-query steps still use
+`step_cached`'s fast path. Purely additive, verified byte-identical to
+pre-change `step()` when the new kwarg is left at its None default.
+
+Required a new sili__new primitive (`DISLDOLayer.forward`'s
+`dy_sparsity_schedule` kwarg, `_graded_top_k_csr`) -- GENUINE independent
+per-row top-k, built specifically because the existing `dy_sparsity_p`
+scalar's `_cpu.dense_to_top_k_csr` turned out to select its top-k
+GLOBALLY across the batch (see the correction entry above), which is
+the wrong semantics for "grade credit by position." Both landed and
+tested (forward-pass/CSR structural correctness proven directly).
+
+**Real methodology finding while validating this**: ran the SAME
+unmodified curriculum config (seed=2001, otherwise identical) twice in a
+row and got DIFFERENT outcomes (peak_vocab 16, then 8) with zero code
+changes between the two runs. Confirmed via `git stash`/`stash pop` that
+this is genuine pre-existing non-determinism in the pipeline, not
+something my edits introduced -- likely OpenMP-thread-order-dependent
+stochastic rounding under num_cpus>1, matching this project's own
+already-documented "seed stochastic RNG for comparisons" and
+"statistical power not seeding" warnings, now confirmed concretely on
+this exact pipeline rather than just flagged in principle.
+
+**Consequence**: every single-seed (n=1) quality comparison run this
+session -- INCLUDING the earlier "step_cached's final_vocab regressed to
+8 while step() held at 16" observation that motivated building the
+graded-schedule fallback in the first place -- is unconfirmed, not
+proven. It may have been a real effect of the reduced gradient signal,
+or it may have been this same run-to-run noise. Not settled either way.
+Real next step: a proper multi-seed comparison (3-5+ seeds per arm) of
+plain step(), plain use_tile_cache, and the new graded-schedule design,
+ideally on more cores than this laptop has so it's not painfully slow.
+Recorded in Claude's memory (project_tile_window_kv_cache.md) rather than
+resolved here -- good candidate to pick up on the next machine.
+
+sili_peridot commits (feature/tile-window-caching): `64db814` (graded
+schedule + tests). sili__new commit (feature/graded-dy-sparsity-schedule):
+`4e12812` (dy_sparsity_schedule primitive + tests).
