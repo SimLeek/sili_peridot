@@ -7353,3 +7353,52 @@ worse, not better. width=512 needs a bigger step budget (or a
 loss-based/quality-gated stopping condition instead of a fixed count) before
 its floor question can be answered cleanly; not re-running blind with more
 steps without deciding that first.
+
+## 2026-08-30 (cont'd 3) -- CORRECTION: dense_to_top_k_csr's k is GLOBAL, not per-row -- every input_sparsity_p/dy_sparsity_p density number reported this session means something different
+
+Found while building a per-row graded gradient-density schedule (see next
+entry): `_cpu.dense_to_top_k_csr(dy2d, k, num_cpus)` -- the C++ primitive
+behind BOTH `input_sparsity_p` (via `CSR.from_dense`) and `dy_sparsity_p`
+(via `DISLDOLayer.forward`'s own `_bwd` closure) -- selects its top-`k`
+entries GLOBALLY across the WHOLE flattened `[rows, cols]` batch, not `k`
+per row. Confirmed at the C++ source (`csr.hpp::top_k_csr` calls
+`top_k_indices(values, rows*cols, k, ...)`, one flat array, no row
+boundary at the selection stage) and empirically (asking for k=4 on a
+3-row x 4-col array kept 1/2/1 entries per row -- whichever 4 entries won
+globally by magnitude, not 4 per row).
+
+Both `CSR.from_dense(x, p, cpus)` and `DISLDOLayer.forward(...,
+dy_sparsity_p=p)` compute `k = cols * p` -- independent of row count --
+then spend that k GLOBALLY. So the real per-row-average density is
+`p / num_rows`, not `p`. For this project's real MQAR runs, q/k/v_proj's
+backward batch is `total_slots = NUM_MEMORY_SLOTS + num_tiles = 2 + 16 =
+18` rows (default config), and `ToyTileRecurrenceRMT._to_sparse` applies
+`input_sparsity_p` to genuinely multi-row batches too (`x_window_t` at 16
+rows, `combined_normed` at 18 rows) -- so a nominal `dy_sparsity_p=0.02`
+from earlier this session was actually giving roughly `0.02/18 ≈ 0.11%`
+real density, not 2%; `input_sparsity_p`'s reported "~0.1 floor" means
+roughly `0.1/16-18 ≈ 0.6%` real density, not 10%. This also means
+individual rows can receive literally zero surviving entries on a given
+call, purely by losing the global top-k competition -- a different,
+harsher form of sparsity than "each row independently keeps its own X%."
+
+**What still holds**: every measured wall-clock number (steps/sec tables
+in the dy_sparsity_p and width-sweep entries above) is real, unaffected --
+those are direct measurements, not derived from the density label. The
+qualitative finding (backward/input tolerate extreme sparsity with no
+measured quality cost) isn't invalidated either -- if anything it's more
+striking now that the real densities tested were far lower than reported.
+What's wrong is only the density LABELS in every prior table this session
+("0.02", "0.005", "~0.1 floor," etc.) -- read them as "whatever
+nominal/num_rows worked out to" for that call site's row count, not
+literal per-row fractions. Full correction detail + implications:
+Claude's memory (`project_dy_sparsity_p_validated_speedup.md`,
+`project_sili_sparsity_deployment_target.md`,
+`feedback_per_layer_width_disparity_uniform_p.md`).
+
+No code fix landed for this yet -- flagging two options (a real per-row-k
+primitive, already prototyped as `_graded_top_k_csr` in sili__new's
+`sparse_rnn.py` for the query-step graded-credit design below, vs.
+explicitly compensating `p` by `num_rows` at each call site) without
+picking one, pending the graded-schedule redesign settling which
+semantics it actually wants.
