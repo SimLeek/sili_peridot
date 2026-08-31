@@ -720,13 +720,18 @@ def main():
     # snapshot/merge overhead).
     _dy_sparsity_p_arg = float(sys.argv[15]) if len(sys.argv) > 15 else -1.0
     dy_sparsity_p = _dy_sparsity_p_arg if _dy_sparsity_p_arg >= 0 else None
+    # step_cached()+graded-schedule (project_tile_window_kv_cache): was only
+    # reachable as a train_curriculum() kwarg, not from the CLI, blocking the
+    # real long-run (2k-20k+ step) validation this design still needs before
+    # merge. Off by default -- zero behavior change unless explicitly set.
+    use_tile_cache = bool(int(sys.argv[16])) if len(sys.argv) > 16 else False
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
           f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
           f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
           f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
-          f"dy_sparsity_p={dy_sparsity_p} "
+          f"dy_sparsity_p={dy_sparsity_p} use_tile_cache={use_tile_cache} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -752,7 +757,8 @@ def main():
                          rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
                          recurrent_only_output=recurrent_only_output,
                          embed_width=embed_width, input_sparsity_p=input_sparsity_p,
-                         wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p)
+                         wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p,
+                         use_tile_cache=use_tile_cache)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
