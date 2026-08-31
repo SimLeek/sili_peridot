@@ -169,3 +169,89 @@ class TestToyTileRecurrenceRMTWidening:
             MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(12),
             input_sparsity_p=0.4)
         assert model.dy_sparsity_p == 0.4
+
+
+def _build_window(embed_table, tokens, i, num_tiles):
+    embed_width = embed_table.shape[1]
+    window = np.zeros((num_tiles, embed_width), dtype=np.float32)
+    for j in range(num_tiles):
+        src = i - (num_tiles - 1) + j
+        if src >= 0:
+            window[j] = embed_table[tokens[src]]
+    return window
+
+
+class TestStepCached:
+    """step_cached (direct instruction): incremental alternative to
+    step() -- one new tile per call, K/V for the other num_tiles-1
+    positions read from an explicit cache instead of recomputed. See
+    step_cached's own docstring for the full rationale."""
+
+    def test_matches_step_bit_exact_when_weights_never_change(self):
+        # The load-bearing correctness claim: input_proj/q/k/v_proj are
+        # per-row (non-mixing) projections, so a content tile's k/v
+        # depends only on its own token and the CURRENT weights -- with
+        # requires_grad=False (no backward, weights genuinely static),
+        # caching introduces zero approximation, not a small one.
+        model_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+                                       MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(42))
+        model_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+                                       MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(42))
+        embed_table = np.random.RandomState(1).randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.1
+        tokens = np.random.RandomState(2).randint(0, VOCAB, size=12)
+
+        memory_a = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        memory_b = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        tile_cache = None
+        for i in range(len(tokens)):
+            window = _build_window(embed_table, tokens, i, NUM_TILES)
+            memory_a, logits_a, _aux_a = model_a.step(window, memory_a, 0.0, requires_grad=False)
+            memory_b, logits_b, _aux_b, tile_cache = model_b.step_cached(
+                embed_table[tokens[i]], memory_b, 0.0, tile_cache, requires_grad=False)
+            row_a = np.asarray(logits_a.data)[NUM_TILES - 1]
+            row_b = np.asarray(logits_b.data)[0]
+            assert np.array_equal(row_a, row_b), f"step {i}: logits diverged with static weights"
+            assert np.array_equal(memory_a, memory_b), f"step {i}: memory_new diverged with static weights"
+
+    def test_shapes_and_finite(self):
+        model = _model()
+        new_embed = np.random.RandomState(1).randn(EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        memory_new, logits, aux_loss, tile_cache = model.step_cached(
+            new_embed, memory_prev, learning_rate=0.01, tile_cache=None)
+        assert memory_new.shape == (NUM_MEM, STATE_WIDTH)
+        assert logits.data.shape == (1, VOCAB)
+        assert np.all(np.isfinite(memory_new))
+        assert np.all(np.isfinite(logits.data))
+        assert aux_loss is None
+        assert len(tile_cache) == 1  # grows by one per call, caps at NUM_TILES-1
+        for k_row, v_row in tile_cache:
+            assert k_row.shape == (STATE_WIDTH,)
+            assert v_row.shape == (STATE_WIDTH,)
+
+    def test_cache_length_caps_at_num_tiles_minus_1(self):
+        model = _model()
+        memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        tile_cache = None
+        rng = np.random.RandomState(5)
+        for _ in range(NUM_TILES + 5):
+            new_embed = (rng.randn(EMBED_WIDTH) * 0.1).astype(np.float32)
+            memory, _logits, _aux, tile_cache = model.step_cached(
+                new_embed, memory, learning_rate=0.0, tile_cache=tile_cache)
+            assert len(tile_cache) <= NUM_TILES - 1
+
+    def test_weights_actually_update_via_backward(self):
+        model = _model()
+        opt = AdamOptimizer()
+        memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        new_embed = np.random.RandomState(6).randn(EMBED_WIDTH).astype(np.float32) * 0.1
+        before = np.asarray(model.input_ln.data).copy()
+        memory, logits, aux, tile_cache = model.step_cached(
+            new_embed, memory, learning_rate=0.05, tile_cache=None, requires_grad=True)
+        loss = cross_entropy_sum(logits, [(0, 1)])
+        if aux is not None:
+            loss = loss + aux
+        loss.backward()
+        opt.step(model.parameters_for_optimizer(), lr=0.05)
+        assert not np.allclose(before, model.input_ln.data), "weights should move after a real backward+opt.step"
+        assert np.all(np.isfinite(memory))

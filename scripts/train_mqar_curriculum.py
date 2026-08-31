@@ -272,9 +272,11 @@ def prev_vocab(vocab_size: int) -> int:
     return max(VOCAB_START, int(round(vocab_size / VOCAB_GROWTH_FACTOR)))
 
 
-def _backward_with_critic(model, logits, target_token: int, num_tiles: int, aux) -> None:
+def _backward_with_critic(model, logits, target_token: int, row: int, aux) -> None:
     """Advantage-actor-critic backward for one query position (task #272).
-    logits: [num_tiles, vocab_size] Tensor, query row = num_tiles-1.
+    logits: [N, vocab_size] Tensor, query row given explicitly by the
+    caller -- num_tiles-1 under model.step()'s full-window logits, 0
+    under model.step_cached()'s single-row logits (see use_tile_cache).
     Replaces the plain unweighted cross-entropy backward with a critic-
     reweighted one -- see ADVANTAGE_CLIP's own comment for the formula.
     The critic itself trains via plain one-step MSE regression against
@@ -282,7 +284,6 @@ def _backward_with_critic(model, logits, target_token: int, num_tiles: int, aux)
     target token is known this same step -- no TD/bootstrap/target-net
     needed, unlike sili__new's mandelbrot RTAC, which needs those because
     its reward isn't known until later)."""
-    row = num_tiles - 1
     vocab_size = logits.data.shape[-1]
     row_logits = logits.data[row]
     shifted = row_logits - row_logits.max()
@@ -335,7 +336,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      embed_width: int = EMBED_WIDTH,
                      input_sparsity_p: Optional[float] = None,
                      wide_max_weights: Optional[int] = None,
-                     dy_sparsity_p: Optional[float] = None) -> dict:
+                     dy_sparsity_p: Optional[float] = None,
+                     use_tile_cache: bool = False) -> dict:
     # embed_width/input_sparsity_p/wide_max_weights (sparsity plan Phase
     # 7, task #336): real values threaded straight through to
     # ToyTileRecurrenceRMT's own identically-named constructor args (see
@@ -354,6 +356,20 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     # input_sparsity_p) applies unchanged -- explicit values here let a
     # caller push dy sparser than the input for a pure speed lever, at
     # whatever quality cost that turns out to have.
+    # use_tile_cache (direct instruction): switches the inner loop from
+    # rebuilding the full [num_tiles, embed_width] sliding window every
+    # step (model.step(), full recompute of every tile in view) to
+    # model.step_cached() -- one new token per call, K/V for the other
+    # num_tiles-1 positions read from an explicit cache instead of
+    # recomputed. Correct (bit-exact vs step()) whenever weights are
+    # static between calls -- verified directly. The one real effect
+    # once training starts: each backward call now gets gradient
+    # through only the NEWEST content position into input_proj/q/k/v_
+    # proj, not all num_tiles -- a genuinely different (sparser)
+    # training signal per call, not a numerical approximation error.
+    # Default False (today's exact behavior, zero change for existing
+    # callers) until a real curriculum accuracy comparison confirms
+    # this reduced signal doesn't cost quality.
     disldo_cls = PRECISION_CLS[precision]
     state_width = embed_width * COLUMN_NEURONS
 
@@ -488,8 +504,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         query_positions = set(pos + offset for pos in query_positions)
 
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
+        tile_cache = None  # reset every sequence, same as memory
         for i in range(seq_len + offset):
-            window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
             # requires_grad=False for non-query steps (direct instruction):
             # the sequential write-then-read design (see step()'s own
             # docstring) makes k_proj/v_proj/o_proj forward()-run TWICE per
@@ -499,15 +515,23 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             # engine's DenseInputStack accumulating never-popped entries
             # across every non-query step in the sequence until it hits its
             # cap and throws.
-            memory, logits, aux = model.step(window, memory, lr, requires_grad=(i in targets))
+            if use_tile_cache:
+                new_embed = embed_table[combined_tokens[i]]
+                memory, logits, aux, tile_cache = model.step_cached(
+                    new_embed, memory, lr, tile_cache, requires_grad=(i in targets))
+                logit_row = 0  # step_cached returns only the newest position's row
+            else:
+                window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
+                memory, logits, aux = model.step(window, memory, lr, requires_grad=(i in targets))
+                logit_row = num_tiles - 1
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
             if i in targets:
-                loss = cross_entropy_sum(logits, [(num_tiles - 1, targets[i])])
+                loss = cross_entropy_sum(logits, [(logit_row, targets[i])])
                 loss_ema = float(loss.data) if loss_ema is None else (
                     LOSS_EMA_DECAY * loss_ema + (1.0 - LOSS_EMA_DECAY) * float(loss.data))
                 if i in query_positions:
-                    correct = predicted_token(logits, num_tiles - 1) == targets[i]
+                    correct = predicted_token(logits, logit_row) == targets[i]
                     acc_ema = float(correct) if acc_ema is None else (
                         ACC_EMA_DECAY * acc_ema + (1.0 - ACC_EMA_DECAY) * float(correct))
                     queries_since_level_change += 1
@@ -518,7 +542,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                         wrong_streak += 1
                         streak = 0
                 if use_critic:
-                    _backward_with_critic(model, logits, targets[i], num_tiles, aux)
+                    _backward_with_critic(model, logits, targets[i], logit_row, aux)
                 else:
                     if aux is not None:
                         loss = loss + aux

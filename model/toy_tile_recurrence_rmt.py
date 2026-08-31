@@ -384,6 +384,15 @@ class ToyTileRecurrenceRMT:
         sigma_init = max(self.total_slots / 4.0, 1.0)
         self.log_sigmas = Tensor(np.full(self.total_slots, np.log(sigma_init), dtype=np.float32))
 
+        # step_cached's own precomputed constant index lists (flat,
+        # matching gather()'s existing [row*sw+col] convention used
+        # throughout step() above) -- fixed for the model's lifetime,
+        # built once here rather than reconstructed every call.
+        self._mem_idx_step = [m * state_width + c for m in range(n_mem) for c in range(state_width)]
+        self._new_content_idx_step = [n_mem * state_width + c for c in range(state_width)]
+        self._mem_center_idx = list(range(n_mem))
+        self._newest_content_idx = [n_mem + n_content - 1]
+
     def _named_real_layers(self):
         """(name, layer) for every real disldo_cls weight layer, INCLUDING
         critic_head when use_critic is set -- the single source of truth
@@ -825,3 +834,224 @@ class ToyTileRecurrenceRMT:
             if self.use_critic else None)
 
         return memory_new, logits, aux_loss
+
+    def step_cached(self, new_token_embed: np.ndarray, memory_prev: np.ndarray,
+                    learning_rate: float, tile_cache: Optional[List[Tuple[np.ndarray, np.ndarray]]],
+                    requires_grad: bool = True
+                    ) -> Tuple[np.ndarray, Tensor, Optional[Tensor], List[Tuple[np.ndarray, np.ndarray]]]:
+        """Incremental alternative to step(): takes ONE new token's raw
+        embedding [embed_width] instead of a full [num_tiles, embed_width]
+        sliding window, plus an explicit `tile_cache` carrying the
+        num_tiles-1 older content positions' (k_row, v_row) -- same
+        explicit-state-in/out convention as memory_prev/memory_new (no
+        hidden instance-mutation cache, matching this project's own
+        established preference, see [[project_sili_dense_input_stack_simplification]]
+        in memory: an earlier engine-side hidden cache caused a real,
+        hard-to-find correctness bug).
+
+        Why this is correct, not just faster: input_proj/q_proj/k_proj/
+        v_proj are simple per-row (non-mixing) projections, so a content
+        tile's k/v depends ONLY on its own token embedding and the
+        CURRENT weight values -- never on other tiles, never on memory.
+        step()'s full-window rebuild therefore recomputes up to
+        num_tiles IDENTICAL values per token as the window slides past
+        it, every single call. Caching removes that redundancy.
+
+        Direct instruction on the one real approximation this
+        introduces: weights only change on requires_grad=True (query)
+        steps, and even then only ~0.1% of individual synapses move per
+        update (see [[project_dy_sparsity_p_validated_speedup]]'s
+        backward-sparsity findings) -- so a cached tile's k/v drifts by
+        a tiny, bounded amount as it ages through the window, rather
+        than being invalidated wholesale after every weight update.
+        Treated as "mostly fine" per direct instruction, not chased to
+        exact invalidation.
+
+        Only the NEWEST content position's own logits/q ever get used
+        downstream (confirmed: train_mqar_curriculum.py's own loss/
+        accuracy always reads row num_tiles-1, never any other content
+        row) -- so q, x_wide, attention, and the final lm_head/
+        critic_head readout are all computed for exactly ONE content
+        row here, not num_tiles. This also means step_cached's own
+        `logits`/`aux_loss` shapes are [1, vocab_size] (a single row),
+        not [num_tiles, vocab_size] -- callers reading row 0 instead of
+        row num_tiles-1 is the one real call-site change needed.
+
+        tile_cache: list of up to (num_tiles-1) (k_row, v_row) numpy
+        [state_width] tuples, OLDEST FIRST. None or an empty/short list
+        (fewer than num_tiles-1 entries) is padded with zero rows at the
+        oldest end -- exactly reproducing _build_tile_window's own
+        "zeros for nothing here yet before sequence start" behavior
+        (input_proj/k_proj/v_proj have no bias term, so a zero raw
+        embedding really does propagate to an exact zero k/v row, not
+        an approximation). Reset to None/[] at the start of each new
+        training sequence, same as memory_prev gets reset to zeros.
+
+        Returns (memory_new, logits [1, vocab_size], aux_loss,
+        new_tile_cache) -- new_tile_cache is ready to pass back in on
+        the very next call."""
+        sw = self.state_width
+        n_mem, n_content = self.num_memory_slots, self.num_tiles
+
+        new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
+        new_embed_t = Tensor(new_embed_2d)
+        new_embed_sparse = self._to_sparse(new_embed_t)
+        x_wide_new = self.input_proj.forward(new_embed_sparse, learning_rate, requires_grad=requires_grad,
+                                             **self.synapse_kwargs, **self._wide_extra_kwargs)  # [1, sw]
+        x_normed_new = rmsnorm_tensor(x_wide_new, self.input_ln, self.rms_eps)
+
+        memory_prev_t = Tensor(memory_prev.astype(np.float32))
+        memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
+
+        combined_normed_step = concat([memory_normed, x_normed_new], axis=0)  # [n_mem+1, sw]
+        combined_normed_step_sparse = self._to_sparse(combined_normed_step)
+
+        q_step = self.q_proj.forward(combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._wide_extra_kwargs)
+        k_step = self.k_proj.forward(combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._wide_extra_kwargs)
+        v_step = self.v_proj.forward(combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._wide_extra_kwargs)
+
+        aux_loss = None
+
+        def _accumulate_penalty(t: Tensor) -> None:
+            nonlocal aux_loss
+            if self.magnitude_clip_penalty_coef > 0.0:
+                term = self._magnitude_clip_penalty(t)
+                aux_loss = term if aux_loss is None else aux_loss + term
+
+        _accumulate_penalty(q_step)
+        _accumulate_penalty(k_step)
+        _accumulate_penalty(v_step)
+
+        q_step.data = np.clip(q_step.data, -self.clip_range, self.clip_range)
+        k_step.data = np.clip(k_step.data, -self.clip_range, self.clip_range)
+        v_step.data = np.clip(v_step.data, -self.clip_range, self.clip_range)
+        sigmas = exp(self.log_sigmas)
+        sigmas.data = np.maximum(sigmas.data, self.min_sigma)
+
+        q_mem = gather(q_step, self._mem_idx_step).reshape((n_mem, sw))
+        k_mem_from_prev = gather(k_step, self._mem_idx_step).reshape((n_mem, sw))
+        v_mem_from_prev = gather(v_step, self._mem_idx_step).reshape((n_mem, sw))
+        q_new = gather(q_step, self._new_content_idx_step).reshape((1, sw))
+        k_new = gather(k_step, self._new_content_idx_step).reshape((1, sw))
+        v_new = gather(v_step, self._new_content_idx_step).reshape((1, sw))
+
+        # Reassemble the FULL [n_content, sw] content k/v from the cache
+        # (oldest first, zero-padded at the oldest end if the sequence
+        # just started) plus this step's one fresh row at the end --
+        # same logical ordering _build_tile_window's own window array
+        # always used (position 0 = oldest, n_content-1 = newest).
+        cache = list(tile_cache) if tile_cache else []
+        pad = max(0, (n_content - 1) - len(cache))
+        zero_row = np.zeros(sw, dtype=np.float32)
+        cache_k_rows = [zero_row] * pad + [row[0] for row in cache[-(n_content - 1):]] if n_content > 1 else []
+        cache_v_rows = [zero_row] * pad + [row[1] for row in cache[-(n_content - 1):]] if n_content > 1 else []
+        cache_k_arr = np.stack(cache_k_rows, axis=0) if cache_k_rows else np.zeros((0, sw), dtype=np.float32)
+        cache_v_arr = np.stack(cache_v_rows, axis=0) if cache_v_rows else np.zeros((0, sw), dtype=np.float32)
+        k_content_full = concat([Tensor(cache_k_arr), k_new], axis=0)  # [n_content, sw]
+        v_content_full = concat([Tensor(cache_v_arr), v_new], axis=0)
+
+        k_full = concat([k_mem_from_prev, k_content_full], axis=0)  # [total_slots, sw]
+        v_full = concat([v_mem_from_prev, v_content_full], axis=0)
+        k_phys = gather(k_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v_phys = gather(v_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+
+        # --- PASS 1: WRITE (identical structure to step()'s own PASS 1) ---
+        centers_mem = gather(self.centers, self._mem_center_idx)
+        sigmas_mem = gather(sigmas, self._mem_center_idx)
+        attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
+                                            num_cpus=self.num_cpus, causal=False)
+        attn_mem = self.o_proj.forward(self._to_sparse(attn_pre_o_mem), learning_rate, requires_grad=requires_grad,
+                                       **self.synapse_kwargs, **self._wide_extra_kwargs)
+        _accumulate_penalty(attn_mem)
+        attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
+
+        # --- PASS 2: READ, only the newest content row's own query ---
+        memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
+        memory_new_normed_sparse = self._to_sparse(memory_new_normed)
+        k_mem_fresh = self.k_proj.forward(memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                          **self.synapse_kwargs, **self._wide_extra_kwargs)
+        v_mem_fresh = self.v_proj.forward(memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                          **self.synapse_kwargs, **self._wide_extra_kwargs)
+        _accumulate_penalty(k_mem_fresh)
+        _accumulate_penalty(v_mem_fresh)
+        k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
+        v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
+
+        k2_full = concat([k_mem_fresh, k_content_full], axis=0)
+        v2_full = concat([v_mem_fresh, v_content_full], axis=0)
+        k2_phys = gather(k2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v2_phys = gather(v2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+
+        centers_content = gather(self.centers, self._newest_content_idx)
+        sigmas_content = gather(sigmas, self._newest_content_idx)
+        if self.recurrent_only_output:
+            v2_phys_mem_only = v2_phys * self._mem_only_value_mask
+            attn_pre_o_content = gaussian_attention(q_new, k2_phys, v2_phys_mem_only,
+                                                     centers_content, sigmas_content,
+                                                     num_cpus=self.num_cpus, causal=False)
+        else:
+            attn_pre_o_content = gaussian_attention(q_new, k2_phys, v2_phys,
+                                                     centers_content, sigmas_content,
+                                                     num_cpus=self.num_cpus, causal=False)
+        attn_content = self.o_proj.forward(self._to_sparse(attn_pre_o_content), learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs)
+        _accumulate_penalty(attn_content)
+        attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
+
+        pre_norm_content = x_wide_new + attn_content
+        content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
+        _accumulate_penalty(content_out)
+        content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)
+
+        self.last_debug = {
+            "x_wide": x_wide_new.data, "q": q_new.data, "k": k_new.data, "v": v_new.data,
+            "attn_pre_o_mem": attn_pre_o_mem.data, "attn_pre_o_content": attn_pre_o_content.data,
+            "attn_mem": attn_mem.data, "attn_content": attn_content.data,
+            "sigmas": sigmas.data, "log_sigmas": self.log_sigmas.data,
+        }
+
+        memory_new = memory_new_t.data.copy()
+
+        pooled = content_out.reshape((1, self.embed_width, self.column_neurons))
+        pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)
+        self.last_debug["pooled"] = pooled.data
+
+        if self.l1_sparsity_coef > 0.0:
+            l1_terms = [
+                self._l1_sparsity_split(self.input_proj, new_embed_sparse, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, **self._wide_extra_kwargs),
+                self._l1_sparsity_split(self.q_proj, combined_normed_step_sparse, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, **self._wide_extra_kwargs),
+                self._l1_sparsity_split(self.k_proj, combined_normed_step_sparse, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, **self._wide_extra_kwargs),
+                self._l1_sparsity_split(self.v_proj, combined_normed_step_sparse, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, **self._wide_extra_kwargs),
+                self._l1_sparsity_split(self.o_proj, self._to_sparse(
+                    concat([attn_pre_o_mem, attn_pre_o_content], axis=0)),
+                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, **self._wide_extra_kwargs),
+            ]
+            for term in l1_terms:
+                aux_loss = term if aux_loss is None else aux_loss + term
+
+        if self.l1_sparsity_coef > 0.0:
+            lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef,
+                                            requires_grad=requires_grad)
+            aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
+        logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs)
+
+        self.last_critic_pred = (
+            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs)
+            if self.use_critic else None)
+
+        new_cache = (list(tile_cache) if tile_cache else []) + [
+            (k_new.data.copy().reshape(sw), v_new.data.copy().reshape(sw))]
+        if len(new_cache) > (n_content - 1):
+            new_cache = new_cache[-(n_content - 1):]
+
+        return memory_new, logits, aux_loss, new_cache
