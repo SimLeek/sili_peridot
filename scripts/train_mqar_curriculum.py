@@ -352,7 +352,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      input_sparsity_p: Optional[float] = None,
                      wide_max_weights: Optional[int] = None,
                      dy_sparsity_p: Optional[float] = None,
-                     use_tile_cache: bool = False) -> dict:
+                     use_tile_cache: bool = False,
+                     output_dy_sparsity_p: Optional[float] = None) -> dict:
     # embed_width/input_sparsity_p/wide_max_weights (sparsity plan Phase
     # 7, task #336): real values threaded straight through to
     # ToyTileRecurrenceRMT's own identically-named constructor args (see
@@ -407,7 +408,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
         recurrent_only_output=recurrent_only_output,
         input_sparsity_p=input_sparsity_p, wide_max_weights=wide_max_weights,
-        dy_sparsity_p=dy_sparsity_p,
+        dy_sparsity_p=dy_sparsity_p, output_dy_sparsity_p=output_dy_sparsity_p,
         rng=model_rng)
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, embed_width).astype(np.float32) * 0.3
@@ -725,6 +726,12 @@ def main():
     # real long-run (2k-20k+ step) validation this design still needs before
     # merge. Off by default -- zero behavior change unless explicitly set.
     use_tile_cache = bool(int(sys.argv[16])) if len(sys.argv) > 16 else False
+    # output_dy_sparsity_p (direct instruction): lm_head/critic_head's own
+    # backward-gradient density -- same -1 "unset" sentinel convention as
+    # input_sparsity_p/dy_sparsity_p above (this script's argv is plain
+    # positional, not None-able flags).
+    _output_dy_sparsity_p_arg = float(sys.argv[17]) if len(sys.argv) > 17 else -1.0
+    output_dy_sparsity_p = _output_dy_sparsity_p_arg if _output_dy_sparsity_p_arg >= 0 else None
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
@@ -732,6 +739,7 @@ def main():
           f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
           f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
           f"dy_sparsity_p={dy_sparsity_p} use_tile_cache={use_tile_cache} "
+          f"output_dy_sparsity_p={output_dy_sparsity_p} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={WRONG_STREAK_THRESHOLD}",
           flush=True)
 
@@ -758,7 +766,8 @@ def main():
                          recurrent_only_output=recurrent_only_output,
                          embed_width=embed_width, input_sparsity_p=input_sparsity_p,
                          wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p,
-                         use_tile_cache=use_tile_cache)
+                         use_tile_cache=use_tile_cache,
+                         output_dy_sparsity_p=output_dy_sparsity_p)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "

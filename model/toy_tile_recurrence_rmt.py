@@ -57,6 +57,7 @@ class ToyTileRecurrenceRMT:
                  input_sparsity_p: Optional[float] = None,
                  dy_sparsity_p: Optional[float] = None,
                  wide_max_weights: Optional[int] = None,
+                 output_dy_sparsity_p: Optional[float] = None,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -175,7 +176,24 @@ class ToyTileRecurrenceRMT:
         lm_head/critic_head stay at the original `max_weights` --
         input+backprop sparsity means compute no longer scales with the
         full stored budget every step, so the extra memory is affordable
-        (direct instruction)."""
+        (direct instruction).
+
+        output_dy_sparsity_p (direct instruction, following the
+        step_cached graded-schedule speed work): density fraction for
+        lm_head/critic_head's own backward GRADIENT only -- genuinely
+        separate axis from input_sparsity_p/dy_sparsity_p above, and
+        NOT threaded through _to_sparse (lm_head/critic_head read
+        `pooled`, a real dense column-averaged readout with no
+        structural sparsity -- unlike the 5 affected layers' inputs,
+        there's no free-lunch argument for sparsifying THIS input).
+        The gradient side is different: `_backward_with_critic`
+        computes `g_logits[row] = (1+advantage) * (probs - onehot)`
+        where `probs` is a softmax over vocab_size -- technically dense
+        (softmax never hits exact 0) but concentrates hard onto a few
+        classes as the model gets confident, so most of `probs-onehot`
+        is near-zero in practice. `dy_sparsity_p`'s top-k-by-magnitude
+        selection is exactly suited to this shape. None (default):
+        byte-identical to today's exact dense backward for both heads."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -211,6 +229,11 @@ class ToyTileRecurrenceRMT:
         # their None default, matching every other conditional kwarg here).
         self._wide_extra_kwargs = ({"dy_sparsity_p": self.dy_sparsity_p}
                                    if self.dy_sparsity_p is not None else {})
+        # Separate axis, lm_head/critic_head only -- see __init__'s own
+        # output_dy_sparsity_p docstring above.
+        self.output_dy_sparsity_p = output_dy_sparsity_p
+        self._output_extra_kwargs = ({"dy_sparsity_p": output_dy_sparsity_p}
+                                     if output_dy_sparsity_p is not None else {})
 
         state_width = self.state_width
         if rng is None:
@@ -853,7 +876,7 @@ class ToyTileRecurrenceRMT:
                                             requires_grad=requires_grad)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
-                                      **self.synapse_kwargs)
+                                      **self.synapse_kwargs, **self._output_extra_kwargs)
 
         # Advantage-actor-critic value head (opt-in, see __init__'s
         # use_critic docstring): exposed via an attribute rather than a
@@ -863,7 +886,8 @@ class ToyTileRecurrenceRMT:
         # scripts/train_mqar_curriculum.py) reads model.last_critic_pred
         # right after this call.
         self.last_critic_pred = (
-            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs)
+            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._output_extra_kwargs)
             if self.use_critic else None)
 
         return memory_new, logits, aux_loss
@@ -1076,10 +1100,11 @@ class ToyTileRecurrenceRMT:
                                             requires_grad=requires_grad)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
-                                      **self.synapse_kwargs)
+                                      **self.synapse_kwargs, **self._output_extra_kwargs)
 
         self.last_critic_pred = (
-            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs)
+            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._output_extra_kwargs)
             if self.use_critic else None)
 
         new_cache = (list(tile_cache) if tile_cache else []) + [

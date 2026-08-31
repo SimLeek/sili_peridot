@@ -171,6 +171,64 @@ class TestToyTileRecurrenceRMTWidening:
         assert model.dy_sparsity_p == 0.4
 
 
+class TestOutputDySparsityP:
+    """lm_head/critic_head's own backward-gradient density (direct
+    instruction, following the graded-schedule speed work): a genuinely
+    separate axis from input_sparsity_p/dy_sparsity_p above -- those
+    never touch lm_head/critic_head at all (see
+    test_wide_max_weights_only_affects_the_5_layers_not_lm_head).
+    output_dy_sparsity_p is the only knob that does."""
+
+    def test_none_default_bit_identical(self):
+        rng_seed = 21
+        m_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed))
+        m_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed),
+                                   output_dy_sparsity_p=None)
+        x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
+        _mem_b, logits_b, _ = m_b.step(x_window, memory_prev, learning_rate=0.05)
+        np.testing.assert_array_equal(logits_a.data, logits_b.data)
+
+    def test_set_value_stays_finite_through_real_backward(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(22),
+            output_dy_sparsity_p=0.5)
+        x_window = np.random.RandomState(23).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        for step in range(5):
+            memory_prev, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.05)
+            loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 3)])
+            loss.grad = np.array(1.0, dtype=np.float32)
+            loss.backward()
+            assert np.isfinite(float(loss.data)), f"step {step}: loss non-finite"
+            assert np.all(np.isfinite(memory_prev)), f"step {step}: memory non-finite"
+
+    def test_does_not_touch_the_5_wide_layers_kwargs(self):
+        # output_dy_sparsity_p must be a strictly separate axis from
+        # input_sparsity_p/dy_sparsity_p -- structural check, not a
+        # runtime-output comparison: this codebase's stochastic-rounding
+        # RNG is a shared/global stream (see
+        # feedback_seed_stochastic_rng_for_comparisons), so changing how
+        # many quantization draws lm_head's backward makes shifts the
+        # RNG state for every LATER draw too, including input_proj's --
+        # expected drift, not something a bit-identical-output assertion
+        # could ever pass. What IS guaranteed: model.dy_sparsity_p (the
+        # 5 wide layers' own gradient-density kwarg) and
+        # model._wide_extra_kwargs (what actually gets splatted into
+        # their forward() calls) stay at their untouched defaults.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(24),
+            output_dy_sparsity_p=0.3)
+        assert model.dy_sparsity_p is None
+        assert model._wide_extra_kwargs == {}
+        assert model._output_extra_kwargs == {"dy_sparsity_p": 0.3}
+
+
 def _build_window(embed_table, tokens, i, num_tiles):
     embed_width = embed_table.shape[1]
     window = np.zeros((num_tiles, embed_width), dtype=np.float32)
