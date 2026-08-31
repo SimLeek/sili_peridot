@@ -543,12 +543,48 @@ class ToyTileRecurrenceRMT:
         existing caller of the 5 affected layers (input_proj/q/k/v/
         o_proj) sees a completely unmodified dense Tensor, same object
         even, matching the plan's own "None = today's exact behavior"
-        requirement."""
+        requirement.
+
+        Root-cause fix (found via sigma_grad_debug_fn probe): CSR.
+        as_tensor() returns a bare leaf Tensor (no _children/_backward),
+        so the old version of this method silently DETACHED x from the
+        graph -- any layer downstream of a _to_sparse call (o_proj, in
+        particular) still updated its OWN weights fine (its dx lands on
+        the CSR tensor's own .grad, which as_tensor's docstring already
+        anticipated being dense), but that gradient never propagated past
+        the CSR tensor, since its _backward was the default no-op. That
+        orphaned everything upstream of any _to_sparse boundary --
+        confirmed directly: log_sigmas.grad was None on every backward
+        call at embed_width=32 (input_sparsity_p set) vs real/nonzero
+        every call at embed_width=16 (input_sparsity_p=None, this method
+        a no-op) -- since centers/log_sigmas only reach the loss via
+        gaussian_attention -> attn_pre_o_{mem,content} -> o_proj, i.e.
+        exclusively through this exact boundary.
+
+        Fix: wire real _children/_backward so gradient flows back to x.
+        Straight-through (the full dense downstream gradient is passed
+        back to x unmasked, not restricted to the k positions this
+        particular top-k call happened to keep) rather than a hard
+        mask-the-gradient-too version -- masking would zero the learning
+        signal for every non-selected position on every step, making the
+        selected/dropped split itself unable to shift over training,
+        which is its own kind of frozen state."""
         if self.input_sparsity_p is None:
             return x
         csr = CSR.from_dense(np.asarray(x.data, dtype=np.float32),
                              self.input_sparsity_p, self.num_cpus)
-        return csr.as_tensor(x.backend)
+        out = Tensor(csr, _children=(x,), _op="to_sparse", backend=x.backend)
+
+        def _bwd():
+            if out.grad is None:
+                return
+            g = np.asarray(out.grad, dtype=np.float32)
+            if x.grad is None:
+                x.grad = x.backend.zeros_like(x.data)
+            x.grad = x.backend.add(x.grad, g)
+
+        out._backward = _bwd
+        return out
 
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float,
                            requires_grad: bool = True, **extra_kwargs) -> Tensor:

@@ -35,7 +35,7 @@ class TestTrainMqarCurriculumPhase7:
         calls = []
 
         def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema,
-                   ranks=None, steps_per_sec=None):
+                   ranks=None, steps_per_sec=None, max_streak=None):
             calls.append((step, event, steps_per_sec))
 
         train_curriculum("fp4", max_steps=25, seed=3, peak_lr=0.015,

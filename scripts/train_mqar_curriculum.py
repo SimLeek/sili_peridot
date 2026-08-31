@@ -340,6 +340,50 @@ def _stage_key(stage: dict) -> tuple:
     return (1, stage["k"]) if stage["phase"] == "k" else (0, stage["vocab"])
 
 
+def _ema_grad_scale(params, ratio_threshold: float, decay: float) -> None:
+    """Per-tensor gradient-norm EMA scaling (direct instruction): purely
+    a function of each tensor's OWN recent gradient-norm history, no step
+    count or wall-clock anywhere in the formula -- required for a
+    lifelong-learning setting where "step N" can't mean anything special.
+
+    Root problem this targets (found via the sigma_grad_debug_fn/
+    probe_sigma_trajectory investigation): input_ln/memory_ln/state_ln/
+    centers/log_sigmas were orphaned by the old _to_sparse autograd bug,
+    so at embed_width=32 they all take their first-ever real gradient
+    step simultaneously once that bug is fixed -- a genuine cold start
+    (their Adam moment estimates have never seen a real value) landing on
+    a group that's structurally prone to hitting q/k/v/attn's hard clip
+    (zero backward gradient past the boundary -- see magnitude_clip_
+    penalty_coef's own docstring for the same failure mode it targets).
+    clip_grad_norm_'s single GLOBAL norm across this whole param group
+    means one exploding tensor (log_sigmas) drowns every other tensor's
+    real update to a near-zero share of the shared budget -- this runs
+    BEFORE that global clip and scales each tensor independently, so an
+    outlier tensor doesn't cannibalize the others' learning signal.
+
+    Each tensor tracks its own `_grad_norm_ema` attribute (state living
+    on the Tensor object itself, updated every call -- not derived from
+    step index). First real gradient for a tensor: no EMA exists yet, so
+    it passes through unscaled and simply seeds the EMA. From the second
+    real gradient onward: if the current raw norm exceeds
+    `ratio_threshold` times that tensor's own EMA, the gradient is scaled
+    down to exactly `ratio_threshold * ema` before anything else touches
+    it; the EMA itself is always updated with the (possibly just-scaled)
+    value, so a suppressed outlier doesn't inflate the reference either.
+    """
+    for p in params:
+        if p.grad is None:
+            continue
+        g = np.asarray(p.grad, dtype=np.float64)
+        g_norm = float(np.linalg.norm(g))
+        ema = getattr(p, "_grad_norm_ema", None)
+        if ema is not None and ema > 0.0 and g_norm > ratio_threshold * ema:
+            cap = ratio_threshold * ema
+            p.grad = (g * (cap / g_norm)).astype(np.float32)
+            g_norm = cap
+        p._grad_norm_ema = g_norm if ema is None else (decay * ema + (1.0 - decay) * g_norm)
+
+
 def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      num_tiles: int, k_max: int, log_every: int = 200,
                      log_fn=None, additive_rank: int = 1,
@@ -355,7 +399,11 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      use_tile_cache: bool = False,
                      output_dy_sparsity_p: Optional[float] = None,
                      wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
-                     query_debug_fn=None) -> dict:
+                     query_debug_fn=None,
+                     sigma_grad_debug_fn=None,
+                     clip_range: float = CLIP_RANGE,
+                     grad_ema_ratio_threshold: Optional[float] = None,
+                     grad_ema_decay: float = 0.9) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
     # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
@@ -413,7 +461,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     model = ToyTileRecurrenceRMT(
         VOCAB, embed_width, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
         MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
-        dense=True, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
+        dense=True, clip_range=clip_range, l1_sparsity_coef=L1_SPARSITY_COEF,
         synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]), scale_rank=1,
         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
         use_critic=use_critic,
@@ -615,6 +663,16 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     if aux is not None:
                         loss = loss + aux
                     loss.backward()
+                if grad_ema_ratio_threshold is not None:
+                    _ema_grad_scale(model.parameters_for_optimizer(),
+                                     grad_ema_ratio_threshold, grad_ema_decay)
+                if sigma_grad_debug_fn is not None:
+                    # Fired BEFORE clip_grad_norm_ -- raw gradient (after
+                    # any per-tensor EMA scaling above, before the shared
+                    # global-norm clip), matching what "is this gradient
+                    # genuinely zero" / "did the EMA scale actually act on
+                    # it" needs to see.
+                    sigma_grad_debug_fn(step, model.log_sigmas.grad, model.centers.grad)
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
                 if dynamic_rank_control:
