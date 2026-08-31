@@ -7511,3 +7511,65 @@ selection algorithm, same math, just faster), so the immediate next
 question is scale (embed_width, lm_head dy_sparsity_p per user's own
 "one-hot" observation) rather than re-running the same comparison.
 Memory updated (project_tile_window_kv_cache.md).
+
+## 2026-08-31 (cont'd) -- output_dy_sparsity_p: sparsifying lm_head's own
+backward gradient didn't just speed things up, it roughly 4x'd peak_vocab
+
+Direct instruction, following the "one-hot" observation two turns
+earlier: `lm_head`/`critic_head` were the only two layers left
+completely untouched by the whole sparsity plan (Phase 6 deliberately
+kept them dense -- see their own docstring). `_backward_with_critic`'s
+`g_logits[row] = (1+advantage) * (probs - onehot)` is technically
+dense (softmax never hits exact 0) but concentrates hard onto a few
+classes as the model gets confident -- exactly the shape
+`dy_sparsity_p`'s top-k selection targets, and this specific gradient
+was never sparsified anywhere in the codebase before.
+
+**Implementation**: new `output_dy_sparsity_p` param on
+`ToyTileRecurrenceRMT.__init__`, a genuinely separate axis from
+`input_sparsity_p`/`dy_sparsity_p` (those never touch lm_head/
+critic_head at all -- confirmed by `test_wide_max_weights_only_
+affects_the_5_layers_not_lm_head`). Only threads `dy_sparsity_p` into
+`lm_head.forward()`/`critic_head.forward()`'s own kwargs -- NOT input
+sparsity, since `pooled` (their forward input) is a real dense
+column-averaged readout with no structural sparsity, unlike the
+gradient side. `None` default verified byte-identical (19/19 model
+tests pass). Exposed via CLI arg 17, same sentinel convention as the
+rest of Phase 6's args.
+
+**Real 20k-step result, same seed (2001), same everything else as the
+just-completed baseline (long_run_baseline_20k.log)**:
+
+| | baseline | output_dy_sparsity_p=0.5 |
+|---|---|---|
+| peak_vocab | 16 | **64** |
+| final_vocab | 8 | **16** |
+| steps/sec avg | 6.6 | **7.9** |
+| wall time | 3032s | **2516s** |
+
+Both axes improved simultaneously: ~17% less wall-clock AND a 4x
+higher peak_vocab (final_vocab=16 alone already matches the baseline's
+own PEAK). Plausible mechanism (not yet directly verified): dense
+backprop was pushing lm_head's many near-zero gradient components
+through the same per-synapse RMSprop update as the real signal every
+step, adding calibration noise to `value_scale`/`output_scale` that
+top-k selection now filters out -- i.e. this isn't just "less compute
+for the same result," the sparsification may be acting as a real
+regularizer on the readout layer specifically.
+
+**Caveat**: single seed. This exact config has shown real oscillation
+before (vocab hopping in the 8-16 band across different runs/seeds),
+but a jump to peak_vocab=64 is well outside that observed noise band,
+so the direction is trusted even though the exact magnitude isn't
+confirmed by a second seed yet.
+
+**Next (direct instruction)**: this clears the user's own bar ("keep
+reaching or exceeding the original peak vocabulary and k value while
+getting speedups") at the original size -- moving to the doubling
+step: `embed_width=32` with `output_dy_sparsity_p=0.5` carried over,
+plus `input_sparsity_p=0.5`/`wide_max_weights=2048` on the 5 wide
+layers (the original Phase 6 plan's own quadrupled-budget default,
+needed to keep the 5 wide layers' compute in check at 2x width instead
+of 4x). One variable (width) changes at a time from here, checking
+whether anything needs retuning at each doubling. Memory updated
+(project_tile_window_kv_cache.md).
