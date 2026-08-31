@@ -354,7 +354,18 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      dy_sparsity_p: Optional[float] = None,
                      use_tile_cache: bool = False,
                      output_dy_sparsity_p: Optional[float] = None,
-                     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD) -> dict:
+                     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
+                     query_debug_fn=None) -> dict:
+    # query_debug_fn (direct instruction, explainable-AI investigation):
+    # optional callback fired at EVERY query step (not just periodic log
+    # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
+    # model.last_debug) -- last_debug already exposes attn_mem/
+    # attn_content/sigmas (task #303's NaN-bisection instrumentation),
+    # letting a caller correlate attention sharpness/pattern with actual
+    # per-query correctness without needing a separate hand-rolled probe
+    # script that risks diverging from this loop's own validated task-
+    # generation/labeling logic. None (default): zero overhead, no
+    # behavior change for existing callers.
     # embed_width/input_sparsity_p/wide_max_weights (sparsity plan Phase
     # 7, task #336): real values threaded straight through to
     # ToyTileRecurrenceRMT's own identically-named constructor args (see
@@ -588,6 +599,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     correct = predicted_token(logits, logit_row) == targets[i]
                     acc_ema = float(correct) if acc_ema is None else (
                         ACC_EMA_DECAY * acc_ema + (1.0 - ACC_EMA_DECAY) * float(correct))
+                    if query_debug_fn is not None:
+                        query_debug_fn(step, correct, logit_row, model.last_debug)
                     queries_since_level_change += 1
                     if correct:
                         streak += 1
