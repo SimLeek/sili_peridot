@@ -255,3 +255,53 @@ class TestStepCached:
         opt.step(model.parameters_for_optimizer(), lr=0.05)
         assert not np.allclose(before, model.input_ln.data), "weights should move after a real backward+opt.step"
         assert np.all(np.isfinite(memory))
+
+
+class TestStepContentDySparsitySchedule:
+    """step()'s content_dy_sparsity_schedule (query-step graded credit
+    design, see conversation/JOURNAL.md) -- None must stay byte-identical
+    to today's exact behavior; a real schedule must run and produce a
+    finite result without changing shapes."""
+
+    def test_none_default_matches_pre_change_behavior(self):
+        model_a = _model()
+        model_b = _model()
+        # separately-constructed models won't share weights, so instead
+        # confirm the SAME model gives identical output whether or not
+        # the new kwarg is explicitly passed as None.
+        window = np.random.RandomState(40).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        _mem_a, logits_a, _aux_a = model_a.step(window, memory, 0.0, requires_grad=False)
+        _mem_b, logits_b, _aux_b = model_a.step(window, memory, 0.0, requires_grad=False,
+                                                 content_dy_sparsity_schedule=None)
+        assert np.array_equal(np.asarray(logits_a.data), np.asarray(logits_b.data))
+
+    def test_graded_schedule_runs_finite_through_real_backward(self):
+        from scripts.train_mqar_curriculum import _default_graded_dy_schedule
+        model = _model()
+        opt = AdamOptimizer()
+        window = np.random.RandomState(41).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        schedule = _default_graded_dy_schedule(NUM_TILES)
+        assert len(schedule) == NUM_TILES
+        memory_new, logits, aux = model.step(window, memory, 0.05, requires_grad=True,
+                                             content_dy_sparsity_schedule=schedule)
+        loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 1)])
+        if aux is not None:
+            loss = loss + aux
+        loss.backward()
+        opt.step(model.parameters_for_optimizer(), lr=0.05)
+        assert logits.data.shape == (NUM_TILES, VOCAB)
+        assert np.all(np.isfinite(memory_new))
+        assert np.all(np.isfinite(logits.data))
+
+    def test_wrong_length_schedule_raises(self):
+        model = _model()
+        window = np.random.RandomState(42).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        try:
+            model.step(window, memory, 0.0, requires_grad=False,
+                      content_dy_sparsity_schedule=[1.0, 0.5])  # wrong length
+            assert False, "expected ValueError for mismatched schedule length"
+        except ValueError:
+            pass

@@ -80,6 +80,21 @@ from scripts.train_mqar_rmt_reference import (
 )
 
 PRECISION_CLS = {"fp4": DISLDOLayer, "fp8": DISLDOLayer8, "fp32": DISLDOLayer32}
+
+
+def _default_graded_dy_schedule(num_tiles: int, floor: float = 0.02) -> list:
+    """Linear decay from 1.0 (newest content position) down to `floor`
+    (oldest) -- length num_tiles, matching content_dy_sparsity_schedule's
+    own oldest-first convention. A real, tunable hyperparameter, not a
+    derived constant -- `floor=0.02` is a starting guess only (see
+    project_dy_sparsity_p_validated_speedup.md's correction: the earlier
+    "~0.02 sweet spot" number came from dense_to_top_k_csr's surprising
+    GLOBAL-not-per-row top-k semantics, so it doesn't directly transfer
+    to this genuinely-per-row schedule -- needs its own real validation,
+    not reused blind)."""
+    if num_tiles <= 1:
+        return [1.0] * num_tiles
+    return [floor + (1.0 - floor) * (i / (num_tiles - 1)) for i in range(num_tiles)]
 NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 # FP8 needs a real (non-infinite) max_abs_delta -- see conversation/
 # sili__new's linear_disldo.hpp fix: FP4's block4 backward computed cw
@@ -515,10 +530,40 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             # engine's DenseInputStack accumulating never-popped entries
             # across every non-query step in the sequence until it hits its
             # cap and throws.
-            if use_tile_cache:
+            #
+            # use_tile_cache query-step handling (direct instruction):
+            # step_cached() alone only credits the NEWEST content position
+            # per backward call (older cached positions are detached, zero
+            # gradient) -- a real, measured stability concern (see
+            # project_tile_window_kv_cache.md). On query steps specifically
+            # (rare, this is where weights actually move), fall back to
+            # step()'s full-window recompute instead, but with a GRADED
+            # per-position dy_sparsity_schedule (denser for the newest
+            # position, sparser further back) rather than either full
+            # uniform density (expensive) or step_cached's zero-credit
+            # default. Non-query steps (the majority) still use
+            # step_cached()'s fast single-position path -- no backward
+            # ever runs on those regardless, so there's no signal being
+            # lost there either way.
+            if use_tile_cache and (i in targets):
+                window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
+                memory, logits, aux = model.step(
+                    window, memory, lr, requires_grad=True,
+                    content_dy_sparsity_schedule=_default_graded_dy_schedule(num_tiles))
+                logit_row = num_tiles - 1
+                # Refresh tile_cache from this step's own freshly-recomputed
+                # k/v (model.last_debug["k"/"v"] are the FULL [total_slots, sw]
+                # pre-pass-2 arrays built at the top of step()) -- drop the
+                # oldest content row (about to age out of the window on the
+                # next call) and keep the rest, same append/trim convention
+                # step_cached() itself uses.
+                k_content = model.last_debug["k"][NUM_MEMORY_SLOTS:]
+                v_content = model.last_debug["v"][NUM_MEMORY_SLOTS:]
+                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy()))
+            elif use_tile_cache:
                 new_embed = embed_table[combined_tokens[i]]
                 memory, logits, aux, tile_cache = model.step_cached(
-                    new_embed, memory, lr, tile_cache, requires_grad=(i in targets))
+                    new_embed, memory, lr, tile_cache, requires_grad=False)
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
