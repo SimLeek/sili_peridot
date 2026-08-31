@@ -7465,3 +7465,49 @@ itself is still real (git stash confirmed literally-identical seeded
 reruns diverge) but is now correctly lower priority: fix run length
 first (2k-20k+ steps, per direct instruction), THEN multi-seed statistics
 matter for whatever's left. Memory updated (project_tile_window_kv_cache.md).
+
+## 2026-08-31 -- real 20k-step run finds the graded-schedule design SLOWER
+than baseline, root-caused and fixed with a real C++ port
+
+Exposed `use_tile_cache` as a CLI arg (was kwarg-only) and ran the real
+comparison the previous entries flagged as needed: baseline
+(`use_tile_cache=0`) vs step_cached+graded-schedule (`use_tile_cache=1`),
+same seed 2001, fp4, 20000 steps each, default config.
+
+**Result: the caching design was SLOWER, not faster.** Baseline: 6.6
+steps/sec avg (3032s total, dropped from ~9.9 as AQRS ranks grew).
+tile_cache+graded: 5.1 steps/sec avg (3949s total). Both arms plateaued
+identically at `peak_vocab=16`, oscillating with `final_vocab=8` --
+20000 steps wasn't enough to break past 16 in either arm (the
+JOURNAL's earlier 60k-step success story used different/smaller AQRS
+rank caps than this run's, which hit the 32-rank ceiling on v_proj/
+o_proj -- not a clean apples-to-apples, so "just needs more steps"
+isn't confirmed OR refuted by this run alone).
+
+**Root cause**: `_graded_top_k_csr` (sili__new/sili/sparse_rnn.py) --
+the per-row top-k selection backing the graded query-step credit
+schedule -- was pure Python/numpy (a per-row `argpartition` loop). It
+runs on every query/backward step, exactly the steps that already pay
+`step()`'s full-window recompute cost, so it added a real per-call tax
+on top instead of the caching design saving anything on those steps.
+
+**Fix (sili__new commit `f99e02d`)**: ported it to a real C++ kernel --
+`top_k_csr_graded` in `csr.hpp` (genuinely per-row top-k, NOT the same
+semantics as `top_k_csr`'s global-k selection), exposed as
+`_cpu.dense_to_graded_top_k_csr`. Verified bit-identical output against
+the old Python loop across 20 random trials before removing it.
+Microbenchmark at the real per-step shape (18 rows x 128 cols): 587us/
+call (Python) vs 79.5us/call (C++), ~7.4x. Full C++ (149 tests, 5
+pre-existing failures unrelated) and Python (10/10 relevant) suites
+clean. Re-ran a 3000-step smoke test post-fix: tile_cache+graded now
+runs at 9.1-9.5 steps/sec, matching baseline's own early-phase rate --
+the regression is resolved.
+
+**Not yet done**: a fresh full-length (20k+) comparison with the FIXED
+C++ code to get real wall-clock AND quality numbers together -- the
+20k numbers above used the old slow Python path. Quality plateau
+(peak_vocab=16) is very unlikely to change from this fix alone (same
+selection algorithm, same math, just faster), so the immediate next
+question is scale (embed_width, lm_head dy_sparsity_p per user's own
+"one-hot" observation) rather than re-running the same comparison.
+Memory updated (project_tile_window_kv_cache.md).
