@@ -453,7 +453,8 @@ class ToyTileRecurrenceRMT:
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
-                                   grace_period_steps: int = 50) -> dict:
+                                   scale_grace_period_steps: int = 50,
+                                   additive_grace_period_steps: int = 5000) -> dict:
         """Runs AQRS Theorem 10 dynamic rank control (task #292, see
         sili__new's delta_csr_types.hpp/DISLDOLayer.apply_dynamic_rank_
         control) on every real disldo_cls weight layer independently --
@@ -467,6 +468,22 @@ class ToyTileRecurrenceRMT:
         not that anything breaks; calling it MORE often than once/step
         has no effect since nothing new has been computed between calls.
 
+        scale_grace_period_steps/additive_grace_period_steps: PER-BRANCH
+        cooldowns (direct instruction, replacing an earlier within-branch
+        grow-vs-shrink asymmetry after a biology literature check -- see
+        sili__new's DISLDOLayer.apply_dynamic_rank_control docstring for
+        the full citations: real dendritic spine formation/elimination
+        rates are roughly comparable within a mechanism, Holtmaat et al.
+        Neuron 2005 / Grutzendler et al. Nature 2002, so each branch now
+        uses ONE symmetric value internally). The real asymmetry is
+        cross-branch: the scale (multiplicative, per-synapse) branch
+        defaults to 50, the additive (whole-layer, homeostatic-like)
+        branch defaults to 5000 (~100x), reflecting the real gap between
+        Hebbian/STDP synaptic timescales (seconds-minutes) and
+        homeostatic synaptic scaling (~24-48h to manifest; Turrigiano
+        and colleagues' activity-blockade experiments; Zenke & Gerstner,
+        Phil. Trans. R. Soc. B, 2017).
+
         Returns {layer_name: mutated_bool} for every real layer -- lets a
         caller log/count real rank-mutation events per layer without
         needing to know the same layer-name tuple again itself.
@@ -475,7 +492,8 @@ class ToyTileRecurrenceRMT:
         for name, layer in self._named_real_layers():
             if hasattr(layer, "apply_dynamic_rank_control"):
                 results[name] = layer.apply_dynamic_rank_control(
-                    tau_death, tau_active, theta, seed_scale, grace_period_steps)
+                    tau_death, tau_active, theta, seed_scale,
+                    scale_grace_period_steps, additive_grace_period_steps)
         return results
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
@@ -849,6 +867,14 @@ class ToyTileRecurrenceRMT:
             "attn_pre_o_mem": attn_pre_o_mem.data, "attn_pre_o_content": attn_pre_o_content.data,
             "attn_mem": attn_mem.data, "attn_content": attn_content.data,
             "sigmas": sigmas.data, "log_sigmas": self.log_sigmas.data,
+            # x_window_t (direct instruction, embedding-learning hook): the
+            # Tensor itself (not just .data) -- when requires_grad=True and
+            # the caller runs loss.backward() after step() returns, this
+            # Tensor's .grad is populated with dL/d(x_window), letting a
+            # caller scatter-update an external embedding table (e.g. an
+            # SDR token embedding built outside this model) without step()
+            # needing to know about tokens/vocab at all.
+            "x_window_t": x_window_t,
         }
 
         if self.l1_sparsity_coef > 0.0:

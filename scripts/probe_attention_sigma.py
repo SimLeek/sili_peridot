@@ -32,7 +32,7 @@ def run_probe(label: str, embed_width: int, input_sparsity_p, wide_max_weights,
               output_dy_sparsity_p, max_steps: int, seed: int = 2001) -> dict:
     records = []
 
-    def query_debug_fn(step, correct, logit_row, last_debug):
+    def query_debug_fn(step, correct, logit_row, last_debug, logit_vec=None, target=None):
         sigmas = last_debug.get("sigmas")
         if sigmas is None:
             return

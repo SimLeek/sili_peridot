@@ -279,11 +279,26 @@ def _check_finite_or_raise(model, logits, step: int, i: int, loss_ema) -> None:
     raise RuntimeError(report)
 
 
-def next_vocab(vocab_size: int) -> int:
+def k_indicator_token(k: int) -> int:
+    """Reuses the real task-vocab token space directly (no dedicated
+    reservation, direct instruction: "you can use the vocab token as the
+    k token") -- token id `k` itself signals k, position in the prefix
+    (2nd slot vs the vocab indicator's 1st) disambiguates it from a
+    genuine in-sequence key/value that happens to share the same id.
+    k is always well within [0, TASK_VOCAB_MAX), so this needs no new
+    tokens and no vocab_size extension."""
+    return k
+
+
+def next_vocab(vocab_size: int, vocab_step: Optional[int] = None) -> int:
+    if vocab_step is not None:
+        return min(TASK_VOCAB_MAX, vocab_size + vocab_step)
     return min(TASK_VOCAB_MAX, int(round(vocab_size * VOCAB_GROWTH_FACTOR)))
 
 
-def prev_vocab(vocab_size: int) -> int:
+def prev_vocab(vocab_size: int, vocab_step: Optional[int] = None) -> int:
+    if vocab_step is not None:
+        return max(VOCAB_START, vocab_size - vocab_step)
     return max(VOCAB_START, int(round(vocab_size / VOCAB_GROWTH_FACTOR)))
 
 
@@ -337,6 +352,15 @@ def _backward_with_critic(model, logits, target_token: int, row: int, aux) -> No
 def _stage_key(stage: dict) -> tuple:
     # total order matching how stages are actually visited: every
     # k-phase stage is harder than every vocab-phase stage.
+    # "kcycle" (k_first_target odometer mode, direct instruction --
+    # "v16k1 v16k2 v16k3 v18k1 v18k2 v18k3 v20k1... like it's an n-ary
+    # number that's incrementing or decrementing"): vocab is the more
+    # significant digit, k the less significant one, so ordering is
+    # plain lexicographic (vocab, k) -- tags its own leading element (2)
+    # so it never compares as equal/lesser against the other two phases'
+    # tags in a mixed context.
+    if stage["phase"] == "kcycle":
+        return (2, stage["vocab"], stage["k"])
     return (1, stage["k"]) if stage["phase"] == "k" else (0, stage["vocab"])
 
 
@@ -389,6 +413,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      log_fn=None, additive_rank: int = 1,
                      dynamic_rank_control: bool = True,
                      rank_grace_period_steps: int = 50,
+                     rank_additive_grace_period_steps: int = 5000,
                      use_critic: bool = False,
                      magnitude_clip_penalty_coef: float = 0.0,
                      recurrent_only_output: bool = False,
@@ -399,11 +424,18 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      use_tile_cache: bool = False,
                      output_dy_sparsity_p: Optional[float] = None,
                      wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
+                     streak_threshold: int = STREAK_THRESHOLD,
+                     vocab_step: Optional[int] = None,
+                     require_new_vocab_before_levelup: bool = False,
                      query_debug_fn=None,
                      sigma_grad_debug_fn=None,
                      clip_range: float = CLIP_RANGE,
                      grad_ema_ratio_threshold: Optional[float] = None,
-                     grad_ema_decay: float = 0.9) -> dict:
+                     grad_ema_decay: float = 0.9,
+                     embed_table_builder=None,
+                     embed_learning_rate: Optional[float] = None,
+                     k_first_target: Optional[int] = None,
+                     k_first_vocab: Optional[int] = None) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
     # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
@@ -446,6 +478,23 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     # Default False (today's exact behavior, zero change for existing
     # callers) until a real curriculum accuracy comparison confirms
     # this reduced signal doesn't cost quality.
+    # k_first_target/k_first_vocab (direct instruction, new curriculum
+    # ordering): reverses the default vocab-then-K phase order to K-then-
+    # vocab. Rationale -- growing vocab first for tens of thousands of
+    # steps means every synapse's "importance" (this project's real
+    # optimizer state, see feedback_importance_is_already_the_optimizer
+    # memory) gets reinforced for K=1-only patterns long before the model
+    # is ever asked to do multi-key discrimination, by which point those
+    # synapses resist the new K>1 feature the same way a CNN that never
+    # saw horizontal lines during training would struggle to grow that
+    # detector later with mostly-set weights. None (default): today's
+    # exact vocab-first behavior, zero change for every existing caller.
+    # k_first_vocab defaults to seq_len_for_k(k_first_target) + 4 (same
+    # "+4 buffer over the minimum" margin VOCAB_START already uses over
+    # seq_len_for_k(1)) if not given explicitly.
+    if k_first_target is not None and k_first_vocab is None:
+        k_first_vocab = seq_len_for_k(k_first_target) + 4
+
     disldo_cls = PRECISION_CLS[precision]
     state_width = embed_width * COLUMN_NEURONS
 
@@ -471,11 +520,46 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         dy_sparsity_p=dy_sparsity_p, output_dy_sparsity_p=output_dy_sparsity_p,
         rng=model_rng)
     opt = AdamOptimizer()
-    embed_table = rng.randn(VOCAB, embed_width).astype(np.float32) * 0.3
+    # embed_table_builder (direct instruction, wide-model SDR redesign):
+    # None (default) preserves today's exact dense-random-projection
+    # embedding, zero change for every existing caller. When set, the
+    # caller controls the embedding's own structure -- returns
+    # (embed_table, active_mask), active_mask a same-shape bool array
+    # marking each token's FIXED sparse-active positions (e.g. a genuine
+    # sparse-distributed-representation table with a fixed k-of-width
+    # active set per token), or None if the embedding has no fixed
+    # sparsity structure to preserve under learning.
+    active_mask = None
+    if embed_table_builder is not None:
+        embed_table, active_mask = embed_table_builder(rng, VOCAB, embed_width)
+    else:
+        embed_table = rng.randn(VOCAB, embed_width).astype(np.float32) * 0.3
 
-    stage_stack = [{"vocab": VOCAB_START, "k": K_START, "phase": "vocab"}]
+    if k_first_target is not None:
+        stage_stack = [{"vocab": k_first_vocab, "k": K_START, "phase": "kcycle"}]
+    else:
+        stage_stack = [{"vocab": VOCAB_START, "k": K_START, "phase": "vocab"}]
     streak = 0
     wrong_streak = 0
+    # new-vocab-forced-sampling (direct instruction): keys are otherwise
+    # drawn uniformly from the whole current key range, so a just-grown
+    # vocab's newest token(s) can go untested for many queries by pure
+    # chance, letting a level-up streak complete on old vocab alone.
+    # new_key_ids = key ids introduced at the most recent vocab level-up
+    # that still need at least 1 real test within every
+    # force_new_vocab_every-query window (see main loop below).
+    new_key_ids: list = []
+    # streak_has_new_vocab (corrected design, direct instruction): gates
+    # the LEVEL-UP itself, not a continuous per-3-queries tax on the whole
+    # level. Tracks whether the CURRENT in-progress streak (the one
+    # building toward streak_threshold) has already included a real test
+    # of the newly-grown vocab. Only forces new vocab onto the query that
+    # would otherwise complete the streak without ever having tested it --
+    # "if (streak_threshold-1)/streak_threshold of a level-up is done and
+    # new vocab hasn't shown up in the correct sequence, force it on THIS
+    # query" -- so a level-up can never fire having never touched the new
+    # material, without repeatedly taxing every re-entry into the level.
+    streak_has_new_vocab = False
     # Diagnostic (direct instruction): LEVEL_UP needs STREAK_THRESHOLD
     # CONSECUTIVE correct queries, not just a high acc_ema -- tracks the
     # best streak actually reached between periodic log points, so a run
@@ -514,11 +598,35 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     def _advance_stage(step):
         nonlocal streak, wrong_streak, stage_step, queries_since_level_change
         nonlocal pending_level_token, peak_key, peak_stage
+        nonlocal new_key_ids, streak_has_new_vocab
         cur = stage_stack[-1]
-        if cur["phase"] == "vocab":
-            nv = next_vocab(cur["vocab"])
-            new_stage = {"vocab": nv, "k": cur["k"],
-                        "phase": "k" if nv >= TASK_VOCAB_MAX else "vocab"}
+        if cur["phase"] == "kcycle":
+            # k_first_target odometer (direct instruction): k is the
+            # least-significant digit, cycling K_START..k_first_target at
+            # a fixed vocab; once it completes a cycle, vocab (the more
+            # significant digit) advances one step and k resets to
+            # K_START -- "v16k1 v16k2 v16k3 v18k1 v18k2 v18k3 v20k1...".
+            # Exception: once vocab is already clamped at TASK_VOCAB_MAX
+            # (next_vocab is a no-op there), wrapping k back to K_START
+            # would spin forever at the top vocab tier without ever
+            # terminating -- so instead k keeps climbing PAST
+            # k_first_target, degenerating into the same "just grow k
+            # forever" terminal behavior the default (vocab-first) run
+            # already has once ITS vocab phase is exhausted.
+            if cur["k"] < k_first_target or cur["vocab"] >= TASK_VOCAB_MAX:
+                new_stage = {"vocab": cur["vocab"], "k": cur["k"] + 1, "phase": "kcycle"}
+                new_key_ids = []
+            else:
+                nv = next_vocab(cur["vocab"], vocab_step)
+                new_stage = {"vocab": nv, "k": K_START, "phase": "kcycle"}
+                new_key_ids = list(range(cur["vocab"] // 2, nv // 2))
+            streak_has_new_vocab = False
+        elif cur["phase"] == "vocab":
+            nv = next_vocab(cur["vocab"], vocab_step)
+            new_phase = "k" if nv >= TASK_VOCAB_MAX else "vocab"
+            new_stage = {"vocab": nv, "k": cur["k"], "phase": new_phase}
+            new_key_ids = list(range(cur["vocab"] // 2, nv // 2))
+            streak_has_new_vocab = False
         else:
             new_stage = {"vocab": cur["vocab"], "k": cur["k"] + 1, "phase": "k"}
         stage_history.append({"step": step, "event": "level_up", "from": cur, "to": new_stage})
@@ -538,6 +646,11 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
 
     def _regress_stage(step):
         nonlocal streak, wrong_streak, stage_step, queries_since_level_change, pending_level_token
+        nonlocal new_key_ids, streak_has_new_vocab
+        # No forcing needed on regression -- we're re-practicing a lower
+        # level whose vocab was already tested on the way up.
+        new_key_ids = []
+        streak_has_new_vocab = False
         if len(stage_stack) <= 1:
             # already at the floor -- nothing to regress to, just reset
             streak = 0
@@ -573,18 +686,54 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
 
         vocab_size, k, phase = _current()
         seq_len = seq_len_for_k(k)
-        tokens, mqar_pairs = generate_mqar_sequence(rng, vocab_size, seq_len, k)
+        # Gate (not tax): only force new vocab onto THIS query if the
+        # in-progress streak is one query away from completing a level-up
+        # and hasn't tested the new vocab yet -- so the level-up can never
+        # fire on old vocab alone, without repeatedly forcing new vocab on
+        # every re-entry into the level (see streak_has_new_vocab comment
+        # above for the full rationale, direct instruction).
+        force_this_step = (require_new_vocab_before_levelup and phase == "vocab"
+                            and len(new_key_ids) > 0
+                            and streak == streak_threshold - 1
+                            and not streak_has_new_vocab)
+        tokens, mqar_pairs = generate_mqar_sequence(
+            rng, vocab_size, seq_len, k,
+            forced_keys=(new_key_ids if force_this_step else None))
+        # Per-query-position new-vocab membership (not a step-wide OR):
+        # each query's own key, so streak_has_new_vocab tracks whether
+        # THIS SPECIFIC query touched the new vocab, not just any query
+        # somewhere in the same step's window.
+        new_vocab_query_positions = (
+            set(pos for pos, _ in mqar_pairs if int(tokens[pos]) in new_key_ids)
+            if new_key_ids else set())
         targets = _build_targets(tokens, mqar_pairs, k)
         query_positions = set(pos for pos, _ in mqar_pairs)
 
-        offset = 1 if pending_level_token is not None else 0
-        if offset:
-            combined_tokens = np.concatenate(([pending_level_token], tokens))
+        # Persistent level-indicator prefix (direct instruction): every
+        # sequence gets an explicit signal of (current vocab, current k),
+        # not just the one-shot LEVEL_UP_TOKEN/LEVEL_DOWN_TOKEN on the
+        # single sequence right after a transition -- otherwise the model
+        # has to re-detect both from raw content (counting distinct
+        # key-value pairs, inferring vocab range) on every other sequence
+        # with zero hint. Two tokens, no spaces:
+        #   [vocab indicator, k indicator]
+        # BOTH indicators reuse the real task-vocab token space directly
+        # (no new dedicated tokens, no vocab_size extension) -- direct
+        # instruction, "you can use the vocab token as the k token".
+        # vocab indicator = the newest/highest currently-unlocked token
+        # (vocab_size-1); k indicator = token id k itself (k_indicator_
+        # token, trivial passthrough -- see its own docstring). Position
+        # alone (1st vs 2nd prefix slot) disambiguates either from the
+        # same token ID appearing later as a genuine in-sequence value.
+        level_prefix = [vocab_size - 1, k_indicator_token(k)]
+        if pending_level_token is not None:
+            level_prefix = [pending_level_token] + level_prefix
             pending_level_token = None
-        else:
-            combined_tokens = tokens
+        offset = len(level_prefix)
+        combined_tokens = np.concatenate((level_prefix, tokens))
         targets = {pos + offset: tgt for pos, tgt in targets.items()}
         query_positions = set(pos + offset for pos in query_positions)
+        new_vocab_query_positions = set(pos + offset for pos in new_vocab_query_positions)
 
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         tile_cache = None  # reset every sequence, same as memory
@@ -648,8 +797,16 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     acc_ema = float(correct) if acc_ema is None else (
                         ACC_EMA_DECAY * acc_ema + (1.0 - ACC_EMA_DECAY) * float(correct))
                     if query_debug_fn is not None:
-                        query_debug_fn(step, correct, logit_row, model.last_debug)
+                        # logits.data[logit_row]/targets[i] added (direct
+                        # instruction): lets a caller compute real
+                        # confidence/hedging signals (target-token
+                        # probability, entropy) itself instead of only
+                        # seeing the binary correct/incorrect outcome.
+                        query_debug_fn(step, correct, logit_row, model.last_debug,
+                                       logits.data[logit_row], targets[i])
                     queries_since_level_change += 1
+                    if i in new_vocab_query_positions:
+                        streak_has_new_vocab = True
                     if correct:
                         streak += 1
                         wrong_streak = 0
@@ -657,12 +814,39 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     else:
                         wrong_streak += 1
                         streak = 0
+                        streak_has_new_vocab = False
                 if use_critic:
                     _backward_with_critic(model, logits, targets[i], logit_row, aux)
                 else:
                     if aux is not None:
                         loss = loss + aux
                     loss.backward()
+                # embed_learning_rate (direct instruction, "add learning
+                # too" on top of the fixed SDR structure): last_debug's
+                # x_window_t Tensor is a leaf of THIS step's backward
+                # graph, so its .grad (populated by the backward() call
+                # just above) is dL/d(x_window) -- a plain scatter-add
+                # embedding-lookup gradient, exactly like a real embedding
+                # layer's backward. Only wired for the non-tile-cache
+                # step() path (use_tile_cache's step_cached() builds its
+                # window differently -- see its own docstring -- and isn't
+                # covered here). active_mask (when set) restricts the
+                # update to each token's fixed active positions, so
+                # learning adjusts MAGNITUDES at the SDR's chosen indices
+                # without ever growing new nonzero positions outside it.
+                if embed_learning_rate is not None and not use_tile_cache:
+                    x_grad = model.last_debug.get("x_window_t")
+                    x_grad = x_grad.grad if x_grad is not None else None
+                    if x_grad is not None:
+                        for j in range(num_tiles):
+                            src = i - (num_tiles - 1) + j
+                            if src < 0:
+                                continue
+                            tok = combined_tokens[src]
+                            g = x_grad[j]
+                            if active_mask is not None:
+                                g = g * active_mask[tok]
+                            embed_table[tok] -= embed_learning_rate * g
                 if grad_ema_ratio_threshold is not None:
                     _ema_grad_scale(model.parameters_for_optimizer(),
                                      grad_ema_ratio_threshold, grad_ema_decay)
@@ -676,7 +860,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
                 if dynamic_rank_control:
-                    mutated = model.apply_dynamic_rank_control(grace_period_steps=rank_grace_period_steps)
+                    mutated = model.apply_dynamic_rank_control(
+                        scale_grace_period_steps=rank_grace_period_steps,
+                        additive_grace_period_steps=rank_additive_grace_period_steps)
                     rank_mutation_count += sum(1 for m in mutated.values() if m)
                     # AQRS channel-diversity pass (task #295 follow-up,
                     # chosen over residual-targeted growth -- direct
@@ -701,10 +887,20 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     # past 4 let it overflow in a real curriculum run).
                     model.apply_scale_overflow_guard()
 
-        if streak >= STREAK_THRESHOLD:
+        if streak >= streak_threshold:
             _advance_stage(step)
-            _, k_now, phase_now = _current()
-            if phase_now == "k" and k_now > k_max:
+            vocab_now, k_now, phase_now = _current()
+            # k_first_target (odometer) run: graduation mirrors the
+            # default run's own terminal condition ("vocab already
+            # maxed out AND k has grown past its own cap") -- here that's
+            # vocab clamped at TASK_VOCAB_MAX (_advance_stage's own wrap
+            # guard degenerates into pure k-growth once that happens) and
+            # k having grown past k_first_target on top of that.
+            graduated_now = ((phase_now == "kcycle" and vocab_now >= TASK_VOCAB_MAX
+                             and k_now > k_first_target)
+                             if k_first_target is not None
+                             else (phase_now == "k" and k_now > k_max))
+            if graduated_now:
                 # _advance_stage already logged ranks for this exact step
                 ranks = model.report_ranks() if dynamic_rank_control else None
                 if log_fn is not None:
@@ -730,7 +926,11 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         "peak_rss_mb": peak_rss_mb,
         "precision": precision, "final_vocab": final_vocab, "final_k": final_k,
         "final_phase": final_phase, "peak_stage": peak_stage,
-        "graduated": final_phase == "k" and final_k > k_max, "total_steps": step,
+        "graduated": ((final_phase == "kcycle" and final_vocab >= TASK_VOCAB_MAX
+                       and final_k > k_first_target)
+                      if k_first_target is not None
+                      else (final_phase == "k" and final_k > k_max)),
+        "total_steps": step,
         "elapsed_s": elapsed_s, "stage_history": stage_history,
         "dynamic_rank_control": dynamic_rank_control,
         "rank_mutation_count": rank_mutation_count,
