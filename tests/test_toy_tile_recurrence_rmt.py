@@ -8,6 +8,7 @@ import numpy as np
 from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
 from model.toy_recall_models import cross_entropy_sum, AdamOptimizer
 from sili.sparse_rnn import DISLDOLayer
+from sili.tensor import Tensor
 
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
@@ -480,6 +481,108 @@ class TestDySurprise:
         # hasn't run backward yet).
         memory_prev, logits2, _aux2 = model.step(x_window, memory_prev, learning_rate=0.05)
         assert model._layer_surprise["q_proj"] == snapshot
+
+
+class TestXRTarget:
+    """Task #365: nucleus/energy-threshold INPUT-side selection via
+    x_r_target -- structurally mirrors TestDyRTarget above (same
+    per-layer dict, same TAKES-PRIORITY-over-fixed-fraction convention,
+    same apply_amortized_x_r_target_control outer loop), just wired
+    into _to_sparse instead of dy sparsification. See __init__'s own
+    x_r_target docstring for the full design rationale (no separate
+    derived signal, stays on the simple speed-target control)."""
+
+    def test_none_default_bit_identical(self):
+        rng_seed = 50
+        m_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed))
+        m_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed),
+                                   x_r_target=None)
+        x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
+        _mem_b, logits_b, _ = m_b.step(x_window, memory_prev, learning_rate=0.05)
+        np.testing.assert_array_equal(logits_a.data, logits_b.data)
+        assert all(v is None for v in m_a.x_r_target.values())
+
+    def test_takes_priority_over_input_sparsity_p(self):
+        # Structural check only, same rationale as
+        # TestOutputDySparsityP.test_does_not_touch_the_5_wide_layers_
+        # kwargs above -- x_r_target enabled means the CSR going into
+        # each wide layer's forward is nucleus-selected, not a fixed
+        # fraction; confirmed by checking the actual selection uses
+        # _nucleus_top_k_csr's own R>=r_target invariant on real data,
+        # not by comparing against the fixed-fraction output (which
+        # would be a different, unrelated set of kept indices).
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(51),
+            input_sparsity_p=0.5, x_r_target=0.7, x_k_min=1)
+        x = Tensor(np.random.RandomState(52).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32))
+        out = model._to_sparse(x, "input_proj")
+        assert out.data.__class__.__name__ == "CSR"
+        # Real R(v,k) >= r_target check on the actual kept entries,
+        # independently re-derived (not trusting the wrapper's own math).
+        x_np = np.asarray(x.data, dtype=np.float32)
+        csr = out.data
+        for row in range(csr.rows):
+            start, end = csr.ptrs[row], csr.ptrs[row + 1]
+            kept_sq = float(np.sum(csr.values[start:end].astype(np.float64) ** 2))
+            total_sq = float(np.sum(x_np[row].astype(np.float64) ** 2))
+            if total_sq > 0:
+                assert kept_sq / total_sq >= 0.7 - 1e-6
+
+    def test_set_value_stays_finite_through_real_backward(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(53),
+            x_r_target=0.6, x_k_min=1)
+        x_window = np.random.RandomState(54).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        for step in range(5):
+            memory_prev, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.05)
+            loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 3)])
+            loss.grad = np.array(1.0, dtype=np.float32)
+            loss.backward()
+            assert np.isfinite(float(loss.data)), f"step {step}: loss non-finite"
+            assert np.all(np.isfinite(memory_prev)), f"step {step}: memory non-finite"
+
+    def test_controller_shrinks_r_target_when_too_slow(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(55),
+            x_r_target=0.7)
+        updated = model.apply_amortized_x_r_target_control(measured_sps=1.0, target_sps=10.0)
+        assert set(updated) == set(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
+        assert updated["q_proj"] < 0.7
+        assert model.x_r_target == updated
+
+    def test_controller_can_target_a_single_layer(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(56),
+            x_r_target=0.7)
+        updated = model.apply_amortized_x_r_target_control(
+            measured_sps=1.0, target_sps=10.0, layer_name="q_proj")
+        assert set(updated) == {"q_proj"}
+        assert model.x_r_target["q_proj"] < 0.7
+        for name in ("input_proj", "k_proj", "v_proj", "o_proj"):
+            assert model.x_r_target[name] == 0.7
+
+    def test_independent_from_dy_r_target(self):
+        # x_r_target and dy_r_target are genuinely separate axes (input
+        # vs grad) -- setting one must not touch the other's state.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(57),
+            x_r_target=0.7, dy_r_target=0.3)
+        assert model.x_r_target["q_proj"] == 0.7
+        assert model.dy_r_target["q_proj"] == 0.3
+        model.apply_amortized_x_r_target_control(measured_sps=1.0, target_sps=100.0)
+        assert model.dy_r_target["q_proj"] == 0.3  # untouched
+        model.apply_amortized_dy_r_target_control(measured_sps=100.0, target_sps=1.0)
+        assert model.x_r_target["q_proj"] != 0.7  # already shrank above, untouched by this call
 
 
 def _build_window(embed_table, tokens, i, num_tiles):
