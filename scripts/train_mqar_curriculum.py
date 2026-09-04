@@ -53,6 +53,23 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     input_sparsity_p to cut backward's real per-call cost (profiled as
     the dominant cost driver, not snapshot/merge overhead) at whatever
     quality tradeoff that implies.
+  [use_tile_cache] [output_dy_sparsity_p] [wrong_streak_threshold]
+  [dy_r_target] [dy_k_min] [dy_k_max] [target_steps_per_sec]
+  dy_r_target: nucleus/energy-threshold captured-energy-ratio target
+    (0..1) for those same 5 layers' backward gradient (task #367) --
+    TAKES PRIORITY over dy_sparsity_p when both are set. k is a
+    CONSEQUENCE of dy_r_target and each step's actual gradient energy,
+    not a fixed fraction. -1 (default) = unset. See JOURNAL.md's
+    "nucleus/energy-threshold top-k math" design note.
+  dy_k_min/dy_k_max: hardware density floor/ceiling clamping the
+    dy_r_target-derived k afterward. dy_k_min default 0 (no floor);
+    dy_k_max -1 (default) = no ceiling.
+  target_steps_per_sec: ARMS the closed-loop controller that adjusts
+    dy_r_target every log_every steps against MEASURED steps/sec (task
+    #368) -- NOT an analytic formula from an assumed compute-cost ratio
+    (measured directly and found non-constant across widths, see
+    JOURNAL.md's "Grad-side k_t design, revised" entry). -1 (default) =
+    unset, dy_r_target stays fixed at its initial value for the whole run.
 """
 from __future__ import annotations
 
@@ -454,7 +471,11 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      k_first_target: Optional[int] = None,
                      k_first_vocab: Optional[int] = None,
                      l2_decay_chunk_size: Optional[int] = None,
-                     l2_decay_adaptation_rate: float = 0.3) -> dict:
+                     l2_decay_adaptation_rate: float = 0.3,
+                     dy_r_target: Optional[float] = None,
+                     dy_k_min: int = 0,
+                     dy_k_max: Optional[int] = None,
+                     target_steps_per_sec: Optional[float] = None) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
     # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
@@ -537,6 +558,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         recurrent_only_output=recurrent_only_output,
         input_sparsity_p=input_sparsity_p, wide_max_weights=wide_max_weights,
         dy_sparsity_p=dy_sparsity_p, output_dy_sparsity_p=output_dy_sparsity_p,
+        dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
         rng=model_rng)
     opt = AdamOptimizer()
     # embed_table_builder (direct instruction, wide-model SDR redesign):
@@ -942,9 +964,18 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         if step % log_every == 0:
             ranks = _log_ranks(step)
             steps_per_sec = step / (time.time() - t0)
+            # dy_r_target closed-loop control (task #368): only fires
+            # when dy_r_target was actually enabled (apply_amortized_dy_
+            # r_target_control is itself a no-op otherwise, matching
+            # apply_amortized_l2_decay's own "safe to always call"
+            # convention). Reuses this loop's own cumulative steps_per_sec
+            # measurement rather than a separate windowed timer.
+            if target_steps_per_sec is not None:
+                model.apply_amortized_dy_r_target_control(steps_per_sec, target_steps_per_sec)
             if log_fn is not None:
                 log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks,
-                      steps_per_sec=steps_per_sec, max_streak=max_streak_seen)
+                      steps_per_sec=steps_per_sec, max_streak=max_streak_seen,
+                      dy_r_target=model.dy_r_target)
             max_streak_seen = 0
 
     elapsed_s = time.time() - t0
@@ -1055,6 +1086,24 @@ def main():
     _wrong_streak_threshold_arg = int(sys.argv[18]) if len(sys.argv) > 18 else -1
     wrong_streak_threshold = (_wrong_streak_threshold_arg if _wrong_streak_threshold_arg >= 0
                               else WRONG_STREAK_THRESHOLD)
+    # dy_r_target/dy_k_min/dy_k_max/target_steps_per_sec (task #367/#368,
+    # nucleus/energy-threshold grad sparsification -- see JOURNAL.md's
+    # "nucleus/energy-threshold top-k math" + "Grad-side k_t design,
+    # revised" entries): same -1/"unset" sentinel convention as every
+    # other sparsity arg above. dy_r_target takes priority over
+    # dy_sparsity_p at the model level when both are set. dy_k_min/
+    # dy_k_max default to 0/unset (no clamp). target_steps_per_sec is
+    # what actually ARMS the closed-loop controller each log_every
+    # window -- dy_r_target alone just sets the (then-fixed) initial
+    # value; leaving target_steps_per_sec at -1 keeps dy_r_target static
+    # for the whole run instead of adapting.
+    _dy_r_target_arg = float(sys.argv[19]) if len(sys.argv) > 19 else -1.0
+    dy_r_target = _dy_r_target_arg if _dy_r_target_arg >= 0 else None
+    dy_k_min = int(sys.argv[20]) if len(sys.argv) > 20 else 0
+    _dy_k_max_arg = int(sys.argv[21]) if len(sys.argv) > 21 else -1
+    dy_k_max = _dy_k_max_arg if _dy_k_max_arg >= 0 else None
+    _target_sps_arg = float(sys.argv[22]) if len(sys.argv) > 22 else -1.0
+    target_steps_per_sec = _target_sps_arg if _target_sps_arg >= 0 else None
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
@@ -1063,7 +1112,9 @@ def main():
           f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
           f"dy_sparsity_p={dy_sparsity_p} use_tile_cache={use_tile_cache} "
           f"output_dy_sparsity_p={output_dy_sparsity_p} "
-          f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold}",
+          f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
+          f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
+          f"target_steps_per_sec={target_steps_per_sec}",
           flush=True)
 
     _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
@@ -1076,14 +1127,18 @@ def main():
         return "  ranks[" + " ".join(parts) + "]"
 
     def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None, steps_per_sec=None,
-               max_streak=None):
+               max_streak=None, dy_r_target=None):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
+        # dy_r_target (task #368): only printed once the mechanism is
+        # actually enabled -- None (default) stays silent, same
+        # opt-in-visible convention as sps_s/streak_s above.
+        dy_r_s = f"  dy_r_target={dy_r_target:.4f}" if dy_r_target is not None else ""
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{_ranks_str(ranks)}", flush=True)
+              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{_ranks_str(ranks)}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
@@ -1093,7 +1148,9 @@ def main():
                          wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p,
                          use_tile_cache=use_tile_cache,
                          output_dy_sparsity_p=output_dy_sparsity_p,
-                         wrong_streak_threshold=wrong_streak_threshold)
+                         wrong_streak_threshold=wrong_streak_threshold,
+                         dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
+                         target_steps_per_sec=target_steps_per_sec)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "
           f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
