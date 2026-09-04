@@ -7798,3 +7798,66 @@ mechanism on the GRAD side (already built) change this INPUT-side
 picture at all if run together, or is input-side nucleus wiring
 (#365/#366, still not built) needed to actually fix this specific
 late-run relapse.
+
+## Follow-up run result: the "late-run relapse" did NOT reproduce --
+## it was noise, not a config property (real finding, changes the
+## whole interpretation above)
+
+Ran arm A (exact rerun of arm F -- same seed=1, same config) and arm B
+(same input_sparsity_p=0.10 but dy_r_target=0.7 replacing
+dy_sparsity_p=1.0, dy_k_min=1, target_steps_per_sec=0.6) back to back,
+3000 steps each.
+
+**Arm A (rerun)**: did NOT relapse. Final loss=2.4827, acc=0.1928 at
+step 3000 -- compare arm F original's final loss=4.1562/acc=0.1178.
+FIVE real LEVEL_UPs across the run (steps 456, 804, 941, 1504, 2473,
+the last one right near the end) vs arm F's original ONE (step 675).
+Same seed, same code, same config -- genuinely different trajectory.
+This directly confirms the [[project_backward_sparse_threading_
+nondeterminism]] finding matters in practice, not just in an isolated
+unit test: it changes which SEQUENCE of curriculum stage transitions a
+run takes, which compounds into a materially different outcome by
+step 3000. **The "late-run relapse" documented above was this specific
+run's own noise, not a reproducible property of 10% input density at
+this width.** Retract the "10% input density is not yet confirmed
+stable" framing above -- the correct framing is "single-seed runs at
+this config are not reproducible at all, stable or not, because of the
+underlying engine nondeterminism," which is a stronger and more
+important caveat.
+
+**Arm B (dy_r_target)**: also did NOT relapse (final loss=2.7925,
+acc=0.1615, 4 LEVEL_UPs). But this run does NOT cleanly test "does
+grad-side nucleus sparsification help/hurt" either: `target_steps_per_
+sec=0.6` was calibrated off arm F's own FINAL sps (0.644), but arm B
+started at sps=1.27 (faster architecture/config interaction) and never
+dropped below ~0.94 the whole run -- so the controller only ever saw
+"faster than target" and grew dy_r_target monotonically from 0.70 to
+its 0.99 ceiling by step ~1400, then sat there for the remaining
+1600+ steps. That's functionally close to dense grad for most of the
+run, not a real sparsity test. Miscalibration, not a mechanism
+failure -- the controller's own direction logic worked exactly as
+designed (grow when comfortably faster than target), it just never got
+asked to shrink.
+
+**Honest bottom line**: this run pair does NOT answer "does dy_r_target
+fix arm F's relapse" (the relapse itself didn't reproduce, so there's
+nothing to fix in this comparison) and does NOT yet demonstrate a real
+compute-savings test for dy_r_target (it stayed near-dense almost the
+whole run). What it DOES establish, solidly: (1) single-seed runs on
+this whole ablation series (arms A-G, all of them, back to the start
+of this session) cannot be trusted to reflect a stable property of
+their config -- the threading nondeterminism is large enough to flip a
+"collapse" into "healthy" on an identical rerun; (2) the closed-loop
+dy_r_target controller mechanically works as designed (confirmed via
+its own visible 0.70->0.99 trajectory); (3) target_steps_per_sec needs
+calibrating against the ACTUAL arm's own early-run sps, not a
+different arm's final sps, before it can be trusted to test a genuine
+sparse steady state.
+
+**Not yet done**: a properly-calibrated dy_r_target run (lower
+target_steps_per_sec, or a lower initial dy_r_target with a HIGHER
+target so it's forced to shrink and stay sparse) to actually exercise
+the mechanism's compute-saving side; a multi-seed re-run of the base
+arm-F config to establish whether ANY reproducible signal exists in
+this comparison at all, before spending more compute chasing single-
+run differences.
