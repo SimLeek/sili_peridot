@@ -7861,3 +7861,106 @@ the mechanism's compute-saving side; a multi-seed re-run of the base
 arm-F config to establish whether ANY reproducible signal exists in
 this comparison at all, before spending more compute chasing single-
 run differences.
+
+## dy_r_target speed-target sweep: found the practical ceiling for this
+## config, confirms the design instinct that grad alone can't go past it
+
+Single-seed (seed=1) exploratory sweep, 4 arms, `target_steps_per_sec`
+in {3.0, 5.0, 7.0, 10.0}, `dy_r_target` starting at 0.3, `dy_k_min=1`,
+`log_every=100` (tighter than the default 200 so each arm has more
+correction windows to actually settle within 3000 steps), same
+input_sparsity_p=0.10/embed_width=48 config as arm F/A/B.
+
+| target | settled dy_r_target | achieved sps | final loss/acc | elapsed |
+|---|---|---|---|---|
+| 3.0 | oscillates 0.19-0.36, never hits floor | 2.986 | 2.27/0.23 | 1005s |
+| 5.0 | hits r_min=0.05 by step ~1100, stays | 4.974 | 3.27/0.17 | 603s |
+| 7.0 | hits r_min=0.05 by step ~1100, stays | 4.391 | 2.50/0.33 | 683s |
+| 10.0 | hits r_min=0.05 by step ~1200, stays | 4.811 | 2.41/0.26 | 624s |
+
+3.0 and 5.0 both landed almost exactly on target (proves the controller
+tracks well when the target is achievable). 7.0 and 10.0 both hit
+`r_min` and plateaued in the 4.4-4.8 sps band regardless of how much
+higher the target was set -- confirms there's a real ceiling around
+~5 sps for THIS config that grad-side sparsification alone can't push
+past, no matter how aggressively `dy_r_target` shrinks. Direct
+instruction anticipated this ("It's fine if it can't reach the steps
+per second, this is mostly just testing") -- not a failure, a genuine
+measurement of where the ceiling sits.
+
+**Root-cause discussion (not yet cleanly measured)**: a same-turn quick
+diagnostic (isolated timing of dense-vs-sparse configs) was run WHILE
+this sweep was still active in the background -- direct instruction
+caught this: running a second num_cpus=4 process alongside an already-
+running num_cpus=4 arm oversubscribes this machine's 4-core/8-thread
+CPU, and the resulting timing numbers (std deviations up to 20ms on a
+~26ms mean) were noise, not signal -- retracted rather than reported as
+real. Real architectural point that DOES hold, independent of that
+botched diagnostic: `DISLDOLayerV` (fp32) has no block4 dense-tile SIMD
+path (see project_sili_block4_dense_loader/task #350, still open) --
+its "dense" path is a plain per-synapse loop, not the SIMD-accelerated
+block4 storage fp4/fp8 get. Combined with this project's own earlier-
+established finding that the scattered/CSR sparse path is gather/
+scatter-bound, not compute-bound, the ~5 sps ceiling plausibly reflects
+selection-sort + scattered-update overhead that doesn't shrink much as
+`dy_r_target` drops further, rather than "input forward cost alone" --
+but this needs a clean (uncontended, single-process) profiling pass to
+actually confirm, not the botched concurrent one.
+
+## Multi-actuator design discussion (input + grad together): revised
+## from "priority order" to "per-layer, signal-driven, no shared knob"
+
+Direct instruction walked through several real corrections to an
+initial design sketch for running `dy_r_target` and a (not-yet-built)
+input-side `x_r_target` together without them fighting each other:
+
+1. **Not a fixed priority order** ("grad first, input as overflow") --
+   too simple. Whether input or grad should be denser depends on the
+   actual situation: complex-but-understood input -> input stays dense,
+   grad can be sparse (little new to learn); simple-but-surprising
+   input -> input can be sparse, grad should be dense (a lot to learn
+   from this specific outcome). The unifying variable grad should track
+   is reproduction/prediction error (surprise), not a shared speed
+   readout alone.
+2. **Grad's r_target should be driven by measured surprise** -- this is
+   exactly the deferred inner E_t/Lbar loop from the original nucleus
+   design note above, now unblocked: use LAST step's `||dy||^2` (or
+   loss, or the critic's predicted error if `use_critic` is on) to set
+   THIS step's `dy_r_target` -- a one-step lag resolves the chicken-
+   and-egg timing problem (dy_r_target is consumed at forward()-call
+   time, before that step's own dy exists) without needing an autograd
+   hook or C++ instrumentation.
+3. **No equivalent derived signal for input, and that's fine** -- a
+   "how well-understood/how compressible" signal for input was
+   speculative and unproven; direct instruction: don't build unproven
+   complexity, keep input's r_target on the same simple closed-loop-
+   against-measured-speed + direct-reproduction-target control
+   `dy_r_target`'s outer loop already uses. Reconstruction-error as an
+   input signal would make sense in an AUTOENCODER-style system (where
+   reconstruction fidelity IS the objective) -- this project's current
+   solver/curriculum task has no such objective, so there's no natural
+   home for that signal here. Filed away, not built.
+4. **Must be PER-LAYER, not per-model** -- different layers have
+   different sparsify cost/benefit (directly following from tonight's
+   own finding that the fwd/bwd cost ratio scales with width, 2.8x at
+   n=48 to 12x at n=384). `E_t` is already naturally per-layer (each
+   layer's own `_bwd()` closure has its own `dy`) -- making grad's
+   r_target per-layer costs nothing extra, it's a MORE natural fit than
+   the model-level scalar built tonight, not an added complexity.
+5. **Per-layer real timing is cheap, not a blocker** -- direct
+   correction: don't build a width-based cost PROXY, just wrap each
+   layer's own forward+backward with `t0=time.perf_counter()`/`t1=...`
+   directly. Layers cost single-digit-to-tens of ms; timer call
+   overhead is ~100ns; real per-layer timing is easier than a proxy
+   would have been, not harder.
+
+**Not yet built**: per-layer `dy_r_target`/state dict (mirroring
+`_l2_decay_factor`'s existing pattern), per-layer lagged `E_t`/`Lbar`
+capture-and-use, real per-layer timing instrumentation (today's
+`_DIAG_TIMING` is a flat cross-layer accumulator, not keyed by layer),
+input-side nucleus wiring (task #365, still doesn't exist at all), and
+the cross-layer budget allocator tying speed-target + per-layer cost +
+per-layer surprise together. Scoped first slice under discussion:
+per-layer grad r_target with the lagged energy signal alone, model
+stays on a single shared speed target for now, input-side and the
+cross-layer allocator deferred until that's validated.
