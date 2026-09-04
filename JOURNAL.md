@@ -7573,3 +7573,183 @@ needed to keep the 5 wide layers' compute in check at 2x width instead
 of 4x). One variable (width) changes at a time from here, checking
 whether anything needs retuning at each doubling. Memory updated
 (project_tile_window_kv_cache.md).
+
+## Design note (not yet implemented): nucleus/energy-threshold top-k math
+
+Recorded here because it previously existed only in chat, not in any
+file. Ablation this session (arms D/E/F/G, wide=48, hard-bound-only)
+cleanly separated `input_sparsity_p` from `dy_sparsity_p` for the
+first time: input-only top-k at 10% collapsed training from scratch
+(loss pinned at ln(vocab)~=4.85, acc~=0), grad-only top-k at 10% was
+healthy (real learning, no collapse) -- so a fixed-fraction top-k is
+too blunt for the input side, but the same math shouldn't need
+retuning by hand every time width/scale changes. NOTE: arm D/E/F's
+`input_sparsity_p=0.10` numbers are now suspect for an unrelated
+reason -- see the `dense_to_top_k_csr` global-vs-per-row entries above
+(b0d0fe2) -- so "10% input alone collapses" may be partly/wholly an
+artifact of that bug rather than a pure density effect. Not yet
+re-run with the per-row-corrected kernel to separate the two.
+
+**Captured-energy ratio.** For a vector `v` and a kept-set of size `k`
+(the top-k by |v_i|):
+
+    R(v, k) = ||v_topk||^2 / ||v||^2
+
+This is exact and provably checkable (sort |v_i| descending, cumsum of
+squares, divide by total sum of squares -- no approximation). Same
+math as Eckart-Young truncated-SVD captured-variance; structurally the
+same operation as LLM nucleus/top-p sampling, but applied to squared
+magnitude instead of softmax probability.
+
+**Nucleus top-k rule (replaces a fixed k or fixed p).** Fix a target
+`R_target` (e.g. 0.95 = "keep enough to retain 95% of the energy").
+Per call: sort |v_i| descending, cumsum of squares, take the smallest
+k such that `cumsum_k / total >= R_target`. k is now a *consequence*
+of R_target and the actual data that call, not a hand-set constant --
+a peaked vector needs few components, a flat one needs many, and this
+falls out of the same formula automatically.
+
+**Grad-side adaptive k_t (uses steps/sec, not just R_target).** dy is
+reported ~10x more expensive than x per the user's own recollection
+(NOT yet independently verified against this codebase's real profiled
+cost -- flag before trusting the 10x number for a real budget calc).
+Free byproducts of computing dy anyway:
+
+    E_t = ||dy_t||^2                              # this step's grad energy
+    Lbar <- beta*Lbar + (1-beta)*E_t               # O(1) running EMA, beta ~ 0.99
+    k_t = clip( kbar * (E_t / Lbar)^alpha, k_min, width )
+
+`kbar` is the *average* k that hits a target steps/sec given the
+measured/assumed backward:forward cost ratio -- i.e. kbar is derived
+from the compute budget, not guessed, and k_t breathes above/below
+kbar per-step based on whether this step's gradient carries more or
+less energy than the running average (high-loss/high-energy steps get
+more of the budget). `alpha` is a gain (like the L2-decay
+`adaptation_rate`), not an equilibrium-setter.
+
+**Relationship to L1 sparsity (mechanistically separate, confirmed by
+existing behavior).** `L1_SPARSITY_COEF` (already active by default,
+`_l1_sparsity_split` in train_mqar_rmt_reference.py) has its own
+LASSO-style equilibrium: a component survives iff the task-loss
+gradient magnitude at zero exceeds the L1 coefficient. This does NOT
+set or converge to any particular R_target/density -- L1 just makes
+top-k truncation less lossy at whatever R_target is already fixed
+(fewer components fight for survival, so the ones that do carry more
+of the energy). The two mechanisms compose; neither substitutes for
+the other. `R_target` itself is a free knob, not something L1
+determines -- open question (not yet tested) is whether R_target
+should itself be trained/pushed by a meta-signal or stay a fixed
+target picked by the same measured-statistics logic the L2-decay
+mechanism already uses (target derived from fan-in, not guessed).
+
+**Status update (sili__new side landed).** `top_k_csr_nucleus` (csr.hpp)
++ `dense_to_nucleus_top_k_csr` pybind binding built and TDD-tested
+(`test_top_k_csr_nucleus.cpp`, R>=R_target + minimality + per-row-
+independence + edge cases, all passing). Fused into ONE sort per row
+(sort once, walk cumulative-sum-of-squares to find k, take that
+prefix -- deliberately NOT split into "compute k from R" + "call the
+existing per-row top-k" as two separate calls, which would re-sort
+the same row twice; same rationale as why `_graded_top_k_csr` itself
+got moved from Python to a single C++ call).
+
+Added a real min/max density clamp per direct instruction: "probably
+want to add a min and max sparsity after the R factor, in and grad,
+since some hardware may struggle at high density when it's usually
+10% or so, and getting to 0% input and grad would also be bad in a
+lot of cases." `k_min`/`k_max` params clamp the R_target-derived k
+AFTER the fact, applied per-row against that row's own actual entry
+count -- k_min padding pulls from the SAME magnitude-sorted list
+already computed for the R_target walk (still top-k, not arbitrary);
+an all-zero row can't manufacture k_min entries out of nothing (stays
+at k=0 regardless). Python wiring not done yet -- the sili_peridot
+side (input_sparsity_p/dy_sparsity_p call sites) still needs an
+r_target/k_min/k_max API added, not built in this pass.
+
+Sequencing note: still Python-wiring-not-done for the epic itself
+(#365-370), but a SEPARATE, more urgent finding landed first --
+`dense_to_top_k_csr`'s k was being spent GLOBALLY across a multi-row
+array instead of per-row (see the b0d0fe2/JOURNAL entries above for
+the earlier partial discovery). Fixed in `CSR.from_dense` and the two
+scalar `dy_sparsity_p` call sites (sili__new commit `25797fc`), by
+routing onto the already-existing `_graded_top_k_csr`/
+`dense_to_graded_top_k_csr` instead of `dense_to_top_k_csr`. Re-ran
+arm F (`input_sparsity_p=0.10, dy_sparsity_p=1.0`, same script/seed
+as the original collapse) with the fix live: original run stayed
+pinned near loss=4.7-4.85/acc~0 through step 1600; the fixed run
+reached loss=2.85/acc=0.20 by step 400 and kept improving -- genuine
+learning, not collapse. This means the per-row bug, not "10% input is
+inherently too aggressive," was the primary cause of the input-
+sparsity collapse found earlier this session -- 10% input density
+looks like it IS a trustworthy checkpoint once fed correctly, same as
+grad's 10% already was. Full 3000-step confirmation still running at
+time of writing; treat as strong-but-not-yet-final until that
+completes.
+
+**Grad-side wiring landed (task #367).** `dy_r_target`/`dy_k_min`/
+`dy_k_max` added to `DISLDOLayer.forward`/`DISLDOLayer32.forward`
+(sili__new), highest priority in the existing `dy_sparsity_schedule` >
+`dy_sparsity_p` chain -- `None` default is a no-op, zero behavior
+change for every existing caller. `DISLDOLayer8` (fp8) intentionally
+NOT touched: it has no `dy_sparsity_p` mechanism at all today, so this
+isn't a parity gap, it's out of scope (would be introducing a new
+capability, not extending an existing one).
+
+**Found while testing (new, unrelated to this change's own logic):**
+`backward_sparse`'s C++ update has genuine run-to-run floating-point
+nondeterminism at `num_cpus=2` -- confirmed directly by calling the
+exact same `dy_r_target`-only path twice with byte-identical inputs on
+a freshly-constructed layer and getting different `value_scale`
+results each time (~1e-4 relative, too large to be simple reduction-
+order ULP noise). Root cause not yet investigated (candidate: OMP
+thread-scheduling order affecting some shared per-column reduction in
+the RMSprop update, but not confirmed). This is NOT a new bug from
+this change -- it's a pre-existing property of the engine, just newly
+observed because a test tried to compare exact floating-point outputs
+across two calls. Fixed the test itself to spy on which selection
+function gets invoked instead of comparing noisy floats. Flagging
+here per "verify claims empirically" -- don't trust exact-value
+floating-point comparisons across separate `backward_sparse` calls
+without also checking single-call reproducibility first.
+
+## Grad-side k_t design, revised: measured fwd/bwd ratio is NOT stable
+
+The original k_t sketch ("kbar derivable from a target steps/sec given
+c_bwd ~= 10*c_fwd, needs empirical verification rather than trusting the
+recalled ratio") assumed a single fixed backward:forward cost ratio.
+Measured directly (`forward_dense` vs `backward_dense`, same layer,
+warm cache, 100-200 reps, DISLDOLayer at n_in=n_out=n):
+
+| n   | fwd (us) | bwd (us) | ratio |
+|-----|----------|----------|-------|
+| 48  | 271      | 769      | 2.8x  |
+| 128 | 550      | 3761     | 6.8x  |
+| 384 | 2137     | 25643    | 12.0x |
+
+The ratio is NOT a constant -- it grows with width (backward's per-
+synapse RMSprop update apparently has worse scaling than forward's
+plain matmul). A single hardcoded ratio (10x or otherwise) baked into
+an analytic kbar formula would be wrong at some scale regardless of
+which constant is picked -- confirms the "needs empirical verification"
+flag was warranted, and rules out an analytic-formula approach.
+
+**Revised design**: don't compute kbar from an assumed ratio at all.
+Since the nucleus kernel is already built around R_target (not a raw
+k), the natural adaptive knob is r_target itself, in two nested loops:
+
+    E_t    = ||dy_t||^2                                    # free byproduct
+    Lbar  <- beta*Lbar + (1-beta)*E_t                       # O(1) EMA
+    r_t    = clip(r_bar * (E_t/Lbar)^alpha, r_min, r_max)   # per-step, energy-driven
+
+    every M steps: measure actual steps/sec
+        if sps < target_sps:        r_bar *= down_factor    # too slow, capture less
+        elif sps > target_sps*margin: r_bar *= up_factor    # headroom, capture more
+        r_bar = clip(r_bar, r_min, r_max)
+
+`r_bar`'s own adjustment is closed-loop against MEASURED steps/sec
+(same "closed-loop, measured-statistics, not guessed constants"
+philosophy the L2-decay redesign already established -- see the
+amortized-decay-factor entries above), sidestepping the need to know
+any cost ratio at all. `r_t` breathes above/below `r_bar` per-step
+based on whether that step's gradient carries more or less energy than
+the running average. Not yet implemented -- this is the design
+correction before implementation starts.

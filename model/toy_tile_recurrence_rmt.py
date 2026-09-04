@@ -59,6 +59,9 @@ class ToyTileRecurrenceRMT:
                  dy_sparsity_p: Optional[float] = None,
                  wide_max_weights: Optional[int] = None,
                  output_dy_sparsity_p: Optional[float] = None,
+                 dy_r_target: Optional[float] = None,
+                 dy_k_min: int = 0,
+                 dy_k_max: Optional[int] = None,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -194,7 +197,27 @@ class ToyTileRecurrenceRMT:
         classes as the model gets confident, so most of `probs-onehot`
         is near-zero in practice. `dy_sparsity_p`'s top-k-by-magnitude
         selection is exactly suited to this shape. None (default):
-        byte-identical to today's exact dense backward for both heads."""
+        byte-identical to today's exact dense backward for both heads.
+
+        dy_r_target/dy_k_min/dy_k_max (task #367, priority 1 -- see
+        JOURNAL.md's "nucleus/energy-threshold top-k math" design note):
+        nucleus/energy-threshold grad sparsification for the SAME 5
+        layers dy_sparsity_p covers, TAKES PRIORITY over dy_sparsity_p
+        when both are set (mirrors DISLDOLayer.forward's own priority
+        chain exactly). Unlike dy_sparsity_p's fixed fraction, k is a
+        CONSEQUENCE of dy_r_target and each step's actual gradient
+        energy -- dy_r_target is the initial/current captured-energy
+        ratio target (mutable after construction via
+        apply_amortized_dy_r_target_control below, a closed-loop
+        controller against MEASURED steps/sec, not a guessed constant --
+        the originally-sketched analytic kbar-from-cost-ratio formula
+        was found NOT to hold: forward:backward cost ratio measured
+        2.8x-12x depending on width, not the recalled ~10x, so no
+        single hardcoded ratio would be right at every scale). dy_k_min/
+        dy_k_max are the hardware density floor/ceiling (see
+        _nucleus_top_k_csr's own docstring, sili__new). None (default):
+        byte-identical to today's exact behavior, same as every other
+        sparsity kwarg here."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -221,15 +244,19 @@ class ToyTileRecurrenceRMT:
         self.input_sparsity_p = input_sparsity_p
         self.dy_sparsity_p = (dy_sparsity_p if dy_sparsity_p is not None
                               else input_sparsity_p)
-        # Conditionally forwarded (same convention as rank_kwargs/
-        # additive_kwargs below) -- only actually threaded into the 5
-        # affected layers' forward() calls, never lm_head/critic_head's,
-        # and never present at all unless dy_sparsity_p ends up set (so a
-        # disldo_cls that doesn't accept the kwarg -- e.g. DISLDOLayer32 --
-        # is unaffected as long as the caller leaves both sparsity args at
-        # their None default, matching every other conditional kwarg here).
-        self._wide_extra_kwargs = ({"dy_sparsity_p": self.dy_sparsity_p}
-                                   if self.dy_sparsity_p is not None else {})
+        # dy_r_target (task #367): mutable after construction via
+        # apply_amortized_dy_r_target_control below -- see __init__'s own
+        # dy_r_target docstring. dy_k_min/dy_k_max are static (no closed-
+        # loop control needed for a hard floor/ceiling).
+        self.dy_r_target = dy_r_target
+        self.dy_k_min = dy_k_min
+        self.dy_k_max = dy_k_max
+        # _wide_extra_kwargs is a live @property (below) now that
+        # dy_r_target is mutable post-construction via
+        # apply_amortized_dy_r_target_control -- every one of step()'s
+        # many **self._wide_extra_kwargs call sites reads it fresh each
+        # time, so updating self.dy_r_target between steps takes effect
+        # immediately with no separate cache-invalidation step needed.
         # Separate axis, lm_head/critic_head only -- see __init__'s own
         # output_dy_sparsity_p docstring above.
         self.output_dy_sparsity_p = output_dy_sparsity_p
@@ -439,6 +466,76 @@ class ToyTileRecurrenceRMT:
 
     def _real_layers(self):
         return [layer for _name, layer in self._named_real_layers()]
+
+    @property
+    def _wide_extra_kwargs(self) -> dict:
+        """Extra kwargs threaded into the 5 affected layers' forward()
+        calls (input_proj/q/k/v/o_proj), never lm_head/critic_head's.
+        Live (not cached at construction) because dy_r_target is mutable
+        post-construction via apply_amortized_dy_r_target_control below.
+
+        dy_r_target takes PRIORITY over dy_sparsity_p when both end up
+        set -- mirrors DISLDOLayer.forward's own priority chain exactly
+        (task #367). Neither set: empty dict, byte-identical to today's
+        exact dense behavior, matching every other conditional kwarg
+        here."""
+        if self.dy_r_target is not None:
+            kw = {"dy_r_target": self.dy_r_target}
+            if self.dy_k_min:
+                kw["dy_k_min"] = self.dy_k_min
+            if self.dy_k_max is not None:
+                kw["dy_k_max"] = self.dy_k_max
+            return kw
+        if self.dy_sparsity_p is not None:
+            return {"dy_sparsity_p": self.dy_sparsity_p}
+        return {}
+
+    def apply_amortized_dy_r_target_control(self, measured_sps: float, target_sps: float,
+                                             down_factor: float = 0.85, up_factor: float = 1.05,
+                                             r_min: float = 0.05, r_max: float = 0.99) -> Optional[float]:
+        """Closed-loop controller adjusting self.dy_r_target against
+        MEASURED steps/sec (task #368, revised design -- see JOURNAL.md's
+        "Grad-side k_t design, revised" entry for the full rationale).
+
+        The original k_t sketch assumed an analytic kbar derivable from a
+        fixed backward:forward compute-cost ratio (~10x, recalled). Direct
+        measurement (forward_dense vs backward_dense, same layer, varying
+        width) found the ratio is NOT constant -- 2.8x at n=48, 6.8x at
+        n=128, 12.0x at n=384 -- so any single hardcoded ratio baked into
+        a formula would be wrong at some scale. This sidesteps that
+        entirely: no assumed ratio anywhere, just react to what steps/sec
+        actually measures, same "closed-loop, measured-statistics, not
+        guessed constants" philosophy apply_amortized_l2_decay already
+        uses successfully.
+
+        Call periodically (e.g. every N steps) from the training loop with
+        that window's own measured steps/sec. measured_sps < target_sps:
+        r_target shrinks (down_factor, capture less energy => fewer
+        entries => cheaper). measured_sps > target_sps (no margin needed,
+        matching l2 decay's own asymmetric-but-simple correction
+        convention): r_target grows back toward r_max (up_factor).
+        Clipped to [r_min, r_max] -- r_max<1.0 by default since 1.0 would
+        defeat the entire compute-savings purpose dy_r_target exists for.
+
+        No-op (returns None) if dy_r_target was never enabled (None at
+        construction and never set) -- this controller only ADJUSTS an
+        already-opted-in mechanism, it doesn't turn the mechanism on.
+
+        Does NOT implement the per-step E_t/Lbar energy-modulation half
+        of the original design (r_t breathing above/below r_bar based on
+        THIS step's own gradient energy) -- deferred: dy_r_target is
+        consumed at forward()-CALL time, before that layer's own dy for
+        this step is known (chicken-and-egg; would need either C++-side
+        instrumentation to expose last-step's ||dy||^2 or an autograd
+        hook, neither built yet). This method only implements the OUTER
+        (r_bar-vs-measured-sps) loop for now."""
+        if self.dy_r_target is None:
+            return None
+        if measured_sps < target_sps:
+            self.dy_r_target = max(r_min, self.dy_r_target * down_factor)
+        elif measured_sps > target_sps:
+            self.dy_r_target = min(r_max, self.dy_r_target * up_factor)
+        return self.dy_r_target
 
     def parameters_for_optimizer(self) -> List[Tensor]:
         return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
