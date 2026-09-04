@@ -585,6 +585,71 @@ class TestXRTarget:
         assert model.x_r_target["q_proj"] != 0.7  # already shrank above, untouched by this call
 
 
+class TestInputSelectionTrajectory:
+    """Task #369: real per-layer R/k trajectory stats, computed
+    directly from the CSR _to_sparse already builds (self.
+    last_input_selection). Cadence/gating policy lives in the CALLER
+    (train_mqar_curriculum.py's own trajectory_log_every) -- the model
+    itself just exposes the most recent snapshot per layer, same
+    convention as self.last_debug."""
+
+    def test_empty_before_any_sparsification(self):
+        model = _model()  # no input_sparsity_p/x_r_target set
+        x_window = np.random.RandomState(70).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        model.step(x_window, memory_prev, learning_rate=0.05)
+        assert model.last_input_selection == {}
+
+    def test_real_r_satisfies_invariant_under_x_r_target(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(71),
+            x_r_target=0.7, x_k_min=1)
+        x_window = np.random.RandomState(72).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        model.step(x_window, memory_prev, learning_rate=0.05)
+        assert set(model.last_input_selection) == set(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
+        for name, stats in model.last_input_selection.items():
+            # Real invariant this kernel guarantees (task #364's own
+            # C++ test covers this at the kernel level; here we confirm
+            # it survives all the way through to the Python-side stats
+            # this task adds).
+            assert stats["R_mean"] >= 0.7 - 1e-6
+            assert stats["k_mean"] >= 1.0  # x_k_min=1 floor
+            assert stats["rows"] > 0
+            assert stats["cols"] == STATE_WIDTH or stats["cols"] == EMBED_WIDTH
+
+    def test_captured_also_under_plain_input_sparsity_p(self):
+        # Real R/k diagnostic is meaningful for the LEGACY fixed-
+        # fraction path too, not just nucleus selection.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(73),
+            input_sparsity_p=0.5)
+        x_window = np.random.RandomState(74).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        model.step(x_window, memory_prev, learning_rate=0.05)
+        assert set(model.last_input_selection) == set(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
+        for stats in model.last_input_selection.values():
+            assert 0.0 <= stats["R_mean"] <= 1.0
+            assert stats["k_mean"] > 0.0
+
+    def test_overwritten_not_accumulated_across_steps(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(75),
+            x_r_target=0.7, x_k_min=1)
+        x_window = np.random.RandomState(76).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        model.step(x_window, memory_prev, learning_rate=0.05)
+        assert len(model.last_input_selection) == len(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
+        model.step(x_window, memory_prev, learning_rate=0.05)
+        # Still exactly one entry per layer -- a snapshot, not a growing list.
+        assert len(model.last_input_selection) == len(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
+        for stats in model.last_input_selection.values():
+            assert isinstance(stats, dict)
+
+
 class TestCrossLayerBudgetAllocator:
     """Task #375: apply_cross_layer_budget_allocator -- coordinates
     x_r_target against real per-layer measured cost (task #373),

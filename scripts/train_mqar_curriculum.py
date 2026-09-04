@@ -55,7 +55,7 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     quality tradeoff that implies.
   [use_tile_cache] [output_dy_sparsity_p] [wrong_streak_threshold]
   [dy_r_target] [dy_k_min] [dy_k_max] [target_steps_per_sec] [dy_surprise_alpha]
-  [x_r_target] [x_k_min]
+  [x_r_target] [x_k_min] [trajectory_log_every]
   dy_r_target: nucleus/energy-threshold captured-energy-ratio target
     (0..1) for those same 5 layers' backward gradient (task #367) --
     TAKES PRIORITY over dy_sparsity_p when both are set. k is a
@@ -85,6 +85,16 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     instead of a second independent speed-reactive loop -- see that
     method's own docstring (ToyTileRecurrenceRMT) for why grad and
     input must not both react to the same speed signal independently.
+  trajectory_log_every: task #369, fine-grained per-layer/both-axes
+    logging -- direct instruction: bounded/opt-in, OFF by default,
+    separate cadence from the coarse log_every above ("I want to see a
+    more fine-detail log... but by default that's quite a lot of
+    data"). -1 (default) = off. When set, prints real R/k_t (actual
+    captured-energy ratio and mean kept-entries, not just the r_target
+    asked for) for the INPUT axis alongside dy_r_target/E_t/Lbar for
+    the GRAD axis, every N steps. trajectory_log_steps (a step range)
+    is Python-kwarg-only, not CLI-exposed -- use train_curriculum()
+    directly for that.
 """
 from __future__ import annotations
 
@@ -92,7 +102,7 @@ import sys
 import time
 import json
 import resource
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -495,7 +505,10 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      x_r_target: Optional[float] = None,
                      x_k_min: int = 0,
                      x_k_max: Optional[int] = None,
-                     target_steps_per_sec: Optional[float] = None) -> dict:
+                     target_steps_per_sec: Optional[float] = None,
+                     trajectory_log_every: Optional[int] = None,
+                     trajectory_log_steps: Optional[Tuple[int, int]] = None,
+                     trajectory_log_fn=None) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
     # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
@@ -983,6 +996,23 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
               and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS):
             _regress_stage(step)
 
+        # Fine-grained trajectory logging (task #369, direct instruction:
+        # "I want to see a more fine-detail log... but by default
+        # that's quite a lot of data" -- bounded/opt-in, off by default,
+        # separate cadence from the coarse log_every block below.
+        # Checked every step (not gated by log_every) so a caller can
+        # request denser-than-log_every logging; trajectory_log_fn
+        # receives the model directly (real R/k live in model.
+        # last_input_selection, E_t/Lbar in model._layer_surprise,
+        # r_target in model.dy_r_target/x_r_target -- all already
+        # per-layer, real, most-recent-snapshot state, no new
+        # accumulator needed here).
+        if trajectory_log_fn is not None and (
+            (trajectory_log_every is not None and step % trajectory_log_every == 0)
+            or (trajectory_log_steps is not None
+                and trajectory_log_steps[0] <= step <= trajectory_log_steps[1])):
+            trajectory_log_fn(step, model)
+
         if step % log_every == 0:
             ranks = _log_ranks(step)
             steps_per_sec = step / (time.time() - t0)
@@ -1162,6 +1192,17 @@ def main():
     _x_r_target_arg = float(sys.argv[24]) if len(sys.argv) > 24 else -1.0
     x_r_target = _x_r_target_arg if _x_r_target_arg >= 0 else None
     x_k_min = int(sys.argv[25]) if len(sys.argv) > 25 else 0
+    # trajectory_log_every (task #369): same -1/"unset" sentinel
+    # convention, off by default (direct instruction: bounded/opt-in,
+    # NOT part of the default log_every cadence -- "quite a lot of
+    # data"). trajectory_log_steps (a step range) is Python-kwarg-only,
+    # not CLI-exposed here -- already at 26 positional CLI args, a
+    # two-number range would be real scope creep for a rarely-used
+    # knob; a caller using train_curriculum() as a library function
+    # (already this session's own convention for real runs) can pass
+    # it directly.
+    _trajectory_log_every_arg = int(sys.argv[26]) if len(sys.argv) > 26 else -1
+    trajectory_log_every = _trajectory_log_every_arg if _trajectory_log_every_arg > 0 else None
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
@@ -1173,7 +1214,7 @@ def main():
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
           f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
           f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha} "
-          f"x_r_target={x_r_target} x_k_min={x_k_min}",
+          f"x_r_target={x_r_target} x_k_min={x_k_min} trajectory_log_every={trajectory_log_every}",
           flush=True)
 
     _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
@@ -1213,7 +1254,45 @@ def main():
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
               f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}", flush=True)
 
+    def trajectory_log_fn_default(step, model) -> None:
+        # Task #369: default fine-grained printer -- one line per axis,
+        # per-layer, real values straight off the model's own most-
+        # recent-snapshot state (no separate accumulator). GRAD axis:
+        # dy_r_target (r_bar/effective r_target) + E_t/Lbar surprise
+        # (task #374, only meaningful once dy_surprise_alpha is set --
+        # printed regardless, since E_t/Lbar exist independent of
+        # whether surprise MODULATION is on). INPUT axis: x_r_target
+        # (what was asked for) alongside the REAL captured R_mean/k_mean
+        # (task #369's own new stat, what was actually achieved) --
+        # printing both side by side is the point of this whole task,
+        # to see when/whether the two diverge.
+        dy_parts = []
+        for name, r_bar in model.dy_r_target.items():
+            if r_bar is None:
+                continue
+            surprise = model._layer_surprise.get(name)
+            if surprise is not None:
+                dy_parts.append(f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f},E{surprise['E_t']:.2g},L{surprise['Lbar']:.2g}")
+            else:
+                dy_parts.append(f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f}")
+        x_parts = []
+        for name, x_target in model.x_r_target.items():
+            if x_target is None:
+                continue
+            sel = model.last_input_selection.get(name)
+            if sel is not None:
+                x_parts.append(f"{_SHORT_NAME.get(name, name)}=target{x_target:.3f},R{sel['R_mean']:.3f},k{sel['k_mean']:.1f}")
+            else:
+                x_parts.append(f"{_SHORT_NAME.get(name, name)}=target{x_target:.3f}")
+        if dy_parts:
+            print(f"    [TRAJ] step={step:>7} axis=dy " + " ".join(dy_parts), flush=True)
+        if x_parts:
+            print(f"    [TRAJ] step={step:>7} axis=x  " + " ".join(x_parts), flush=True)
+
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
+                         trajectory_log_every=trajectory_log_every,
+                         trajectory_log_fn=(trajectory_log_fn_default
+                                            if trajectory_log_every is not None else None),
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
                          rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
                          recurrent_only_output=recurrent_only_output,

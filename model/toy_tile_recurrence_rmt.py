@@ -344,6 +344,11 @@ class ToyTileRecurrenceRMT:
         self.x_r_target: dict = {name: x_r_target for name in self._WIDE_LAYER_NAMES}
         self.x_k_min = x_k_min
         self.x_k_max = x_k_max
+        # Task #369: real per-layer INPUT-axis trajectory stats (R_mean/
+        # k_mean/rows/cols), overwritten each _to_sparse call that
+        # actually sparsifies -- see _update_input_selection_stats's own
+        # docstring. Lazily populated, empty until the first such call.
+        self.last_input_selection: dict = {}
         # dy_r_target (task #367, per-layer dict since task #372): mutable
         # after construction via apply_amortized_dy_r_target_control below
         # -- see __init__'s own dy_r_target docstring. dy_k_min/dy_k_max
@@ -1143,19 +1148,25 @@ class ToyTileRecurrenceRMT:
         mask-the-gradient-too version -- masking would zero the learning
         signal for every non-selected position on every step, making the
         selected/dropped split itself unable to shift over training,
-        which is its own kind of frozen state."""
+        which is its own kind of frozen state.
+
+        Task #369: also updates self.last_input_selection[layer_name]
+        with real R/k trajectory stats -- see that update's own
+        docstring (_update_input_selection_stats) for why this is
+        near-zero extra cost and why it's a plain overwritten snapshot,
+        not an accumulator."""
         x_r_target = self.x_r_target.get(layer_name)
+        if x_r_target is None and self.input_sparsity_p is None:
+            return x
+        x_np = np.asarray(x.data, dtype=np.float32)
+        x2d = x_np[np.newaxis, :] if x_np.ndim == 1 else x_np
         if x_r_target is not None:
-            x_np = np.asarray(x.data, dtype=np.float32)
-            x2d = x_np[np.newaxis, :] if x_np.ndim == 1 else x_np
             ptrs, indices, values = _nucleus_top_k_csr(
                 x2d, x_r_target, self.num_cpus, k_min=self.x_k_min, k_max=self.x_k_max)
             csr = CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
-        elif self.input_sparsity_p is not None:
-            csr = CSR.from_dense(np.asarray(x.data, dtype=np.float32),
-                                 self.input_sparsity_p, self.num_cpus)
         else:
-            return x
+            csr = CSR.from_dense(x2d, self.input_sparsity_p, self.num_cpus)
+        self._update_input_selection_stats(layer_name, x2d, csr)
         out = Tensor(csr, _children=(x,), _op="to_sparse", backend=x.backend)
 
         def _bwd():
@@ -1168,6 +1179,45 @@ class ToyTileRecurrenceRMT:
 
         out._backward = _bwd
         return out
+
+    def _update_input_selection_stats(self, layer_name: str, x2d: np.ndarray, csr: CSR) -> None:
+        """Task #369: real per-layer INPUT-axis trajectory stats -- R
+        (the actual captured squared-magnitude ratio R(v,k) THIS call
+        achieved, not just the r_target it was asked for) and k (mean
+        kept-entries-per-row), computed directly from the CSR
+        _to_sparse already just built (near-zero extra cost -- unlike
+        the grad axis, this method already has both the dense input and
+        the resulting CSR in hand, no new C++ instrumentation needed).
+        Meaningful for BOTH the nucleus (x_r_target) and fixed-fraction
+        (input_sparsity_p) paths -- R is a real, honest diagnostic
+        either way, not something that only makes sense under nucleus
+        selection.
+
+        Stored in self.last_input_selection[layer_name], OVERWRITTEN
+        each call (mirrors self.last_debug's own "most recent snapshot"
+        convention), not accumulated across steps. Direct instruction
+        (bounded fine-grained logging, opt-in, off by default): the
+        actual "log every N steps" / "log this step range" gating
+        policy lives in the CALLER (e.g. train_mqar_curriculum.py's own
+        trajectory_log_every), which already tracks its own step
+        counter -- the model itself stays stateless about step numbers,
+        same existing design choice as every other per-step model
+        attribute here (last_debug, last_critic_pred, etc.)."""
+        row_sq_total = np.sum(x2d.astype(np.float64) ** 2, axis=1)
+        kept_sq = np.zeros(csr.rows, dtype=np.float64)
+        k_per_row = np.zeros(csr.rows, dtype=np.int64)
+        for row in range(csr.rows):
+            start, end = int(csr.ptrs[row]), int(csr.ptrs[row + 1])
+            kept_sq[row] = np.sum(csr.values[start:end].astype(np.float64) ** 2)
+            k_per_row[row] = end - start
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_per_row = np.where(row_sq_total > 0, kept_sq / row_sq_total, 1.0)
+        self.last_input_selection[layer_name] = {
+            "R_mean": float(np.mean(r_per_row)),
+            "k_mean": float(np.mean(k_per_row)),
+            "rows": int(csr.rows),
+            "cols": int(csr.cols),
+        }
 
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float,
                            requires_grad: bool = True, layer_name: Optional[str] = None,
