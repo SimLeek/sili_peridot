@@ -55,6 +55,7 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     quality tradeoff that implies.
   [use_tile_cache] [output_dy_sparsity_p] [wrong_streak_threshold]
   [dy_r_target] [dy_k_min] [dy_k_max] [target_steps_per_sec] [dy_surprise_alpha]
+  [x_r_target] [x_k_min]
   dy_r_target: nucleus/energy-threshold captured-energy-ratio target
     (0..1) for those same 5 layers' backward gradient (task #367) --
     TAKES PRIORITY over dy_sparsity_p when both are set. k is a
@@ -77,6 +78,13 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     unset, mechanism off, r_bar used unmodified (same as before this
     task). See ToyTileRecurrenceRMT.__init__'s own dy_surprise_alpha
     docstring for the full formula.
+  x_r_target/x_k_min: task #365, INPUT-side mirror of dy_r_target/
+    dy_k_min -- same -1 (default) = unset convention. When
+    target_steps_per_sec is ALSO set, x_r_target's periodic adjustment
+    goes through apply_cross_layer_budget_allocator (task #375)
+    instead of a second independent speed-reactive loop -- see that
+    method's own docstring (ToyTileRecurrenceRMT) for why grad and
+    input must not both react to the same speed signal independently.
 """
 from __future__ import annotations
 
@@ -484,6 +492,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      dy_k_max: Optional[int] = None,
                      dy_surprise_alpha: Optional[float] = None,
                      dy_surprise_beta: float = 0.99,
+                     x_r_target: Optional[float] = None,
+                     x_k_min: int = 0,
+                     x_k_max: Optional[int] = None,
                      target_steps_per_sec: Optional[float] = None) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
@@ -569,6 +580,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         dy_sparsity_p=dy_sparsity_p, output_dy_sparsity_p=output_dy_sparsity_p,
         dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
         dy_surprise_alpha=dy_surprise_alpha, dy_surprise_beta=dy_surprise_beta,
+        x_r_target=x_r_target, x_k_min=x_k_min, x_k_max=x_k_max,
         rng=model_rng)
     opt = AdamOptimizer()
     # embed_table_builder (direct instruction, wide-model SDR redesign):
@@ -980,12 +992,29 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             # apply_amortized_l2_decay's own "safe to always call"
             # convention). Reuses this loop's own cumulative steps_per_sec
             # measurement rather than a separate windowed timer.
+            #
+            # x_r_target uses apply_cross_layer_budget_allocator (task
+            # #375), NOT apply_amortized_x_r_target_control directly --
+            # the allocator deliberately never touches dy_r_target
+            # (grad stays need-driven via #374's surprise signal,
+            # independent of speed), only x_r_target reacts to the
+            # speed budget here, weighted by each layer's own real
+            # measured cost share (task #373's _layer_timing) instead
+            # of every layer getting the same uniform correction. Also
+            # a no-op when x_r_target was never enabled.
             if target_steps_per_sec is not None:
                 model.apply_amortized_dy_r_target_control(steps_per_sec, target_steps_per_sec)
+                model.apply_cross_layer_budget_allocator(steps_per_sec, target_steps_per_sec)
+                # Reset AFTER using this window's timing data -- next
+                # window's per-layer weight should reflect only steps
+                # since THIS checkpoint (task #373's own reset_layer_
+                # timing docstring convention), not a slow cumulative
+                # drift across the whole run.
+                model.reset_layer_timing()
             if log_fn is not None:
                 log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks,
                       steps_per_sec=steps_per_sec, max_streak=max_streak_seen,
-                      dy_r_target=model.dy_r_target)
+                      dy_r_target=model.dy_r_target, x_r_target=model.x_r_target)
             max_streak_seen = 0
 
     elapsed_s = time.time() - t0
@@ -1122,6 +1151,17 @@ def main():
     # same session: don't over-parameterize unproven complexity).
     _dy_surprise_alpha_arg = float(sys.argv[23]) if len(sys.argv) > 23 else -1.0
     dy_surprise_alpha = _dy_surprise_alpha_arg if _dy_surprise_alpha_arg >= 0 else None
+    # x_r_target (task #365, INPUT-side mirror of dy_r_target): same
+    # -1/"unset" sentinel convention. x_k_min mirrors dy_k_min's own
+    # CLI treatment; x_k_max stays un-exposed here (defaults to no
+    # ceiling), matching dy_k_max's own scope decision at the time.
+    # When target_steps_per_sec is also set, x_r_target's own periodic
+    # adjustment goes through apply_cross_layer_budget_allocator (task
+    # #375), NOT a second independent sps-reactive loop -- see that
+    # call site's own comment for why.
+    _x_r_target_arg = float(sys.argv[24]) if len(sys.argv) > 24 else -1.0
+    x_r_target = _x_r_target_arg if _x_r_target_arg >= 0 else None
+    x_k_min = int(sys.argv[25]) if len(sys.argv) > 25 else 0
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
@@ -1132,7 +1172,8 @@ def main():
           f"output_dy_sparsity_p={output_dy_sparsity_p} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
           f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
-          f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha}",
+          f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha} "
+          f"x_r_target={x_r_target} x_k_min={x_k_min}",
           flush=True)
 
     _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
@@ -1145,28 +1186,32 @@ def main():
         return "  ranks[" + " ".join(parts) + "]"
 
     def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None, steps_per_sec=None,
-               max_streak=None, dy_r_target=None):
+               max_streak=None, dy_r_target=None, x_r_target=None):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
-        # dy_r_target (task #368, per-layer dict since task #372): only
-        # printed once the mechanism is actually enabled on at least one
-        # wide layer -- empty/all-None stays silent, same opt-in-visible
-        # convention as sps_s/streak_s above. Compact per-layer format
-        # since layers can diverge independently once task #374 lands
-        # (today they still move in lockstep, but the log format doesn't
-        # assume that).
-        if dy_r_target:
-            _set = {n: v for n, v in dy_r_target.items() if v is not None}
-            dy_r_s = ("  dy_r_target[" +
-                      " ".join(f"{_SHORT_NAME.get(n, n)}={v:.3f}" for n, v in _set.items()) +
-                      "]") if _set else ""
-        else:
-            dy_r_s = ""
+
+        def _r_target_str(label, d):
+            # Shared formatter for dy_r_target (task #368/#372) and
+            # x_r_target (task #365/#375) -- both per-layer dicts, both
+            # silent unless the mechanism is enabled on at least one
+            # wide layer, same opt-in-visible convention as sps_s/
+            # streak_s above.
+            if not d:
+                return ""
+            _set = {n: v for n, v in d.items() if v is not None}
+            if not _set:
+                return ""
+            return ("  " + label + "[" +
+                    " ".join(f"{_SHORT_NAME.get(n, n)}={v:.3f}" for n, v in _set.items()) +
+                    "]")
+
+        dy_r_s = _r_target_str("dy_r_target", dy_r_target)
+        x_r_s = _r_target_str("x_r_target", x_r_target)
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{_ranks_str(ranks)}", flush=True)
+              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}", flush=True)
 
     r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
                          additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
@@ -1179,6 +1224,7 @@ def main():
                          wrong_streak_threshold=wrong_streak_threshold,
                          dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
                          dy_surprise_alpha=dy_surprise_alpha,
+                         x_r_target=x_r_target, x_k_min=x_k_min,
                          target_steps_per_sec=target_steps_per_sec)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "

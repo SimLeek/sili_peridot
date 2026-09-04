@@ -585,6 +585,114 @@ class TestXRTarget:
         assert model.x_r_target["q_proj"] != 0.7  # already shrank above, untouched by this call
 
 
+class TestCrossLayerBudgetAllocator:
+    """Task #375: apply_cross_layer_budget_allocator -- coordinates
+    x_r_target against real per-layer measured cost (task #373),
+    deliberately never touching dy_r_target (grad stays need-driven,
+    task #374) to avoid both axes fighting over the same speed signal.
+    See the method's own docstring for the full weight formula."""
+
+    def _model_with_x_r_target(self, seed=60, **kwargs):
+        return ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(seed),
+            x_r_target=0.7, **kwargs)
+
+    def test_never_touches_dy_r_target(self):
+        model = self._model_with_x_r_target(dy_r_target=0.3)
+        model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=100.0)
+        assert all(v == 0.3 for v in model.dy_r_target.values())
+        model.apply_cross_layer_budget_allocator(measured_sps=100.0, target_sps=1.0)
+        assert all(v == 0.3 for v in model.dy_r_target.values())
+
+    def test_falls_back_to_uniform_weight_cold_start(self):
+        # No _layer_timing data yet -- must behave exactly like
+        # apply_amortized_x_r_target_control's own plain uniform
+        # down_factor (weight=1.0 for every layer).
+        model = self._model_with_x_r_target(seed=61)
+        assert model._layer_timing == {}
+        updated = model.apply_cross_layer_budget_allocator(
+            measured_sps=1.0, target_sps=10.0, down_factor=0.8)
+        for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
+            assert abs(updated[name] - 0.7 * 0.8) < 1e-9
+
+    def test_expensive_layer_shrinks_more_when_too_slow(self):
+        model = self._model_with_x_r_target(seed=62)
+        # q_proj eats 80% of the real measured time, the other 4 share
+        # the remaining 20% evenly (5% each) -- well above/below the
+        # uniform 1/5=20% baseline.
+        model._layer_timing = {
+            "input_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+            "q_proj": {"fwd_s": 0.4, "bwd_s": 0.4},
+            "k_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+            "v_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+            "o_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+        }
+        updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=10.0)
+        # q_proj (80% share, weight clipped to 3.0) shrinks the hardest;
+        # input_proj (5% share, weight 0.25) barely moves.
+        assert updated["q_proj"] < updated["input_proj"]
+        assert updated["q_proj"] < 0.7
+        assert updated["input_proj"] < 0.7  # still shrinks some (measured_sps<target_sps)
+
+    def test_weight_clipped_to_3x(self):
+        model = self._model_with_x_r_target(seed=63)
+        # Degenerate case: one layer eats effectively 100% of the
+        # window's real time -- weight would be 5.0 unclipped, must
+        # clip to 3.0 and stay bounded (not runaway/negative).
+        model._layer_timing = {
+            "q_proj": {"fwd_s": 1.0, "bwd_s": 0.0},
+        }
+        updated = model.apply_cross_layer_budget_allocator(
+            measured_sps=1.0, target_sps=10.0, down_factor=0.85)
+        eff_down_clipped = 1.0 - (1.0 - 0.85) * 3.0  # weight clipped to 3.0
+        assert eff_down_clipped > 0.0  # sanity: still a valid multiplicative factor
+        assert abs(updated["q_proj"] - 0.7 * eff_down_clipped) < 1e-9
+
+    def test_growth_direction_also_weighted(self):
+        model = self._model_with_x_r_target(seed=64)
+        model._layer_timing = {
+            "input_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+            "q_proj": {"fwd_s": 0.4, "bwd_s": 0.4},
+            "k_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+            "v_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+            "o_proj": {"fwd_s": 0.025, "bwd_s": 0.0},
+        }
+        updated = model.apply_cross_layer_budget_allocator(measured_sps=10.0, target_sps=1.0)
+        # Plenty of headroom (sps>target) -- q_proj (the expensive one)
+        # grows back toward r_max hardest; input_proj barely grows.
+        assert updated["q_proj"] > updated["input_proj"]
+        assert updated["q_proj"] > 0.7
+        assert updated["input_proj"] > 0.7
+
+    def test_only_adjusts_layers_with_x_r_target_already_set(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(65))
+        model.x_r_target["q_proj"] = 0.7  # only one layer opted in
+        updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=10.0)
+        assert set(updated) == {"q_proj"}
+        assert all(v is None for name, v in model.x_r_target.items() if name != "q_proj")
+
+    def test_real_integration_with_373_timing(self):
+        # End-to-end: real per-layer timing from #373's own instrumentation
+        # feeding directly into the allocator, no manual state seeding.
+        model = self._model_with_x_r_target(seed=66)
+        x_window = np.random.RandomState(67).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        model.reset_layer_timing()
+        for _ in range(3):
+            memory_prev, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.05)
+            loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 3)])
+            loss.grad = np.array(1.0, dtype=np.float32)
+            loss.backward()
+        assert model._layer_timing  # real data accumulated
+        updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=100.0)
+        for name, v in updated.items():
+            assert np.isfinite(v)
+            assert 0.05 <= v <= 0.99
+
+
 def _build_window(embed_table, tokens, i, num_tiles):
     embed_width = embed_table.shape[1]
     window = np.zeros((num_tiles, embed_width), dtype=np.float32)

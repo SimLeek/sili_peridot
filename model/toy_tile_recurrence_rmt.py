@@ -818,6 +818,80 @@ class ToyTileRecurrenceRMT:
             updated[name] = current
         return updated
 
+    def apply_cross_layer_budget_allocator(self, measured_sps: float, target_sps: float,
+                                           down_factor: float = 0.85, up_factor: float = 1.05,
+                                           r_min: float = 0.05, r_max: float = 0.99) -> dict:
+        """Task #375: coordinates x_r_target (INPUT axis) against the
+        remaining compute budget using task #373's real per-layer
+        timing as the "how expensive is this layer actually" signal --
+        WITHOUT inventing an analytic cost-vs-r_target formula
+        (JOURNAL.md's own measurement already found fwd:bwd cost ratio
+        varies 2.8x-12x across layers/widths, so no single hardcoded
+        ratio/formula would be right at every scale -- same "measured
+        statistics, not guessed constants" philosophy every other outer
+        loop here already uses).
+
+        dy_r_target (GRAD axis) is DELIBERATELY NOT TOUCHED by this
+        method at all -- direct instruction: grad's r_target must be
+        driven by its own need (task #374's E_t/Lbar surprise signal),
+        INDEPENDENT of the speed budget. The problem this task exists
+        to prevent is both axes independently reacting to the SAME
+        measured_sps and fighting/oscillating together -- the fix is
+        structural (only ONE axis reacts to speed in any one
+        coordinated call), not a smarter simultaneous-adjustment
+        formula. A caller MAY still call
+        apply_amortized_dy_r_target_control separately, rarely, to keep
+        r_bar from drifting arbitrarily over a very long run -- that's
+        an orthogonal, slower-timescale concern this method doesn't
+        manage.
+
+        Per-layer WEIGHT: each layer's real measured (fwd_s+bwd_s)
+        share of the total across all 5 wide layers (from
+        self._layer_timing, task #373), normalized against the uniform
+        1/5 baseline -- a layer currently eating an above-average share
+        of real time gets a correspondingly STRONGER correction (it's
+        the layer most responsible for the current speed), a
+        below-average layer gets a correspondingly WEAKER one. Weight
+        is clipped to [0, 3] to keep the correction bounded and
+        predictable -- an unclipped weight could blow up arbitrarily
+        for a layer that happens to have almost zero competing cost
+        this window. Falls back to weight=1.0 for every layer (matching
+        apply_amortized_x_r_target_control's own plain uniform
+        behavior) when self._layer_timing has no data yet (cold start,
+        before any _timed_layer_forward call has run) -- caller should
+        call reset_layer_timing() at the start of each measurement
+        window (same convention #373 already established) so this
+        weight reflects THAT window's real costs, not a stale
+        accumulation.
+
+        Returns the updated {layer_name: x_r_target} dict for whichever
+        layers were actually touched (only ones with x_r_target already
+        set -- same "only ADJUSTS an already-opted-in mechanism"
+        contract as every other outer loop here)."""
+        names = [n for n in self._WIDE_LAYER_NAMES if self.x_r_target.get(n) is not None]
+        if not names:
+            return {}
+        total_t = sum(rec["fwd_s"] + rec["bwd_s"] for rec in self._layer_timing.values())
+        uniform_share = 1.0 / len(self._WIDE_LAYER_NAMES)
+        updated = {}
+        for name in names:
+            if total_t > 0:
+                layer_t = self._layer_timing.get(name, {"fwd_s": 0.0, "bwd_s": 0.0})
+                share = (layer_t["fwd_s"] + layer_t["bwd_s"]) / total_t
+                weight = min(max(share / uniform_share, 0.0), 3.0)
+            else:
+                weight = 1.0
+            current = self.x_r_target[name]
+            if measured_sps < target_sps:
+                eff_down = 1.0 - (1.0 - down_factor) * weight
+                current = max(r_min, current * eff_down)
+            elif measured_sps > target_sps:
+                eff_up = 1.0 + (up_factor - 1.0) * weight
+                current = min(r_max, current * eff_up)
+            self.x_r_target[name] = current
+            updated[name] = current
+        return updated
+
     def parameters_for_optimizer(self) -> List[Tensor]:
         return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
 
