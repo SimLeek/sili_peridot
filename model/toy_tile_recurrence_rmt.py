@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -336,6 +337,17 @@ class ToyTileRecurrenceRMT:
         # Lazily populated (name -> factor), default 1.0 (no decay) until a
         # layer's first full cycle completes and supplies real data.
         self._l2_decay_factor: dict = {}
+        # Task #373: real per-layer forward+backward timing, keyed by the
+        # same _WIDE_LAYER_NAMES as dy_r_target -- direct time.perf_
+        # counter() wraps via _timed_layer_forward below, NOT a
+        # width-based cost proxy (direct correction: layers cost single-
+        # digit-to-tens of ms, timer overhead is ~100ns, real measurement
+        # is cheaper than a calibrated proxy would have been). Lazily
+        # populated per layer on first call, mirroring _l2_decay_factor's
+        # own lazy-dict convention. Feeds the cross-layer budget
+        # allocator (#375) -- each layer's own measured fwd_s/bwd_s is
+        # the real economics a shared model-level knob (pre-#372) wasted.
+        self._layer_timing: dict = {}
         if use_critic:
             critic_seed = int(rng.integers(0, 2**31 - 1))
             self.critic_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
@@ -482,6 +494,52 @@ class ToyTileRecurrenceRMT:
 
     def _real_layers(self):
         return [layer for _name, layer in self._named_real_layers()]
+
+    def _timed_layer_forward(self, layer, layer_name: str, *args, **kwargs) -> Tensor:
+        """Task #373: real per-layer forward+backward timing -- direct
+        time.perf_counter() wraps, not a width-based cost proxy (a proxy
+        was over-engineering this: layers cost single-digit-to-tens of
+        ms, timer overhead is ~100ns, direct measurement is both cheaper
+        and simpler than calibrating a proxy would have been, direct
+        instruction).
+
+        Forward timing is straightforward (wraps the call itself).
+        Backward is deferred -- sili__new's autograd attaches a Python
+        closure to `out._backward` that only actually runs later, inside
+        the caller's own loss.backward() graph walk, outside step()'s
+        own call stack entirely. Wrapping that closure here (instead of
+        modifying sili__new's engine) keeps this purely a sili_peridot-
+        side concern: `out._backward` is REPLACED with a thin timer
+        wrapper around the original closure, so whichever later
+        loss.backward() call eventually triggers it, this layer's own
+        share of that walk gets attributed correctly.
+
+        Accumulates into self._layer_timing[layer_name] (fwd_s/bwd_s/
+        fwd_calls/bwd_calls) -- callers use reset_layer_timing() to zero
+        it before a measurement window (mirrors how steps_per_sec is
+        computed over a window in train_mqar_curriculum.py, not since
+        t=0)."""
+        t0 = time.perf_counter()
+        out = layer.forward(*args, **kwargs)
+        rec = self._layer_timing.setdefault(
+            layer_name, {"fwd_s": 0.0, "bwd_s": 0.0, "fwd_calls": 0, "bwd_calls": 0})
+        rec["fwd_s"] += time.perf_counter() - t0
+        rec["fwd_calls"] += 1
+        orig_backward = out._backward
+        if orig_backward is not None:
+            def _timed_backward(_orig=orig_backward, _rec=rec):
+                tb0 = time.perf_counter()
+                _orig()
+                _rec["bwd_s"] += time.perf_counter() - tb0
+                _rec["bwd_calls"] += 1
+            out._backward = _timed_backward
+        return out
+
+    def reset_layer_timing(self) -> None:
+        """Zero self._layer_timing -- call at the start of a measurement
+        window (task #373), same convention as train_mqar_curriculum.py's
+        own windowed steps_per_sec, not a cumulative-since-t=0 total."""
+        self._layer_timing = {}
 
     def _wide_extra_kwargs(self, layer_name: str) -> dict:
         """Extra kwargs threaded into ONE of the 5 affected layers'
@@ -826,7 +884,8 @@ class ToyTileRecurrenceRMT:
         return out
 
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float,
-                           requires_grad: bool = True, **extra_kwargs) -> Tensor:
+                           requires_grad: bool = True, layer_name: Optional[str] = None,
+                           **extra_kwargs) -> Tensor:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its
         l1_sparsity_coef docstring for the full split-backward rationale.
 
@@ -839,9 +898,22 @@ class ToyTileRecurrenceRMT:
         (each Python closure holds its own input directly, same as
         every other Tensor op), so this is no longer order-sensitive at
         all -- previously needed use_explicit_token to avoid a real
-        engine-side LIFO-cache bug, now simply not a concern."""
-        out_aux = layer.forward(input_t, lr, requires_grad=requires_grad,
-                                damp_by_importance=False, **self.synapse_kwargs, **extra_kwargs)
+        engine-side LIFO-cache bug, now simply not a concern.
+
+        layer_name (task #373): when given (one of the 5 wide layers),
+        this call's real forward+backward cost is folded into
+        self._layer_timing too -- this probe is real compute the same
+        as the main pass, so the budget allocator (#375) needs to see
+        it. None (default, used by lm_head's own untimed call site)
+        skips timing entirely, matching every other caller's previous
+        behavior exactly."""
+        if layer_name is not None:
+            out_aux = self._timed_layer_forward(
+                layer, layer_name, input_t, lr, requires_grad=requires_grad,
+                damp_by_importance=False, **self.synapse_kwargs, **extra_kwargs)
+        else:
+            out_aux = layer.forward(input_t, lr, requires_grad=requires_grad,
+                                    damp_by_importance=False, **self.synapse_kwargs, **extra_kwargs)
         n = float(np.asarray(out_aux.data).size)
         return reduce_sum(tensor_abs(out_aux)) * (coef / n)
 
@@ -931,8 +1003,8 @@ class ToyTileRecurrenceRMT:
         # Phase 6 (task #335): _to_sparse is a no-op unless input_sparsity_p
         # is set -- x_window_sparse IS x_window_t in that (default) case.
         x_window_sparse = self._to_sparse(x_window_t)
-        x_wide = self.input_proj.forward(x_window_sparse, learning_rate, requires_grad=requires_grad,
-                                         **self.synapse_kwargs, **_kw("input_proj", "content"))  # [n_content, sw]
+        x_wide = self._timed_layer_forward(self.input_proj, "input_proj", x_window_sparse, learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **_kw("input_proj", "content"))  # [n_content, sw]
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -941,12 +1013,12 @@ class ToyTileRecurrenceRMT:
         combined_normed = concat([memory_normed, x_normed], axis=0)          # [total_slots, sw]
         combined_normed_sparse = self._to_sparse(combined_normed)
 
-        q = self.q_proj.forward(combined_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                **self.synapse_kwargs, **_kw("q_proj", "full"))
-        k = self.k_proj.forward(combined_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                **self.synapse_kwargs, **_kw("k_proj", "full"))
-        v = self.v_proj.forward(combined_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                **self.synapse_kwargs, **_kw("v_proj", "full"))
+        q = self._timed_layer_forward(self.q_proj, "q_proj", combined_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **_kw("q_proj", "full"))
+        k = self._timed_layer_forward(self.k_proj, "k_proj", combined_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **_kw("k_proj", "full"))
+        v = self._timed_layer_forward(self.v_proj, "v_proj", combined_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **_kw("v_proj", "full"))
 
         aux_loss = None
 
@@ -1010,8 +1082,8 @@ class ToyTileRecurrenceRMT:
         sigmas_mem = gather(sigmas, list(range(n_mem)))
         attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
                                             num_cpus=self.num_cpus, causal=False)
-        attn_mem = self.o_proj.forward(self._to_sparse(attn_pre_o_mem), learning_rate, requires_grad=requires_grad,
-                                       **self.synapse_kwargs, **_kw("o_proj", "mem"))
+        attn_mem = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_mem), learning_rate, requires_grad=requires_grad,
+                                             **self.synapse_kwargs, **_kw("o_proj", "mem"))
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
@@ -1039,10 +1111,10 @@ class ToyTileRecurrenceRMT:
         # to survive the hard-detach between step() calls.
         memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
         memory_new_normed_sparse = self._to_sparse(memory_new_normed)
-        k_mem_fresh = self.k_proj.forward(memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                          **self.synapse_kwargs, **_kw("k_proj", "mem"))
-        v_mem_fresh = self.v_proj.forward(memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                          **self.synapse_kwargs, **_kw("v_proj", "mem"))
+        k_mem_fresh = self._timed_layer_forward(self.k_proj, "k_proj", memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **_kw("k_proj", "mem"))
+        v_mem_fresh = self._timed_layer_forward(self.v_proj, "v_proj", memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **_kw("v_proj", "mem"))
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
@@ -1081,8 +1153,8 @@ class ToyTileRecurrenceRMT:
             attn_pre_o_content = gaussian_attention(q_content, k2_phys, v2_phys,
                                                      centers_content, sigmas_content,
                                                      num_cpus=self.num_cpus, causal=False)
-        attn_content = self.o_proj.forward(self._to_sparse(attn_pre_o_content), learning_rate, requires_grad=requires_grad,
-                                           **self.synapse_kwargs, **_kw("o_proj", "content"))
+        attn_content = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_content), learning_rate, requires_grad=requires_grad,
+                                                 **self.synapse_kwargs, **_kw("o_proj", "content"))
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
 
@@ -1110,16 +1182,16 @@ class ToyTileRecurrenceRMT:
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [
                 self._l1_sparsity_split(self.input_proj, x_window_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("input_proj")),
+                                        requires_grad=requires_grad, layer_name="input_proj", **self._wide_extra_kwargs("input_proj")),
                 self._l1_sparsity_split(self.q_proj, combined_normed_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("q_proj")),
+                                        requires_grad=requires_grad, layer_name="q_proj", **self._wide_extra_kwargs("q_proj")),
                 self._l1_sparsity_split(self.k_proj, combined_normed_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("k_proj")),
+                                        requires_grad=requires_grad, layer_name="k_proj", **self._wide_extra_kwargs("k_proj")),
                 self._l1_sparsity_split(self.v_proj, combined_normed_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("v_proj")),
+                                        requires_grad=requires_grad, layer_name="v_proj", **self._wide_extra_kwargs("v_proj")),
                 self._l1_sparsity_split(self.o_proj, self._to_sparse(gaussian_attention(
                     q, k_phys, v_phys, self.centers, sigmas, num_cpus=self.num_cpus, causal=False)),
-                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, **self._wide_extra_kwargs("o_proj")),
+                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, layer_name="o_proj", **self._wide_extra_kwargs("o_proj")),
             ]
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
@@ -1245,8 +1317,8 @@ class ToyTileRecurrenceRMT:
         new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
         new_embed_t = Tensor(new_embed_2d)
         new_embed_sparse = self._to_sparse(new_embed_t)
-        x_wide_new = self.input_proj.forward(new_embed_sparse, learning_rate, requires_grad=requires_grad,
-                                             **self.synapse_kwargs, **self._wide_extra_kwargs("input_proj"))  # [1, sw]
+        x_wide_new = self._timed_layer_forward(self.input_proj, "input_proj", new_embed_sparse, learning_rate, requires_grad=requires_grad,
+                                               **self.synapse_kwargs, **self._wide_extra_kwargs("input_proj"))  # [1, sw]
         x_normed_new = rmsnorm_tensor(x_wide_new, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -1255,12 +1327,12 @@ class ToyTileRecurrenceRMT:
         combined_normed_step = concat([memory_normed, x_normed_new], axis=0)  # [n_mem+1, sw]
         combined_normed_step_sparse = self._to_sparse(combined_normed_step)
 
-        q_step = self.q_proj.forward(combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
-                                     **self.synapse_kwargs, **self._wide_extra_kwargs("q_proj"))
-        k_step = self.k_proj.forward(combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
-                                     **self.synapse_kwargs, **self._wide_extra_kwargs("k_proj"))
-        v_step = self.v_proj.forward(combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
-                                     **self.synapse_kwargs, **self._wide_extra_kwargs("v_proj"))
+        q_step = self._timed_layer_forward(self.q_proj, "q_proj", combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs("q_proj"))
+        k_step = self._timed_layer_forward(self.k_proj, "k_proj", combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs("k_proj"))
+        v_step = self._timed_layer_forward(self.v_proj, "v_proj", combined_normed_step_sparse, learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs("v_proj"))
 
         aux_loss = None
 
@@ -1312,8 +1384,8 @@ class ToyTileRecurrenceRMT:
         sigmas_mem = gather(sigmas, self._mem_center_idx)
         attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
                                             num_cpus=self.num_cpus, causal=False)
-        attn_mem = self.o_proj.forward(self._to_sparse(attn_pre_o_mem), learning_rate, requires_grad=requires_grad,
-                                       **self.synapse_kwargs, **self._wide_extra_kwargs("o_proj"))
+        attn_mem = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_mem), learning_rate, requires_grad=requires_grad,
+                                             **self.synapse_kwargs, **self._wide_extra_kwargs("o_proj"))
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
@@ -1322,10 +1394,10 @@ class ToyTileRecurrenceRMT:
         # --- PASS 2: READ, only the newest content row's own query ---
         memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
         memory_new_normed_sparse = self._to_sparse(memory_new_normed)
-        k_mem_fresh = self.k_proj.forward(memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                          **self.synapse_kwargs, **self._wide_extra_kwargs("k_proj"))
-        v_mem_fresh = self.v_proj.forward(memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
-                                          **self.synapse_kwargs, **self._wide_extra_kwargs("v_proj"))
+        k_mem_fresh = self._timed_layer_forward(self.k_proj, "k_proj", memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **self._wide_extra_kwargs("k_proj"))
+        v_mem_fresh = self._timed_layer_forward(self.v_proj, "v_proj", memory_new_normed_sparse, learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **self._wide_extra_kwargs("v_proj"))
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
@@ -1347,8 +1419,8 @@ class ToyTileRecurrenceRMT:
             attn_pre_o_content = gaussian_attention(q_new, k2_phys, v2_phys,
                                                      centers_content, sigmas_content,
                                                      num_cpus=self.num_cpus, causal=False)
-        attn_content = self.o_proj.forward(self._to_sparse(attn_pre_o_content), learning_rate, requires_grad=requires_grad,
-                                           **self.synapse_kwargs, **self._wide_extra_kwargs("o_proj"))
+        attn_content = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_content), learning_rate, requires_grad=requires_grad,
+                                                 **self.synapse_kwargs, **self._wide_extra_kwargs("o_proj"))
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
 
@@ -1373,16 +1445,16 @@ class ToyTileRecurrenceRMT:
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [
                 self._l1_sparsity_split(self.input_proj, new_embed_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("input_proj")),
+                                        requires_grad=requires_grad, layer_name="input_proj", **self._wide_extra_kwargs("input_proj")),
                 self._l1_sparsity_split(self.q_proj, combined_normed_step_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("q_proj")),
+                                        requires_grad=requires_grad, layer_name="q_proj", **self._wide_extra_kwargs("q_proj")),
                 self._l1_sparsity_split(self.k_proj, combined_normed_step_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("k_proj")),
+                                        requires_grad=requires_grad, layer_name="k_proj", **self._wide_extra_kwargs("k_proj")),
                 self._l1_sparsity_split(self.v_proj, combined_normed_step_sparse, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad, **self._wide_extra_kwargs("v_proj")),
+                                        requires_grad=requires_grad, layer_name="v_proj", **self._wide_extra_kwargs("v_proj")),
                 self._l1_sparsity_split(self.o_proj, self._to_sparse(
                     concat([attn_pre_o_mem, attn_pre_o_content], axis=0)),
-                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, **self._wide_extra_kwargs("o_proj")),
+                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, layer_name="o_proj", **self._wide_extra_kwargs("o_proj")),
             ]
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
