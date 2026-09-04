@@ -117,7 +117,24 @@ NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 # kind of per-step code-space ceiling FP4 gets for free, while FP4/FP32
 # stay on the deliberately uncapped NOCAPS_KWARGS unchanged.
 NOCAPS_KWARGS_FP8 = {"max_abs_delta": 2.0, "max_ci": 1e30}
-PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS}
+# fp32 does NOT get the same free pass as FP4: FP4/FP8's raw stored value is
+# a quantization CODE with a small fixed table ceiling (FP4 ~6, FP8 E4M3
+# ~448), which gives it an implicit per-step safety margin even under an
+# uncapped max_abs_delta (see NOCAPS_KWARGS_FP8's comment above). fp32's
+# raw stored value is a plain, genuinely unbounded float -- there is no
+# implicit ceiling at all. Confirmed the hard way: a wide (3x embed_width),
+# 10%-input-sparse/10%-grad-sparse fp32 MQAR run under NOCAPS_KWARGS blew
+# up input_proj/v_proj to ~1e14-1e17 within 16k steps (overflow/invalid
+# RuntimeWarnings, near-chance accuracy) while q/k/o_proj/lm_head -- same
+# code, same NOCAPS -- stayed healthy; this is the simple hard-bound half
+# of the fix (immediate safety net), the amortized L2 decay mechanism
+# (apply_amortized_l2_decay) is the complementary ongoing-health half.
+# Reuse the library's own already-tuned production default
+# (kSynapsePolicyMaxAbsDelta/MaxCi, sili/cpu_backend.cpp) rather than
+# guessing new numbers -- these are what every OTHER precision already
+# runs under whenever synapse_kwargs isn't explicitly overridden.
+NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0}
+PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS_FP32}
 
 DEFAULT_PEAK_LR = 0.015
 DEFAULT_NUM_TILES = 16         # fixed local-attention window (model param, not a task param)
@@ -435,7 +452,9 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      embed_table_builder=None,
                      embed_learning_rate: Optional[float] = None,
                      k_first_target: Optional[int] = None,
-                     k_first_vocab: Optional[int] = None) -> dict:
+                     k_first_vocab: Optional[int] = None,
+                     l2_decay_chunk_size: Optional[int] = None,
+                     l2_decay_adaptation_rate: float = 0.3) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
     # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
@@ -859,6 +878,16 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                     sigma_grad_debug_fn(step, model.log_sigmas.grad, model.centers.grad)
                 clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+                # Amortized decoupled L2 decay + health stats (direct
+                # instruction): the "ongoing health" complement to
+                # NOCAPS_KWARGS's per-precision max_abs_delta/max_ci hard
+                # bound above -- independent of dynamic_rank_control (this
+                # decays raw synapse weights, not AQRS scale/additive
+                # channels, so it applies identically whether or not rank
+                # can mutate). None (default): zero overhead, unchanged
+                # behavior for every existing caller.
+                if l2_decay_chunk_size is not None:
+                    model.apply_amortized_l2_decay(l2_decay_chunk_size, l2_decay_adaptation_rate)
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,

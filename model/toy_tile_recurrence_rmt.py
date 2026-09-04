@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -286,6 +287,12 @@ class ToyTileRecurrenceRMT:
         # see zero behavior change.
         self.use_critic = use_critic
         self.critic_head = None
+        # Persistent per-layer decay_factor state for apply_amortized_l2_decay
+        # (closed-loop, corrected toward each layer's fan-in-normalized target
+        # from its own measured rms -- see that method's own docstring).
+        # Lazily populated (name -> factor), default 1.0 (no decay) until a
+        # layer's first full cycle completes and supplies real data.
+        self._l2_decay_factor: dict = {}
         if use_critic:
             critic_seed = int(rng.integers(0, 2**31 - 1))
             self.critic_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
@@ -450,6 +457,83 @@ class ToyTileRecurrenceRMT:
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
             elif hasattr(layer, "magnitude_rescale_output") and hasattr(layer, "digits"):
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
+    def apply_amortized_l2_decay(self, chunk_size: int, adaptation_rate: float = 0.3) -> dict:
+        """Apply the amortized decoupled L2 decay + rolling health-stats
+        mechanism (direct instruction, see conversation) to every real
+        disldo_cls weight layer, INCLUDING the fp32 control (unlike
+        magnitude_rescale_output, apply_amortized_l2_decay is bound on
+        all three backends -- ValueAccessor-generic, no hasattr guard
+        needed). Meant to be called once per real training step -- this
+        is the "simple bound helps immediately, L2 helps health"
+        complement to NOCAPS_KWARGS's per-precision max_abs_delta/max_ci
+        (train_mqar_curriculum.py).
+
+        CLOSED-LOOP, not a hand-picked half-life (corrects an earlier
+        version of this method that took a fixed `half_life_steps` --
+        direct instruction: "I thought we could set the L2
+        hyperparameters based off the statistically measured health of
+        the neural network itself for an exact solution"). A first
+        attempt at a fixed half-life (2000 steps) DID verify the
+        overflow fix but was badly overtuned for the wide+sparse config:
+        q/k/o_proj -- already healthy with ZERO decay in the original
+        buggy run (mean|w| ~0.04-0.13) -- got crushed to ~1e-5 by step
+        16000, meaning the guessed constant dominated real learning
+        instead of just providing a long-horizon health ceiling. Picking
+        a bigger constant (20000) would have been the same mistake again
+        with extra steps.
+
+        Real fix: no half-life at all. Each layer keeps its own
+        decay_factor in self._l2_decay_factor (persistent across step()
+        calls, lazily initialized to 1.0 = no decay -- the max_abs_delta/
+        max_ci hard bound is the actual immediate safety net per the
+        two-part design, so it's fine for L2 to do nothing until it has
+        real data). Every time a layer's rolling cursor completes a full
+        pass, its MEASURED rms is compared against the closed-form
+        target 1/sqrt(fan_in) (the same fan-in-normalized scale
+        _preseed_dense_scattered already inits every dense fp32 layer
+        to, sili/sparse_rnn.py) and decay_factor is corrected
+        multiplicatively toward that target:
+            decay_factor *= clip((target / measured_rms) ** adaptation_rate, 0.5, 2.0)
+        clipped to (1e-6, 1.0]. rms above target -> decay strengthens
+        (factor drops); rms below target -> decay relaxes (factor rises
+        back toward 1.0, never above -- L2 only ever shrinks). This
+        converges toward the fan-in-normalized target using the model's
+        own measured statistics, the same rms/mean_abs/max_abs
+        apply_amortized_l2_decay already returns every cycle -- no
+        separate stats pass, no externally-guessed timescale.
+        adaptation_rate is a control-loop GAIN (how fast the correction
+        responds), not an equilibrium-setting parameter like half_life_
+        steps was -- a 2x-off gain still converges to the same correct
+        fixed point, just slower/faster, unlike a 2x-off half-life which
+        directly sets the wrong equilibrium magnitude.
+
+        chunk_size: synapses touched PER LAYER PER call (same raw budget
+        for every layer regardless of width).
+
+        Returns {layer_name: stats_dict} for every layer that JUST
+        completed a full pass this call (stats_dict has mean_abs/rms/
+        max_abs/n plus target/decay_factor for diagnostics); layers
+        still mid-cycle are omitted since their reported stats would be
+        the stale previous cycle's numbers."""
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            decay_factor = self._l2_decay_factor.get(name, 1.0)
+            stats = layer.apply_amortized_l2_decay(chunk_size, decay_factor)
+            if stats.get("cycle_complete") and stats.get("n", 0) > 0:
+                target = 1.0 / math.sqrt(layer.in_features)
+                measured_rms = stats.get("rms", 0.0)
+                if measured_rms > 0.0:
+                    correction = (target / measured_rms) ** adaptation_rate
+                    correction = min(max(correction, 0.5), 2.0)
+                    decay_factor = min(max(decay_factor * correction, 1e-6), 1.0)
+                    self._l2_decay_factor[name] = decay_factor
+                stats = dict(stats, target=target, decay_factor=decay_factor)
+                results[name] = stats
+        return results
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
