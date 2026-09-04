@@ -338,6 +338,150 @@ class TestDyRTarget:
         assert all(v <= 0.99 for v in model2.dy_r_target.values())
 
 
+class TestDySurprise:
+    """Task #374: lagged per-layer E_t/Lbar surprise modulation on top of
+    dy_r_target's own r_bar -- see ToyTileRecurrenceRMT.__init__'s own
+    dy_surprise_alpha docstring for the full formula (r_t = clip(r_bar *
+    (E_t/Lbar)^alpha, 0.05, 0.99)) and JOURNAL.md's "Grad-side k_t
+    design, revised" / "Multi-actuator design discussion" entries for
+    the derivation."""
+
+    def test_off_by_default_even_with_surprise_data(self):
+        # dy_surprise_alpha=None (default) must return r_bar UNMODIFIED
+        # regardless of whatever's in _layer_surprise -- byte-identical
+        # to task #372's own behavior, matching every other opt-in
+        # kwarg's None-means-off convention in this file.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(40),
+            dy_r_target=0.7)
+        model._layer_surprise["q_proj"] = {"E_t": 100.0, "Lbar": 1.0}  # would be a huge ratio if used
+        assert model._effective_dy_r_target("q_proj") == 0.7
+        assert model._wide_extra_kwargs("q_proj")["dy_r_target"] == 0.7
+
+    def test_no_modulation_before_any_backward_ever_ran(self):
+        # Cold start: dy_surprise_alpha set, but _layer_surprise is still
+        # empty (no real backward has run yet) -- must fall back to
+        # r_bar unmodified, not divide-by-zero or KeyError.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(41),
+            dy_r_target=0.7, dy_surprise_alpha=0.5)
+        assert model._layer_surprise == {}
+        assert model._effective_dy_r_target("q_proj") == 0.7
+
+    def test_formula_modulates_up_when_e_t_above_lbar(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(42),
+            dy_r_target=0.3, dy_surprise_alpha=0.5)
+        model._layer_surprise["q_proj"] = {"E_t": 4.0, "Lbar": 1.0}  # ratio=4, sqrt=2
+        r_t = model._effective_dy_r_target("q_proj")  # 0.3*2=0.6, within [0.05, 0.99]
+        assert abs(r_t - 0.3 * 2.0) < 1e-9
+
+    def test_formula_modulates_down_when_e_t_below_lbar(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(43),
+            dy_r_target=0.5, dy_surprise_alpha=0.5)
+        model._layer_surprise["q_proj"] = {"E_t": 0.25, "Lbar": 1.0}  # ratio=0.25, sqrt=0.5
+        r_t = model._effective_dy_r_target("q_proj")
+        assert abs(r_t - 0.5 * 0.5) < 1e-9
+
+    def test_formula_clips_to_0_05_0_99(self):
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(44),
+            dy_r_target=0.5, dy_surprise_alpha=1.0)
+        model._layer_surprise["q_proj"] = {"E_t": 1000.0, "Lbar": 1.0}
+        assert model._effective_dy_r_target("q_proj") == 0.99
+        model._layer_surprise["q_proj"] = {"E_t": 0.0001, "Lbar": 1.0}
+        assert model._effective_dy_r_target("q_proj") == 0.05
+
+    def test_per_layer_independent(self):
+        # Only q_proj has surprise data seeded -- every other wide layer
+        # (real cold start) must stay at r_bar unmodified.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(45),
+            dy_r_target=0.5, dy_surprise_alpha=0.5)
+        model._layer_surprise["q_proj"] = {"E_t": 4.0, "Lbar": 1.0}
+        assert model._effective_dy_r_target("q_proj") != 0.5
+        for name in ("input_proj", "k_proj", "v_proj", "o_proj"):
+            assert model._effective_dy_r_target(name) == 0.5
+
+    def test_update_layer_surprise_lbar_inits_to_e_t_not_zero(self):
+        model = _model()
+        model.dy_surprise_alpha = 0.5  # bypass constructor for a bare unit check
+        model._update_layer_surprise("q_proj", np.array([3.0, 4.0], dtype=np.float32))  # E_t=25
+        rec = model._layer_surprise["q_proj"]
+        assert rec["E_t"] == 25.0
+        assert rec["Lbar"] == 25.0  # first observation: Lbar==E_t exactly, ratio=1.0 (neutral)
+
+    def test_update_layer_surprise_ema_tracks_over_multiple_calls(self):
+        model = _model()
+        model.dy_surprise_alpha = 0.5
+        model.dy_surprise_beta = 0.5  # fast-moving EMA for a quick, checkable test
+        model._update_layer_surprise("q_proj", np.array([1.0], dtype=np.float32))  # E_t=1
+        assert model._layer_surprise["q_proj"]["Lbar"] == 1.0
+        model._update_layer_surprise("q_proj", np.array([3.0], dtype=np.float32))  # E_t=9
+        # Lbar = 0.5*1.0 + 0.5*9.0 = 5.0
+        assert abs(model._layer_surprise["q_proj"]["Lbar"] - 5.0) < 1e-9
+        assert model._layer_surprise["q_proj"]["E_t"] == 9.0
+
+    def test_real_backward_populates_surprise_for_all_5_wide_layers(self):
+        # Integration smoke test, same style as test_set_value_stays_
+        # finite_through_real_backward above -- confirms the full path
+        # (forward -> _timed_layer_forward -> real backward -> out.grad
+        # -> _update_layer_surprise) actually wires up end to end, not
+        # just the formula in isolation.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(46),
+            dy_r_target=0.7, dy_surprise_alpha=0.5)
+        x_window = np.random.RandomState(47).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        memory_prev, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.05)
+        loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 3)])
+        loss.grad = np.array(1.0, dtype=np.float32)
+        loss.backward()
+        for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
+            assert name in model._layer_surprise
+            assert model._layer_surprise[name]["E_t"] >= 0.0
+            assert np.isfinite(model._layer_surprise[name]["E_t"])
+            assert np.isfinite(model._layer_surprise[name]["Lbar"])
+
+    def test_lagged_not_current_step(self):
+        # The core design property: a layer's OWN forward()-time kwargs
+        # for step N must reflect step N-1's surprise data, never step
+        # N's own (which doesn't exist yet at forward()-call time).
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(48),
+            dy_r_target=0.7, dy_surprise_alpha=0.5)
+        x_window = np.random.RandomState(49).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+
+        # Step 1: no surprise data exists yet -- must be unmodulated r_bar.
+        assert model._effective_dy_r_target("q_proj") == 0.7
+        memory_prev, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.05)
+        assert model._layer_surprise == {}  # forward alone never populates it
+        loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 3)])
+        loss.grad = np.array(1.0, dtype=np.float32)
+        loss.backward()
+        # NOW step 1's backward has run -- surprise data exists, first
+        # observation always has ratio==1.0 (Lbar inits to E_t), so
+        # still no modulation on this exact call, but the STATE exists.
+        assert "q_proj" in model._layer_surprise
+        snapshot = dict(model._layer_surprise["q_proj"])
+
+        # Step 2: forward()-time kwargs must reflect step 1's surprise
+        # snapshot, unchanged by anything from step 2 itself (which
+        # hasn't run backward yet).
+        memory_prev, logits2, _aux2 = model.step(x_window, memory_prev, learning_rate=0.05)
+        assert model._layer_surprise["q_proj"] == snapshot
+
+
 def _build_window(embed_table, tokens, i, num_tiles):
     embed_width = embed_table.shape[1]
     window = np.zeros((num_tiles, embed_width), dtype=np.float32)

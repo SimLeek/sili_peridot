@@ -54,7 +54,7 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     the dominant cost driver, not snapshot/merge overhead) at whatever
     quality tradeoff that implies.
   [use_tile_cache] [output_dy_sparsity_p] [wrong_streak_threshold]
-  [dy_r_target] [dy_k_min] [dy_k_max] [target_steps_per_sec]
+  [dy_r_target] [dy_k_min] [dy_k_max] [target_steps_per_sec] [dy_surprise_alpha]
   dy_r_target: nucleus/energy-threshold captured-energy-ratio target
     (0..1) for those same 5 layers' backward gradient (task #367) --
     TAKES PRIORITY over dy_sparsity_p when both are set. k is a
@@ -70,6 +70,13 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     (measured directly and found non-constant across widths, see
     JOURNAL.md's "Grad-side k_t design, revised" entry). -1 (default) =
     unset, dy_r_target stays fixed at its initial value for the whole run.
+  dy_surprise_alpha: task #374, per-layer INNER loop -- breathes each
+    wide layer's own EFFECTIVE dy_r_target above/below its r_bar based
+    on that layer's own lagged gradient energy (E_t=||dy||^2 vs its
+    running EMA Lbar, beta=0.99 fixed, not CLI-exposed). -1 (default) =
+    unset, mechanism off, r_bar used unmodified (same as before this
+    task). See ToyTileRecurrenceRMT.__init__'s own dy_surprise_alpha
+    docstring for the full formula.
 """
 from __future__ import annotations
 
@@ -475,6 +482,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                      dy_r_target: Optional[float] = None,
                      dy_k_min: int = 0,
                      dy_k_max: Optional[int] = None,
+                     dy_surprise_alpha: Optional[float] = None,
+                     dy_surprise_beta: float = 0.99,
                      target_steps_per_sec: Optional[float] = None) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
@@ -559,6 +568,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         input_sparsity_p=input_sparsity_p, wide_max_weights=wide_max_weights,
         dy_sparsity_p=dy_sparsity_p, output_dy_sparsity_p=output_dy_sparsity_p,
         dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
+        dy_surprise_alpha=dy_surprise_alpha, dy_surprise_beta=dy_surprise_beta,
         rng=model_rng)
     opt = AdamOptimizer()
     # embed_table_builder (direct instruction, wide-model SDR redesign):
@@ -1104,6 +1114,14 @@ def main():
     dy_k_max = _dy_k_max_arg if _dy_k_max_arg >= 0 else None
     _target_sps_arg = float(sys.argv[22]) if len(sys.argv) > 22 else -1.0
     target_steps_per_sec = _target_sps_arg if _target_sps_arg >= 0 else None
+    # dy_surprise_alpha (task #374, per-layer lagged E_t/Lbar inner
+    # loop): same -1/"unset" sentinel convention. dy_surprise_beta
+    # (EMA decay) stays at its 0.99 default -- not exposed via CLI, an
+    # unvalidated mechanism doesn't need every sub-parameter tunable
+    # from the command line yet (direct-instruction pattern from this
+    # same session: don't over-parameterize unproven complexity).
+    _dy_surprise_alpha_arg = float(sys.argv[23]) if len(sys.argv) > 23 else -1.0
+    dy_surprise_alpha = _dy_surprise_alpha_arg if _dy_surprise_alpha_arg >= 0 else None
 
     print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
           f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
@@ -1114,7 +1132,7 @@ def main():
           f"output_dy_sparsity_p={output_dy_sparsity_p} "
           f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
           f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
-          f"target_steps_per_sec={target_steps_per_sec}",
+          f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha}",
           flush=True)
 
     _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
@@ -1160,6 +1178,7 @@ def main():
                          output_dy_sparsity_p=output_dy_sparsity_p,
                          wrong_streak_threshold=wrong_streak_threshold,
                          dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
+                         dy_surprise_alpha=dy_surprise_alpha,
                          target_steps_per_sec=target_steps_per_sec)
     print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
           f"final_phase={r['final_phase']} graduated={r['graduated']} "

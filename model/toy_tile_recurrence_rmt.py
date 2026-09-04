@@ -68,6 +68,8 @@ class ToyTileRecurrenceRMT:
                  dy_r_target: Optional[float] = None,
                  dy_k_min: int = 0,
                  dy_k_max: Optional[int] = None,
+                 dy_surprise_alpha: Optional[float] = None,
+                 dy_surprise_beta: float = 0.99,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -233,7 +235,47 @@ class ToyTileRecurrenceRMT:
         #368's own measurement), so per-layer state is the natural
         representation even though this constructor arg still only
         offers one shared starting point; task #374's per-layer surprise
-        loop will make each entry diverge independently over training."""
+        loop will make each entry diverge independently over training.
+
+        dy_surprise_alpha/dy_surprise_beta (task #374, see JOURNAL.md's
+        "Grad-side k_t design, revised" + "Multi-actuator design
+        discussion" entries for the full derivation): per-layer INNER
+        loop, breathing each layer's own EFFECTIVE r_target above/below
+        its r_bar (self.dy_r_target[name], the OUTER sps-controlled
+        anchor from apply_amortized_dy_r_target_control) based on that
+        layer's own recent gradient energy --
+
+            E_t   = ||dy_t||^2                          # free byproduct of backward
+            Lbar <- beta*Lbar + (1-beta)*E_t             # per-layer running EMA
+            r_t   = clip(r_bar * (E_t/Lbar)^alpha, 0.05, 0.99)
+
+        A layer whose gradient just carried more energy than its own
+        recent average (surprising -- more to learn from this step) gets
+        a HIGHER effective capture ratio; a layer coasting near its own
+        average gets pulled back down, independent of every other
+        layer's own r_bar/surprise state. E_t/Lbar are naturally
+        LAGGED one step already (no explicit bookkeeping needed): a
+        layer's `_wide_extra_kwargs` call happens at forward()-time,
+        strictly BEFORE that step's own backward (and therefore that
+        step's own dy) exists -- so it always reads whatever E_t/Lbar
+        the PREVIOUS backward pass left behind, which is exactly the
+        one-step lag the design calls for (sidesteps the forward-
+        before-dy-exists chicken-and-egg without an autograd hook or
+        C++ instrumentation).
+
+        dy_surprise_alpha None (default): mechanism fully OFF, effective
+        r_target is exactly r_bar with zero modulation -- byte-identical
+        to every existing dy_r_target caller/test, matching every other
+        opt-in kwarg's own None-means-off convention here. Set (e.g.
+        0.5, an unvalidated starting point -- not yet tuned against a
+        real quality metric) to turn it on. dy_surprise_beta (0.99,
+        matching the design note's own "beta ~ 0.99") only matters once
+        alpha is set. r_min/r_max for this INNER per-step clip are
+        hardcoded at 0.05/0.99, matching apply_amortized_dy_r_target_
+        control's own OUTER-loop defaults -- not exposed as further
+        constructor params, to avoid over-parameterizing an unvalidated
+        mechanism (direct-instruction pattern from this same session:
+        don't build unproven complexity)."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -268,6 +310,14 @@ class ToyTileRecurrenceRMT:
         self.dy_r_target: dict = {name: dy_r_target for name in self._WIDE_LAYER_NAMES}
         self.dy_k_min = dy_k_min
         self.dy_k_max = dy_k_max
+        # Task #374: per-layer surprise state (name -> {"E_t", "Lbar"}),
+        # lazily populated on each layer's first real backward call (see
+        # _timed_layer_forward). dy_surprise_alpha=None means the whole
+        # inner loop is a no-op -- see __init__'s own dy_surprise_alpha
+        # docstring above.
+        self.dy_surprise_alpha = dy_surprise_alpha
+        self.dy_surprise_beta = dy_surprise_beta
+        self._layer_surprise: dict = {}
         # _wide_extra_kwargs (below) is a live METHOD, keyed by layer name,
         # now that dy_r_target is a per-layer dict mutable post-construction
         # via apply_amortized_dy_r_target_control -- every one of step()'s
@@ -518,7 +568,14 @@ class ToyTileRecurrenceRMT:
         fwd_calls/bwd_calls) -- callers use reset_layer_timing() to zero
         it before a measurement window (mirrors how steps_per_sec is
         computed over a window in train_mqar_curriculum.py, not since
-        t=0)."""
+        t=0).
+
+        Also the task #374 surprise-signal capture point: `out.grad` at
+        the moment `out._backward` actually runs IS `dy` for this layer
+        (the real gradient flowing into this forward call's output) --
+        a free byproduct of the same wrapper, no separate instrumentation
+        needed. Feeds self._update_layer_surprise (no-op unless
+        dy_surprise_alpha is set -- see __init__'s own docstring)."""
         t0 = time.perf_counter()
         out = layer.forward(*args, **kwargs)
         rec = self._layer_timing.setdefault(
@@ -527,11 +584,13 @@ class ToyTileRecurrenceRMT:
         rec["fwd_calls"] += 1
         orig_backward = out._backward
         if orig_backward is not None:
-            def _timed_backward(_orig=orig_backward, _rec=rec):
+            def _timed_backward(_orig=orig_backward, _rec=rec, _out=out, _name=layer_name):
                 tb0 = time.perf_counter()
                 _orig()
                 _rec["bwd_s"] += time.perf_counter() - tb0
                 _rec["bwd_calls"] += 1
+                if self.dy_surprise_alpha is not None and _out.grad is not None:
+                    self._update_layer_surprise(_name, _out.grad)
             out._backward = _timed_backward
         return out
 
@@ -540,6 +599,52 @@ class ToyTileRecurrenceRMT:
         window (task #373), same convention as train_mqar_curriculum.py's
         own windowed steps_per_sec, not a cumulative-since-t=0 total."""
         self._layer_timing = {}
+
+    def _update_layer_surprise(self, layer_name: str, dy) -> None:
+        """Task #374: E_t = ||dy||^2 (this backward call's own gradient
+        energy), Lbar <- beta*Lbar + (1-beta)*E_t (per-layer running
+        EMA) -- see __init__'s own dy_surprise_alpha docstring for the
+        full formula/derivation. Called once per REAL backward
+        invocation (multiple times per step() for k/v/o_proj under the
+        write-then-read design -- each is a genuine, independent
+        observation of that layer's gradient energy at that moment, not
+        an artifact to dedupe).
+
+        Lbar initialized to E_t itself on a layer's first-ever
+        observation (not 0) -- starting Lbar at 0 would make the very
+        first E_t/Lbar ratio divide-by-zero; starting it AT E_t instead
+        makes the first ratio exactly 1.0 (no modulation), a neutral
+        cold start that only diverges once real variation is observed."""
+        E_t = float(np.sum(np.asarray(dy, dtype=np.float64) ** 2))
+        rec = self._layer_surprise.get(layer_name)
+        if rec is None:
+            self._layer_surprise[layer_name] = {"E_t": E_t, "Lbar": max(E_t, 1e-12)}
+            return
+        rec["E_t"] = E_t
+        rec["Lbar"] = self.dy_surprise_beta * rec["Lbar"] + (1.0 - self.dy_surprise_beta) * E_t
+
+    def _effective_dy_r_target(self, layer_name: str) -> Optional[float]:
+        """Task #374: r_t = clip(r_bar * (E_t/Lbar)^alpha, 0.05, 0.99),
+        using whatever E_t/Lbar the layer's PREVIOUS real backward call
+        left behind -- see __init__'s own dy_surprise_alpha docstring
+        for why this is already correctly lagged one step with zero
+        extra bookkeeping (this method is only ever called from
+        _wide_extra_kwargs, at forward()-time, strictly before the
+        CURRENT step's own backward has run).
+
+        dy_surprise_alpha is None (default, mechanism off) or this
+        layer has no surprise data yet (cold start, first step ever):
+        returns r_bar unmodified -- byte-identical to task #372's own
+        behavior in both cases."""
+        r_bar = self.dy_r_target.get(layer_name)
+        if r_bar is None or self.dy_surprise_alpha is None:
+            return r_bar
+        surprise = self._layer_surprise.get(layer_name)
+        if surprise is None or surprise["Lbar"] <= 0.0:
+            return r_bar
+        ratio = surprise["E_t"] / surprise["Lbar"]
+        r_t = r_bar * (ratio ** self.dy_surprise_alpha)
+        return min(max(r_t, 0.05), 0.99)
 
     def _wide_extra_kwargs(self, layer_name: str) -> dict:
         """Extra kwargs threaded into ONE of the 5 affected layers'
@@ -556,8 +661,14 @@ class ToyTileRecurrenceRMT:
         dy_sparsity_p when both end up set -- mirrors DISLDOLayer.
         forward's own priority chain exactly (task #367). Neither set:
         empty dict, byte-identical to today's exact dense behavior,
-        matching every other conditional kwarg here."""
-        r_target = self.dy_r_target.get(layer_name)
+        matching every other conditional kwarg here.
+
+        Reads _effective_dy_r_target (task #374), not the raw
+        self.dy_r_target[name] dict entry directly -- applies the
+        lagged per-layer surprise modulation on top of r_bar when
+        dy_surprise_alpha is set, otherwise returns r_bar unmodified
+        (byte-identical to pre-#374 behavior)."""
+        r_target = self._effective_dy_r_target(layer_name)
         if r_target is not None:
             kw = {"dy_r_target": r_target}
             if self.dy_k_min:
