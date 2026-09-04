@@ -1133,10 +1133,20 @@ def main():
         tag = f"  [{event}]" if event else ""
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
-        # dy_r_target (task #368): only printed once the mechanism is
-        # actually enabled -- None (default) stays silent, same
-        # opt-in-visible convention as sps_s/streak_s above.
-        dy_r_s = f"  dy_r_target={dy_r_target:.4f}" if dy_r_target is not None else ""
+        # dy_r_target (task #368, per-layer dict since task #372): only
+        # printed once the mechanism is actually enabled on at least one
+        # wide layer -- empty/all-None stays silent, same opt-in-visible
+        # convention as sps_s/streak_s above. Compact per-layer format
+        # since layers can diverge independently once task #374 lands
+        # (today they still move in lockstep, but the log format doesn't
+        # assume that).
+        if dy_r_target:
+            _set = {n: v for n, v in dy_r_target.items() if v is not None}
+            dy_r_s = ("  dy_r_target[" +
+                      " ".join(f"{_SHORT_NAME.get(n, n)}={v:.3f}" for n, v in _set.items()) +
+                      "]") if _set else ""
+        else:
+            dy_r_s = ""
         print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
               f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{_ranks_str(ranks)}", flush=True)
 

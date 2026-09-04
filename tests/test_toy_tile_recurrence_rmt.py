@@ -218,14 +218,15 @@ class TestOutputDySparsityP:
         # expected drift, not something a bit-identical-output assertion
         # could ever pass. What IS guaranteed: model.dy_sparsity_p (the
         # 5 wide layers' own gradient-density kwarg) and
-        # model._wide_extra_kwargs (what actually gets splatted into
-        # their forward() calls) stay at their untouched defaults.
+        # model._wide_extra_kwargs(name) (what actually gets splatted
+        # into their forward() calls) stay at their untouched defaults.
         model = ToyTileRecurrenceRMT(
             VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
             MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(24),
             output_dy_sparsity_p=0.3)
         assert model.dy_sparsity_p is None
-        assert model._wide_extra_kwargs == {}
+        for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
+            assert model._wide_extra_kwargs(name) == {}
         assert model._output_extra_kwargs == {"dy_sparsity_p": 0.3}
 
 
@@ -249,14 +250,16 @@ class TestDyRTarget:
         _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
         _mem_b, logits_b, _ = m_b.step(x_window, memory_prev, learning_rate=0.05)
         np.testing.assert_array_equal(logits_a.data, logits_b.data)
-        assert m_a._wide_extra_kwargs == {}
+        for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
+            assert m_a._wide_extra_kwargs(name) == {}
 
     def test_takes_priority_over_dy_sparsity_p_in_wide_extra_kwargs(self):
         model = ToyTileRecurrenceRMT(
             VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
             MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(32),
             dy_sparsity_p=0.5, dy_r_target=0.7, dy_k_min=2)
-        assert model._wide_extra_kwargs == {"dy_r_target": 0.7, "dy_k_min": 2}
+        for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
+            assert model._wide_extra_kwargs(name) == {"dy_r_target": 0.7, "dy_k_min": 2}
 
     def test_set_value_stays_finite_through_real_backward(self):
         model = ToyTileRecurrenceRMT(
@@ -275,28 +278,47 @@ class TestDyRTarget:
 
     def test_controller_is_noop_when_dy_r_target_never_enabled(self):
         model = _model()
-        assert model.dy_r_target is None
+        assert all(v is None for v in model.dy_r_target.values())
         result = model.apply_amortized_dy_r_target_control(measured_sps=1.0, target_sps=10.0)
-        assert result is None
-        assert model.dy_r_target is None
+        assert result == {}
+        assert all(v is None for v in model.dy_r_target.values())
 
     def test_controller_shrinks_r_target_when_too_slow(self):
         model = ToyTileRecurrenceRMT(
             VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
             MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(35),
             dy_r_target=0.7)
-        r = model.apply_amortized_dy_r_target_control(measured_sps=1.0, target_sps=10.0)
+        # layer_name=None (default) applies the same correction to every
+        # wide layer uniformly (task #372) -- all 5 entries start and end
+        # identical, so any one of them is representative.
+        updated = model.apply_amortized_dy_r_target_control(measured_sps=1.0, target_sps=10.0)
+        assert set(updated) == set(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
+        r = updated["q_proj"]
         assert r < 0.7
-        assert model.dy_r_target == r
-        assert model._wide_extra_kwargs["dy_r_target"] == r
+        assert model.dy_r_target == updated
+        assert model._wide_extra_kwargs("q_proj")["dy_r_target"] == r
 
     def test_controller_grows_r_target_when_faster_than_target(self):
         model = ToyTileRecurrenceRMT(
             VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
             MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(36),
             dy_r_target=0.5)
-        r = model.apply_amortized_dy_r_target_control(measured_sps=20.0, target_sps=10.0)
-        assert r > 0.5
+        updated = model.apply_amortized_dy_r_target_control(measured_sps=20.0, target_sps=10.0)
+        assert updated["q_proj"] > 0.5
+
+    def test_controller_can_target_a_single_layer(self):
+        # task #372: layer_name lets a caller (task #374's future inner
+        # loop) adjust one layer independently -- the rest stay untouched.
+        model = ToyTileRecurrenceRMT(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
+            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(39),
+            dy_r_target=0.7)
+        updated = model.apply_amortized_dy_r_target_control(
+            measured_sps=1.0, target_sps=10.0, layer_name="q_proj")
+        assert set(updated) == {"q_proj"}
+        assert model.dy_r_target["q_proj"] < 0.7
+        for name in ("input_proj", "k_proj", "v_proj", "o_proj"):
+            assert model.dy_r_target[name] == 0.7
 
     def test_controller_respects_r_min_r_max_clip(self):
         model = ToyTileRecurrenceRMT(
@@ -305,7 +327,7 @@ class TestDyRTarget:
             dy_r_target=0.06)
         for _ in range(50):
             model.apply_amortized_dy_r_target_control(measured_sps=1.0, target_sps=100.0, r_min=0.05)
-        assert model.dy_r_target >= 0.05
+        assert all(v >= 0.05 for v in model.dy_r_target.values())
 
         model2 = ToyTileRecurrenceRMT(
             VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
@@ -313,7 +335,7 @@ class TestDyRTarget:
             dy_r_target=0.95)
         for _ in range(50):
             model2.apply_amortized_dy_r_target_control(measured_sps=100.0, target_sps=1.0, r_max=0.99)
-        assert model2.dy_r_target <= 0.99
+        assert all(v <= 0.99 for v in model2.dy_r_target.values())
 
 
 def _build_window(embed_table, tokens, i, num_tiles):
