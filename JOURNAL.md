@@ -7751,5 +7751,50 @@ philosophy the L2-decay redesign already established -- see the
 amortized-decay-factor entries above), sidestepping the need to know
 any cost ratio at all. `r_t` breathes above/below `r_bar` per-step
 based on whether that step's gradient carries more or less energy than
-the running average. Not yet implemented -- this is the design
-correction before implementation starts.
+the running average.
+
+**Status: the OUTER (r_bar-vs-measured-sps) loop is now implemented**
+(`apply_amortized_dy_r_target_control` on `ToyTileRecurrenceRMT`, +
+`dy_r_target`/`dy_k_min`/`dy_k_max`/`target_steps_per_sec` CLI args in
+`train_mqar_curriculum.py`) and smoke-tested end to end -- a real fp32
+run showed `dy_r_target` correctly growing 0.7->0.735->0.772 as
+measured steps/sec (3.6-3.8) exceeded a 2.0 target. The INNER (per-step
+E_t/Lbar) loop is still NOT implemented (chicken-and-egg: dy_r_target
+is consumed at forward()-call time, before that layer's own dy for the
+step is known -- would need C++ instrumentation or an autograd hook).
+32/32 relevant tests pass (26 model-level + 7 nucleus Python-layer, one
+overlap). See project_nucleus_energy_threshold_topk.md memory.
+
+## Arm F final result: per-row fix genuinely unblocks learning, but
+## doesn't fully stabilize it over the full 3000 steps -- correcting
+## the earlier mid-run "strong" read
+
+Full 3000-step run (with the per-row fix, same config/seed as the
+original collapse): loss dropped to 2.85 by step 400, accuracy peaked
+at 0.2603 (step 400 in a rerun) / 0.2522 (this run, step 675), and the
+run achieved a real curriculum LEVEL_UP (k: 1->2) at step 675 -- the
+original buggy run NEVER did any of this in 3000 steps (loss pinned
+4.7-4.85, acc~0, zero level-ups). That part of the earlier read holds.
+
+**Correction**: this run was NOT smoothly convergent for the full
+3000 steps. After the step-675 LEVEL_UP/step-690 LEVEL_DOWN, loss
+oscillated in the 3.1-3.5 band through step 2000 (acc bouncing
+0.06-0.25, still clearly non-trivial learning) but then degraded
+further in the final third: loss climbed to 4.94 (step 2200) and
+stayed elevated (4.16-4.58) through step 3000, acc dropping to
+0.03-0.12. Final summary: `peak_vocab=16 peak_k=2 final_k=1
+sps=0.644`.
+
+**Honest read**: the per-row bug was real and its fix genuinely
+changes what the model CAN do (proven by the LEVEL_UP and the sustained
+mid-run accuracy band that never existed before) -- but 10% input
+density at this width does not look like a fully stable, "as good as
+grad's 10%" checkpoint over a full run; there's a late-run relapse
+resembling (though milder than) the original collapse. Single seed --
+not yet re-run with a second seed to check whether this specific
+late-run degradation is a property of the config or this seed's own
+noise. Next useful check (not yet done): does the nucleus/dy_r_target
+mechanism on the GRAD side (already built) change this INPUT-side
+picture at all if run together, or is input-side nucleus wiring
+(#365/#366, still not built) needed to actually fix this specific
+late-run relapse.
