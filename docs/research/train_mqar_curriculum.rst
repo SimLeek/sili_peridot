@@ -569,3 +569,26 @@ a no-op when ``x_r_target`` was never enabled.
 data -- next window's per-layer weight should reflect only steps since
 THIS checkpoint (``reset_layer_timing``'s own docstring convention), not a
 slow cumulative drift across the whole run.
+
+.. _train_curriculum.query_debug_fn_explainable_ai_hook:
+
+``query_debug_fn``: a per-query probe hook for the explainable-AI investigation
+---------------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.query_debug_fn_explainable_ai_hook``
+
+Direct instruction, explainable-AI investigation. Optional callback fired
+at EVERY query step (not just periodic log points or LEVEL_UP/DOWN
+events) with ``(step, correct, logit_row, model.last_debug,
+logits.data[logit_row], targets[i])`` -- ``last_debug`` already exposes
+``attn_mem``/``attn_content``/``sigmas`` (task #303's NaN-bisection
+instrumentation), letting a caller correlate attention sharpness/pattern
+with actual per-query correctness without needing a separate hand-rolled
+probe script that risks diverging from this loop's own validated
+task-generation/labeling logic. ``None`` (default): zero overhead, no
+behavior change for existing callers.
+
+``logits.data[logit_row]``/``targets[i]`` (direct instruction) are passed
+alongside the binary correct/incorrect outcome so a caller can compute
+real confidence/hedging signals (target-token probability, entropy)
+itself instead of only seeing whether the prediction was right.
