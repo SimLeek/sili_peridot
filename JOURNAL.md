@@ -7131,3 +7131,836 @@ stays roughly flat while capacity grows.
 sili__new PR #39 (DenseInputStack) + PR #40 (FP8 scale fix), sili_peridot
 PR #18 (RNN validation, default-recurrence-unblank, FP8 max_abs_delta,
 AQRS curriculum defaults).
+
+## 2026-08-30 -- sisldo sparsity-parity plan complete; OpenMP small-array fix flips sparse from 4x-slower to faster-than-dense; width x input_sparsity_p sweep finds compute time, not RAM, is the real ceiling
+
+sisldo sparsity-parity plan (top-k activation sparsification + block4
+zero-skip wired into `ToyTileRecurrenceRMT`, full AQRS parity in the
+sparse-input C++ path) landed complete: sili__new `feature/sisldo-sparsity-parity`
+@ `dbac746`, sili_peridot `feature/rnn-recurrence-validation` @ `50d5305`.
+
+**OpenMP regression found and fixed on the first real end-to-end run**:
+the widened+sparsified arm (`embed_width=32`, `input_sparsity_p=0.5`) ran
+1.8 steps/sec vs the 128-wide dense baseline's 7.5-7.6 -- 4x slower,
+contradicting block4's historical speed advantage. Root cause:
+`CSR.from_dense`'s top-k conversion (`csr.hpp`'s `top_k_indices`/
+`top_k_csr`/`to_csr`) paid `#pragma omp parallel`'s thread-team
+rendezvous cost (measured 403us @ num_cpus=4 vs 53us serial, even with a
+warmed pool) on arrays far too small (256 elements) to amortize it, on
+every one of ~13 per-step calls. Fixed via `SILI_OMP_SMALL_THRESHOLD`
+(4096 elements): below it, a serial fast-path; above it, unchanged.
+Verified byte-identical output across thread counts (new
+`test_top_k_csr_small_array_fast_path.cpp`), full C++ (149/149, 5
+pre-existing unrelated failures) and Python suites clean. Real re-run:
+1.8 -> 15.5-15.8 steps/sec, flipping to ~1.7x FASTER than the 128-wide
+dense baseline.
+
+**Width x input_sparsity_p sweep** (`train_mqar_curriculum.py`'s
+`embed_width`/`input_sparsity_p`/`wide_max_weights` args, `dense=True`
+so `wide_max_weights` only affects capacity bookkeeping, not real
+connectivity or memory footprint under fp4/fp8): the real deployment
+target is running near 60Hz while using 70-90% of available system RAM,
+not minimizing density for its own sake. Doubled `embed_width` from 32
+up while sweeping `input_sparsity_p` in {dense control, 0.5, 0.25/0.2,
+0.1, 0.05, 0.02} at each width, first slice used a wall-time-adaptive
+step budget (target ~90s/run):
+
+| embed_width | steps used | p=dense | p=0.5 | p=0.2/0.25 | p=0.1 | p=0.05 | p=0.02 |
+|---|---|---|---|---|---|---|---|
+| 32 | 2500 | peak=16, 2.9 sps | peak=32, 18.5 sps | peak=16, 22.6 sps | peak=16, 26.3 sps | peak=8, 27.5 sps | peak=8, 28.0 sps |
+| 64 | 1179 | -- | peak=16, 8.4 sps | peak=16, 12.5 sps | peak=16, 15.2 sps | peak=8, 16.7 sps | -- |
+| 128 | 585 | -- | peak=16, 2.9 sps | peak=16, 4.9 sps | peak=16, 6.8 sps | peak=8, 8.3 sps | -- |
+| 256 | 216 | -- | peak=16, 0.8 sps | peak=8, 1.6 sps | peak=8, 2.4 sps | peak=8, 3.1 sps | -- |
+
+Widths 32/64/128 agree: quality floor sits at p~=0.1, dropping to
+peak_vocab=8 at p=0.05. Width=256 looks worse across the board, but
+**this comparison is confounded**: the step budget targeted constant
+wall-clock time, not constant step count, so step count fell
+2500->1179->585->216 as compute cost grew with width -- width=256 may
+simply have had too few training steps to reach the same curriculum
+level, independent of density. Peak RSS stayed trivial throughout
+(107-357MB across all four widths) -- nowhere near the 70-90%-of-15GiB
+target (10.5-13.5GB); real memory for the 5 sparsified block4-resident
+layers scales as `state_width^2` (`state_width = 8*embed_width`) at
+~1.2 bytes/synapse (fp4), but interpreter/scratch overhead dominates at
+these small widths.
+
+Switched to a **fixed 600-step budget** (comparable across widths,
+sacrificing wall-clock-per-run instead) and resumed at `embed_width=512`:
+calibration (100 steps) measured 0.7 steps/sec and 637MB RSS, projecting
+~857s for a full 600-step run. The real run never finished -- killed at
+the 1800s hard timeout. **Compute time, not memory, is the practical
+ceiling on this task/hardware**: steps/sec fell ~3-3.6x per width
+doubling (roughly `state_width^2` cost as expected), while RSS grew far
+slower than projected available headroom (11GB free the whole time, no
+OOM watchdog trigger at any width tested). Never got remotely close to
+the 70-90%-RAM target -- compute cost makes it impractical to reach that
+width at a step count worth training on this hardware.
+
+**Open follow-ups, not yet done**: (1) re-run the width>=256 comparison
+with the fixed-step methodology to separate "step-starved" from "density
+too low" as the cause of width=256's apparent quality drop; (2) profile
+whether AQRS's rank-N scale/additive-branch computation is being
+redundantly recomputed per-tile instead of cached+reused, flagged as a
+plausible speed lever given steps/sec fell faster than pure
+`state_width^2` storage growth would predict; (3) `input_proj`'s input
+width is `embed_width` while `q/k/v/o_proj`'s is `state_width` (8x
+larger) -- a single scalar `input_sparsity_p` applied uniformly means
+`input_proj` always runs ~8x sparser in absolute terms for the same `p`;
+this ratio is constant across widths so it likely doesn't explain the
+width-trend, but per-layer `p` is needed to tell which layer(s) actually
+set the p~=0.1 floor.
+
+sili__new PR (feature/sisldo-sparsity-parity, commit dbac746), sili_peridot
+commit 440d6a2 (peak RSS instrumentation) on feature/rnn-recurrence-validation.
+
+## 2026-08-30 (cont'd) -- backward's real cost profiled to per-synapse update math, not snapshot/merge; dy_sparsity_p tuned as a genuine free speedup
+
+Followed up on "what is the bulk of backward's time going into" with direct
+C++ chrono instrumentation of `disldo_backward_sparse_grad`'s block4 write
+path (state_width=2048, dy density~0.1, num_cpus=1, standalone benchmark
+outside the Python pipeline). Two hypotheses tested and REJECTED before
+landing on the real answer -- both caught by measuring before touching
+code, not by reasoning alone:
+
+1. Hoisting AQRS's `get_scale(row,col)` out of the inner loop (per the
+   "redundant recompute" idea) gave no real speedup at scale_rank 1, 2, 8,
+   or 32 -- tested all four, all within noise or slightly worse. Not
+   landed.
+2. `snapshot_row`/`merge_row_workspace` (suspected O(state_width^2)
+   unconditional full-row copy) measured at only ~5%/~1% of per-call time
+   -- NOT the bottleneck. Real breakdown of the per-tile loop: any-check
+   ~17%, walk-past-inactive-tile ~15%, **active-tile real synapse-update
+   math ~68%** (dominant). Backward is fundamentally more expensive than
+   forward per synapse actually touched (richer per-synapse work: `get_scale`,
+   importance tracking, `SynapsePolicy::update_ci`/`update_cw`, two FP4
+   quantize calls, rank-N gradient accumulation), not because it's
+   wastefully re-visiting things it shouldn't -- the existing
+   `dy_local[lj]==0` gradient-side zero-skip is already doing its job
+   structurally.
+
+User explicitly directed: skip on the GRADIENT axis, never the INPUT axis
+for this -- confirmed why directly: `SynapsePolicy::update_ci`'s formula
+is `ema = beta2*ci + (1-beta2)*(g^2+contrib^2)`, which is `beta2*ci` (a
+real decay), NOT a no-op, at `g=0`. An input-side skip would freeze that
+decay for topk-dropped positions instead of matching the dense
+reference's own behavior -- a genuine behavior change, not a pure
+speedup, and would break `test_sisldo_disldo_parity.cpp`'s explicit
+"sparsifying is mathematically a no-op vs dense" invariant. Never
+implemented for exactly this reason.
+
+Given backward's real per-call cost scales with how many (row,
+active-dy-column) pairs survive the EXISTING gradient-sparsity gate,
+`dy_sparsity_p` (already a genuinely independent axis in
+`ToyTileRecurrenceRMT`, just previously defaulting to match
+`input_sparsity_p` with no CLI override) was exposed as its own CLI arg
+and swept independently, holding `input_sparsity_p=0.1` and `embed_width`
+fixed, fixed step count both times (2000 @ width=32, 1000 @ width=128,
+avoiding the earlier wall-time-adaptive-step-budget confound):
+
+| embed_width | dy_sparsity_p=-1 (matches input) | dy_sparsity_p=0.02 | dy_sparsity_p=0.005 | quality |
+|---|---|---|---|---|
+| 32  | 23.9 sps | 27.7 sps | 27.3 sps | peak_vocab=16 throughout, no degradation |
+| 128 | 7.0 sps  | 8.2 sps  | 8.5 sps  | peak_vocab=16 throughout, no degradation |
+
+~15-27% real end-to-end speedup, plateauing after ~dy_sparsity_p=0.02,
+with ZERO measured quality cost down to 0.5% density at either width
+tested. Smaller than the raw kernel-level 7-8x backward-vs-forward gap
+because backward is only one part of a real step (forward, attention,
+Python/numpy overhead, AQRS diagnostics all still cost the same) -- but
+it's a real, zero-risk, already-wired win (no C++ changes, no
+correctness questions). `dy_sparsity_p~=0.02` looks like the practical
+sweet spot at both widths tested. Not yet made the new default (still
+defaults to matching `input_sparsity_p`) -- that's the natural next step
+if this holds up at wider models too.
+
+sili_peridot commit (feature/rnn-recurrence-validation): dy_sparsity_p
+CLI wiring in train_mqar_curriculum.py.
+
+## 2026-08-30 (cont'd 2) -- 256/512 floor sweep: dy_sparsity_p win holds at width=256 (0.5% density, zero cost); dense is now impractical; width=512 quality inconclusive (step-budget confound recurs)
+
+Ran a clean (fixed-step, non-wall-time-adaptive) floor sweep covering both
+axes at embed_width=256 (800 steps) and embed_width=512 (400 steps), 20min
+per-run timeout, following directly from the width=32/128 dy_sparsity_p
+result above.
+
+**Dense baseline is no longer even completable in budget**: `input_sparsity_p=-1`
+(fully dense) TIMED OUT at 1200s at width=256 (never finished 800 steps),
+and BOTH `input_sparsity_p=-1` and `=0.5` timed out at width=512. Sparsity
+has crossed from "nice speedup" to "required to finish a run at all" at
+these widths.
+
+**input_sparsity_p floor, width=256** (dy_sparsity_p left at -1, i.e.
+matches input): peak_vocab=16 held through p=0.1, dropped to peak_vocab=8
+at p=0.05 and p=0.02. **Same floor location (~0.1) as widths 32/64/128** --
+confirms, with a clean (non-confounded) run this time, that the floor
+really is flat across width in the tested range, not shrinking. This is
+the unfavorable-for-scaling result already flagged in
+`project_sili_sparsity_deployment_target` -- now confirmed at width=256
+specifically instead of relying on the earlier confounded data point.
+
+| embed_width=256, input_sparsity_p | steps/sec | peak_vocab |
+|---|---|---|
+| dense (-1) | -- | TIMEOUT, no result |
+| 0.5 | 0.9 | 16 |
+| 0.25 | 1.4 | 16 |
+| 0.1 | 2.4 | 16 |
+| 0.05 | 3.2 | 8 |
+| 0.02 | 4.0 | 8 |
+
+**dy_sparsity_p floor, width=256** (input_sparsity_p=0.1 fixed): peak_vocab
+held at 16 all the way down to dy_sparsity_p=0.005 (0.5% gradient density)
+-- zero measured quality cost, extending the width=32/128 result to
+width=256. Speed: 2.4 -> 3.2 sps (~33% real end-to-end speedup) from
+dy_sparsity_p=-1 down to 0.005.
+
+| embed_width=256, dy_sparsity_p (input_sparsity_p=0.1 fixed) | steps/sec | peak_vocab |
+|---|---|---|
+| -1 (matches input) | 2.4 | 16 |
+| 0.1 | 2.4 | 16 |
+| 0.05 | 2.8 | 16 |
+| 0.02 | 3.0 | 16 |
+| 0.01 | 3.2 | 16 |
+| 0.005 | 3.2 | 16 |
+
+**width=512: inconclusive on quality, confirms speed win, hits the same
+step-budget confound flagged before at width=256**. Every single arm at
+width=512 (both the input_sparsity_p sweep and the dy_sparsity_p sweep,
+6+6 configs) plateaued at peak_vocab=8 -- including the highest-density
+completable arm (p=0.25). Since even the LEAST-sparse tested arm caps at
+vocab=8, this looks like 400 steps simply isn't enough real training at
+this width (matches the exact confound already flagged in
+`feedback_per_layer_width_disparity_uniform_p` for the first, discarded
+width=256 attempt) rather than evidence of a lower quality floor. Not
+trusting this as a floor result. Speed data is still real and consistent
+though: dy_sparsity_p again gives ~43% speedup (0.7 -> 1.0 sps, -1 to
+0.005) with no visible quality change (weak evidence given the flat
+vocab=8 ceiling, but directionally consistent with 32/128/256).
+
+**Width-doubling slowdown, extended**: at matched input_sparsity_p=0.1,
+dy_sparsity_p=-1: 128-width 7.0 sps -> 256-width 2.4 sps (2.92x) ->
+512-width 0.7 sps (3.43x). Continues the previously observed trend
+(1.73, 2.24, 2.83, 3.43x for widths 32->64->128->256->512) trending toward
+the theoretical O(p*state_width^2) 4x/doubling ceiling.
+
+**Conclusion**: `dy_sparsity_p~=0.005-0.02` is now validated at 3 widths
+(32, 128, 256) with zero quality cost and a real ~15-43% speedup -- strong
+enough to consider making it the new default over "match input_sparsity_p".
+`input_sparsity_p`'s own floor stays flat (~0.1) through width=256, still
+no evidence sparsity fraction can shrink with width to offset the width^2
+compute cost -- if anything this makes the eventual 64GB-scale extrapolation
+worse, not better. width=512 needs a bigger step budget (or a
+loss-based/quality-gated stopping condition instead of a fixed count) before
+its floor question can be answered cleanly; not re-running blind with more
+steps without deciding that first.
+
+## 2026-08-30 (cont'd 3) -- CORRECTION: dense_to_top_k_csr's k is GLOBAL, not per-row -- every input_sparsity_p/dy_sparsity_p density number reported this session means something different
+
+Found while building a per-row graded gradient-density schedule (see next
+entry): `_cpu.dense_to_top_k_csr(dy2d, k, num_cpus)` -- the C++ primitive
+behind BOTH `input_sparsity_p` (via `CSR.from_dense`) and `dy_sparsity_p`
+(via `DISLDOLayer.forward`'s own `_bwd` closure) -- selects its top-`k`
+entries GLOBALLY across the WHOLE flattened `[rows, cols]` batch, not `k`
+per row. Confirmed at the C++ source (`csr.hpp::top_k_csr` calls
+`top_k_indices(values, rows*cols, k, ...)`, one flat array, no row
+boundary at the selection stage) and empirically (asking for k=4 on a
+3-row x 4-col array kept 1/2/1 entries per row -- whichever 4 entries won
+globally by magnitude, not 4 per row).
+
+Both `CSR.from_dense(x, p, cpus)` and `DISLDOLayer.forward(...,
+dy_sparsity_p=p)` compute `k = cols * p` -- independent of row count --
+then spend that k GLOBALLY. So the real per-row-average density is
+`p / num_rows`, not `p`. For this project's real MQAR runs, q/k/v_proj's
+backward batch is `total_slots = NUM_MEMORY_SLOTS + num_tiles = 2 + 16 =
+18` rows (default config), and `ToyTileRecurrenceRMT._to_sparse` applies
+`input_sparsity_p` to genuinely multi-row batches too (`x_window_t` at 16
+rows, `combined_normed` at 18 rows) -- so a nominal `dy_sparsity_p=0.02`
+from earlier this session was actually giving roughly `0.02/18 ≈ 0.11%`
+real density, not 2%; `input_sparsity_p`'s reported "~0.1 floor" means
+roughly `0.1/16-18 ≈ 0.6%` real density, not 10%. This also means
+individual rows can receive literally zero surviving entries on a given
+call, purely by losing the global top-k competition -- a different,
+harsher form of sparsity than "each row independently keeps its own X%."
+
+**What still holds**: every measured wall-clock number (steps/sec tables
+in the dy_sparsity_p and width-sweep entries above) is real, unaffected --
+those are direct measurements, not derived from the density label. The
+qualitative finding (backward/input tolerate extreme sparsity with no
+measured quality cost) isn't invalidated either -- if anything it's more
+striking now that the real densities tested were far lower than reported.
+What's wrong is only the density LABELS in every prior table this session
+("0.02", "0.005", "~0.1 floor," etc.) -- read them as "whatever
+nominal/num_rows worked out to" for that call site's row count, not
+literal per-row fractions. Full correction detail + implications:
+Claude's memory (`project_dy_sparsity_p_validated_speedup.md`,
+`project_sili_sparsity_deployment_target.md`,
+`feedback_per_layer_width_disparity_uniform_p.md`).
+
+No code fix landed for this yet -- flagging two options (a real per-row-k
+primitive, already prototyped as `_graded_top_k_csr` in sili__new's
+`sparse_rnn.py` for the query-step graded-credit design below, vs.
+explicitly compensating `p` by `num_rows` at each call site) without
+picking one, pending the graded-schedule redesign settling which
+semantics it actually wants.
+
+## 2026-08-30 (cont'd 4) -- graded query-step credit design implemented + a real methodology finding: this pipeline is non-deterministic run-to-run at fixed seed
+
+Following up on step_cached's open stability question: implemented the
+fallback design flagged earlier. `step()` gained `content_dy_sparsity_
+schedule` (per-position graded gradient density, dense for the newest
+content position, sparser further back) -- on query/backward steps
+(where weights actually move), the curriculum loop now uses `step()`'s
+full-window recompute with this graded schedule instead of `step_cached`'s
+zero-credit-for-older-rows default; non-query steps still use
+`step_cached`'s fast path. Purely additive, verified byte-identical to
+pre-change `step()` when the new kwarg is left at its None default.
+
+Required a new sili__new primitive (`DISLDOLayer.forward`'s
+`dy_sparsity_schedule` kwarg, `_graded_top_k_csr`) -- GENUINE independent
+per-row top-k, built specifically because the existing `dy_sparsity_p`
+scalar's `_cpu.dense_to_top_k_csr` turned out to select its top-k
+GLOBALLY across the batch (see the correction entry above), which is
+the wrong semantics for "grade credit by position." Both landed and
+tested (forward-pass/CSR structural correctness proven directly).
+
+**Real methodology finding while validating this**: ran the SAME
+unmodified curriculum config (seed=2001, otherwise identical) twice in a
+row and got DIFFERENT outcomes (peak_vocab 16, then 8) with zero code
+changes between the two runs. Confirmed via `git stash`/`stash pop` that
+this is genuine pre-existing non-determinism in the pipeline, not
+something my edits introduced -- likely OpenMP-thread-order-dependent
+stochastic rounding under num_cpus>1, matching this project's own
+already-documented "seed stochastic RNG for comparisons" and
+"statistical power not seeding" warnings, now confirmed concretely on
+this exact pipeline rather than just flagged in principle.
+
+**Consequence**: every single-seed (n=1) quality comparison run this
+session -- INCLUDING the earlier "step_cached's final_vocab regressed to
+8 while step() held at 16" observation that motivated building the
+graded-schedule fallback in the first place -- is unconfirmed, not
+proven. It may have been a real effect of the reduced gradient signal,
+or it may have been this same run-to-run noise. Not settled either way.
+Real next step: a proper multi-seed comparison (3-5+ seeds per arm) of
+plain step(), plain use_tile_cache, and the new graded-schedule design,
+ideally on more cores than this laptop has so it's not painfully slow.
+Recorded in Claude's memory (project_tile_window_kv_cache.md) rather than
+resolved here -- good candidate to pick up on the next machine.
+
+sili_peridot commits (feature/tile-window-caching): `64db814` (graded
+schedule + tests). sili__new commit (feature/graded-dy-sparsity-schedule):
+`4e12812` (dy_sparsity_schedule primitive + tests).
+
+## 2026-08-30 (cont'd 5) -- correction: 1200-step comparisons were too short, not primarily a non-determinism problem
+
+Direct correction: this project's MQAR curriculum normally oscillates for
+~2k-20k steps before locking in a stable vocabulary level. The earlier
+"step() held peak_vocab=16, step_cached regressed to 8" comparison ran
+only 1200 steps -- well inside that normal noisy window for both arms, so
+it was very likely just sampling each arm at a different point in its own
+expected oscillation, not a real quality difference. Run length, not the
+separately-confirmed pipeline non-determinism, was the actual problem
+with that comparison -- even a perfectly deterministic pipeline would
+have made a 1200-step single read meaningless here. The non-determinism
+itself is still real (git stash confirmed literally-identical seeded
+reruns diverge) but is now correctly lower priority: fix run length
+first (2k-20k+ steps, per direct instruction), THEN multi-seed statistics
+matter for whatever's left. Memory updated (project_tile_window_kv_cache.md).
+
+## 2026-08-31 -- real 20k-step run finds the graded-schedule design SLOWER
+than baseline, root-caused and fixed with a real C++ port
+
+Exposed `use_tile_cache` as a CLI arg (was kwarg-only) and ran the real
+comparison the previous entries flagged as needed: baseline
+(`use_tile_cache=0`) vs step_cached+graded-schedule (`use_tile_cache=1`),
+same seed 2001, fp4, 20000 steps each, default config.
+
+**Result: the caching design was SLOWER, not faster.** Baseline: 6.6
+steps/sec avg (3032s total, dropped from ~9.9 as AQRS ranks grew).
+tile_cache+graded: 5.1 steps/sec avg (3949s total). Both arms plateaued
+identically at `peak_vocab=16`, oscillating with `final_vocab=8` --
+20000 steps wasn't enough to break past 16 in either arm (the
+JOURNAL's earlier 60k-step success story used different/smaller AQRS
+rank caps than this run's, which hit the 32-rank ceiling on v_proj/
+o_proj -- not a clean apples-to-apples, so "just needs more steps"
+isn't confirmed OR refuted by this run alone).
+
+**Root cause**: `_graded_top_k_csr` (sili__new/sili/sparse_rnn.py) --
+the per-row top-k selection backing the graded query-step credit
+schedule -- was pure Python/numpy (a per-row `argpartition` loop). It
+runs on every query/backward step, exactly the steps that already pay
+`step()`'s full-window recompute cost, so it added a real per-call tax
+on top instead of the caching design saving anything on those steps.
+
+**Fix (sili__new commit `f99e02d`)**: ported it to a real C++ kernel --
+`top_k_csr_graded` in `csr.hpp` (genuinely per-row top-k, NOT the same
+semantics as `top_k_csr`'s global-k selection), exposed as
+`_cpu.dense_to_graded_top_k_csr`. Verified bit-identical output against
+the old Python loop across 20 random trials before removing it.
+Microbenchmark at the real per-step shape (18 rows x 128 cols): 587us/
+call (Python) vs 79.5us/call (C++), ~7.4x. Full C++ (149 tests, 5
+pre-existing failures unrelated) and Python (10/10 relevant) suites
+clean. Re-ran a 3000-step smoke test post-fix: tile_cache+graded now
+runs at 9.1-9.5 steps/sec, matching baseline's own early-phase rate --
+the regression is resolved.
+
+**Not yet done**: a fresh full-length (20k+) comparison with the FIXED
+C++ code to get real wall-clock AND quality numbers together -- the
+20k numbers above used the old slow Python path. Quality plateau
+(peak_vocab=16) is very unlikely to change from this fix alone (same
+selection algorithm, same math, just faster), so the immediate next
+question is scale (embed_width, lm_head dy_sparsity_p per user's own
+"one-hot" observation) rather than re-running the same comparison.
+Memory updated (project_tile_window_kv_cache.md).
+
+## 2026-08-31 (cont'd) -- output_dy_sparsity_p: sparsifying lm_head's own
+backward gradient didn't just speed things up, it roughly 4x'd peak_vocab
+
+Direct instruction, following the "one-hot" observation two turns
+earlier: `lm_head`/`critic_head` were the only two layers left
+completely untouched by the whole sparsity plan (Phase 6 deliberately
+kept them dense -- see their own docstring). `_backward_with_critic`'s
+`g_logits[row] = (1+advantage) * (probs - onehot)` is technically
+dense (softmax never hits exact 0) but concentrates hard onto a few
+classes as the model gets confident -- exactly the shape
+`dy_sparsity_p`'s top-k selection targets, and this specific gradient
+was never sparsified anywhere in the codebase before.
+
+**Implementation**: new `output_dy_sparsity_p` param on
+`ToyTileRecurrenceRMT.__init__`, a genuinely separate axis from
+`input_sparsity_p`/`dy_sparsity_p` (those never touch lm_head/
+critic_head at all -- confirmed by `test_wide_max_weights_only_
+affects_the_5_layers_not_lm_head`). Only threads `dy_sparsity_p` into
+`lm_head.forward()`/`critic_head.forward()`'s own kwargs -- NOT input
+sparsity, since `pooled` (their forward input) is a real dense
+column-averaged readout with no structural sparsity, unlike the
+gradient side. `None` default verified byte-identical (19/19 model
+tests pass). Exposed via CLI arg 17, same sentinel convention as the
+rest of Phase 6's args.
+
+**Real 20k-step result, same seed (2001), same everything else as the
+just-completed baseline (long_run_baseline_20k.log)**:
+
+| | baseline | output_dy_sparsity_p=0.5 |
+|---|---|---|
+| peak_vocab | 16 | **64** |
+| final_vocab | 8 | **16** |
+| steps/sec avg | 6.6 | **7.9** |
+| wall time | 3032s | **2516s** |
+
+Both axes improved simultaneously: ~17% less wall-clock AND a 4x
+higher peak_vocab (final_vocab=16 alone already matches the baseline's
+own PEAK). Plausible mechanism (not yet directly verified): dense
+backprop was pushing lm_head's many near-zero gradient components
+through the same per-synapse RMSprop update as the real signal every
+step, adding calibration noise to `value_scale`/`output_scale` that
+top-k selection now filters out -- i.e. this isn't just "less compute
+for the same result," the sparsification may be acting as a real
+regularizer on the readout layer specifically.
+
+**Caveat**: single seed. This exact config has shown real oscillation
+before (vocab hopping in the 8-16 band across different runs/seeds),
+but a jump to peak_vocab=64 is well outside that observed noise band,
+so the direction is trusted even though the exact magnitude isn't
+confirmed by a second seed yet.
+
+**Next (direct instruction)**: this clears the user's own bar ("keep
+reaching or exceeding the original peak vocabulary and k value while
+getting speedups") at the original size -- moving to the doubling
+step: `embed_width=32` with `output_dy_sparsity_p=0.5` carried over,
+plus `input_sparsity_p=0.5`/`wide_max_weights=2048` on the 5 wide
+layers (the original Phase 6 plan's own quadrupled-budget default,
+needed to keep the 5 wide layers' compute in check at 2x width instead
+of 4x). One variable (width) changes at a time from here, checking
+whether anything needs retuning at each doubling. Memory updated
+(project_tile_window_kv_cache.md).
+
+## Design note (not yet implemented): nucleus/energy-threshold top-k math
+
+Recorded here because it previously existed only in chat, not in any
+file. Ablation this session (arms D/E/F/G, wide=48, hard-bound-only)
+cleanly separated `input_sparsity_p` from `dy_sparsity_p` for the
+first time: input-only top-k at 10% collapsed training from scratch
+(loss pinned at ln(vocab)~=4.85, acc~=0), grad-only top-k at 10% was
+healthy (real learning, no collapse) -- so a fixed-fraction top-k is
+too blunt for the input side, but the same math shouldn't need
+retuning by hand every time width/scale changes. NOTE: arm D/E/F's
+`input_sparsity_p=0.10` numbers are now suspect for an unrelated
+reason -- see the `dense_to_top_k_csr` global-vs-per-row entries above
+(b0d0fe2) -- so "10% input alone collapses" may be partly/wholly an
+artifact of that bug rather than a pure density effect. Not yet
+re-run with the per-row-corrected kernel to separate the two.
+
+**Captured-energy ratio.** For a vector `v` and a kept-set of size `k`
+(the top-k by |v_i|):
+
+    R(v, k) = ||v_topk||^2 / ||v||^2
+
+This is exact and provably checkable (sort |v_i| descending, cumsum of
+squares, divide by total sum of squares -- no approximation). Same
+math as Eckart-Young truncated-SVD captured-variance; structurally the
+same operation as LLM nucleus/top-p sampling, but applied to squared
+magnitude instead of softmax probability.
+
+**Nucleus top-k rule (replaces a fixed k or fixed p).** Fix a target
+`R_target` (e.g. 0.95 = "keep enough to retain 95% of the energy").
+Per call: sort |v_i| descending, cumsum of squares, take the smallest
+k such that `cumsum_k / total >= R_target`. k is now a *consequence*
+of R_target and the actual data that call, not a hand-set constant --
+a peaked vector needs few components, a flat one needs many, and this
+falls out of the same formula automatically.
+
+**Grad-side adaptive k_t (uses steps/sec, not just R_target).** dy is
+reported ~10x more expensive than x per the user's own recollection
+(NOT yet independently verified against this codebase's real profiled
+cost -- flag before trusting the 10x number for a real budget calc).
+Free byproducts of computing dy anyway:
+
+    E_t = ||dy_t||^2                              # this step's grad energy
+    Lbar <- beta*Lbar + (1-beta)*E_t               # O(1) running EMA, beta ~ 0.99
+    k_t = clip( kbar * (E_t / Lbar)^alpha, k_min, width )
+
+`kbar` is the *average* k that hits a target steps/sec given the
+measured/assumed backward:forward cost ratio -- i.e. kbar is derived
+from the compute budget, not guessed, and k_t breathes above/below
+kbar per-step based on whether this step's gradient carries more or
+less energy than the running average (high-loss/high-energy steps get
+more of the budget). `alpha` is a gain (like the L2-decay
+`adaptation_rate`), not an equilibrium-setter.
+
+**Relationship to L1 sparsity (mechanistically separate, confirmed by
+existing behavior).** `L1_SPARSITY_COEF` (already active by default,
+`_l1_sparsity_split` in train_mqar_rmt_reference.py) has its own
+LASSO-style equilibrium: a component survives iff the task-loss
+gradient magnitude at zero exceeds the L1 coefficient. This does NOT
+set or converge to any particular R_target/density -- L1 just makes
+top-k truncation less lossy at whatever R_target is already fixed
+(fewer components fight for survival, so the ones that do carry more
+of the energy). The two mechanisms compose; neither substitutes for
+the other. `R_target` itself is a free knob, not something L1
+determines -- open question (not yet tested) is whether R_target
+should itself be trained/pushed by a meta-signal or stay a fixed
+target picked by the same measured-statistics logic the L2-decay
+mechanism already uses (target derived from fan-in, not guessed).
+
+**Status update (sili__new side landed).** `top_k_csr_nucleus` (csr.hpp)
++ `dense_to_nucleus_top_k_csr` pybind binding built and TDD-tested
+(`test_top_k_csr_nucleus.cpp`, R>=R_target + minimality + per-row-
+independence + edge cases, all passing). Fused into ONE sort per row
+(sort once, walk cumulative-sum-of-squares to find k, take that
+prefix -- deliberately NOT split into "compute k from R" + "call the
+existing per-row top-k" as two separate calls, which would re-sort
+the same row twice; same rationale as why `_graded_top_k_csr` itself
+got moved from Python to a single C++ call).
+
+Added a real min/max density clamp per direct instruction: "probably
+want to add a min and max sparsity after the R factor, in and grad,
+since some hardware may struggle at high density when it's usually
+10% or so, and getting to 0% input and grad would also be bad in a
+lot of cases." `k_min`/`k_max` params clamp the R_target-derived k
+AFTER the fact, applied per-row against that row's own actual entry
+count -- k_min padding pulls from the SAME magnitude-sorted list
+already computed for the R_target walk (still top-k, not arbitrary);
+an all-zero row can't manufacture k_min entries out of nothing (stays
+at k=0 regardless). Python wiring not done yet -- the sili_peridot
+side (input_sparsity_p/dy_sparsity_p call sites) still needs an
+r_target/k_min/k_max API added, not built in this pass.
+
+Sequencing note: still Python-wiring-not-done for the epic itself
+(#365-370), but a SEPARATE, more urgent finding landed first --
+`dense_to_top_k_csr`'s k was being spent GLOBALLY across a multi-row
+array instead of per-row (see the b0d0fe2/JOURNAL entries above for
+the earlier partial discovery). Fixed in `CSR.from_dense` and the two
+scalar `dy_sparsity_p` call sites (sili__new commit `25797fc`), by
+routing onto the already-existing `_graded_top_k_csr`/
+`dense_to_graded_top_k_csr` instead of `dense_to_top_k_csr`. Re-ran
+arm F (`input_sparsity_p=0.10, dy_sparsity_p=1.0`, same script/seed
+as the original collapse) with the fix live: original run stayed
+pinned near loss=4.7-4.85/acc~0 through step 1600; the fixed run
+reached loss=2.85/acc=0.20 by step 400 and kept improving -- genuine
+learning, not collapse. This means the per-row bug, not "10% input is
+inherently too aggressive," was the primary cause of the input-
+sparsity collapse found earlier this session -- 10% input density
+looks like it IS a trustworthy checkpoint once fed correctly, same as
+grad's 10% already was. Full 3000-step confirmation still running at
+time of writing; treat as strong-but-not-yet-final until that
+completes.
+
+**Grad-side wiring landed (task #367).** `dy_r_target`/`dy_k_min`/
+`dy_k_max` added to `DISLDOLayer.forward`/`DISLDOLayer32.forward`
+(sili__new), highest priority in the existing `dy_sparsity_schedule` >
+`dy_sparsity_p` chain -- `None` default is a no-op, zero behavior
+change for every existing caller. `DISLDOLayer8` (fp8) intentionally
+NOT touched: it has no `dy_sparsity_p` mechanism at all today, so this
+isn't a parity gap, it's out of scope (would be introducing a new
+capability, not extending an existing one).
+
+**Found while testing (new, unrelated to this change's own logic):**
+`backward_sparse`'s C++ update has genuine run-to-run floating-point
+nondeterminism at `num_cpus=2` -- confirmed directly by calling the
+exact same `dy_r_target`-only path twice with byte-identical inputs on
+a freshly-constructed layer and getting different `value_scale`
+results each time (~1e-4 relative, too large to be simple reduction-
+order ULP noise). Root cause not yet investigated (candidate: OMP
+thread-scheduling order affecting some shared per-column reduction in
+the RMSprop update, but not confirmed). This is NOT a new bug from
+this change -- it's a pre-existing property of the engine, just newly
+observed because a test tried to compare exact floating-point outputs
+across two calls. Fixed the test itself to spy on which selection
+function gets invoked instead of comparing noisy floats. Flagging
+here per "verify claims empirically" -- don't trust exact-value
+floating-point comparisons across separate `backward_sparse` calls
+without also checking single-call reproducibility first.
+
+## Grad-side k_t design, revised: measured fwd/bwd ratio is NOT stable
+
+The original k_t sketch ("kbar derivable from a target steps/sec given
+c_bwd ~= 10*c_fwd, needs empirical verification rather than trusting the
+recalled ratio") assumed a single fixed backward:forward cost ratio.
+Measured directly (`forward_dense` vs `backward_dense`, same layer,
+warm cache, 100-200 reps, DISLDOLayer at n_in=n_out=n):
+
+| n   | fwd (us) | bwd (us) | ratio |
+|-----|----------|----------|-------|
+| 48  | 271      | 769      | 2.8x  |
+| 128 | 550      | 3761     | 6.8x  |
+| 384 | 2137     | 25643    | 12.0x |
+
+The ratio is NOT a constant -- it grows with width (backward's per-
+synapse RMSprop update apparently has worse scaling than forward's
+plain matmul). A single hardcoded ratio (10x or otherwise) baked into
+an analytic kbar formula would be wrong at some scale regardless of
+which constant is picked -- confirms the "needs empirical verification"
+flag was warranted, and rules out an analytic-formula approach.
+
+**Revised design**: don't compute kbar from an assumed ratio at all.
+Since the nucleus kernel is already built around R_target (not a raw
+k), the natural adaptive knob is r_target itself, in two nested loops:
+
+    E_t    = ||dy_t||^2                                    # free byproduct
+    Lbar  <- beta*Lbar + (1-beta)*E_t                       # O(1) EMA
+    r_t    = clip(r_bar * (E_t/Lbar)^alpha, r_min, r_max)   # per-step, energy-driven
+
+    every M steps: measure actual steps/sec
+        if sps < target_sps:        r_bar *= down_factor    # too slow, capture less
+        elif sps > target_sps*margin: r_bar *= up_factor    # headroom, capture more
+        r_bar = clip(r_bar, r_min, r_max)
+
+`r_bar`'s own adjustment is closed-loop against MEASURED steps/sec
+(same "closed-loop, measured-statistics, not guessed constants"
+philosophy the L2-decay redesign already established -- see the
+amortized-decay-factor entries above), sidestepping the need to know
+any cost ratio at all. `r_t` breathes above/below `r_bar` per-step
+based on whether that step's gradient carries more or less energy than
+the running average.
+
+**Status: the OUTER (r_bar-vs-measured-sps) loop is now implemented**
+(`apply_amortized_dy_r_target_control` on `ToyTileRecurrenceRMT`, +
+`dy_r_target`/`dy_k_min`/`dy_k_max`/`target_steps_per_sec` CLI args in
+`train_mqar_curriculum.py`) and smoke-tested end to end -- a real fp32
+run showed `dy_r_target` correctly growing 0.7->0.735->0.772 as
+measured steps/sec (3.6-3.8) exceeded a 2.0 target. The INNER (per-step
+E_t/Lbar) loop is still NOT implemented (chicken-and-egg: dy_r_target
+is consumed at forward()-call time, before that layer's own dy for the
+step is known -- would need C++ instrumentation or an autograd hook).
+32/32 relevant tests pass (26 model-level + 7 nucleus Python-layer, one
+overlap). See project_nucleus_energy_threshold_topk.md memory.
+
+## Arm F final result: per-row fix genuinely unblocks learning, but
+## doesn't fully stabilize it over the full 3000 steps -- correcting
+## the earlier mid-run "strong" read
+
+Full 3000-step run (with the per-row fix, same config/seed as the
+original collapse): loss dropped to 2.85 by step 400, accuracy peaked
+at 0.2603 (step 400 in a rerun) / 0.2522 (this run, step 675), and the
+run achieved a real curriculum LEVEL_UP (k: 1->2) at step 675 -- the
+original buggy run NEVER did any of this in 3000 steps (loss pinned
+4.7-4.85, acc~0, zero level-ups). That part of the earlier read holds.
+
+**Correction**: this run was NOT smoothly convergent for the full
+3000 steps. After the step-675 LEVEL_UP/step-690 LEVEL_DOWN, loss
+oscillated in the 3.1-3.5 band through step 2000 (acc bouncing
+0.06-0.25, still clearly non-trivial learning) but then degraded
+further in the final third: loss climbed to 4.94 (step 2200) and
+stayed elevated (4.16-4.58) through step 3000, acc dropping to
+0.03-0.12. Final summary: `peak_vocab=16 peak_k=2 final_k=1
+sps=0.644`.
+
+**Honest read**: the per-row bug was real and its fix genuinely
+changes what the model CAN do (proven by the LEVEL_UP and the sustained
+mid-run accuracy band that never existed before) -- but 10% input
+density at this width does not look like a fully stable, "as good as
+grad's 10%" checkpoint over a full run; there's a late-run relapse
+resembling (though milder than) the original collapse. Single seed --
+not yet re-run with a second seed to check whether this specific
+late-run degradation is a property of the config or this seed's own
+noise. Next useful check (not yet done): does the nucleus/dy_r_target
+mechanism on the GRAD side (already built) change this INPUT-side
+picture at all if run together, or is input-side nucleus wiring
+(#365/#366, still not built) needed to actually fix this specific
+late-run relapse.
+
+## Follow-up run result: the "late-run relapse" did NOT reproduce --
+## it was noise, not a config property (real finding, changes the
+## whole interpretation above)
+
+Ran arm A (exact rerun of arm F -- same seed=1, same config) and arm B
+(same input_sparsity_p=0.10 but dy_r_target=0.7 replacing
+dy_sparsity_p=1.0, dy_k_min=1, target_steps_per_sec=0.6) back to back,
+3000 steps each.
+
+**Arm A (rerun)**: did NOT relapse. Final loss=2.4827, acc=0.1928 at
+step 3000 -- compare arm F original's final loss=4.1562/acc=0.1178.
+FIVE real LEVEL_UPs across the run (steps 456, 804, 941, 1504, 2473,
+the last one right near the end) vs arm F's original ONE (step 675).
+Same seed, same code, same config -- genuinely different trajectory.
+This directly confirms the [[project_backward_sparse_threading_
+nondeterminism]] finding matters in practice, not just in an isolated
+unit test: it changes which SEQUENCE of curriculum stage transitions a
+run takes, which compounds into a materially different outcome by
+step 3000. **The "late-run relapse" documented above was this specific
+run's own noise, not a reproducible property of 10% input density at
+this width.** Retract the "10% input density is not yet confirmed
+stable" framing above -- the correct framing is "single-seed runs at
+this config are not reproducible at all, stable or not, because of the
+underlying engine nondeterminism," which is a stronger and more
+important caveat.
+
+**Arm B (dy_r_target)**: also did NOT relapse (final loss=2.7925,
+acc=0.1615, 4 LEVEL_UPs). But this run does NOT cleanly test "does
+grad-side nucleus sparsification help/hurt" either: `target_steps_per_
+sec=0.6` was calibrated off arm F's own FINAL sps (0.644), but arm B
+started at sps=1.27 (faster architecture/config interaction) and never
+dropped below ~0.94 the whole run -- so the controller only ever saw
+"faster than target" and grew dy_r_target monotonically from 0.70 to
+its 0.99 ceiling by step ~1400, then sat there for the remaining
+1600+ steps. That's functionally close to dense grad for most of the
+run, not a real sparsity test. Miscalibration, not a mechanism
+failure -- the controller's own direction logic worked exactly as
+designed (grow when comfortably faster than target), it just never got
+asked to shrink.
+
+**Honest bottom line**: this run pair does NOT answer "does dy_r_target
+fix arm F's relapse" (the relapse itself didn't reproduce, so there's
+nothing to fix in this comparison) and does NOT yet demonstrate a real
+compute-savings test for dy_r_target (it stayed near-dense almost the
+whole run). What it DOES establish, solidly: (1) single-seed runs on
+this whole ablation series (arms A-G, all of them, back to the start
+of this session) cannot be trusted to reflect a stable property of
+their config -- the threading nondeterminism is large enough to flip a
+"collapse" into "healthy" on an identical rerun; (2) the closed-loop
+dy_r_target controller mechanically works as designed (confirmed via
+its own visible 0.70->0.99 trajectory); (3) target_steps_per_sec needs
+calibrating against the ACTUAL arm's own early-run sps, not a
+different arm's final sps, before it can be trusted to test a genuine
+sparse steady state.
+
+**Not yet done**: a properly-calibrated dy_r_target run (lower
+target_steps_per_sec, or a lower initial dy_r_target with a HIGHER
+target so it's forced to shrink and stay sparse) to actually exercise
+the mechanism's compute-saving side; a multi-seed re-run of the base
+arm-F config to establish whether ANY reproducible signal exists in
+this comparison at all, before spending more compute chasing single-
+run differences.
+
+## dy_r_target speed-target sweep: found the practical ceiling for this
+## config, confirms the design instinct that grad alone can't go past it
+
+Single-seed (seed=1) exploratory sweep, 4 arms, `target_steps_per_sec`
+in {3.0, 5.0, 7.0, 10.0}, `dy_r_target` starting at 0.3, `dy_k_min=1`,
+`log_every=100` (tighter than the default 200 so each arm has more
+correction windows to actually settle within 3000 steps), same
+input_sparsity_p=0.10/embed_width=48 config as arm F/A/B.
+
+| target | settled dy_r_target | achieved sps | final loss/acc | elapsed |
+|---|---|---|---|---|
+| 3.0 | oscillates 0.19-0.36, never hits floor | 2.986 | 2.27/0.23 | 1005s |
+| 5.0 | hits r_min=0.05 by step ~1100, stays | 4.974 | 3.27/0.17 | 603s |
+| 7.0 | hits r_min=0.05 by step ~1100, stays | 4.391 | 2.50/0.33 | 683s |
+| 10.0 | hits r_min=0.05 by step ~1200, stays | 4.811 | 2.41/0.26 | 624s |
+
+3.0 and 5.0 both landed almost exactly on target (proves the controller
+tracks well when the target is achievable). 7.0 and 10.0 both hit
+`r_min` and plateaued in the 4.4-4.8 sps band regardless of how much
+higher the target was set -- confirms there's a real ceiling around
+~5 sps for THIS config that grad-side sparsification alone can't push
+past, no matter how aggressively `dy_r_target` shrinks. Direct
+instruction anticipated this ("It's fine if it can't reach the steps
+per second, this is mostly just testing") -- not a failure, a genuine
+measurement of where the ceiling sits.
+
+**Root-cause discussion (not yet cleanly measured)**: a same-turn quick
+diagnostic (isolated timing of dense-vs-sparse configs) was run WHILE
+this sweep was still active in the background -- direct instruction
+caught this: running a second num_cpus=4 process alongside an already-
+running num_cpus=4 arm oversubscribes this machine's 4-core/8-thread
+CPU, and the resulting timing numbers (std deviations up to 20ms on a
+~26ms mean) were noise, not signal -- retracted rather than reported as
+real. Real architectural point that DOES hold, independent of that
+botched diagnostic: `DISLDOLayerV` (fp32) has no block4 dense-tile SIMD
+path (see project_sili_block4_dense_loader/task #350, still open) --
+its "dense" path is a plain per-synapse loop, not the SIMD-accelerated
+block4 storage fp4/fp8 get. Combined with this project's own earlier-
+established finding that the scattered/CSR sparse path is gather/
+scatter-bound, not compute-bound, the ~5 sps ceiling plausibly reflects
+selection-sort + scattered-update overhead that doesn't shrink much as
+`dy_r_target` drops further, rather than "input forward cost alone" --
+but this needs a clean (uncontended, single-process) profiling pass to
+actually confirm, not the botched concurrent one.
+
+## Multi-actuator design discussion (input + grad together): revised
+## from "priority order" to "per-layer, signal-driven, no shared knob"
+
+Direct instruction walked through several real corrections to an
+initial design sketch for running `dy_r_target` and a (not-yet-built)
+input-side `x_r_target` together without them fighting each other:
+
+1. **Not a fixed priority order** ("grad first, input as overflow") --
+   too simple. Whether input or grad should be denser depends on the
+   actual situation: complex-but-understood input -> input stays dense,
+   grad can be sparse (little new to learn); simple-but-surprising
+   input -> input can be sparse, grad should be dense (a lot to learn
+   from this specific outcome). The unifying variable grad should track
+   is reproduction/prediction error (surprise), not a shared speed
+   readout alone.
+2. **Grad's r_target should be driven by measured surprise** -- this is
+   exactly the deferred inner E_t/Lbar loop from the original nucleus
+   design note above, now unblocked: use LAST step's `||dy||^2` (or
+   loss, or the critic's predicted error if `use_critic` is on) to set
+   THIS step's `dy_r_target` -- a one-step lag resolves the chicken-
+   and-egg timing problem (dy_r_target is consumed at forward()-call
+   time, before that step's own dy exists) without needing an autograd
+   hook or C++ instrumentation.
+3. **No equivalent derived signal for input, and that's fine** -- a
+   "how well-understood/how compressible" signal for input was
+   speculative and unproven; direct instruction: don't build unproven
+   complexity, keep input's r_target on the same simple closed-loop-
+   against-measured-speed + direct-reproduction-target control
+   `dy_r_target`'s outer loop already uses. Reconstruction-error as an
+   input signal would make sense in an AUTOENCODER-style system (where
+   reconstruction fidelity IS the objective) -- this project's current
+   solver/curriculum task has no such objective, so there's no natural
+   home for that signal here. Filed away, not built.
+4. **Must be PER-LAYER, not per-model** -- different layers have
+   different sparsify cost/benefit (directly following from tonight's
+   own finding that the fwd/bwd cost ratio scales with width, 2.8x at
+   n=48 to 12x at n=384). `E_t` is already naturally per-layer (each
+   layer's own `_bwd()` closure has its own `dy`) -- making grad's
+   r_target per-layer costs nothing extra, it's a MORE natural fit than
+   the model-level scalar built tonight, not an added complexity.
+5. **Per-layer real timing is cheap, not a blocker** -- direct
+   correction: don't build a width-based cost PROXY, just wrap each
+   layer's own forward+backward with `t0=time.perf_counter()`/`t1=...`
+   directly. Layers cost single-digit-to-tens of ms; timer call
+   overhead is ~100ns; real per-layer timing is easier than a proxy
+   would have been, not harder.
+
+**Not yet built**: per-layer `dy_r_target`/state dict (mirroring
+`_l2_decay_factor`'s existing pattern), per-layer lagged `E_t`/`Lbar`
+capture-and-use, real per-layer timing instrumentation (today's
+`_DIAG_TIMING` is a flat cross-layer accumulator, not keyed by layer),
+input-side nucleus wiring (task #365, still doesn't exist at all), and
+the cross-layer budget allocator tying speed-target + per-layer cost +
+per-layer surprise together. Scoped first slice under discussion:
+per-layer grad r_target with the lagged energy signal alone, model
+stays on a single shared speed target for now, input-side and the
+cross-layer allocator deferred until that's validated.

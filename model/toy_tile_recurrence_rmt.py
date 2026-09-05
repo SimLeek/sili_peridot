@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
 
 from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, tensor_abs, gather, concat, relu, power
-from sili.sparse_rnn import DISLDOLayer
+from sili.sparse_rnn import DISLDOLayer, CSR, _nucleus_top_k_csr
 
 from .toy_recall_models import rmsnorm_tensor
 
@@ -41,6 +43,11 @@ class ToyTileRecurrenceRMT:
     itself has none; the memory update is handled entirely by ordinary
     attention + residual, same as any other token position)."""
 
+    # The 5 layers dy_r_target/dy_sparsity_p/input_sparsity_p/
+    # wide_max_weights all affect (never lm_head/critic_head) -- single
+    # source of truth for the per-layer dict keys used below (task #372).
+    _WIDE_LAYER_NAMES = ("input_proj", "q_proj", "k_proj", "v_proj", "o_proj")
+
     def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
                  num_tiles: int, num_memory_slots: int, max_weights: int,
                  num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
@@ -54,6 +61,18 @@ class ToyTileRecurrenceRMT:
                  dynamic_rank_control: bool = False,
                  use_critic: bool = False,
                  recurrent_only_output: bool = False,
+                 input_sparsity_p: Optional[float] = None,
+                 dy_sparsity_p: Optional[float] = None,
+                 wide_max_weights: Optional[int] = None,
+                 output_dy_sparsity_p: Optional[float] = None,
+                 dy_r_target: Optional[float] = None,
+                 dy_k_min: int = 0,
+                 dy_k_max: Optional[int] = None,
+                 dy_surprise_alpha: Optional[float] = None,
+                 dy_surprise_beta: float = 0.99,
+                 x_r_target: Optional[float] = None,
+                 x_k_min: int = 0,
+                 x_k_max: Optional[int] = None,
                  rng: Optional[np.random.Generator] = None):
         """num_memory_slots: RMT's own paper uses a small handful of
         memory tokens (their experiments: as few as 1-16 depending on
@@ -129,7 +148,170 @@ class ToyTileRecurrenceRMT:
 
         Default off -- existing callers see zero behavior change (same
         6+1 layer-seed draws either way, this doesn't touch construction
-        at all, only step())."""
+        at all, only step()).
+
+        input_sparsity_p/dy_sparsity_p/wide_max_weights (sparsity plan
+        Phase 6, task #335): real values, not a bool toggle -- presence
+        (non-None) IS the toggle, matching this whole plan's own
+        convention (see sili.sparse_rnn.DISLDOLayer.forward's identical
+        dy_sparsity_p). All three default to None, meaning every
+        existing caller gets byte-identical behavior (no CSR anywhere,
+        max_weights unchanged for every layer).
+
+        Only input_proj/q_proj/k_proj/v_proj/o_proj are affected --
+        lm_head/critic_head stay fully dense/unwidened the whole time
+        (their own budget stays `max_weights`, never wide_max_weights;
+        their forward() calls never see a CSR input). Widening those
+        two isn't part of this plan: they read `pooled` (already
+        column-averaged down from state_width back to embed_width), not
+        one of the 5 layers whose INPUT width doubles with embed_width.
+
+        input_sparsity_p: density fraction for the 5 affected layers'
+        forward INPUT (reuses CSR.from_dense's own `p` convention, see
+        _to_sparse below). A layer whose input width just doubled needs
+        p~=0.5 to keep total compute at ~2x instead of 4x -- the whole
+        point of pairing width-doubling with input sparsification in
+        this plan.
+
+        dy_sparsity_p: density fraction for those same 5 layers'
+        backward GRADIENT -- a genuinely separate axis from
+        input_sparsity_p (see DISLDOLayer.forward's own docstring: forward-
+        input-sparsity and backward-gradient-sparsity are independent
+        parameters on the underlying sisldo_forward/disldo_backward_
+        sparse_grad C++ functions). If left None while input_sparsity_p
+        is set, defaults internally to input_sparsity_p (matches the
+        original requirement that dy gets the same treatment as the
+        input by default); an explicit value overrides independently.
+
+        wide_max_weights: per-layer synapse budget override for the 5
+        affected layers only. None (default) means they share the same
+        `max_weights` as every other layer, today's exact behavior. Set
+        to an int (e.g. 2048, the quadrupled default this plan's own
+        curriculum script uses) to give them a larger budget while
+        lm_head/critic_head stay at the original `max_weights` --
+        input+backprop sparsity means compute no longer scales with the
+        full stored budget every step, so the extra memory is affordable
+        (direct instruction).
+
+        output_dy_sparsity_p (direct instruction, following the
+        step_cached graded-schedule speed work): density fraction for
+        lm_head/critic_head's own backward GRADIENT only -- genuinely
+        separate axis from input_sparsity_p/dy_sparsity_p above, and
+        NOT threaded through _to_sparse (lm_head/critic_head read
+        `pooled`, a real dense column-averaged readout with no
+        structural sparsity -- unlike the 5 affected layers' inputs,
+        there's no free-lunch argument for sparsifying THIS input).
+        The gradient side is different: `_backward_with_critic`
+        computes `g_logits[row] = (1+advantage) * (probs - onehot)`
+        where `probs` is a softmax over vocab_size -- technically dense
+        (softmax never hits exact 0) but concentrates hard onto a few
+        classes as the model gets confident, so most of `probs-onehot`
+        is near-zero in practice. `dy_sparsity_p`'s top-k-by-magnitude
+        selection is exactly suited to this shape. None (default):
+        byte-identical to today's exact dense backward for both heads.
+
+        dy_r_target/dy_k_min/dy_k_max (task #367, priority 1 -- see
+        JOURNAL.md's "nucleus/energy-threshold top-k math" design note):
+        nucleus/energy-threshold grad sparsification for the SAME 5
+        layers dy_sparsity_p covers, TAKES PRIORITY over dy_sparsity_p
+        when both are set (mirrors DISLDOLayer.forward's own priority
+        chain exactly). Unlike dy_sparsity_p's fixed fraction, k is a
+        CONSEQUENCE of dy_r_target and each step's actual gradient
+        energy -- dy_r_target is the initial/current captured-energy
+        ratio target (mutable after construction via
+        apply_amortized_dy_r_target_control below, a closed-loop
+        controller against MEASURED steps/sec, not a guessed constant --
+        the originally-sketched analytic kbar-from-cost-ratio formula
+        was found NOT to hold: forward:backward cost ratio measured
+        2.8x-12x depending on width, not the recalled ~10x, so no
+        single hardcoded ratio would be right at every scale). dy_k_min/
+        dy_k_max are the hardware density floor/ceiling (see
+        _nucleus_top_k_csr's own docstring, sili__new). None (default):
+        byte-identical to today's exact behavior, same as every other
+        sparsity kwarg here.
+
+        Task #372: this scalar is the INITIAL value applied uniformly to
+        all 5 wide layers -- internally stored as self.dy_r_target, a
+        per-layer dict (name -> r_target), same pattern as
+        self._l2_decay_factor. A model-level knob wastes each layer's
+        own economics (different fwd:bwd cost ratios per layer, task
+        #368's own measurement), so per-layer state is the natural
+        representation even though this constructor arg still only
+        offers one shared starting point; task #374's per-layer surprise
+        loop will make each entry diverge independently over training.
+
+        dy_surprise_alpha/dy_surprise_beta (task #374, see JOURNAL.md's
+        "Grad-side k_t design, revised" + "Multi-actuator design
+        discussion" entries for the full derivation): per-layer INNER
+        loop, breathing each layer's own EFFECTIVE r_target above/below
+        its r_bar (self.dy_r_target[name], the OUTER sps-controlled
+        anchor from apply_amortized_dy_r_target_control) based on that
+        layer's own recent gradient energy --
+
+            E_t   = ||dy_t||^2                          # free byproduct of backward
+            Lbar <- beta*Lbar + (1-beta)*E_t             # per-layer running EMA
+            r_t   = clip(r_bar * (E_t/Lbar)^alpha, 0.05, 0.99)
+
+        A layer whose gradient just carried more energy than its own
+        recent average (surprising -- more to learn from this step) gets
+        a HIGHER effective capture ratio; a layer coasting near its own
+        average gets pulled back down, independent of every other
+        layer's own r_bar/surprise state. E_t/Lbar are naturally
+        LAGGED one step already (no explicit bookkeeping needed): a
+        layer's `_wide_extra_kwargs` call happens at forward()-time,
+        strictly BEFORE that step's own backward (and therefore that
+        step's own dy) exists -- so it always reads whatever E_t/Lbar
+        the PREVIOUS backward pass left behind, which is exactly the
+        one-step lag the design calls for (sidesteps the forward-
+        before-dy-exists chicken-and-egg without an autograd hook or
+        C++ instrumentation).
+
+        dy_surprise_alpha None (default): mechanism fully OFF, effective
+        r_target is exactly r_bar with zero modulation -- byte-identical
+        to every existing dy_r_target caller/test, matching every other
+        opt-in kwarg's own None-means-off convention here. Set (e.g.
+        0.5, an unvalidated starting point -- not yet tuned against a
+        real quality metric) to turn it on. dy_surprise_beta (0.99,
+        matching the design note's own "beta ~ 0.99") only matters once
+        alpha is set. r_min/r_max for this INNER per-step clip are
+        hardcoded at 0.05/0.99, matching apply_amortized_dy_r_target_
+        control's own OUTER-loop defaults -- not exposed as further
+        constructor params, to avoid over-parameterizing an unvalidated
+        mechanism (direct-instruction pattern from this same session:
+        don't build unproven complexity).
+
+        x_r_target/x_k_min/x_k_max (task #365, INPUT side -- see
+        JOURNAL.md's "Multi-actuator design discussion" entry, point 3):
+        nucleus/energy-threshold selection for the SAME 5 layers'
+        forward INPUT that input_sparsity_p currently covers with a
+        fixed fraction -- TAKES PRIORITY over input_sparsity_p when
+        both are set, mirroring dy_r_target's own priority chain over
+        dy_sparsity_p exactly (task #367). Per-layer dict (mirrors
+        dy_r_target's own #372 pattern), NOT a single model-level
+        scalar -- same rationale: different layers/consumers have
+        different real economics.
+
+        Direct instruction, revised scope: input stays on the SIMPLE
+        closed-loop control dy_r_target's own OUTER loop already uses
+        (apply_amortized_x_r_target_control below, structurally
+        identical to apply_amortized_dy_r_target_control) -- measured
+        speed vs a target, adjusting r_bar up/down. `r_target` IS
+        already "the direct reproduction-percent target" in this
+        design: R(v,k)=sum(v_topk^2)/sum(v^2) literally means "% of
+        this row's own squared magnitude reproduced by the kept
+        entries," so no separate reconstruction-error signal is needed
+        for x_r_target to mean something concrete -- it directly IS a
+        percent-reproduced target, unlike dy's surprise signal there is
+        no equivalent DERIVED complexity signal for input in this
+        non-autoencoder solver/curriculum task (see [[project_
+        nucleus_energy_threshold_topk]] and task #376, filed away as a
+        future idea, not built: an action/prediction output split would
+        give input a genuine reconstruction-error signal to drive a
+        smarter allocation than measured-speed alone, but that's
+        unproven and explicitly deferred until after this epic).
+
+        None (default): byte-identical to today's exact input_sparsity_p
+        behavior, same convention as every other opt-in kwarg here."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -150,6 +332,50 @@ class ToyTileRecurrenceRMT:
         # touching every one of this step()'s own 6 disldo_cls.forward()
         # call sites by hand.
         self.synapse_kwargs = synapse_kwargs or {}
+
+        # Phase 6 (task #335): see __init__'s own input_sparsity_p/
+        # dy_sparsity_p/wide_max_weights docstring above.
+        self.input_sparsity_p = input_sparsity_p
+        self.dy_sparsity_p = (dy_sparsity_p if dy_sparsity_p is not None
+                              else input_sparsity_p)
+        # x_r_target (task #365, per-layer dict mirroring dy_r_target's
+        # own #372 pattern): TAKES PRIORITY over input_sparsity_p in
+        # _to_sparse below -- see __init__'s own x_r_target docstring.
+        self.x_r_target: dict = {name: x_r_target for name in self._WIDE_LAYER_NAMES}
+        self.x_k_min = x_k_min
+        self.x_k_max = x_k_max
+        # Task #369: real per-layer INPUT-axis trajectory stats (R_mean/
+        # k_mean/rows/cols), overwritten each _to_sparse call that
+        # actually sparsifies -- see _update_input_selection_stats's own
+        # docstring. Lazily populated, empty until the first such call.
+        self.last_input_selection: dict = {}
+        # dy_r_target (task #367, per-layer dict since task #372): mutable
+        # after construction via apply_amortized_dy_r_target_control below
+        # -- see __init__'s own dy_r_target docstring. dy_k_min/dy_k_max
+        # stay plain scalars (static hardware floor/ceiling, same value
+        # for every layer -- no closed-loop control needed for those).
+        self.dy_r_target: dict = {name: dy_r_target for name in self._WIDE_LAYER_NAMES}
+        self.dy_k_min = dy_k_min
+        self.dy_k_max = dy_k_max
+        # Task #374: per-layer surprise state (name -> {"E_t", "Lbar"}),
+        # lazily populated on each layer's first real backward call (see
+        # _timed_layer_forward). dy_surprise_alpha=None means the whole
+        # inner loop is a no-op -- see __init__'s own dy_surprise_alpha
+        # docstring above.
+        self.dy_surprise_alpha = dy_surprise_alpha
+        self.dy_surprise_beta = dy_surprise_beta
+        self._layer_surprise: dict = {}
+        # _wide_extra_kwargs (below) is a live METHOD, keyed by layer name,
+        # now that dy_r_target is a per-layer dict mutable post-construction
+        # via apply_amortized_dy_r_target_control -- every one of step()'s
+        # many self._wide_extra_kwargs(name) call sites reads it fresh each
+        # time, so updating self.dy_r_target between steps takes effect
+        # immediately with no separate cache-invalidation step needed.
+        # Separate axis, lm_head/critic_head only -- see __init__'s own
+        # output_dy_sparsity_p docstring above.
+        self.output_dy_sparsity_p = output_dy_sparsity_p
+        self._output_extra_kwargs = ({"dy_sparsity_p": output_dy_sparsity_p}
+                                     if output_dy_sparsity_p is not None else {})
 
         state_width = self.state_width
         if rng is None:
@@ -176,16 +402,22 @@ class ToyTileRecurrenceRMT:
         # (see sili__new sparse_rnn.py _activate_gamma_tracking).
         dynamic_kwargs = {"dynamic_rank_control": True} if dynamic_rank_control else {}
         layer_kwargs = {**dense_kwargs, **rank_kwargs, **additive_kwargs, **dynamic_kwargs}
+        # Phase 6 (task #335): per-layer budget override for ONLY the 5
+        # affected layers (input_proj/q/k/v/o_proj) -- lm_head/critic_head
+        # below deliberately keep using the plain `max_weights` positional
+        # arg, never wide_max_weights. None (default) means
+        # wide_max_weights_ == max_weights, i.e. today's exact behavior.
+        wide_max_weights_ = wide_max_weights if wide_max_weights is not None else max_weights
 
-        self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
+        self.input_proj = disldo_cls(embed_width, state_width, wide_max_weights_, num_cpus,
                                      rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
-        self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+        self.q_proj = disldo_cls(state_width, state_width, wide_max_weights_, num_cpus,
                                  rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
-        self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+        self.k_proj = disldo_cls(state_width, state_width, wide_max_weights_, num_cpus,
                                  rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
-        self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+        self.v_proj = disldo_cls(state_width, state_width, wide_max_weights_, num_cpus,
                                  rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
-        self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
+        self.o_proj = disldo_cls(state_width, state_width, wide_max_weights_, num_cpus,
                                  rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
         self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
                                   rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs)
@@ -196,6 +428,23 @@ class ToyTileRecurrenceRMT:
         # see zero behavior change.
         self.use_critic = use_critic
         self.critic_head = None
+        # Persistent per-layer decay_factor state for apply_amortized_l2_decay
+        # (closed-loop, corrected toward each layer's fan-in-normalized target
+        # from its own measured rms -- see that method's own docstring).
+        # Lazily populated (name -> factor), default 1.0 (no decay) until a
+        # layer's first full cycle completes and supplies real data.
+        self._l2_decay_factor: dict = {}
+        # Task #373: real per-layer forward+backward timing, keyed by the
+        # same _WIDE_LAYER_NAMES as dy_r_target -- direct time.perf_
+        # counter() wraps via _timed_layer_forward below, NOT a
+        # width-based cost proxy (direct correction: layers cost single-
+        # digit-to-tens of ms, timer overhead is ~100ns, real measurement
+        # is cheaper than a calibrated proxy would have been). Lazily
+        # populated per layer on first call, mirroring _l2_decay_factor's
+        # own lazy-dict convention. Feeds the cross-layer budget
+        # allocator (#375) -- each layer's own measured fwd_s/bwd_s is
+        # the real economics a shared model-level knob (pre-#372) wasted.
+        self._layer_timing: dict = {}
         if use_critic:
             critic_seed = int(rng.integers(0, 2**31 - 1))
             self.critic_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
@@ -317,6 +566,15 @@ class ToyTileRecurrenceRMT:
         sigma_init = max(self.total_slots / 4.0, 1.0)
         self.log_sigmas = Tensor(np.full(self.total_slots, np.log(sigma_init), dtype=np.float32))
 
+        # step_cached's own precomputed constant index lists (flat,
+        # matching gather()'s existing [row*sw+col] convention used
+        # throughout step() above) -- fixed for the model's lifetime,
+        # built once here rather than reconstructed every call.
+        self._mem_idx_step = [m * state_width + c for m in range(n_mem) for c in range(state_width)]
+        self._new_content_idx_step = [n_mem * state_width + c for c in range(state_width)]
+        self._mem_center_idx = list(range(n_mem))
+        self._newest_content_idx = [n_mem + n_content - 1]
+
     def _named_real_layers(self):
         """(name, layer) for every real disldo_cls weight layer, INCLUDING
         critic_head when use_critic is set -- the single source of truth
@@ -333,6 +591,311 @@ class ToyTileRecurrenceRMT:
 
     def _real_layers(self):
         return [layer for _name, layer in self._named_real_layers()]
+
+    def _timed_layer_forward(self, layer, layer_name: str, *args, **kwargs) -> Tensor:
+        """Task #373: real per-layer forward+backward timing -- direct
+        time.perf_counter() wraps, not a width-based cost proxy (a proxy
+        was over-engineering this: layers cost single-digit-to-tens of
+        ms, timer overhead is ~100ns, direct measurement is both cheaper
+        and simpler than calibrating a proxy would have been, direct
+        instruction).
+
+        Forward timing is straightforward (wraps the call itself).
+        Backward is deferred -- sili__new's autograd attaches a Python
+        closure to `out._backward` that only actually runs later, inside
+        the caller's own loss.backward() graph walk, outside step()'s
+        own call stack entirely. Wrapping that closure here (instead of
+        modifying sili__new's engine) keeps this purely a sili_peridot-
+        side concern: `out._backward` is REPLACED with a thin timer
+        wrapper around the original closure, so whichever later
+        loss.backward() call eventually triggers it, this layer's own
+        share of that walk gets attributed correctly.
+
+        Accumulates into self._layer_timing[layer_name] (fwd_s/bwd_s/
+        fwd_calls/bwd_calls) -- callers use reset_layer_timing() to zero
+        it before a measurement window (mirrors how steps_per_sec is
+        computed over a window in train_mqar_curriculum.py, not since
+        t=0).
+
+        Also the task #374 surprise-signal capture point: `out.grad` at
+        the moment `out._backward` actually runs IS `dy` for this layer
+        (the real gradient flowing into this forward call's output) --
+        a free byproduct of the same wrapper, no separate instrumentation
+        needed. Feeds self._update_layer_surprise (no-op unless
+        dy_surprise_alpha is set -- see __init__'s own docstring)."""
+        t0 = time.perf_counter()
+        out = layer.forward(*args, **kwargs)
+        rec = self._layer_timing.setdefault(
+            layer_name, {"fwd_s": 0.0, "bwd_s": 0.0, "fwd_calls": 0, "bwd_calls": 0})
+        rec["fwd_s"] += time.perf_counter() - t0
+        rec["fwd_calls"] += 1
+        orig_backward = out._backward
+        if orig_backward is not None:
+            def _timed_backward(_orig=orig_backward, _rec=rec, _out=out, _name=layer_name):
+                tb0 = time.perf_counter()
+                _orig()
+                _rec["bwd_s"] += time.perf_counter() - tb0
+                _rec["bwd_calls"] += 1
+                if self.dy_surprise_alpha is not None and _out.grad is not None:
+                    self._update_layer_surprise(_name, _out.grad)
+            out._backward = _timed_backward
+        return out
+
+    def reset_layer_timing(self) -> None:
+        """Zero self._layer_timing -- call at the start of a measurement
+        window (task #373), same convention as train_mqar_curriculum.py's
+        own windowed steps_per_sec, not a cumulative-since-t=0 total."""
+        self._layer_timing = {}
+
+    def _update_layer_surprise(self, layer_name: str, dy) -> None:
+        """Task #374: E_t = ||dy||^2 (this backward call's own gradient
+        energy), Lbar <- beta*Lbar + (1-beta)*E_t (per-layer running
+        EMA) -- see __init__'s own dy_surprise_alpha docstring for the
+        full formula/derivation. Called once per REAL backward
+        invocation (multiple times per step() for k/v/o_proj under the
+        write-then-read design -- each is a genuine, independent
+        observation of that layer's gradient energy at that moment, not
+        an artifact to dedupe).
+
+        Lbar initialized to E_t itself on a layer's first-ever
+        observation (not 0) -- starting Lbar at 0 would make the very
+        first E_t/Lbar ratio divide-by-zero; starting it AT E_t instead
+        makes the first ratio exactly 1.0 (no modulation), a neutral
+        cold start that only diverges once real variation is observed."""
+        E_t = float(np.sum(np.asarray(dy, dtype=np.float64) ** 2))
+        rec = self._layer_surprise.get(layer_name)
+        if rec is None:
+            self._layer_surprise[layer_name] = {"E_t": E_t, "Lbar": max(E_t, 1e-12)}
+            return
+        rec["E_t"] = E_t
+        rec["Lbar"] = self.dy_surprise_beta * rec["Lbar"] + (1.0 - self.dy_surprise_beta) * E_t
+
+    def _effective_dy_r_target(self, layer_name: str) -> Optional[float]:
+        """Task #374: r_t = clip(r_bar * (E_t/Lbar)^alpha, 0.05, 0.99),
+        using whatever E_t/Lbar the layer's PREVIOUS real backward call
+        left behind -- see __init__'s own dy_surprise_alpha docstring
+        for why this is already correctly lagged one step with zero
+        extra bookkeeping (this method is only ever called from
+        _wide_extra_kwargs, at forward()-time, strictly before the
+        CURRENT step's own backward has run).
+
+        dy_surprise_alpha is None (default, mechanism off) or this
+        layer has no surprise data yet (cold start, first step ever):
+        returns r_bar unmodified -- byte-identical to task #372's own
+        behavior in both cases."""
+        r_bar = self.dy_r_target.get(layer_name)
+        if r_bar is None or self.dy_surprise_alpha is None:
+            return r_bar
+        surprise = self._layer_surprise.get(layer_name)
+        if surprise is None or surprise["Lbar"] <= 0.0:
+            return r_bar
+        ratio = surprise["E_t"] / surprise["Lbar"]
+        r_t = r_bar * (ratio ** self.dy_surprise_alpha)
+        return min(max(r_t, 0.05), 0.99)
+
+    def _wide_extra_kwargs(self, layer_name: str) -> dict:
+        """Extra kwargs threaded into ONE of the 5 affected layers'
+        forward() calls (input_proj/q/k/v/o_proj), never lm_head/
+        critic_head's -- layer_name must be one of _WIDE_LAYER_NAMES.
+        Live (not cached at construction) because self.dy_r_target[name]
+        is mutable post-construction via
+        apply_amortized_dy_r_target_control below.
+
+        Per-layer since task #372 (was a single shared @property before
+        -- a model-level knob wastes each layer's own economics, task
+        #368's own measurement found fwd:bwd cost ratio varies 2.8x-12x
+        across layers/widths). dy_r_target takes PRIORITY over
+        dy_sparsity_p when both end up set -- mirrors DISLDOLayer.
+        forward's own priority chain exactly (task #367). Neither set:
+        empty dict, byte-identical to today's exact dense behavior,
+        matching every other conditional kwarg here.
+
+        Reads _effective_dy_r_target (task #374), not the raw
+        self.dy_r_target[name] dict entry directly -- applies the
+        lagged per-layer surprise modulation on top of r_bar when
+        dy_surprise_alpha is set, otherwise returns r_bar unmodified
+        (byte-identical to pre-#374 behavior)."""
+        r_target = self._effective_dy_r_target(layer_name)
+        if r_target is not None:
+            kw = {"dy_r_target": r_target}
+            if self.dy_k_min:
+                kw["dy_k_min"] = self.dy_k_min
+            if self.dy_k_max is not None:
+                kw["dy_k_max"] = self.dy_k_max
+            return kw
+        if self.dy_sparsity_p is not None:
+            return {"dy_sparsity_p": self.dy_sparsity_p}
+        return {}
+
+    def apply_amortized_dy_r_target_control(self, measured_sps: float, target_sps: float,
+                                             layer_name: Optional[str] = None,
+                                             down_factor: float = 0.85, up_factor: float = 1.05,
+                                             r_min: float = 0.05, r_max: float = 0.99) -> dict:
+        """Closed-loop controller adjusting self.dy_r_target against
+        MEASURED steps/sec (task #368, revised design -- see JOURNAL.md's
+        "Grad-side k_t design, revised" entry for the full rationale).
+
+        The original k_t sketch assumed an analytic kbar derivable from a
+        fixed backward:forward compute-cost ratio (~10x, recalled). Direct
+        measurement (forward_dense vs backward_dense, same layer, varying
+        width) found the ratio is NOT constant -- 2.8x at n=48, 6.8x at
+        n=128, 12.0x at n=384 -- so any single hardcoded ratio baked into
+        a formula would be wrong at some scale. This sidesteps that
+        entirely: no assumed ratio anywhere, just react to what steps/sec
+        actually measures, same "closed-loop, measured-statistics, not
+        guessed constants" philosophy apply_amortized_l2_decay already
+        uses successfully.
+
+        Call periodically (e.g. every N steps) from the training loop with
+        that window's own measured steps/sec. measured_sps < target_sps:
+        r_target shrinks (down_factor, capture less energy => fewer
+        entries => cheaper). measured_sps > target_sps (no margin needed,
+        matching l2 decay's own asymmetric-but-simple correction
+        convention): r_target grows back toward r_max (up_factor).
+        Clipped to [r_min, r_max] -- r_max<1.0 by default since 1.0 would
+        defeat the entire compute-savings purpose dy_r_target exists for.
+
+        layer_name (task #372): None (default) applies the SAME
+        measured_sps/target_sps correction to every wide layer whose
+        dy_r_target is currently set (mirrors the old model-level
+        behavior exactly -- existing callers like the speed-target sweep
+        script pass a single model-wide measured_sps and see the same
+        net effect as before, since every layer started at the same
+        initial value and moves in lockstep). Pass a specific name once
+        real per-layer measured_sps is available (task #373's timing)
+        to adjust just that layer independently -- a no-op (KeyError) if
+        that layer's dy_r_target entry was never enabled (None) to begin
+        with, since this controller only ADJUSTS an already-opted-in
+        mechanism, it doesn't turn the mechanism on for a fresh layer.
+
+        Does NOT implement the per-step E_t/Lbar energy-modulation half
+        of the original design (r_t breathing above/below r_bar based on
+        THIS step's own gradient energy) -- deferred to task #374:
+        dy_r_target is consumed at forward()-CALL time, before that
+        layer's own dy for this step is known (chicken-and-egg; resolved
+        there via a one-step lag, not built yet here). This method only
+        implements the OUTER (r_bar-vs-measured-sps) loop for now.
+
+        Returns the updated {layer_name: r_target} dict for whichever
+        layers were actually touched (empty if none had dy_r_target set,
+        matching the old None-return no-op case)."""
+        names = [layer_name] if layer_name is not None else list(self._WIDE_LAYER_NAMES)
+        updated = {}
+        for name in names:
+            current = self.dy_r_target.get(name)
+            if current is None:
+                continue
+            if measured_sps < target_sps:
+                current = max(r_min, current * down_factor)
+            elif measured_sps > target_sps:
+                current = min(r_max, current * up_factor)
+            self.dy_r_target[name] = current
+            updated[name] = current
+        return updated
+
+    def apply_amortized_x_r_target_control(self, measured_sps: float, target_sps: float,
+                                            layer_name: Optional[str] = None,
+                                            down_factor: float = 0.85, up_factor: float = 1.05,
+                                            r_min: float = 0.05, r_max: float = 0.99) -> dict:
+        """Closed-loop controller adjusting self.x_r_target against
+        MEASURED steps/sec (task #365, INPUT side) -- structurally
+        IDENTICAL to apply_amortized_dy_r_target_control above (same
+        formula, same layer_name/None convention, same clip defaults),
+        just operating on x_r_target instead of dy_r_target. See that
+        method's own docstring for the full "why measured-speed, not an
+        assumed cost ratio" rationale -- direct instruction: input
+        stays on this SAME simple control, no separate derived signal
+        (see __init__'s own x_r_target docstring for why not).
+
+        Returns the updated {layer_name: r_target} dict for whichever
+        layers were actually touched (empty if none had x_r_target set)."""
+        names = [layer_name] if layer_name is not None else list(self._WIDE_LAYER_NAMES)
+        updated = {}
+        for name in names:
+            current = self.x_r_target.get(name)
+            if current is None:
+                continue
+            if measured_sps < target_sps:
+                current = max(r_min, current * down_factor)
+            elif measured_sps > target_sps:
+                current = min(r_max, current * up_factor)
+            self.x_r_target[name] = current
+            updated[name] = current
+        return updated
+
+    def apply_cross_layer_budget_allocator(self, measured_sps: float, target_sps: float,
+                                           down_factor: float = 0.85, up_factor: float = 1.05,
+                                           r_min: float = 0.05, r_max: float = 0.99) -> dict:
+        """Task #375: coordinates x_r_target (INPUT axis) against the
+        remaining compute budget using task #373's real per-layer
+        timing as the "how expensive is this layer actually" signal --
+        WITHOUT inventing an analytic cost-vs-r_target formula
+        (JOURNAL.md's own measurement already found fwd:bwd cost ratio
+        varies 2.8x-12x across layers/widths, so no single hardcoded
+        ratio/formula would be right at every scale -- same "measured
+        statistics, not guessed constants" philosophy every other outer
+        loop here already uses).
+
+        dy_r_target (GRAD axis) is DELIBERATELY NOT TOUCHED by this
+        method at all -- direct instruction: grad's r_target must be
+        driven by its own need (task #374's E_t/Lbar surprise signal),
+        INDEPENDENT of the speed budget. The problem this task exists
+        to prevent is both axes independently reacting to the SAME
+        measured_sps and fighting/oscillating together -- the fix is
+        structural (only ONE axis reacts to speed in any one
+        coordinated call), not a smarter simultaneous-adjustment
+        formula. A caller MAY still call
+        apply_amortized_dy_r_target_control separately, rarely, to keep
+        r_bar from drifting arbitrarily over a very long run -- that's
+        an orthogonal, slower-timescale concern this method doesn't
+        manage.
+
+        Per-layer WEIGHT: each layer's real measured (fwd_s+bwd_s)
+        share of the total across all 5 wide layers (from
+        self._layer_timing, task #373), normalized against the uniform
+        1/5 baseline -- a layer currently eating an above-average share
+        of real time gets a correspondingly STRONGER correction (it's
+        the layer most responsible for the current speed), a
+        below-average layer gets a correspondingly WEAKER one. Weight
+        is clipped to [0, 3] to keep the correction bounded and
+        predictable -- an unclipped weight could blow up arbitrarily
+        for a layer that happens to have almost zero competing cost
+        this window. Falls back to weight=1.0 for every layer (matching
+        apply_amortized_x_r_target_control's own plain uniform
+        behavior) when self._layer_timing has no data yet (cold start,
+        before any _timed_layer_forward call has run) -- caller should
+        call reset_layer_timing() at the start of each measurement
+        window (same convention #373 already established) so this
+        weight reflects THAT window's real costs, not a stale
+        accumulation.
+
+        Returns the updated {layer_name: x_r_target} dict for whichever
+        layers were actually touched (only ones with x_r_target already
+        set -- same "only ADJUSTS an already-opted-in mechanism"
+        contract as every other outer loop here)."""
+        names = [n for n in self._WIDE_LAYER_NAMES if self.x_r_target.get(n) is not None]
+        if not names:
+            return {}
+        total_t = sum(rec["fwd_s"] + rec["bwd_s"] for rec in self._layer_timing.values())
+        uniform_share = 1.0 / len(self._WIDE_LAYER_NAMES)
+        updated = {}
+        for name in names:
+            if total_t > 0:
+                layer_t = self._layer_timing.get(name, {"fwd_s": 0.0, "bwd_s": 0.0})
+                share = (layer_t["fwd_s"] + layer_t["bwd_s"]) / total_t
+                weight = min(max(share / uniform_share, 0.0), 3.0)
+            else:
+                weight = 1.0
+            current = self.x_r_target[name]
+            if measured_sps < target_sps:
+                eff_down = 1.0 - (1.0 - down_factor) * weight
+                current = max(r_min, current * eff_down)
+            elif measured_sps > target_sps:
+                eff_up = 1.0 + (up_factor - 1.0) * weight
+                current = min(r_max, current * eff_up)
+            self.x_r_target[name] = current
+            updated[name] = current
+        return updated
 
     def parameters_for_optimizer(self) -> List[Tensor]:
         return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
@@ -352,9 +915,87 @@ class ToyTileRecurrenceRMT:
             elif hasattr(layer, "magnitude_rescale_output") and hasattr(layer, "digits"):
                 layer.magnitude_rescale_output(target, correction_rate, scale_invariant)
 
+    def apply_amortized_l2_decay(self, chunk_size: int, adaptation_rate: float = 0.3) -> dict:
+        """Apply the amortized decoupled L2 decay + rolling health-stats
+        mechanism (direct instruction, see conversation) to every real
+        disldo_cls weight layer, INCLUDING the fp32 control (unlike
+        magnitude_rescale_output, apply_amortized_l2_decay is bound on
+        all three backends -- ValueAccessor-generic, no hasattr guard
+        needed). Meant to be called once per real training step -- this
+        is the "simple bound helps immediately, L2 helps health"
+        complement to NOCAPS_KWARGS's per-precision max_abs_delta/max_ci
+        (train_mqar_curriculum.py).
+
+        CLOSED-LOOP, not a hand-picked half-life (corrects an earlier
+        version of this method that took a fixed `half_life_steps` --
+        direct instruction: "I thought we could set the L2
+        hyperparameters based off the statistically measured health of
+        the neural network itself for an exact solution"). A first
+        attempt at a fixed half-life (2000 steps) DID verify the
+        overflow fix but was badly overtuned for the wide+sparse config:
+        q/k/o_proj -- already healthy with ZERO decay in the original
+        buggy run (mean|w| ~0.04-0.13) -- got crushed to ~1e-5 by step
+        16000, meaning the guessed constant dominated real learning
+        instead of just providing a long-horizon health ceiling. Picking
+        a bigger constant (20000) would have been the same mistake again
+        with extra steps.
+
+        Real fix: no half-life at all. Each layer keeps its own
+        decay_factor in self._l2_decay_factor (persistent across step()
+        calls, lazily initialized to 1.0 = no decay -- the max_abs_delta/
+        max_ci hard bound is the actual immediate safety net per the
+        two-part design, so it's fine for L2 to do nothing until it has
+        real data). Every time a layer's rolling cursor completes a full
+        pass, its MEASURED rms is compared against the closed-form
+        target 1/sqrt(fan_in) (the same fan-in-normalized scale
+        _preseed_dense_scattered already inits every dense fp32 layer
+        to, sili/sparse_rnn.py) and decay_factor is corrected
+        multiplicatively toward that target:
+            decay_factor *= clip((target / measured_rms) ** adaptation_rate, 0.5, 2.0)
+        clipped to (1e-6, 1.0]. rms above target -> decay strengthens
+        (factor drops); rms below target -> decay relaxes (factor rises
+        back toward 1.0, never above -- L2 only ever shrinks). This
+        converges toward the fan-in-normalized target using the model's
+        own measured statistics, the same rms/mean_abs/max_abs
+        apply_amortized_l2_decay already returns every cycle -- no
+        separate stats pass, no externally-guessed timescale.
+        adaptation_rate is a control-loop GAIN (how fast the correction
+        responds), not an equilibrium-setting parameter like half_life_
+        steps was -- a 2x-off gain still converges to the same correct
+        fixed point, just slower/faster, unlike a 2x-off half-life which
+        directly sets the wrong equilibrium magnitude.
+
+        chunk_size: synapses touched PER LAYER PER call (same raw budget
+        for every layer regardless of width).
+
+        Returns {layer_name: stats_dict} for every layer that JUST
+        completed a full pass this call (stats_dict has mean_abs/rms/
+        max_abs/n plus target/decay_factor for diagnostics); layers
+        still mid-cycle are omitted since their reported stats would be
+        the stale previous cycle's numbers."""
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            decay_factor = self._l2_decay_factor.get(name, 1.0)
+            stats = layer.apply_amortized_l2_decay(chunk_size, decay_factor)
+            if stats.get("cycle_complete") and stats.get("n", 0) > 0:
+                target = 1.0 / math.sqrt(layer.in_features)
+                measured_rms = stats.get("rms", 0.0)
+                if measured_rms > 0.0:
+                    correction = (target / measured_rms) ** adaptation_rate
+                    correction = min(max(correction, 0.5), 2.0)
+                    decay_factor = min(max(decay_factor * correction, 1e-6), 1.0)
+                    self._l2_decay_factor[name] = decay_factor
+                stats = dict(stats, target=target, decay_factor=decay_factor)
+                results[name] = stats
+        return results
+
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
-                                   grace_period_steps: int = 50) -> dict:
+                                   scale_grace_period_steps: int = 50,
+                                   additive_grace_period_steps: int = 5000) -> dict:
         """Runs AQRS Theorem 10 dynamic rank control (task #292, see
         sili__new's delta_csr_types.hpp/DISLDOLayer.apply_dynamic_rank_
         control) on every real disldo_cls weight layer independently --
@@ -368,6 +1009,22 @@ class ToyTileRecurrenceRMT:
         not that anything breaks; calling it MORE often than once/step
         has no effect since nothing new has been computed between calls.
 
+        scale_grace_period_steps/additive_grace_period_steps: PER-BRANCH
+        cooldowns (direct instruction, replacing an earlier within-branch
+        grow-vs-shrink asymmetry after a biology literature check -- see
+        sili__new's DISLDOLayer.apply_dynamic_rank_control docstring for
+        the full citations: real dendritic spine formation/elimination
+        rates are roughly comparable within a mechanism, Holtmaat et al.
+        Neuron 2005 / Grutzendler et al. Nature 2002, so each branch now
+        uses ONE symmetric value internally). The real asymmetry is
+        cross-branch: the scale (multiplicative, per-synapse) branch
+        defaults to 50, the additive (whole-layer, homeostatic-like)
+        branch defaults to 5000 (~100x), reflecting the real gap between
+        Hebbian/STDP synaptic timescales (seconds-minutes) and
+        homeostatic synaptic scaling (~24-48h to manifest; Turrigiano
+        and colleagues' activity-blockade experiments; Zenke & Gerstner,
+        Phil. Trans. R. Soc. B, 2017).
+
         Returns {layer_name: mutated_bool} for every real layer -- lets a
         caller log/count real rank-mutation events per layer without
         needing to know the same layer-name tuple again itself.
@@ -376,7 +1033,8 @@ class ToyTileRecurrenceRMT:
         for name, layer in self._named_real_layers():
             if hasattr(layer, "apply_dynamic_rank_control"):
                 results[name] = layer.apply_dynamic_rank_control(
-                    tau_death, tau_active, theta, seed_scale, grace_period_steps)
+                    tau_death, tau_active, theta, seed_scale,
+                    scale_grace_period_steps, additive_grace_period_steps)
         return results
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
@@ -435,8 +1093,135 @@ class ToyTileRecurrenceRMT:
                 results[name] = (c.get_scale_rank(), c.get_additive_rank())
         return results
 
+    def _to_sparse(self, x: Tensor, layer_name: str) -> Tensor:
+        """Sparsity plan Phase 6 (task #335) -- mirrors the existing
+        sparse_rnn.py recurrent-cell precedent (`if not isinstance(
+        state.data, CSR): ... CSR.from_dense(...).as_tensor(...)`)
+        exactly, just as its own small reusable helper here. A no-op
+        (returns x unchanged) when neither x_r_target[layer_name] nor
+        input_sparsity_p is set -- every existing caller of the 5
+        affected layers (input_proj/q/k/v/o_proj) sees a completely
+        unmodified dense Tensor, same object even, matching the plan's
+        own "None = today's exact behavior" requirement.
+
+        layer_name (task #365): identifies WHICH of the 5 wide layers
+        is about to CONSUME this sparsified tensor as its forward
+        input -- selects that layer's own x_r_target entry. Several
+        call sites feed the SAME underlying dense tensor to multiple
+        layers (e.g. combined_normed feeds q_proj/k_proj/v_proj all
+        three) -- each of those calls this method separately with its
+        own layer_name, so a layer whose x_r_target differs from its
+        sibling consumers gets its own independently-selected top-k
+        set, not a shared one. This means 3x the selection work for
+        that shared-input case when per-layer x_r_target values
+        actually differ (accepted cost of genuine per-layer control,
+        same tradeoff task #372 already made for dy_r_target).
+
+        x_r_target[layer_name] set (task #365): nucleus/energy-
+        threshold selection via _nucleus_top_k_csr -- TAKES PRIORITY
+        over input_sparsity_p, mirrors dy_r_target's own priority over
+        dy_sparsity_p (task #367) exactly. Falls back to
+        input_sparsity_p's fixed-fraction CSR.from_dense when
+        x_r_target[layer_name] is None (today's exact pre-#365
+        behavior, unchanged).
+
+        Root-cause fix (found via sigma_grad_debug_fn probe): CSR.
+        as_tensor() returns a bare leaf Tensor (no _children/_backward),
+        so the old version of this method silently DETACHED x from the
+        graph -- any layer downstream of a _to_sparse call (o_proj, in
+        particular) still updated its OWN weights fine (its dx lands on
+        the CSR tensor's own .grad, which as_tensor's docstring already
+        anticipated being dense), but that gradient never propagated past
+        the CSR tensor, since its _backward was the default no-op. That
+        orphaned everything upstream of any _to_sparse boundary --
+        confirmed directly: log_sigmas.grad was None on every backward
+        call at embed_width=32 (input_sparsity_p set) vs real/nonzero
+        every call at embed_width=16 (input_sparsity_p=None, this method
+        a no-op) -- since centers/log_sigmas only reach the loss via
+        gaussian_attention -> attn_pre_o_{mem,content} -> o_proj, i.e.
+        exclusively through this exact boundary.
+
+        Fix: wire real _children/_backward so gradient flows back to x.
+        Straight-through (the full dense downstream gradient is passed
+        back to x unmasked, not restricted to the k positions this
+        particular top-k call happened to keep) rather than a hard
+        mask-the-gradient-too version -- masking would zero the learning
+        signal for every non-selected position on every step, making the
+        selected/dropped split itself unable to shift over training,
+        which is its own kind of frozen state.
+
+        Task #369: also updates self.last_input_selection[layer_name]
+        with real R/k trajectory stats -- see that update's own
+        docstring (_update_input_selection_stats) for why this is
+        near-zero extra cost and why it's a plain overwritten snapshot,
+        not an accumulator."""
+        x_r_target = self.x_r_target.get(layer_name)
+        if x_r_target is None and self.input_sparsity_p is None:
+            return x
+        x_np = np.asarray(x.data, dtype=np.float32)
+        x2d = x_np[np.newaxis, :] if x_np.ndim == 1 else x_np
+        if x_r_target is not None:
+            ptrs, indices, values = _nucleus_top_k_csr(
+                x2d, x_r_target, self.num_cpus, k_min=self.x_k_min, k_max=self.x_k_max)
+            csr = CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
+        else:
+            csr = CSR.from_dense(x2d, self.input_sparsity_p, self.num_cpus)
+        self._update_input_selection_stats(layer_name, x2d, csr)
+        out = Tensor(csr, _children=(x,), _op="to_sparse", backend=x.backend)
+
+        def _bwd():
+            if out.grad is None:
+                return
+            g = np.asarray(out.grad, dtype=np.float32)
+            if x.grad is None:
+                x.grad = x.backend.zeros_like(x.data)
+            x.grad = x.backend.add(x.grad, g)
+
+        out._backward = _bwd
+        return out
+
+    def _update_input_selection_stats(self, layer_name: str, x2d: np.ndarray, csr: CSR) -> None:
+        """Task #369: real per-layer INPUT-axis trajectory stats -- R
+        (the actual captured squared-magnitude ratio R(v,k) THIS call
+        achieved, not just the r_target it was asked for) and k (mean
+        kept-entries-per-row), computed directly from the CSR
+        _to_sparse already just built (near-zero extra cost -- unlike
+        the grad axis, this method already has both the dense input and
+        the resulting CSR in hand, no new C++ instrumentation needed).
+        Meaningful for BOTH the nucleus (x_r_target) and fixed-fraction
+        (input_sparsity_p) paths -- R is a real, honest diagnostic
+        either way, not something that only makes sense under nucleus
+        selection.
+
+        Stored in self.last_input_selection[layer_name], OVERWRITTEN
+        each call (mirrors self.last_debug's own "most recent snapshot"
+        convention), not accumulated across steps. Direct instruction
+        (bounded fine-grained logging, opt-in, off by default): the
+        actual "log every N steps" / "log this step range" gating
+        policy lives in the CALLER (e.g. train_mqar_curriculum.py's own
+        trajectory_log_every), which already tracks its own step
+        counter -- the model itself stays stateless about step numbers,
+        same existing design choice as every other per-step model
+        attribute here (last_debug, last_critic_pred, etc.)."""
+        row_sq_total = np.sum(x2d.astype(np.float64) ** 2, axis=1)
+        kept_sq = np.zeros(csr.rows, dtype=np.float64)
+        k_per_row = np.zeros(csr.rows, dtype=np.int64)
+        for row in range(csr.rows):
+            start, end = int(csr.ptrs[row]), int(csr.ptrs[row + 1])
+            kept_sq[row] = np.sum(csr.values[start:end].astype(np.float64) ** 2)
+            k_per_row[row] = end - start
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_per_row = np.where(row_sq_total > 0, kept_sq / row_sq_total, 1.0)
+        self.last_input_selection[layer_name] = {
+            "R_mean": float(np.mean(r_per_row)),
+            "k_mean": float(np.mean(k_per_row)),
+            "rows": int(csr.rows),
+            "cols": int(csr.cols),
+        }
+
     def _l1_sparsity_split(self, layer, input_t: Tensor, lr: float, coef: float,
-                           requires_grad: bool = True) -> Tensor:
+                           requires_grad: bool = True, layer_name: Optional[str] = None,
+                           **extra_kwargs) -> Tensor:
         """Exact port of ToyTileRecurrenceRealFP4's own helper -- see its
         l1_sparsity_coef docstring for the full split-backward rationale.
 
@@ -449,9 +1234,22 @@ class ToyTileRecurrenceRMT:
         (each Python closure holds its own input directly, same as
         every other Tensor op), so this is no longer order-sensitive at
         all -- previously needed use_explicit_token to avoid a real
-        engine-side LIFO-cache bug, now simply not a concern."""
-        out_aux = layer.forward(input_t, lr, requires_grad=requires_grad,
-                                damp_by_importance=False, **self.synapse_kwargs)
+        engine-side LIFO-cache bug, now simply not a concern.
+
+        layer_name (task #373): when given (one of the 5 wide layers),
+        this call's real forward+backward cost is folded into
+        self._layer_timing too -- this probe is real compute the same
+        as the main pass, so the budget allocator (#375) needs to see
+        it. None (default, used by lm_head's own untimed call site)
+        skips timing entirely, matching every other caller's previous
+        behavior exactly."""
+        if layer_name is not None:
+            out_aux = self._timed_layer_forward(
+                layer, layer_name, input_t, lr, requires_grad=requires_grad,
+                damp_by_importance=False, **self.synapse_kwargs, **extra_kwargs)
+        else:
+            out_aux = layer.forward(input_t, lr, requires_grad=requires_grad,
+                                    damp_by_importance=False, **self.synapse_kwargs, **extra_kwargs)
         n = float(np.asarray(out_aux.data).size)
         return reduce_sum(tensor_abs(out_aux)) * (coef / n)
 
@@ -466,7 +1264,8 @@ class ToyTileRecurrenceRMT:
         return reduce_sum(power(excess, 2)) * (self.magnitude_clip_penalty_coef / n)
 
     def step(self, x_window: np.ndarray, memory_prev: np.ndarray,
-             learning_rate: float, requires_grad: bool = True
+             learning_rate: float, requires_grad: bool = True,
+             content_dy_sparsity_schedule: Optional[List[float]] = None
              ) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
         """x_window: [num_tiles, embed_width] -- same convention as
         ToyTileRecurrenceRealFP4 (a real per-tile embedding, zeros for
@@ -491,13 +1290,57 @@ class ToyTileRecurrenceRMT:
         per step -- once for the write, once for the read -- but
         sili__new's backward_dense/backward now take `x` explicitly, so
         there's no engine-side call-ordering concern to manage either
-        way.)"""
+        way.)
+
+        content_dy_sparsity_schedule (query-step graded credit-assignment
+        design, see step_cached's own docstring and conversation/
+        JOURNAL.md): list of length num_tiles, index 0 = oldest content
+        position ... index num_tiles-1 = newest, giving each content
+        row its OWN backward gradient density instead of one uniform
+        value -- e.g. full density for the newest (just-computed) row,
+        progressively less for older cached ones, cheaper than uniform
+        full density but richer than step_cached's zero-credit-for-
+        older-rows default. Memory rows always keep full density
+        (1.0) regardless -- they're the live recurrent state, not a
+        graded-by-age position. None (default): completely unchanged
+        behavior, every existing caller sees zero difference -- uses
+        `self._wide_extra_kwargs`'s own scalar `dy_sparsity_p` exactly
+        as before. Uses sili__new's `dy_sparsity_schedule` kwarg (real
+        per-row top-k, NOT the same as the scalar `dy_sparsity_p`'s own
+        surprising global-across-the-batch top-k semantics -- see
+        DISLDOLayer.forward's own docstring correction)."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
+        if content_dy_sparsity_schedule is not None:
+            if len(content_dy_sparsity_schedule) != n_content:
+                raise ValueError(
+                    f"content_dy_sparsity_schedule has {len(content_dy_sparsity_schedule)} "
+                    f"entries, expected num_tiles={n_content}")
+            mem_schedule = [1.0] * n_mem
+            content_schedule = list(content_dy_sparsity_schedule)
+            full_schedule = mem_schedule + content_schedule
+            _schedule_by_group = {"mem": mem_schedule, "content": content_schedule, "full": full_schedule}
+
+            def _kw(layer_name: str, group: str) -> dict:
+                return {"dy_sparsity_schedule": _schedule_by_group[group]}
+        else:
+            # Task #372: _wide_extra_kwargs is now per-layer (dy_r_target
+            # is a dict), so the row-GROUP selection (mem/content/full)
+            # and the layer-NAME selection are genuinely independent axes
+            # here -- layer_name picks which entry of self.dy_r_target to
+            # read, group is ignored entirely in this branch (dy_r_target/
+            # dy_sparsity_p apply uniformly across a layer's own rows,
+            # unlike the schedule branch above).
+            def _kw(layer_name: str, group: str) -> dict:
+                return self._wide_extra_kwargs(layer_name)
+
         x_window_t = Tensor(x_window.astype(np.float32))
-        x_wide = self.input_proj.forward(x_window_t, learning_rate, requires_grad=requires_grad,
-                                         **self.synapse_kwargs)  # [n_content, sw]
+        # Phase 6 (task #335): _to_sparse is a no-op unless input_sparsity_p
+        # is set -- x_window_sparse IS x_window_t in that (default) case.
+        x_window_sparse = self._to_sparse(x_window_t, "input_proj")
+        x_wide = self._timed_layer_forward(self.input_proj, "input_proj", x_window_sparse, learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **_kw("input_proj", "content"))  # [n_content, sw]
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -505,12 +1348,19 @@ class ToyTileRecurrenceRMT:
 
         combined_normed = concat([memory_normed, x_normed], axis=0)          # [total_slots, sw]
 
-        q = self.q_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
-                                **self.synapse_kwargs)
-        k = self.k_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
-                                **self.synapse_kwargs)
-        v = self.v_proj.forward(combined_normed, learning_rate, requires_grad=requires_grad,
-                                **self.synapse_kwargs)
+        # Task #365: each of q/k/v_proj gets its OWN _to_sparse call on
+        # the same underlying combined_normed -- their x_r_target values
+        # can differ per layer, so a single shared CSR (pre-#365
+        # behavior) would silently apply whichever layer's r_target won
+        # the race to compute it first. 3x the selection work when
+        # values actually differ; free when they're all None/equal
+        # (the common case today).
+        q = self._timed_layer_forward(self.q_proj, "q_proj", self._to_sparse(combined_normed, "q_proj"), learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **_kw("q_proj", "full"))
+        k = self._timed_layer_forward(self.k_proj, "k_proj", self._to_sparse(combined_normed, "k_proj"), learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **_kw("k_proj", "full"))
+        v = self._timed_layer_forward(self.v_proj, "v_proj", self._to_sparse(combined_normed, "v_proj"), learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **_kw("v_proj", "full"))
 
         aux_loss = None
 
@@ -574,8 +1424,8 @@ class ToyTileRecurrenceRMT:
         sigmas_mem = gather(sigmas, list(range(n_mem)))
         attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
                                             num_cpus=self.num_cpus, causal=False)
-        attn_mem = self.o_proj.forward(attn_pre_o_mem, learning_rate, requires_grad=requires_grad,
-                                       **self.synapse_kwargs)
+        attn_mem = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_mem, "o_proj"), learning_rate, requires_grad=requires_grad,
+                                             **self.synapse_kwargs, **_kw("o_proj", "mem"))
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
@@ -602,10 +1452,12 @@ class ToyTileRecurrenceRMT:
         # "did this write end up useful," without ever needing gradient
         # to survive the hard-detach between step() calls.
         memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
-        k_mem_fresh = self.k_proj.forward(memory_new_normed, learning_rate, requires_grad=requires_grad,
-                                          **self.synapse_kwargs)
-        v_mem_fresh = self.v_proj.forward(memory_new_normed, learning_rate, requires_grad=requires_grad,
-                                          **self.synapse_kwargs)
+        # Task #365: separate _to_sparse call per consumer -- same
+        # reasoning as combined_normed above.
+        k_mem_fresh = self._timed_layer_forward(self.k_proj, "k_proj", self._to_sparse(memory_new_normed, "k_proj"), learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **_kw("k_proj", "mem"))
+        v_mem_fresh = self._timed_layer_forward(self.v_proj, "v_proj", self._to_sparse(memory_new_normed, "v_proj"), learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **_kw("v_proj", "mem"))
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
@@ -644,8 +1496,8 @@ class ToyTileRecurrenceRMT:
             attn_pre_o_content = gaussian_attention(q_content, k2_phys, v2_phys,
                                                      centers_content, sigmas_content,
                                                      num_cpus=self.num_cpus, causal=False)
-        attn_content = self.o_proj.forward(attn_pre_o_content, learning_rate, requires_grad=requires_grad,
-                                           **self.synapse_kwargs)
+        attn_content = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_content, "o_proj"), learning_rate, requires_grad=requires_grad,
+                                                 **self.synapse_kwargs, **_kw("o_proj", "content"))
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
 
@@ -660,21 +1512,29 @@ class ToyTileRecurrenceRMT:
             "attn_pre_o_mem": attn_pre_o_mem.data, "attn_pre_o_content": attn_pre_o_content.data,
             "attn_mem": attn_mem.data, "attn_content": attn_content.data,
             "sigmas": sigmas.data, "log_sigmas": self.log_sigmas.data,
+            # x_window_t (direct instruction, embedding-learning hook): the
+            # Tensor itself (not just .data) -- when requires_grad=True and
+            # the caller runs loss.backward() after step() returns, this
+            # Tensor's .grad is populated with dL/d(x_window), letting a
+            # caller scatter-update an external embedding table (e.g. an
+            # SDR token embedding built outside this model) without step()
+            # needing to know about tokens/vocab at all.
+            "x_window_t": x_window_t,
         }
 
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [
-                self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad),
-                self._l1_sparsity_split(self.q_proj, combined_normed, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad),
-                self._l1_sparsity_split(self.k_proj, combined_normed, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad),
-                self._l1_sparsity_split(self.v_proj, combined_normed, learning_rate, self.l1_sparsity_coef,
-                                        requires_grad=requires_grad),
-                self._l1_sparsity_split(self.o_proj, gaussian_attention(
-                    q, k_phys, v_phys, self.centers, sigmas, num_cpus=self.num_cpus, causal=False),
-                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad),
+                self._l1_sparsity_split(self.input_proj, x_window_sparse, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="input_proj", **self._wide_extra_kwargs("input_proj")),
+                self._l1_sparsity_split(self.q_proj, self._to_sparse(combined_normed, "q_proj"), learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="q_proj", **self._wide_extra_kwargs("q_proj")),
+                self._l1_sparsity_split(self.k_proj, self._to_sparse(combined_normed, "k_proj"), learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="k_proj", **self._wide_extra_kwargs("k_proj")),
+                self._l1_sparsity_split(self.v_proj, self._to_sparse(combined_normed, "v_proj"), learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="v_proj", **self._wide_extra_kwargs("v_proj")),
+                self._l1_sparsity_split(self.o_proj, self._to_sparse(gaussian_attention(
+                    q, k_phys, v_phys, self.centers, sigmas, num_cpus=self.num_cpus, causal=False), "o_proj"),
+                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, layer_name="o_proj", **self._wide_extra_kwargs("o_proj")),
             ]
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
@@ -723,7 +1583,7 @@ class ToyTileRecurrenceRMT:
                                             requires_grad=requires_grad)
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
         logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
-                                      **self.synapse_kwargs)
+                                      **self.synapse_kwargs, **self._output_extra_kwargs)
 
         # Advantage-actor-critic value head (opt-in, see __init__'s
         # use_critic docstring): exposed via an attribute rather than a
@@ -733,7 +1593,230 @@ class ToyTileRecurrenceRMT:
         # scripts/train_mqar_curriculum.py) reads model.last_critic_pred
         # right after this call.
         self.last_critic_pred = (
-            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs)
+            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._output_extra_kwargs)
             if self.use_critic else None)
 
         return memory_new, logits, aux_loss
+
+    def step_cached(self, new_token_embed: np.ndarray, memory_prev: np.ndarray,
+                    learning_rate: float, tile_cache: Optional[List[Tuple[np.ndarray, np.ndarray]]],
+                    requires_grad: bool = True
+                    ) -> Tuple[np.ndarray, Tensor, Optional[Tensor], List[Tuple[np.ndarray, np.ndarray]]]:
+        """Incremental alternative to step(): takes ONE new token's raw
+        embedding [embed_width] instead of a full [num_tiles, embed_width]
+        sliding window, plus an explicit `tile_cache` carrying the
+        num_tiles-1 older content positions' (k_row, v_row) -- same
+        explicit-state-in/out convention as memory_prev/memory_new (no
+        hidden instance-mutation cache, matching this project's own
+        established preference, see [[project_sili_dense_input_stack_simplification]]
+        in memory: an earlier engine-side hidden cache caused a real,
+        hard-to-find correctness bug).
+
+        Why this is correct, not just faster: input_proj/q_proj/k_proj/
+        v_proj are simple per-row (non-mixing) projections, so a content
+        tile's k/v depends ONLY on its own token embedding and the
+        CURRENT weight values -- never on other tiles, never on memory.
+        step()'s full-window rebuild therefore recomputes up to
+        num_tiles IDENTICAL values per token as the window slides past
+        it, every single call. Caching removes that redundancy.
+
+        Direct instruction on the one real approximation this
+        introduces: weights only change on requires_grad=True (query)
+        steps, and even then only ~0.1% of individual synapses move per
+        update (see [[project_dy_sparsity_p_validated_speedup]]'s
+        backward-sparsity findings) -- so a cached tile's k/v drifts by
+        a tiny, bounded amount as it ages through the window, rather
+        than being invalidated wholesale after every weight update.
+        Treated as "mostly fine" per direct instruction, not chased to
+        exact invalidation.
+
+        Only the NEWEST content position's own logits/q ever get used
+        downstream (confirmed: train_mqar_curriculum.py's own loss/
+        accuracy always reads row num_tiles-1, never any other content
+        row) -- so q, x_wide, attention, and the final lm_head/
+        critic_head readout are all computed for exactly ONE content
+        row here, not num_tiles. This also means step_cached's own
+        `logits`/`aux_loss` shapes are [1, vocab_size] (a single row),
+        not [num_tiles, vocab_size] -- callers reading row 0 instead of
+        row num_tiles-1 is the one real call-site change needed.
+
+        tile_cache: list of up to (num_tiles-1) (k_row, v_row) numpy
+        [state_width] tuples, OLDEST FIRST. None or an empty/short list
+        (fewer than num_tiles-1 entries) is padded with zero rows at the
+        oldest end -- exactly reproducing _build_tile_window's own
+        "zeros for nothing here yet before sequence start" behavior
+        (input_proj/k_proj/v_proj have no bias term, so a zero raw
+        embedding really does propagate to an exact zero k/v row, not
+        an approximation). Reset to None/[] at the start of each new
+        training sequence, same as memory_prev gets reset to zeros.
+
+        Returns (memory_new, logits [1, vocab_size], aux_loss,
+        new_tile_cache) -- new_tile_cache is ready to pass back in on
+        the very next call."""
+        sw = self.state_width
+        n_mem, n_content = self.num_memory_slots, self.num_tiles
+
+        new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
+        new_embed_t = Tensor(new_embed_2d)
+        new_embed_sparse = self._to_sparse(new_embed_t, "input_proj")
+        x_wide_new = self._timed_layer_forward(self.input_proj, "input_proj", new_embed_sparse, learning_rate, requires_grad=requires_grad,
+                                               **self.synapse_kwargs, **self._wide_extra_kwargs("input_proj"))  # [1, sw]
+        x_normed_new = rmsnorm_tensor(x_wide_new, self.input_ln, self.rms_eps)
+
+        memory_prev_t = Tensor(memory_prev.astype(np.float32))
+        memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
+
+        combined_normed_step = concat([memory_normed, x_normed_new], axis=0)  # [n_mem+1, sw]
+
+        # Task #365: separate _to_sparse call per consumer (see step()'s
+        # own combined_normed comment for the full reasoning).
+        q_step = self._timed_layer_forward(self.q_proj, "q_proj", self._to_sparse(combined_normed_step, "q_proj"), learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs("q_proj"))
+        k_step = self._timed_layer_forward(self.k_proj, "k_proj", self._to_sparse(combined_normed_step, "k_proj"), learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs("k_proj"))
+        v_step = self._timed_layer_forward(self.v_proj, "v_proj", self._to_sparse(combined_normed_step, "v_proj"), learning_rate, requires_grad=requires_grad,
+                                           **self.synapse_kwargs, **self._wide_extra_kwargs("v_proj"))
+
+        aux_loss = None
+
+        def _accumulate_penalty(t: Tensor) -> None:
+            nonlocal aux_loss
+            if self.magnitude_clip_penalty_coef > 0.0:
+                term = self._magnitude_clip_penalty(t)
+                aux_loss = term if aux_loss is None else aux_loss + term
+
+        _accumulate_penalty(q_step)
+        _accumulate_penalty(k_step)
+        _accumulate_penalty(v_step)
+
+        q_step.data = np.clip(q_step.data, -self.clip_range, self.clip_range)
+        k_step.data = np.clip(k_step.data, -self.clip_range, self.clip_range)
+        v_step.data = np.clip(v_step.data, -self.clip_range, self.clip_range)
+        sigmas = exp(self.log_sigmas)
+        sigmas.data = np.maximum(sigmas.data, self.min_sigma)
+
+        q_mem = gather(q_step, self._mem_idx_step).reshape((n_mem, sw))
+        k_mem_from_prev = gather(k_step, self._mem_idx_step).reshape((n_mem, sw))
+        v_mem_from_prev = gather(v_step, self._mem_idx_step).reshape((n_mem, sw))
+        q_new = gather(q_step, self._new_content_idx_step).reshape((1, sw))
+        k_new = gather(k_step, self._new_content_idx_step).reshape((1, sw))
+        v_new = gather(v_step, self._new_content_idx_step).reshape((1, sw))
+
+        # Reassemble the FULL [n_content, sw] content k/v from the cache
+        # (oldest first, zero-padded at the oldest end if the sequence
+        # just started) plus this step's one fresh row at the end --
+        # same logical ordering _build_tile_window's own window array
+        # always used (position 0 = oldest, n_content-1 = newest).
+        cache = list(tile_cache) if tile_cache else []
+        pad = max(0, (n_content - 1) - len(cache))
+        zero_row = np.zeros(sw, dtype=np.float32)
+        cache_k_rows = [zero_row] * pad + [row[0] for row in cache[-(n_content - 1):]] if n_content > 1 else []
+        cache_v_rows = [zero_row] * pad + [row[1] for row in cache[-(n_content - 1):]] if n_content > 1 else []
+        cache_k_arr = np.stack(cache_k_rows, axis=0) if cache_k_rows else np.zeros((0, sw), dtype=np.float32)
+        cache_v_arr = np.stack(cache_v_rows, axis=0) if cache_v_rows else np.zeros((0, sw), dtype=np.float32)
+        k_content_full = concat([Tensor(cache_k_arr), k_new], axis=0)  # [n_content, sw]
+        v_content_full = concat([Tensor(cache_v_arr), v_new], axis=0)
+
+        k_full = concat([k_mem_from_prev, k_content_full], axis=0)  # [total_slots, sw]
+        v_full = concat([v_mem_from_prev, v_content_full], axis=0)
+        k_phys = gather(k_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v_phys = gather(v_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+
+        # --- PASS 1: WRITE (identical structure to step()'s own PASS 1) ---
+        centers_mem = gather(self.centers, self._mem_center_idx)
+        sigmas_mem = gather(sigmas, self._mem_center_idx)
+        attn_pre_o_mem = gaussian_attention(q_mem, k_phys, v_phys, centers_mem, sigmas_mem,
+                                            num_cpus=self.num_cpus, causal=False)
+        attn_mem = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_mem, "o_proj"), learning_rate, requires_grad=requires_grad,
+                                             **self.synapse_kwargs, **self._wide_extra_kwargs("o_proj"))
+        _accumulate_penalty(attn_mem)
+        attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
+
+        # --- PASS 2: READ, only the newest content row's own query ---
+        memory_new_normed = rmsnorm_tensor(memory_new_t, self.memory_ln, self.rms_eps)
+        k_mem_fresh = self._timed_layer_forward(self.k_proj, "k_proj", self._to_sparse(memory_new_normed, "k_proj"), learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **self._wide_extra_kwargs("k_proj"))
+        v_mem_fresh = self._timed_layer_forward(self.v_proj, "v_proj", self._to_sparse(memory_new_normed, "v_proj"), learning_rate, requires_grad=requires_grad,
+                                                **self.synapse_kwargs, **self._wide_extra_kwargs("v_proj"))
+        _accumulate_penalty(k_mem_fresh)
+        _accumulate_penalty(v_mem_fresh)
+        k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
+        v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
+
+        k2_full = concat([k_mem_fresh, k_content_full], axis=0)
+        v2_full = concat([v_mem_fresh, v_content_full], axis=0)
+        k2_phys = gather(k2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v2_phys = gather(v2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+
+        centers_content = gather(self.centers, self._newest_content_idx)
+        sigmas_content = gather(sigmas, self._newest_content_idx)
+        if self.recurrent_only_output:
+            v2_phys_mem_only = v2_phys * self._mem_only_value_mask
+            attn_pre_o_content = gaussian_attention(q_new, k2_phys, v2_phys_mem_only,
+                                                     centers_content, sigmas_content,
+                                                     num_cpus=self.num_cpus, causal=False)
+        else:
+            attn_pre_o_content = gaussian_attention(q_new, k2_phys, v2_phys,
+                                                     centers_content, sigmas_content,
+                                                     num_cpus=self.num_cpus, causal=False)
+        attn_content = self._timed_layer_forward(self.o_proj, "o_proj", self._to_sparse(attn_pre_o_content, "o_proj"), learning_rate, requires_grad=requires_grad,
+                                                 **self.synapse_kwargs, **self._wide_extra_kwargs("o_proj"))
+        _accumulate_penalty(attn_content)
+        attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
+
+        pre_norm_content = x_wide_new + attn_content
+        content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
+        _accumulate_penalty(content_out)
+        content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)
+
+        self.last_debug = {
+            "x_wide": x_wide_new.data, "q": q_new.data, "k": k_new.data, "v": v_new.data,
+            "attn_pre_o_mem": attn_pre_o_mem.data, "attn_pre_o_content": attn_pre_o_content.data,
+            "attn_mem": attn_mem.data, "attn_content": attn_content.data,
+            "sigmas": sigmas.data, "log_sigmas": self.log_sigmas.data,
+        }
+
+        memory_new = memory_new_t.data.copy()
+
+        pooled = content_out.reshape((1, self.embed_width, self.column_neurons))
+        pooled = reduce_sum(pooled, axis=-1) * (1.0 / self.column_neurons)
+        self.last_debug["pooled"] = pooled.data
+
+        if self.l1_sparsity_coef > 0.0:
+            l1_terms = [
+                self._l1_sparsity_split(self.input_proj, new_embed_sparse, learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="input_proj", **self._wide_extra_kwargs("input_proj")),
+                self._l1_sparsity_split(self.q_proj, self._to_sparse(combined_normed_step, "q_proj"), learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="q_proj", **self._wide_extra_kwargs("q_proj")),
+                self._l1_sparsity_split(self.k_proj, self._to_sparse(combined_normed_step, "k_proj"), learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="k_proj", **self._wide_extra_kwargs("k_proj")),
+                self._l1_sparsity_split(self.v_proj, self._to_sparse(combined_normed_step, "v_proj"), learning_rate, self.l1_sparsity_coef,
+                                        requires_grad=requires_grad, layer_name="v_proj", **self._wide_extra_kwargs("v_proj")),
+                self._l1_sparsity_split(self.o_proj, self._to_sparse(
+                    concat([attn_pre_o_mem, attn_pre_o_content], axis=0), "o_proj"),
+                    learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad, layer_name="o_proj", **self._wide_extra_kwargs("o_proj")),
+            ]
+            for term in l1_terms:
+                aux_loss = term if aux_loss is None else aux_loss + term
+
+        if self.l1_sparsity_coef > 0.0:
+            lm_l1 = self._l1_sparsity_split(self.lm_head, pooled, learning_rate, self.l1_sparsity_coef,
+                                            requires_grad=requires_grad)
+            aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
+        logits = self.lm_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                      **self.synapse_kwargs, **self._output_extra_kwargs)
+
+        self.last_critic_pred = (
+            self.critic_head.forward(pooled, learning_rate, requires_grad=requires_grad,
+                                     **self.synapse_kwargs, **self._output_extra_kwargs)
+            if self.use_critic else None)
+
+        new_cache = (list(tile_cache) if tile_cache else []) + [
+            (k_new.data.copy().reshape(sw), v_new.data.copy().reshape(sw))]
+        if len(new_cache) > (n_content - 1):
+            new_cache = new_cache[-(n_content - 1):]
+
+        return memory_new, logits, aux_loss, new_cache

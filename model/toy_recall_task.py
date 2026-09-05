@@ -68,6 +68,7 @@ def generate_mqar_sequence(
     num_kv_pairs: int,
     power_a: float = 0.01,
     random_non_queries: bool = True,
+    forced_keys: np.ndarray = None,
 ) -> Tuple[np.ndarray, list]:
     """Standard Multi-Query Associative Recall task (Arora, Eyuboglu et
     al., "Zoology: Measuring and Improving Recall in Efficient Language
@@ -115,7 +116,25 @@ def generate_mqar_sequence(
     key_vocab_size = vocab_size // 2
     key_choices = np.arange(1, key_vocab_size)
     value_choices = np.arange(key_vocab_size, vocab_size)
-    keys = rng.choice(key_choices, size=num_kv_pairs, replace=False)
+    if forced_keys is not None and len(forced_keys) > 0:
+        # forced_keys (curriculum "at least 1 new vocab per N queries"
+        # guarantee): without this, keys are drawn uniformly from the
+        # WHOLE current key range, so a just-grown vocab's newest token
+        # can go untested for many steps by pure chance, letting a
+        # level-up streak complete on old vocab alone.
+        valid_forced = np.asarray(forced_keys, dtype=np.int64)
+        valid_forced = valid_forced[(valid_forced >= 1) & (valid_forced < key_vocab_size)]
+        n_forced = min(len(valid_forced), num_kv_pairs)
+        if n_forced < len(valid_forced):
+            valid_forced = rng.choice(valid_forced, size=n_forced, replace=False)
+        remaining_choices = np.setdiff1d(key_choices, valid_forced)
+        n_remaining = num_kv_pairs - n_forced
+        rest = (rng.choice(remaining_choices, size=n_remaining, replace=False)
+                if n_remaining > 0 else np.array([], dtype=np.int64))
+        keys = np.concatenate([valid_forced, rest])
+        rng.shuffle(keys)
+    else:
+        keys = rng.choice(key_choices, size=num_kv_pairs, replace=False)
     values = rng.choice(value_choices, size=num_kv_pairs, replace=False)
 
     kvs = np.zeros(context_size, dtype=np.int64)
