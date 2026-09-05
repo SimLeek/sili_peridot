@@ -46,6 +46,7 @@ it learned to carry running parity in M.
 
 Run: python -m scripts.train_toy_beyond_context_comparison
 """
+
 from __future__ import annotations
 
 import sys
@@ -55,34 +56,39 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from model.toy_beyond_context_task import generate_parity_sequence, VOCAB_SIZE
-from model.toy_recall_models import (
-    ToySmallTransformer, cross_entropy_sum, predicted_token,
-    AdamOptimizer, clip_grad_norm_, lr_schedule,
-)
-from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import PeakEligibilityDISLDOLayer
 from sili.sparse_rnn import DISLDOLayer
 
-W = 4                       # the fixed window -- num_tiles for tile-recurrence,
-                             # half_bandwidth for the dense baseline
-TRAIN_STEPS = 120_000       # ~40x the first real run (3000) -- that run measured
-                            # ~93s total training time across all 3 models, too
-                            # quick to give each of the 13 curriculum levels enough
-                            # dedicated practice (per direct decision: "give it an
-                            # hour or so this time"). Scaled steps AND STEPS_PER_LEVEL/
-                            # WARMUP_STEPS together, same ratios, same curriculum
-                            # shape -- just far more repetitions at every level.
+from model.toy_beyond_context_task import VOCAB_SIZE, generate_parity_sequence
+from model.toy_precision_models import PeakEligibilityDISLDOLayer
+from model.toy_recall_models import (
+    AdamOptimizer,
+    ToySmallTransformer,
+    clip_grad_norm_,
+    cross_entropy_sum,
+    lr_schedule,
+    predicted_token,
+)
+from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
+
+W = 4  # the fixed window -- num_tiles for tile-recurrence,
+# half_bandwidth for the dense baseline
+TRAIN_STEPS = 120_000  # ~40x the first real run (3000) -- that run measured
+# ~93s total training time across all 3 models, too
+# quick to give each of the 13 curriculum levels enough
+# dedicated practice (per direct decision: "give it an
+# hour or so this time"). Scaled steps AND STEPS_PER_LEVEL/
+# WARMUP_STEPS together, same ratios, same curriculum
+# shape -- just far more repetitions at every level.
 WARMUP_STEPS = 4_000
 PEAK_LR = 0.02
 MAX_GRAD_NORM = 1.0
 OUT_OF_CONTEXT_MAX = 4 * W
-STEPS_PER_LEVEL = 6_000     # steps of practice before advancing the ceiling by 1
-                            # (2..OUT_OF_CONTEXT_MAX is (OUT_OF_CONTEXT_MAX-1) levels
-                            # -- ramp finishes well before TRAIN_STEPS, leaving real
-                            # consolidation time at the final out-of-context ceiling)
-CURRICULUM_WINDOW = 3       # sample from [level-CURRICULUM_WINDOW, level], not just
-                            # the exact frontier -- some review, concentrated recent
+STEPS_PER_LEVEL = 6_000  # steps of practice before advancing the ceiling by 1
+# (2..OUT_OF_CONTEXT_MAX is (OUT_OF_CONTEXT_MAX-1) levels
+# -- ramp finishes well before TRAIN_STEPS, leaving real
+# consolidation time at the final out-of-context ceiling)
+CURRICULUM_WINDOW = 3  # sample from [level-CURRICULUM_WINDOW, level], not just
+# the exact frontier -- some review, concentrated recent
 EVAL_SEQUENCES = 60
 EVAL_N_VALUES = [2, 4, 8, 16, 24]
 
@@ -92,8 +98,8 @@ MLP_HIDDEN = 48
 COLUMN_NEURONS = 8
 TILE_MLP_HIDDEN = EMBED_WIDTH * COLUMN_NEURONS * 2
 MAX_WEIGHTS_PER_LAYER = 4096  # genuine sparse budget -- see JOURNAL.md's
-                              # "ToyTileRecurrence ported onto real sili" entry
-                              # for why this must NOT be sized as in*out
+# "ToyTileRecurrence ported onto real sili" entry
+# for why this must NOT be sized as in*out
 NUM_CPUS = 4
 
 
@@ -109,14 +115,14 @@ def _sample_n_bits(rng: np.random.RandomState, step: int) -> int:
     return int(rng.randint(lo, level + 1))
 
 
-def _build_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                  num_tiles: int, M_prev: np.ndarray, column_neurons: int) -> np.ndarray:
+def _build_window(
+    embed_table: np.ndarray, tokens: np.ndarray, i: int, num_tiles: int, M_prev: np.ndarray, column_neurons: int
+) -> np.ndarray:
     state_width = embed_table.shape[1] * column_neurons
     window = np.empty((num_tiles, state_width), dtype=np.float32)
     for j in range(num_tiles):
         src = i - (num_tiles - 1) + j
-        window[j] = (np.repeat(embed_table[tokens[src]], column_neurons)
-                     if src >= 0 else M_prev[j])
+        window[j] = np.repeat(embed_table[tokens[src]], column_neurons) if src >= 0 else M_prev[j]
     return window
 
 
@@ -134,9 +140,17 @@ def _train_tile(disldo_cls, use_energy: bool, seed: int):
     where it hurt)."""
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
-    tile = ToyTileRecurrenceRealFP4(VOCAB_SIZE, EMBED_WIDTH, COLUMN_NEURONS, TILE_MLP_HIDDEN,
-                                    W, MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS,
-                                    disldo_cls=disldo_cls, use_energy=use_energy)
+    tile = ToyTileRecurrenceRealFP4(
+        VOCAB_SIZE,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        TILE_MLP_HIDDEN,
+        W,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=disldo_cls,
+        use_energy=use_energy,
+    )
     tile_opt = AdamOptimizer()
     tile_embed = rng.randn(VOCAB_SIZE, EMBED_WIDTH).astype(np.float32) * 0.3
     state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -166,8 +180,7 @@ def _train_tile(disldo_cls, use_energy: bool, seed: int):
 def train_dense():
     rng = np.random.RandomState(1)
     np.random.seed(1)
-    dense = ToySmallTransformer(VOCAB_SIZE, HIDDEN, MLP_HIDDEN, n_layers=1,
-                                num_cpus=2, half_bandwidth=W)
+    dense = ToySmallTransformer(VOCAB_SIZE, HIDDEN, MLP_HIDDEN, n_layers=1, num_cpus=2, half_bandwidth=W)
     dense_opt = AdamOptimizer()
     dense_embed = rng.randn(VOCAB_SIZE, HIDDEN).astype(np.float32) * 0.3
 
@@ -221,9 +234,11 @@ def evaluate_tile(tile, tile_embed, rng):
 
 
 def main():
-    print(f"W={W} train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} peak_lr={PEAK_LR} "
-          f"steps_per_level={STEPS_PER_LEVEL} curriculum_window={CURRICULUM_WINDOW} "
-          f"out_of_context_max={OUT_OF_CONTEXT_MAX} eval_sequences={EVAL_SEQUENCES}\n")
+    print(
+        f"W={W} train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} peak_lr={PEAK_LR} "
+        f"steps_per_level={STEPS_PER_LEVEL} curriculum_window={CURRICULUM_WINDOW} "
+        f"out_of_context_max={OUT_OF_CONTEXT_MAX} eval_sequences={EVAL_SEQUENCES}\n"
+    )
 
     t0 = time.time()
     dense, dense_embed, dense_rng = train_dense()
@@ -244,20 +259,20 @@ def main():
     print(f"tile, +energy trained ({t1 - t0:.1f}s)")
 
     t0 = time.time()
-    tile_peak, tile_peak_embed, tile_peak_rng = _train_tile(
-        PeakEligibilityDISLDOLayer, use_energy=False, seed=4)
+    tile_peak, tile_peak_embed, tile_peak_rng = _train_tile(PeakEligibilityDISLDOLayer, use_energy=False, seed=4)
     t1 = time.time()
     tile_peak_results = evaluate_tile(tile_peak, tile_peak_embed, tile_peak_rng)
     print(f"tile, peak-eligibility trained ({t1 - t0:.1f}s)\n")
 
-    print(f"{'n_bits':>8}  {'in_ctx':>7}  {'dense':>7}  {'tile':>7}  "
-          f"{'tile+egy':>9}  {'peak-elig':>10}")
+    print(f"{'n_bits':>8}  {'in_ctx':>7}  {'dense':>7}  {'tile':>7}  {'tile+egy':>9}  {'peak-elig':>10}")
     for n_bits in EVAL_N_VALUES:
         in_ctx = "yes" if n_bits <= W else "NO"
-        print(f"{n_bits:>8}  {in_ctx:>7}  {dense_results[n_bits]:>7.2f}  "
-              f"{tile_no_energy_results[n_bits]:>7.2f}  {tile_energy_results[n_bits]:>9.2f}  "
-              f"{tile_peak_results[n_bits]:>10.2f}")
-    print(f"\n(chance = 0.5 for a single binary answer bit)")
+        print(
+            f"{n_bits:>8}  {in_ctx:>7}  {dense_results[n_bits]:>7.2f}  "
+            f"{tile_no_energy_results[n_bits]:>7.2f}  {tile_energy_results[n_bits]:>9.2f}  "
+            f"{tile_peak_results[n_bits]:>10.2f}"
+        )
+    print("\n(chance = 0.5 for a single binary answer bit)")
     return (dense_results, tile_no_energy_results, tile_energy_results, tile_peak_results)
 
 

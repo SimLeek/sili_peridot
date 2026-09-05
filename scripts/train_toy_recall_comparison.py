@@ -56,6 +56,7 @@ skipped, not trained on.
 
 Run: python -m scripts.train_toy_recall_comparison
 """
+
 from __future__ import annotations
 
 import sys
@@ -65,14 +66,19 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from model.toy_recall_task import generate_mqar_sequence
 from model.toy_recall_models import (
-    ToySmallTransformer, ToyTileRecurrence,
-    cross_entropy_sum, predicted_token, AdamOptimizer, clip_grad_norm_, lr_schedule,
+    AdamOptimizer,
+    ToySmallTransformer,
+    ToyTileRecurrence,
+    clip_grad_norm_,
+    cross_entropy_sum,
+    lr_schedule,
+    predicted_token,
 )
+from model.toy_recall_task import generate_mqar_sequence
 
-COLUMN_NEURONS = 8         # state_width = embed_width * COLUMN_NEURONS
-TRAIN_STEPS = 3000         # matches scripts/torch_mqar_control.py's own step count
+COLUMN_NEURONS = 8  # state_width = embed_width * COLUMN_NEURONS
+TRAIN_STEPS = 3000  # matches scripts/torch_mqar_control.py's own step count
 WARMUP_STEPS = 100
 PEAK_LR = 0.02
 MAX_GRAD_NORM = 1.0
@@ -138,8 +144,9 @@ def train_and_eval_dense(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed)
     return correct / total
 
 
-def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                       num_tiles: int, M_prev: np.ndarray, column_neurons: int) -> np.ndarray:
+def _build_tile_window(
+    embed_table: np.ndarray, tokens: np.ndarray, i: int, num_tiles: int, M_prev: np.ndarray, column_neurons: int
+) -> np.ndarray:
     """[num_tiles, state_width] -- real-token slots get their
     embed_width embedding broadcast up to state_width
     (np.repeat, parameter-free, matches the readout's own
@@ -150,8 +157,7 @@ def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
     window = np.empty((num_tiles, state_width), dtype=np.float32)
     for j in range(num_tiles):
         src = i - (num_tiles - 1) + j
-        window[j] = (np.repeat(embed_table[tokens[src]], column_neurons)
-                     if src >= 0 else M_prev[j])
+        window[j] = np.repeat(embed_table[tokens[src]], column_neurons) if src >= 0 else M_prev[j]
     return window
 
 
@@ -195,36 +201,37 @@ def train_and_eval_tile(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed):
 
 
 def main():
-    hidden, mlp_hidden = 32, 48   # zoology's own smallest real attention-baseline
-                                   # d_model for MQAR is 32 (models_repo.py's
-                                   # add_attention sweeps d_model in [32, 64, 128],
-                                   # n_layers=2) -- looked up, not guessed.
+    hidden, mlp_hidden = 32, 48  # zoology's own smallest real attention-baseline
+    # d_model for MQAR is 32 (models_repo.py's
+    # add_attention sweeps d_model in [32, 64, 128],
+    # n_layers=2) -- looked up, not guessed.
     tile_mlp_hidden = hidden * COLUMN_NEURONS * 2  # scaled with state_width, same ratio as dense
-    print(f"column_neurons={COLUMN_NEURONS} hidden={hidden} mlp_hidden={mlp_hidden} "
-          f"tile_mlp_hidden={tile_mlp_hidden} train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} "
-          f"peak_lr={PEAK_LR} max_grad_norm={MAX_GRAD_NORM} eval_sequences={EVAL_SEQUENCES} "
-          f"optimizer=Adam+global-norm-clip\n")
+    print(
+        f"column_neurons={COLUMN_NEURONS} hidden={hidden} mlp_hidden={mlp_hidden} "
+        f"tile_mlp_hidden={tile_mlp_hidden} train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} "
+        f"peak_lr={PEAK_LR} max_grad_norm={MAX_GRAD_NORM} eval_sequences={EVAL_SEQUENCES} "
+        f"optimizer=Adam+global-norm-clip\n"
+    )
     print(f"{'seq_len':>8}  {'kv_pairs':>9}  {'vocab':>6}  {'dense_acc':>10}  {'tile_acc':>10}")
     results = []
     for seq_len, num_kv_pairs, vocab in CONFIGS:
         t0 = time.time()
-        dense_acc = train_and_eval_dense(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden,
-                                         seed=1000 + seq_len)
-        tile_acc = train_and_eval_tile(seq_len, num_kv_pairs, vocab, hidden, tile_mlp_hidden,
-                                       seed=2000 + seq_len)
+        dense_acc = train_and_eval_dense(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed=1000 + seq_len)
+        tile_acc = train_and_eval_tile(seq_len, num_kv_pairs, vocab, hidden, tile_mlp_hidden, seed=2000 + seq_len)
         elapsed = time.time() - t0
-        print(f"{seq_len:>8}  {num_kv_pairs:>9}  {vocab:>6}  {dense_acc:>10.2f}  "
-              f"{tile_acc:>10.2f}   ({elapsed:.1f}s)")
+        print(f"{seq_len:>8}  {num_kv_pairs:>9}  {vocab:>6}  {dense_acc:>10.2f}  {tile_acc:>10.2f}   ({elapsed:.1f}s)")
         results.append((seq_len, num_kv_pairs, vocab, dense_acc, tile_acc))
 
-    print(f"\nDense is the unmodified control (true MQAR pairs only, unchanged from "
-          f"the first comparison run). ToyTileRecurrence gets the unified per-position "
-          f"target (query positions -> recalled value, context-laydown region -> real "
-          f"next token, elsewhere skipped) -- a fix specific to its own column-mean "
-          f"readout, not applied to dense. num_tiles=seq_len per config -- "
-          f"tile-recurrence can see the whole sequence directly this run "
-          f"(parity-of-visibility test), not yet testing recall genuinely beyond a "
-          f"narrow window.")
+    print(
+        "\nDense is the unmodified control (true MQAR pairs only, unchanged from "
+        "the first comparison run). ToyTileRecurrence gets the unified per-position "
+        "target (query positions -> recalled value, context-laydown region -> real "
+        "next token, elsewhere skipped) -- a fix specific to its own column-mean "
+        "readout, not applied to dense. num_tiles=seq_len per config -- "
+        "tile-recurrence can see the whole sequence directly this run "
+        "(parity-of-visibility test), not yet testing recall genuinely beyond a "
+        "narrow window."
+    )
     return results
 
 

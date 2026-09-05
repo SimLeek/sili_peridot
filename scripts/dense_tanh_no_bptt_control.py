@@ -34,17 +34,20 @@ IS the optimizer's whole job), but the COMPUTATION GRAPH does not.
 
 Run: python -m scripts.dense_tanh_no_bptt_control
 """
+
 from __future__ import annotations
 
 import time
 
 import numpy as np
-
 from sili.tensor import Tensor
 
-from model.toy_beyond_context_task import generate_deviation_sequence, VOCAB_SIZE
+from model.toy_beyond_context_task import VOCAB_SIZE, generate_deviation_sequence
 from model.toy_recall_models import (
-    DenseTensorLinear, AdamOptimizer, cross_entropy_sum, predicted_token,
+    AdamOptimizer,
+    DenseTensorLinear,
+    cross_entropy_sum,
+    predicted_token,
 )
 
 HIDDEN = 128
@@ -63,8 +66,7 @@ class DenseTanhRecurrentControl:
 
     def __init__(self, seed: int):
         embed_rng = np.random.RandomState(seed)
-        self.embed_matrix = (embed_rng.randn(VOCAB_SIZE, HIDDEN)
-                              * (1.0 / np.sqrt(HIDDEN))).astype(np.float32)
+        self.embed_matrix = (embed_rng.randn(VOCAB_SIZE, HIDDEN) * (1.0 / np.sqrt(HIDDEN))).astype(np.float32)
         np.random.seed(seed + 1)
         self.cell = DenseTensorLinear(HIDDEN * 2, HIDDEN, scale=0.1)
         np.random.seed(seed + 2)
@@ -105,7 +107,7 @@ def train_and_eval(seed: int):
     model = DenseTanhRecurrentControl(seed=seed + 10_000)
 
     losses = []
-    for step in range(TRAIN_STEPS):
+    for _step in range(TRAIN_STEPS):
         n_bits = int(rng.randint(2, OUT_OF_CONTEXT_MAX + 1))
         tokens, pairs = generate_deviation_sequence(rng, n_bits)
         query_pos, answer = pairs[0]
@@ -131,9 +133,11 @@ def train_and_eval(seed: int):
 
 
 def main():
-    print(f"hidden={HIDDEN} train_steps={TRAIN_STEPS} lr={LR} "
-          f"eval_sequences={EVAL_SEQUENCES} (sili DENSE Tensor + Adam, tanh full-overwrite, "
-          f"no BPTT, no curriculum -- no FP4/DISLDO anywhere)\n")
+    print(
+        f"hidden={HIDDEN} train_steps={TRAIN_STEPS} lr={LR} "
+        f"eval_sequences={EVAL_SEQUENCES} (sili DENSE Tensor + Adam, tanh full-overwrite, "
+        f"no BPTT, no curriculum -- no FP4/DISLDO anywhere)\n"
+    )
     N_SEEDS = 5
     agg = {n: [] for n in EVAL_N_VALUES}
     t0 = time.time()
@@ -141,9 +145,8 @@ def main():
         results, final_loss = train_and_eval(seed=1000 + s)
         for n in EVAL_N_VALUES:
             agg[n].append(results[n])
-        print(f"seed {s}: final_loss(last100)={final_loss:.4f}  "
-              f"{ {n: round(results[n], 2) for n in EVAL_N_VALUES} }")
-    print(f"\n({time.time()-t0:.1f}s total)")
+        print(f"seed {s}: final_loss(last100)={final_loss:.4f}  { {n: round(results[n], 2) for n in EVAL_N_VALUES} }")
+    print(f"\n({time.time() - t0:.1f}s total)")
     print(f"{'n_bits':>8}  {'mean':>6}  {'std':>6}")
     for n in EVAL_N_VALUES:
         arr = np.array(agg[n])

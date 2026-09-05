@@ -42,15 +42,15 @@ throwing away) -- a genuinely fair "did an already-alive-at-both-points
 synapse move" comparison, independent of how many synapses appeared or
 disappeared in between.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
 
 import numpy as np
 
 # (row, col) -> (weight, importance)
-Snapshot = Dict[Tuple[int, int], Tuple[float, float]]
+Snapshot = dict[tuple[int, int], tuple[float, float]]
 
 
 def snapshot_layer_state(layer) -> Snapshot:
@@ -65,7 +65,8 @@ def snapshot_layer_state(layer) -> Snapshot:
         raise ValueError(
             "layer has no ._c -- not a raw DISLDOLayer-style wrapper "
             "(pass a single digit, or use snapshot_multi_digit_state "
-            "for a TrueMultiDigitLayer)")
+            "for a TrueMultiDigitLayer)"
+        )
     ptrs = np.asarray(c.ptrs)
     indices = np.asarray(c.indices)
     weights = np.asarray(c.weights_vals, dtype=np.float64)
@@ -80,7 +81,7 @@ def snapshot_layer_state(layer) -> Snapshot:
     return snap
 
 
-def snapshot_multi_digit_state(layer) -> List[Snapshot]:
+def snapshot_multi_digit_state(layer) -> list[Snapshot]:
     """TrueMultiDigitLayer holds n_stages separate DISLDOLayer digits,
     each with its own weights/importance -- snapshots ALL of them (not
     just stage 0), since a stuck synapse in any digit stage is a real
@@ -96,8 +97,8 @@ def snapshot_multi_digit_state(layer) -> List[Snapshot]:
 @dataclass
 class StuckWeightsReport:
     n_synapses: int  # size of the before/after KEY INTERSECTION -- see n_new/n_died
-    n_new: int        # present in `after` but not `before` (woke up / grew in)
-    n_died: int        # present in `before` but not `after` (pruned / went dead)
+    n_new: int  # present in `after` but not `before` (woke up / grew in)
+    n_died: int  # present in `before` but not `after` (pruned / went dead)
     n_high_importance: int
     n_stuck: int
     stuck_fraction: float  # n_stuck / n_high_importance (0.0 if none high-importance)
@@ -130,9 +131,13 @@ class StuckWeightsReport:
         return (self.n_new + self.n_died) / self.n_synapses
 
 
-def check_stuck_weights(before: List[Snapshot], after: List[Snapshot], *,
-                         importance_percentile: float = 75.0,
-                         movement_percentile: float = 25.0) -> StuckWeightsReport:
+def check_stuck_weights(
+    before: list[Snapshot],
+    after: list[Snapshot],
+    *,
+    importance_percentile: float = 75.0,
+    movement_percentile: float = 25.0,
+) -> StuckWeightsReport:
     """before/after: lists of {(row,col): (weight,importance)} snapshots
     (one per digit/layer, from snapshot_multi_digit_state -- pass
     snapshots from MULTIPLE layers concatenated together for a whole-
@@ -151,7 +156,7 @@ def check_stuck_weights(before: List[Snapshot], after: List[Snapshot], *,
     either stuck or moving."""
     w_before_list, imp_before_list, delta_list = [], [], []
     n_new = n_died = 0
-    for b, a in zip(before, after):
+    for b, a in zip(before, after, strict=False):
         common = b.keys() & a.keys()
         n_new += len(a.keys() - b.keys())
         n_died += len(b.keys() - a.keys())
@@ -167,7 +172,8 @@ def check_stuck_weights(before: List[Snapshot], after: List[Snapshot], *,
         raise ValueError(
             "no synapses present in BOTH before and after snapshots -- "
             "nothing to compare (connectivity changed completely, or "
-            "empty snapshots were passed in)")
+            "empty snapshots were passed in)"
+        )
 
     imp_before = np.array(imp_before_list, dtype=np.float64)
     delta_w = np.array(delta_list, dtype=np.float64)

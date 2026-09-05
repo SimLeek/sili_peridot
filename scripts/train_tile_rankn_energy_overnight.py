@@ -25,57 +25,64 @@ as the existing train_toy_tile_precision_comparison.py.
 Usage: python3 train_tile_rankn_energy_overnight.py <arm> <use_energy 0|1> <train_steps> <checkpoint_every>
   arm: rank1 | rank2 | fp8
 """
+
 from __future__ import annotations
 
+import functools
 import sys
 import time
-import functools
-import warnings
 import traceback
+import warnings
 
 import numpy as np
 
 sys.path.insert(0, ".")
 
 from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8
-from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
+
 from model.toy_precision_models import QuantizedDISLDOLayer32
+from model.toy_recall_models import AdamOptimizer, cross_entropy_sum, lr_schedule, predicted_token
 from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
+from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
 
 EMBED_WIDTH = 8
-COLUMN_NEURONS = 8                       # state_width = 1024 -- near-full-scale, not toy
+COLUMN_NEURONS = 8  # state_width = 1024 -- near-full-scale, not toy
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
 MLP_HIDDEN = STATE_WIDTH * 2
-NUM_TILES = 8                            # seq_len=32, matches largest existing tested variant
-SEQ_LEN = int(NUM_TILES/2)
+NUM_TILES = 8  # seq_len=32, matches largest existing tested variant
+SEQ_LEN = int(NUM_TILES / 2)
 NUM_KV_PAIRS = 1
 VOCAB = 40
-MAX_WEIGHTS_PER_LAYER = 16384             # per_row=16 at state_width=1024, matching the
-                                           # per_row~16 ratio the original 4096-at-256 fix
-                                           # established -- kept proportional, not left at a
-                                           # width-independent constant that would make this
-                                           # scale needlessly sparse for no capacity reason.
+MAX_WEIGHTS_PER_LAYER = 16384  # per_row=16 at state_width=1024, matching the
+# per_row~16 ratio the original 4096-at-256 fix
+# established -- kept proportional, not left at a
+# width-independent constant that would make this
+# scale needlessly sparse for no capacity reason.
 NUM_CPUS = 4
 PEAK_LR = 0.002  # NOT 0.02 -- matches the already-documented DISLDOLayer-family
-                 # fix (JOURNAL.md ~line 2637): raw, unclipped per-synapse update
-                 # diverges at Adam-tuned rates regardless of quantization.
-                 # Re-verified directly at this scale, with the state_ln fix
-                 # already applied: peak_lr=0.02 still gives 65 overflow warnings
-                 # in exp() over 100 steps (max|M|=78); peak_lr=0.002 gives zero.
-                 # The two bugs (unbounded M, LR too high) are separate and both
-                 # real -- state_ln alone does not make 0.02 safe.
+# fix (JOURNAL.md ~line 2637): raw, unclipped per-synapse update
+# diverges at Adam-tuned rates regardless of quantization.
+# Re-verified directly at this scale, with the state_ln fix
+# already applied: peak_lr=0.02 still gives 65 overflow warnings
+# in exp() over 100 steps (max|M|=78); peak_lr=0.002 gives zero.
+# The two bugs (unbounded M, LR too high) are separate and both
+# real -- state_ln alone does not make 0.02 safe.
 WARMUP_STEPS = 100
 EVAL_SEQUENCES = 60
 
-ENERGY_KWARGS = dict(drive=0.00535, activation_cost=0.005, precision=0.001,
-                     density=0.005, p=0.995, reactivity=0.0001)
+ENERGY_KWARGS = {
+    "drive": 0.00535,
+    "activation_cost": 0.005,
+    "precision": 0.001,
+    "density": 0.005,
+    "p": 0.995,
+    "reactivity": 0.0001,
+}
 
 ARMS = {
     "rank1": DISLDOLayer,
-    "rank2": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2,
-                               quantize_importance=True),
-    "fp8":   DISLDOLayer8,
+    "rank2": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2, quantize_importance=True),
+    "fp8": DISLDOLayer8,
 }
 
 warnings.filterwarnings("error", category=RuntimeWarning)
@@ -89,10 +96,11 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
     return targets
 
 
-def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                       num_tiles: int, column_neurons: int) -> np.ndarray:
+def _build_tile_window(
+    embed_table: np.ndarray, tokens: np.ndarray, i: int, num_tiles: int, column_neurons: int
+) -> np.ndarray:
     """Builds the sliding window of token embeddings for the current step.
-    Out-of-bound tokens (src < 0) remain as initialized zeros to prevent 
+    Out-of-bound tokens (src < 0) remain as initialized zeros to prevent
     double-counting the recurrent state in the qkv_source."""
     state_width = embed_table.shape[1] * column_neurons
     window = np.zeros((num_tiles, state_width), dtype=np.float32)
@@ -130,16 +138,26 @@ def main():
         rng = np.random.RandomState(seed)
         np.random.seed(seed)
         model = ToyTileRecurrenceRealFP4(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, MLP_HIDDEN, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
-            num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
-            use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            MLP_HIDDEN,
+            NUM_TILES,
+            MAX_WEIGHTS_PER_LAYER,
+            num_cpus=NUM_CPUS,
+            disldo_cls=ARMS[arm],
+            use_energy=use_energy,
+            energy_kwargs=ENERGY_KWARGS if use_energy else None,
+        )
         opt = AdamOptimizer()
         embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
-        print(f"# arm={arm} use_energy={use_energy} train_steps={train_steps} "
-              f"checkpoint_every={checkpoint_every} seed={seed} "
-              f"state_width={STATE_WIDTH} num_tiles={NUM_TILES} max_weights={MAX_WEIGHTS_PER_LAYER}",
-              flush=True)
+        print(
+            f"# arm={arm} use_energy={use_energy} train_steps={train_steps} "
+            f"checkpoint_every={checkpoint_every} seed={seed} "
+            f"state_width={STATE_WIDTH} num_tiles={NUM_TILES} max_weights={MAX_WEIGHTS_PER_LAYER}",
+            flush=True,
+        )
 
         t0 = time.time()
         for step in range(1, train_steps + 1):
@@ -154,18 +172,19 @@ def main():
                     loss = cross_entropy_sum(logits, [(NUM_TILES - 1, targets[i])])
                     if aux is not None:
                         loss = loss + aux
-                    #loss.grad = np.array(1.0, dtype=np.float32)
+                    # loss.grad = np.array(1.0, dtype=np.float32)  # noqa: ERA001 -- flagged for user, not touched (see cleanup PR notes)
                     loss.backward()
                     model.debug_learning_state()
                     opt.step(model.parameters_for_optimizer(), lr=lr)
-                    
+
             if step % checkpoint_every == 0:
                 acc = evaluate(model, rng, embed_table)
                 elapsed = time.time() - t0
-                print(f"step={step:>7}  acc={acc:.4f}  ({elapsed:.0f}s elapsed, "
-                      f"{elapsed/step:.3f}s/step)", flush=True)
+                print(
+                    f"step={step:>7}  acc={acc:.4f}  ({elapsed:.0f}s elapsed, {elapsed / step:.3f}s/step)", flush=True
+                )
 
-        print(f"# DONE arm={arm} use_energy={use_energy} ({time.time()-t0:.0f}s total)", flush=True)
+        print(f"# DONE arm={arm} use_energy={use_energy} ({time.time() - t0:.0f}s total)", flush=True)
     except RuntimeWarning:
         print("Caught RuntimeWarning.")
         traceback.print_exc()

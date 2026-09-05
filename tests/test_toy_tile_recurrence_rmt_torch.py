@@ -1,22 +1,29 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from model.toy_tile_recurrence_rmt_torch import ToyTileRecurrenceRMTTorch
-
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
 
 
 def _model(l1_sparsity_coef=0.0):
-    return ToyTileRecurrenceRMTTorch(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                     l1_sparsity_coef=l1_sparsity_coef,
-                                     rng=np.random.default_rng(0))
+    return ToyTileRecurrenceRMTTorch(
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        NUM_TILES,
+        NUM_MEM,
+        l1_sparsity_coef=l1_sparsity_coef,
+        rng=np.random.default_rng(0),
+    )
 
 
 class TestToyTileRecurrenceRMTTorch:
@@ -56,7 +63,8 @@ class TestToyTileRecurrenceRMTTorch:
         after = model.step(probe_window, probe_memory, 0.0)[1].detach()
         assert torch.isfinite(after).all()
         assert not torch.allclose(before, after), (
-            "output on a fixed probe never changed -- inline weight update never fired")
+            "output on a fixed probe never changed -- inline weight update never fired"
+        )
 
     def test_extract_memory_matches_state_width_shape(self):
         model = _model()
@@ -67,6 +75,7 @@ class TestToyTileRecurrenceRMTTorch:
         assert memory_new.shape == (NUM_MEM, STATE_WIDTH)
         assert np.all(np.isfinite(memory_new))
 
+    @pytest.mark.integration  # real training-convergence run
     def test_loss_decreases_on_a_single_repeated_example(self):
         model = _model()
         opt = torch.optim.Adam(model.parameters_for_optimizer(), lr=0.02)
@@ -90,4 +99,5 @@ class TestToyTileRecurrenceRMTTorch:
             min_loss = loss_val if min_loss is None else min(min_loss, loss_val)
 
         assert min_loss < first_loss * 0.5, (
-            f"loss never reached a real minimum: {first_loss:.3f} -> best {min_loss:.3f}")
+            f"loss never reached a real minimum: {first_loss:.3f} -> best {min_loss:.3f}"
+        )

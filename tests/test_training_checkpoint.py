@@ -1,31 +1,45 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from model.config import MiniCPM5Config
-from model.sili_block import build_step_layers, run_folded_recurrence, _extract_true_csr
 from model.curriculum import WindowState, advance_window
+from model.sili_block import _extract_true_csr, build_step_layers, run_folded_recurrence
 from model.training_checkpoint import (
-    save_training_checkpoint, load_training_checkpoint,
-    sparse_linear_layer_state_dict, sparse_linear_layer_from_state_dict,
+    load_training_checkpoint,
+    save_training_checkpoint,
+    sparse_linear_layer_from_state_dict,
+    sparse_linear_layer_state_dict,
 )
 
 SUFFIXES = [
-    ".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
-    ".self_attn.v_proj.weight", ".self_attn.o_proj.weight",
-    ".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight",
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
 ]
 
 
 def _tiny_config(n_layers=4) -> MiniCPM5Config:
     return MiniCPM5Config(
-        hidden_size=8, intermediate_size=12, num_hidden_layers=n_layers,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=4,
-        vocab_size=10, rms_norm_eps=1e-6, rope_theta=10000.0,
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=n_layers,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=10,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
         tie_word_embeddings=False,
     )
 
@@ -35,14 +49,35 @@ def _fake_sparse_state(cfg: MiniCPM5Config, seed=3) -> dict:
     sd = {}
     for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
-        sd[p + ".self_attn.q_proj.weight"] = {"raw": torch.randn(cfg.q_proj_out, cfg.attn_in), "shape": (cfg.q_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.k_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.v_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.o_proj.weight"] = {"raw": torch.randn(cfg.attn_out, cfg.o_proj_in), "shape": (cfg.attn_out, cfg.o_proj_in)}
-        sd[p + ".mlp.gate_proj.weight"]    = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.up_proj.weight"]      = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.down_proj.weight"]    = {"raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden), "shape": (cfg.mlp_out, cfg.mlp_hidden)}
-        sd[p + ".input_layernorm.weight"]         = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
+        sd[p + ".self_attn.q_proj.weight"] = {
+            "raw": torch.randn(cfg.q_proj_out, cfg.attn_in),
+            "shape": (cfg.q_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.k_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.v_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.o_proj.weight"] = {
+            "raw": torch.randn(cfg.attn_out, cfg.o_proj_in),
+            "shape": (cfg.attn_out, cfg.o_proj_in),
+        }
+        sd[p + ".mlp.gate_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.up_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.down_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden),
+            "shape": (cfg.mlp_out, cfg.mlp_hidden),
+        }
+        sd[p + ".input_layernorm.weight"] = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
         sd[p + ".post_attention_layernorm.weight"] = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
     return sd
 
@@ -79,14 +114,14 @@ class TestTrainingCheckpointRoundtrip:
         cfg, step_layers, input_ln, post_ln, final_norm = self._built()
         ckpt_path = tmp_path / "ckpt.pkl"
 
-        save_training_checkpoint(ckpt_path, step_layers, input_ln, post_ln, final_norm,
-                                 stage_index=2, quality=0.31)
+        save_training_checkpoint(ckpt_path, step_layers, input_ln, post_ln, final_norm, stage_index=2, quality=0.31)
 
         assert ckpt_path.exists()
         assert not ckpt_path.with_name(ckpt_path.name + ".tmp").exists()
 
-        (r_step_layers, r_input_ln, r_post_ln, r_final_norm,
-         r_window_state, r_stage_index, r_quality) = load_training_checkpoint(ckpt_path)
+        (r_step_layers, r_input_ln, r_post_ln, r_final_norm, r_window_state, r_stage_index, r_quality) = (
+            load_training_checkpoint(ckpt_path)
+        )
 
         assert r_window_state is None
         assert r_stage_index == 2
@@ -114,11 +149,13 @@ class TestTrainingCheckpointRoundtrip:
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
 
         ckpt_path = tmp_path / "ckpt_window.pkl"
-        save_training_checkpoint(ckpt_path, step_layers, input_ln, post_ln, final_norm,
-                                 window_state=state, stage_index=1, quality=0.4)
+        save_training_checkpoint(
+            ckpt_path, step_layers, input_ln, post_ln, final_norm, window_state=state, stage_index=1, quality=0.4
+        )
 
-        (r_step_layers, r_input_ln, r_post_ln, r_final_norm,
-         r_window_state, r_stage_index, r_quality) = load_training_checkpoint(ckpt_path)
+        (r_step_layers, r_input_ln, r_post_ln, r_final_norm, r_window_state, _r_stage_index, _r_quality) = (
+            load_training_checkpoint(ckpt_path)
+        )
 
         assert r_window_state is not None
         assert r_window_state.window_size == 2
@@ -131,16 +168,18 @@ class TestTrainingCheckpointRoundtrip:
         T = 4
         x = np.random.RandomState(93).randn(T, cfg.hidden_size).astype(np.float32)
         np.random.seed(24680)
-        original_out = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
-                                             cfg, half_bandwidth=T, window_state=state)
+        original_out = run_folded_recurrence(
+            x, step_layers, input_ln, post_ln, final_norm, cfg, half_bandwidth=T, window_state=state
+        )
         np.random.seed(24680)
-        restored_out = run_folded_recurrence(x, r_step_layers, r_input_ln, r_post_ln, r_final_norm,
-                                             cfg, half_bandwidth=T, window_state=r_window_state)
+        restored_out = run_folded_recurrence(
+            x, r_step_layers, r_input_ln, r_post_ln, r_final_norm, cfg, half_bandwidth=T, window_state=r_window_state
+        )
 
         np.testing.assert_allclose(restored_out, original_out, rtol=1e-4, atol=1e-4)
 
     def test_save_is_atomic_no_leftover_tmp_file(self, tmp_path):
-        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=1, seed=94)
+        _cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=1, seed=94)
         ckpt_path = tmp_path / "nested" / "dir" / "ckpt.pkl"
 
         save_training_checkpoint(ckpt_path, step_layers, input_ln, post_ln, final_norm)

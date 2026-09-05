@@ -14,6 +14,7 @@ each other.
 
 Run: python3 scripts/train_mqar_rmt_standard.py [train_steps] [seed]
 """
+
 from __future__ import annotations
 
 import sys
@@ -62,8 +63,7 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
     return targets
 
 
-def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int,
-                   log_fn=None, eval_every: int = None) -> dict:
+def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None, eval_every: int | None = None) -> dict:
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -101,14 +101,14 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int,
             g["lr"] = lr
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
         memory = torch.zeros(NUM_MEMORY_SLOTS, state_width)
         for i in range(seq_len):
             window = torch.tensor(_build_tile_window(embed_table, tokens, i, num_tiles))
             memory, logits = model(window, memory)
             if i in targets:
                 target = torch.tensor([targets[i]], dtype=torch.long)
-                loss = torch.nn.functional.cross_entropy(logits[num_tiles - 1:num_tiles], target)
+                loss = torch.nn.functional.cross_entropy(logits[num_tiles - 1 : num_tiles], target)
                 if i in query_positions:
                     recent_query_loss.append(float(loss))
                 opt.zero_grad()
@@ -140,23 +140,32 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int,
                     correct += int(pred == mqar_by_pos[i])
                     total += 1
 
-    return {"num_kv_pairs": num_kv_pairs, "seq_len": seq_len,
-            "acc": correct / total if total else 0.0, "elapsed_s": time.time() - t0}
+    return {
+        "num_kv_pairs": num_kv_pairs,
+        "seq_len": seq_len,
+        "acc": correct / total if total else 0.0,
+        "elapsed_s": time.time() - t0,
+    }
 
 
 def main():
     train_steps = int(sys.argv[1]) if len(sys.argv) > 1 else 3000
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
 
-    print(f"# ToyTileRecurrenceRMTStandard (K=1) train_steps={train_steps} seed={seed} "
-          f"num_memory_slots={NUM_MEMORY_SLOTS} embed_width={EMBED_WIDTH} "
-          f"column_neurons={COLUMN_NEURONS} state_width={EMBED_WIDTH*COLUMN_NEURONS} "
-          f"vocab={VOCAB} peak_lr={PEAK_LR}", flush=True)
+    print(
+        f"# ToyTileRecurrenceRMTStandard (K=1) train_steps={train_steps} seed={seed} "
+        f"num_memory_slots={NUM_MEMORY_SLOTS} embed_width={EMBED_WIDTH} "
+        f"column_neurons={COLUMN_NEURONS} state_width={EMBED_WIDTH * COLUMN_NEURONS} "
+        f"vocab={VOCAB} peak_lr={PEAK_LR}",
+        flush=True,
+    )
 
     def log_fn(k, step, total_steps, elapsed, mean_q_loss, quick_acc=None):
         acc_str = f"  quick_acc={quick_acc:.4f}" if quick_acc is not None else ""
-        print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  "
-              f"({elapsed:.0f}s elapsed)", flush=True)
+        print(
+            f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  ({elapsed:.0f}s elapsed)",
+            flush=True,
+        )
 
     r = train_and_eval(1, seed, train_steps, log_fn=log_fn, eval_every=max(train_steps // 10, 1))
     print(f"\nFINAL acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)", flush=True)

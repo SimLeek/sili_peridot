@@ -28,6 +28,7 @@ plateaued) at 15000 steps in the original single-seed sweep, so a
 pass/fail threshold on it would be testing noise, not a real
 regression.
 """
+
 import os
 import re
 import statistics
@@ -71,9 +72,11 @@ def _seeds():
     return [int(s) for s in raw.split(",")]
 
 
-@pytest.mark.skipif(not os.environ.get(RUN_ENV_VAR),
-                    reason=f"expensive multi-seed real training run, opt in via {RUN_ENV_VAR}=1 "
-                           f"(control seed count with {SEEDS_ENV_VAR}=1000,1001,...)")
+@pytest.mark.skipif(
+    not os.environ.get(RUN_ENV_VAR),
+    reason=f"expensive multi-seed real training run, opt in via {RUN_ENV_VAR}=1 "
+    f"(control seed count with {SEEDS_ENV_VAR}=1000,1001,...)",
+)
 def test_residual_base_sweep_reports_results():
     seeds = _seeds()
     # results[label][seed] = mean_acc for that (arm, seed) run
@@ -83,20 +86,28 @@ def test_residual_base_sweep_reports_results():
             args = [*FIXED_ARGS, str(seed), *POST_SEED_ARGS]
             proc = subprocess.run(
                 [sys.executable, SCRIPT, arm, *args],
-                cwd=REPO_ROOT, capture_output=True, text=True, timeout=300)
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
             assert proc.returncode == 0, f"{arm} seed={seed} failed:\n{proc.stderr}"
             steps, accs = _parse_checkpoints_from_text(proc.stdout)
             analyzed = analyze(steps, accs, CHANCE_RATE, window=8)
             results[label][seed] = analyzed["mean_acc"]
-            print(f"{label:<6} seed={seed}  mean_acc={analyzed['mean_acc']:.4f}  "
-                  f"status={analyzed['status']}", flush=True)
+            print(
+                f"{label:<6} seed={seed}  mean_acc={analyzed['mean_acc']:.4f}  status={analyzed['status']}", flush=True
+            )
 
     print("\nbase   mean(mean_acc)  std(mean_acc)  per-seed")
     for label in ("base4", "base6", "base12", "base24"):
         per_seed = [results[label][s] for s in seeds]
-        print(f"{label:<6} {statistics.mean(per_seed):.4f}          "
-              f"{statistics.stdev(per_seed) if len(per_seed) > 1 else 0.0:.4f}         "
-              f"{[round(v, 4) for v in per_seed]}")
+        print(
+            f"{label:<6} {statistics.mean(per_seed):.4f}          "
+            f"{statistics.stdev(per_seed) if len(per_seed) > 1 else 0.0:.4f}         "
+            f"{[round(v, 4) for v in per_seed]}"
+        )
 
     # Paired comparison (same seed set for every arm): count how many
     # seeds base12 beats base4 on, rather than trusting a single
@@ -109,7 +120,8 @@ def test_residual_base_sweep_reports_results():
     assert base4_wins > len(seeds) / 2, (
         f"base=12 (current default) only beat base=4 (old default) on "
         f"{base4_wins}/{len(seeds)} seeds -- the switch to base=12 as the "
-        f"project default needs revisiting.")
+        f"project default needs revisiting."
+    )
 
 
 def _parse_checkpoints_from_text(text: str):

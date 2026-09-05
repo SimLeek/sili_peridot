@@ -1,24 +1,29 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model.checkpoint import load_minicpm5_checkpoint
+from model.eval_pruning import (
+    EVAL_TEXTS,
+    EVAL_TEXTS_HELDOUT,
+    EvalResult,
+    compare_dense_vs_pruned,
+    evaluate_next_token_prediction,
+)
 from model.prune import (
-    prune_state_dict, prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    prune_state_dict,
+    prune_state_dict_by_role,
     sparse_state_to_dense_state_dict,
 )
-from model.eval_pruning import (
-    evaluate_next_token_prediction, compare_dense_vs_pruned,
-    EvalResult, EVAL_TEXTS, EVAL_TEXTS_HELDOUT,
-)
 
-REAL_CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
+REAL_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "MiniCPM5-1B-Base")
 
 
 class TestEvalResult:
@@ -31,8 +36,9 @@ class TestEvalResult:
         assert r.accuracy == pytest.approx(0.5)
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestRealCheckpointEvaluation:
     """The whole point of this module: does a pruning decision actually
     preserve next-token quality, measured directly, not assumed from
@@ -101,5 +107,5 @@ class TestRealCheckpointEvaluation:
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
         compare_dense_vs_pruned(model, tokenizer, pruned_dense, EVAL_TEXTS)
         after = model.state_dict()
-        for k in original:
-            assert torch.equal(original[k], after[k]), f"{k} not restored after comparison"
+        for k, v in original.items():
+            assert torch.equal(v, after[k]), f"{k} not restored after comparison"

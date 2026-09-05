@@ -1,21 +1,23 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import torch
 import pytest
 
+torch = pytest.importorskip("torch")
+
 from model.checkpoint import load_minicpm5_checkpoint
-from model.config import MiniCPM5Config
 from model.prune import (
-    prune_state_dict, DEFAULT_TARGET_SPARSITY,
-    prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE,
-    sparse_state_to_dense_state_dict, _role_of,
+    DEFAULT_TARGET_SPARSITY,
+    DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    _role_of,
+    prune_state_dict,
+    prune_state_dict_by_role,
+    sparse_state_to_dense_state_dict,
 )
 
-REAL_CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
+REAL_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "MiniCPM5-1B-Base")
 
 
 class TestPruneStateDictWithExplicitThreshold:
@@ -24,7 +26,7 @@ class TestPruneStateDictWithExplicitThreshold:
 
     def _sd(self):
         return {
-            "norm.weight": torch.full((8,), 100.0),   # 1-D -- always dense
+            "norm.weight": torch.full((8,), 100.0),  # 1-D -- always dense
             # All values 100.0: nothing gets pruned regardless of
             # threshold -- 0% sparsity, well under min_sparsity -> dense.
             "big_zero": torch.full((10, 10), 100.0),
@@ -32,9 +34,7 @@ class TestPruneStateDictWithExplicitThreshold:
             # between them prunes exactly the 95 small ones -> 95%
             # sparsity, comfortably above min_sparsity and cheap enough
             # as CSR -> sparse.
-            "mostly_pruned": torch.cat([
-                torch.full((95,), 0.0001), torch.full((5,), 100.0)
-            ]).reshape(10, 10),
+            "mostly_pruned": torch.cat([torch.full((95,), 0.0001), torch.full((5,), 100.0)]).reshape(10, 10),
         }
 
     def test_vector_always_dense(self):
@@ -100,12 +100,12 @@ def _fake_layered_state_dict(n_layers=2, hidden=8, kv=4, inter=12):
     torch.manual_seed(3)
     sd = {
         "model.embed_tokens.weight": torch.randn(20, hidden) * 0.5,
-        "lm_head.weight":            torch.randn(20, hidden) * 0.5,
-        "model.norm.weight":         torch.randn(hidden),
+        "lm_head.weight": torch.randn(20, hidden) * 0.5,
+        "model.norm.weight": torch.randn(hidden),
     }
     for i in range(n_layers):
         p = f"model.layers.{i}."
-        sd[p + "input_layernorm.weight"]          = torch.randn(hidden)
+        sd[p + "input_layernorm.weight"] = torch.randn(hidden)
         sd[p + "post_attention_layernorm.weight"] = torch.randn(hidden)
         # v_proj deliberately much larger magnitude than q_proj/k_proj --
         # same idea as the real MiniCPM5 finding (different roles need
@@ -115,9 +115,9 @@ def _fake_layered_state_dict(n_layers=2, hidden=8, kv=4, inter=12):
         sd[p + "self_attn.k_proj.weight"] = torch.randn(kv, hidden) * 0.1
         sd[p + "self_attn.v_proj.weight"] = torch.randn(kv, hidden) * 10.0
         sd[p + "self_attn.o_proj.weight"] = torch.randn(hidden, hidden) * 0.1
-        sd[p + "mlp.gate_proj.weight"]    = torch.randn(inter, hidden) * 0.1
-        sd[p + "mlp.up_proj.weight"]      = torch.randn(inter, hidden) * 0.1
-        sd[p + "mlp.down_proj.weight"]    = torch.randn(hidden, inter) * 0.1
+        sd[p + "mlp.gate_proj.weight"] = torch.randn(inter, hidden) * 0.1
+        sd[p + "mlp.up_proj.weight"] = torch.randn(inter, hidden) * 0.1
+        sd[p + "mlp.down_proj.weight"] = torch.randn(hidden, inter) * 0.1
     return sd
 
 
@@ -181,7 +181,7 @@ class TestSparseStateToDenseStateDict:
         # Force an entry we know goes sparse: high sparsity, large enough
         # to clear the CSR-overhead bar.
         big = torch.zeros(200, 200)
-        big[0, :] = 10.0   # 200 nonzeros out of 40000 -- 99.5% sparse
+        big[0, :] = 10.0  # 200 nonzeros out of 40000 -- 99.5% sparse
         sd = {"w": big}
         sparse_state, report = prune_state_dict(sd, min_abs_param=1.0)
         assert report.tensors[0].stored_format == "sparse"
@@ -189,8 +189,9 @@ class TestSparseStateToDenseStateDict:
         assert torch.equal(dense["w"], big)
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestRealCheckpointPruning:
     """B3a: verify ACTUAL density on the real checkpoint, not just that
     pruning ran without crashing. Also locks in the finding that drove
@@ -231,8 +232,7 @@ class TestRealCheckpointPruning:
         by_name = {t.name: t for t in default_report.tensors}
         for name in ("model.embed_tokens.weight", "lm_head.weight"):
             assert by_name[name].stored_format == "sparse", (
-                f"{name} unexpectedly stayed dense at "
-                f"target_sparsity={DEFAULT_TARGET_SPARSITY}"
+                f"{name} unexpectedly stayed dense at target_sparsity={DEFAULT_TARGET_SPARSITY}"
             )
 
     def test_no_catastrophic_over_pruning(self, default_report):
@@ -241,8 +241,9 @@ class TestRealCheckpointPruning:
         assert default_report.overall_sparsity < 0.95
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestRealCheckpointPruningByRole:
     """DEFAULT_TARGET_SPARSITY_BY_ROLE structural checks only -- the
     actual next-token-quality validation for these thresholds lives in

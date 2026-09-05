@@ -1,30 +1,41 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
 import pytest
 
-from model.config import MiniCPM5Config
-from model.checkpoint import load_minicpm5_checkpoint
-from model.prune import prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE
-from model.fold import (
-    fold_suffix, fold_all_suffixes, verify_lossless, SUFFIXES,
-    build_folded_layers, build_folded_layers_streaming,
-    build_and_save_folded_layers, reference_fold_forward,
-)
+torch = pytest.importorskip("torch")
 
-REAL_CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
+from model.checkpoint import load_minicpm5_checkpoint
+from model.config import MiniCPM5Config
+from model.fold import (
+    SUFFIXES,
+    build_and_save_folded_layers,
+    build_folded_layers,
+    build_folded_layers_streaming,
+    fold_all_suffixes,
+    fold_suffix,
+    reference_fold_forward,
+    verify_lossless,
+)
+from model.prune import DEFAULT_TARGET_SPARSITY_BY_ROLE, prune_state_dict_by_role
+
+REAL_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "MiniCPM5-1B-Base")
 
 
 def _tiny_config(n_layers=3) -> MiniCPM5Config:
     return MiniCPM5Config(
-        hidden_size=8, intermediate_size=12, num_hidden_layers=n_layers,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=4,
-        vocab_size=10, rms_norm_eps=1e-6, rope_theta=5000000.0,
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=n_layers,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=10,
+        rms_norm_eps=1e-6,
+        rope_theta=5000000.0,
         tie_word_embeddings=False,
     )
 
@@ -42,15 +53,15 @@ def _fake_sparse_state(cfg: MiniCPM5Config, mix_raw_and_csr=True) -> dict:
 
     sd = {}
     for i in range(cfg.num_hidden_layers):
-        p = f"model.layers.{i}"   # no trailing dot -- SUFFIXES already start with one
-        as_csr = mix_raw_and_csr and (i % 2 == 0)   # alternate raw/csr across layers
+        p = f"model.layers.{i}"  # no trailing dot -- SUFFIXES already start with one
+        as_csr = mix_raw_and_csr and (i % 2 == 0)  # alternate raw/csr across layers
         sd[p + ".self_attn.q_proj.weight"] = entry(torch.randn(cfg.q_proj_out, cfg.attn_in), as_csr)
         sd[p + ".self_attn.k_proj.weight"] = entry(torch.randn(cfg.kv_proj_out, cfg.attn_in), as_csr)
         sd[p + ".self_attn.v_proj.weight"] = entry(torch.randn(cfg.kv_proj_out, cfg.attn_in), as_csr)
         sd[p + ".self_attn.o_proj.weight"] = entry(torch.randn(cfg.attn_out, cfg.o_proj_in), as_csr)
-        sd[p + ".mlp.gate_proj.weight"]    = entry(torch.randn(cfg.mlp_hidden, cfg.mlp_in), as_csr)
-        sd[p + ".mlp.up_proj.weight"]      = entry(torch.randn(cfg.mlp_hidden, cfg.mlp_in), as_csr)
-        sd[p + ".mlp.down_proj.weight"]    = entry(torch.randn(cfg.mlp_out, cfg.mlp_hidden), as_csr)
+        sd[p + ".mlp.gate_proj.weight"] = entry(torch.randn(cfg.mlp_hidden, cfg.mlp_in), as_csr)
+        sd[p + ".mlp.up_proj.weight"] = entry(torch.randn(cfg.mlp_hidden, cfg.mlp_in), as_csr)
+        sd[p + ".mlp.down_proj.weight"] = entry(torch.randn(cfg.mlp_out, cfg.mlp_hidden), as_csr)
     return sd
 
 
@@ -67,10 +78,10 @@ class TestFoldSuffix:
         sd = _fake_sparse_state(cfg)
         for suffix in SUFFIXES:
             desc = fold_suffix(sd, suffix, cfg, prefix="model.layers.")
-            assert desc.out_dims[suffix] > 0   # sanity: didn't raise, matched expectation
+            assert desc.out_dims[suffix] > 0  # sanity: didn't raise, matched expectation
 
     def test_raw_and_csr_mixed_within_one_suffix_fold_consistently(self):
-        cfg = _tiny_config(n_layers=4)   # alternates raw/csr by layer index
+        cfg = _tiny_config(n_layers=4)  # alternates raw/csr by layer index
         sd = _fake_sparse_state(cfg, mix_raw_and_csr=True)
         desc = fold_suffix(sd, ".mlp.down_proj.weight", cfg, prefix="model.layers.")
         assert desc.stacked_weights[".mlp.down_proj.weight"].shape[0] == 4 * cfg.mlp_out
@@ -90,7 +101,7 @@ class TestFoldSuffix:
             "raw": torch.randn(cfg.q_proj_out + 1, cfg.attn_in),
             "shape": (cfg.q_proj_out + 1, cfg.attn_in),
         }
-        with pytest.raises(Exception):   # either stack_csr_vertical or our own out_dim check
+        with pytest.raises(Exception):  # either stack_csr_vertical or our own out_dim check
             fold_suffix(sd, ".self_attn.q_proj.weight", cfg, prefix="model.layers.")
 
 
@@ -165,8 +176,9 @@ class TestBuildFoldedLayers:
         # not identical (quantization is lossy by design), but not wildly
         # different either, for well-scaled random weights.
         from sili.tensor import Tensor
+
         cfg = _tiny_config(n_layers=3)
-        sd = _fake_sparse_state(cfg, mix_raw_and_csr=False)   # avoid CSR-branch dtype surprises
+        sd = _fake_sparse_state(cfg, mix_raw_and_csr=False)  # avoid CSR-branch dtype surprises
         desc = fold_suffix(sd, ".self_attn.v_proj.weight", cfg, prefix="model.layers.")
         layer = build_folded_layers({".self_attn.v_proj.weight": desc})[".self_attn.v_proj.weight"]
 
@@ -192,7 +204,7 @@ class TestBuildFoldedLayersStreaming:
     def test_matches_non_streaming_build(self):
         cfg = _tiny_config(n_layers=2)
         sd_a = _fake_sparse_state(cfg)
-        sd_b = {k: v for k, v in sd_a.items()}   # shallow copy -- same tensor objects
+        sd_b = dict(sd_a.items())  # shallow copy -- same tensor objects
         descriptors = fold_all_suffixes(sd_a, cfg, prefix="model.layers.")
         non_streamed = build_folded_layers(descriptors)
 
@@ -206,7 +218,7 @@ class TestBuildAndSaveFoldedLayers:
         sd = _fake_sparse_state(cfg)
         paths = build_and_save_folded_layers(sd, cfg, str(tmp_path), prefix="model.layers.")
         assert set(paths.keys()) == set(SUFFIXES)
-        for suffix, path in paths.items():
+        for path in paths.values():
             assert os.path.isfile(path)
             loaded = np.load(path)
             assert "n_folds" in loaded and int(loaded["n_folds"][0]) == 2
@@ -214,8 +226,9 @@ class TestBuildAndSaveFoldedLayers:
         assert remaining_suffix_keys == []
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestRealCheckpointFolding:
     """B4 end-to-end against the real checkpoint, using B3's actual
     per-role pruning output as input -- the real integration point this
@@ -223,8 +236,7 @@ class TestRealCheckpointFolding:
 
     @pytest.fixture(scope="module")
     def config(self):
-        return MiniCPM5Config.from_json(
-            os.path.join(REAL_CHECKPOINT_DIR, "config.json"))
+        return MiniCPM5Config.from_json(os.path.join(REAL_CHECKPOINT_DIR, "config.json"))
 
     @pytest.fixture(scope="module")
     def pruned_sparse_state(self, config):
@@ -240,7 +252,7 @@ class TestRealCheckpointFolding:
         assert set(descriptors.keys()) == set(SUFFIXES)
 
     def test_each_descriptor_has_24_folds(self, descriptors, config):
-        for suffix, desc in descriptors.items():
+        for desc in descriptors.values():
             assert desc.n_folds == config.num_hidden_layers == 24
 
     def test_out_dims_match_config(self, descriptors, config):
@@ -249,9 +261,9 @@ class TestRealCheckpointFolding:
             ".self_attn.k_proj.weight": config.kv_proj_out,
             ".self_attn.v_proj.weight": config.kv_proj_out,
             ".self_attn.o_proj.weight": config.attn_out,
-            ".mlp.gate_proj.weight":    config.mlp_hidden,
-            ".mlp.up_proj.weight":      config.mlp_hidden,
-            ".mlp.down_proj.weight":    config.mlp_out,
+            ".mlp.gate_proj.weight": config.mlp_hidden,
+            ".mlp.up_proj.weight": config.mlp_hidden,
+            ".mlp.down_proj.weight": config.mlp_out,
         }
         for suffix, desc in descriptors.items():
             assert desc.out_dims[suffix] == expected[suffix]
@@ -259,8 +271,7 @@ class TestRealCheckpointFolding:
     def test_folding_is_lossless(self, pruned_sparse_state, descriptors, config):
         report = verify_lossless(pruned_sparse_state, descriptors, config)
         assert report.lossless, (
-            f"nnz mismatch: before={report.per_suffix_nnz_before} "
-            f"after={report.per_suffix_nnz_after}"
+            f"nnz mismatch: before={report.per_suffix_nnz_before} after={report.per_suffix_nnz_after}"
         )
 
     def test_no_per_layer_keys_would_remain_after_removal(self, pruned_sparse_state, config):
@@ -269,8 +280,5 @@ class TestRealCheckpointFolding:
         # same "0 leftover keys" check sili__new's own fold_sparse_payload
         # makes, done manually here since we fold suffix-by-suffix rather
         # than through that all-at-once entry point.
-        expected_names = {
-            f"model.layers.{i}{suffix}"
-            for i in range(config.num_hidden_layers) for suffix in SUFFIXES
-        }
+        expected_names = {f"model.layers.{i}{suffix}" for i in range(config.num_hidden_layers) for suffix in SUFFIXES}
         assert expected_names <= set(pruned_sparse_state.keys())

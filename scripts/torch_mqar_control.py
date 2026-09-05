@@ -20,6 +20,7 @@ by this control).
 
 Run: python -m scripts.torch_mqar_control
 """
+
 from __future__ import annotations
 
 import sys
@@ -27,8 +28,8 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 sys.path.insert(0, ".")
 
@@ -52,7 +53,7 @@ class DenseLayer(nn.Module):
         T, hidden = x.shape
         normed = self.ln1(x)
         q, k, v = self.q(normed), self.k(normed), self.v(normed)
-        scores = (q @ k.T) / (hidden ** 0.5)
+        scores = (q @ k.T) / (hidden**0.5)
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(mask, float("-inf"))
         attn = torch.softmax(scores, dim=-1) @ v
@@ -76,8 +77,7 @@ class DenseModel(nn.Module):
         return self.lm_head(x)
 
 
-def train_and_eval(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, n_layers,
-                    train_steps, lr, eval_sequences, seed):
+def train_and_eval(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, n_layers, train_steps, lr, eval_sequences, seed):
     rng = np.random.RandomState(seed)
     torch.manual_seed(seed)
     model = DenseModel(vocab, hidden, mlp_hidden, n_layers)
@@ -121,14 +121,26 @@ def main():
     eval_sequences = 60
     configs = [(16, 2, 20), (32, 4, 40)]
 
-    print(f"hidden={hidden} mlp_hidden={mlp_hidden} n_layers={n_layers} "
-          f"train_steps={train_steps} lr={lr} optimizer=Adam precision=fp32\n")
+    print(
+        f"hidden={hidden} mlp_hidden={mlp_hidden} n_layers={n_layers} "
+        f"train_steps={train_steps} lr={lr} optimizer=Adam precision=fp32\n"
+    )
     for seq_len, num_kv_pairs, vocab in configs:
         print(f"seq_len={seq_len} num_kv_pairs={num_kv_pairs} vocab={vocab}")
         t0 = time.time()
-        acc = train_and_eval(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, n_layers,
-                             train_steps, lr, eval_sequences, seed=1000 + seq_len)
-        print(f"  -> eval accuracy: {acc:.2f}  ({time.time()-t0:.1f}s)\n")
+        acc = train_and_eval(
+            seq_len,
+            num_kv_pairs,
+            vocab,
+            hidden,
+            mlp_hidden,
+            n_layers,
+            train_steps,
+            lr,
+            eval_sequences,
+            seed=1000 + seq_len,
+        )
+        print(f"  -> eval accuracy: {acc:.2f}  ({time.time() - t0:.1f}s)\n")
 
 
 if __name__ == "__main__":

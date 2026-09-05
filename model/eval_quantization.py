@@ -11,9 +11,8 @@ then with those SAME weights additionally FP4-quantized, and compare
 next-token loss/perplexity/accuracy -- isolating quantization's own
 effect from pruning's (already measured separately).
 """
-from __future__ import annotations
 
-from typing import Dict, List
+from __future__ import annotations
 
 import torch
 
@@ -23,9 +22,9 @@ from .eval_pruning import EVAL_TEXTS, evaluate_next_token_prediction
 def compare_pruned_vs_quantized(
     model,
     tokenizer,
-    pruned_dense_state_dict: Dict[str, torch.Tensor],
-    quantized_dense_state_dict: Dict[str, torch.Tensor],
-    texts: List[str] = EVAL_TEXTS,
+    pruned_dense_state_dict: dict[str, torch.Tensor],
+    quantized_dense_state_dict: dict[str, torch.Tensor],
+    texts: list[str] = EVAL_TEXTS,
 ) -> dict:
     """
     Evaluate `model` with pruned_dense_state_dict loaded (B3's already
@@ -45,10 +44,10 @@ def compare_pruned_vs_quantized(
         model.load_state_dict(original_state_dict)
 
     return {
-        "pruned_perplexity":       pruned_result.perplexity,
-        "quantized_perplexity":    quantized_result.perplexity,
-        "pruned_accuracy":         pruned_result.accuracy,
-        "quantized_accuracy":      quantized_result.accuracy,
-        "pruned_per_text_loss":    pruned_result.per_text_loss,
+        "pruned_perplexity": pruned_result.perplexity,
+        "quantized_perplexity": quantized_result.perplexity,
+        "pruned_accuracy": pruned_result.accuracy,
+        "quantized_accuracy": quantized_result.accuracy,
+        "pruned_per_text_loss": pruned_result.per_text_loss,
         "quantized_per_text_loss": quantized_result.per_text_loss,
     }

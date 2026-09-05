@@ -47,13 +47,13 @@ Two DIFFERENT quantities, both provided, DO NOT conflate them:
   too expensive to call every single training step the way
   SpectralProbe is designed for.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
-
 from sili.tensor import Tensor
 
 
@@ -83,8 +83,8 @@ class SpectralProbe:
         u = rng.standard_normal(dim).astype(np.float32)
         self.u = u / (np.linalg.norm(u) + 1e-8)
         self.ema_decay = ema_decay
-        self.sigma_ema: Optional[float] = None
-        self.sigma_raw: Optional[float] = None  # last unsmoothed estimate, for convergence checks
+        self.sigma_ema: float | None = None
+        self.sigma_raw: float | None = None  # last unsmoothed estimate, for convergence checks
 
     def measure(self, layer) -> float:
         """layer must expose .forward(x: Tensor, learning_rate: float) ->
@@ -100,26 +100,27 @@ class SpectralProbe:
         sigma = float(np.linalg.norm(raw))
         self.u = raw / (sigma + eps)
         self.sigma_raw = sigma
-        self.sigma_ema = sigma if self.sigma_ema is None else (
-            self.ema_decay * self.sigma_ema + (1.0 - self.ema_decay) * sigma)
+        self.sigma_ema = (
+            sigma if self.sigma_ema is None else (self.ema_decay * self.sigma_ema + (1.0 - self.ema_decay) * sigma)
+        )
         return self.sigma_ema
 
 
 @dataclass
 class SpectralSnapshot:
     step: int
-    sigma_ema: Dict[str, float]
-    sigma_raw: Dict[str, float]
+    sigma_ema: dict[str, float]
+    sigma_raw: dict[str, float]
 
 
 @dataclass
 class SpectralTrajectory:
-    snapshots: List[SpectralSnapshot] = field(default_factory=list)
+    snapshots: list[SpectralSnapshot] = field(default_factory=list)
 
-    def layer_names(self) -> List[str]:
+    def layer_names(self) -> list[str]:
         return list(self.snapshots[0].sigma_ema.keys()) if self.snapshots else []
 
-    def series(self, layer_name: str, *, raw: bool = False) -> List[float]:
+    def series(self, layer_name: str, *, raw: bool = False) -> list[float]:
         key = "sigma_raw" if raw else "sigma_ema"
         return [getattr(s, key)[layer_name] for s in self.snapshots]
 
@@ -130,8 +131,7 @@ class SpectralTrajectory:
         return self.series(layer_name)[-1]
 
 
-def probe_layers(layers: Mapping[str, object], *, seed: int = 0,
-                  ema_decay: float = 0.9) -> Dict[str, SpectralProbe]:
+def probe_layers(layers: Mapping[str, object], *, seed: int = 0, ema_decay: float = 0.9) -> dict[str, SpectralProbe]:
     """Build one SpectralProbe per named layer, sized to each layer's own
     input width (reads .in_features/.out_features, matching every
     DISLDOLayer-family layer's own attributes). Requires SQUARE layers
@@ -146,20 +146,21 @@ def probe_layers(layers: Mapping[str, object], *, seed: int = 0,
             raise ValueError(
                 f"layer '{name}' has no .in_features/.out_features -- "
                 f"use a layer type this module doesn't yet support, or "
-                f"exact_spectral_norm (no such requirement) instead")
+                f"exact_spectral_norm (no such requirement) instead"
+            )
         if in_dim != out_dim:
             raise ValueError(
                 f"layer '{name}' is rectangular ({in_dim}x{out_dim}) -- "
                 f"SpectralProbe only works on square (state-to-state) "
                 f"layers, since it feeds its own output back in as the "
                 f"next step's input. Use exact_spectral_norm instead "
-                f"for a rectangular layer.")
+                f"for a rectangular layer."
+            )
         probes[name] = SpectralProbe(in_dim, seed=seed + i, ema_decay=ema_decay)
     return probes
 
 
-def measure_snapshot(probes: Mapping[str, SpectralProbe],
-                      layers: Mapping[str, object], step: int) -> SpectralSnapshot:
+def measure_snapshot(probes: Mapping[str, SpectralProbe], layers: Mapping[str, object], step: int) -> SpectralSnapshot:
     """One measurement pass across every probed layer -- call this
     periodically from inside a training loop (same cadence pattern as
     run()'s own periodic_eval) to build up a SpectralTrajectory."""
@@ -192,7 +193,7 @@ def track_spectral_health(
     nothing about OriginalArchModel or any specific architecture. See
     tests/test_eval_eigenvalues.py for a worked adapter.
     """
-    probes: Dict[str, SpectralProbe] = {}
+    probes: dict[str, SpectralProbe] = {}
     trajectory = SpectralTrajectory()
     for step in range(1, n_steps + 1):
         model_step_fn()
@@ -250,23 +251,24 @@ def exact_spectral_radius(layer) -> float:
         raise ValueError(
             f"exact_spectral_radius needs a square weight matrix, got "
             f"shape {W.shape} -- eigenvalues aren't defined for a "
-            f"rectangular layer (use exact_spectral_norm instead)")
+            f"rectangular layer (use exact_spectral_norm instead)"
+        )
     eigvals = np.linalg.eigvals(W)
     return float(np.max(np.abs(eigvals)))
 
 
-def exact_spectral_snapshot(layers: Mapping[str, object]) -> Dict[str, Dict[str, Optional[float]]]:
+def exact_spectral_snapshot(layers: Mapping[str, object]) -> dict[str, dict[str, float | None]]:
     """One-shot EXACT measurement across every named layer -- returns
     {name: {"norm": exact top singular value, "radius": exact spectral
     radius, or None if that layer's matrix isn't square}}. Companion to
     measure_snapshot's cheap/approximate per-step version -- use this
     one when a precise answer matters more than call cost (e.g. a final
     post-training health check, not every-N-steps tracking)."""
-    result: Dict[str, Dict[str, Optional[float]]] = {}
+    result: dict[str, dict[str, float | None]] = {}
     for name, layer in layers.items():
         W = dense_weight_matrix(layer)
         norm = float(np.linalg.svd(W, compute_uv=False)[0])
-        radius: Optional[float] = None
+        radius: float | None = None
         if W.shape[0] == W.shape[1]:
             radius = float(np.max(np.abs(np.linalg.eigvals(W))))
         result[name] = {"norm": norm, "radius": radius}

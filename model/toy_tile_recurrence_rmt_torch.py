@@ -84,9 +84,10 @@ scale_rank>1, FP4/FP8 quantization codecs themselves (this port is
 fp32-only, matching DISLDOLayer32's own math exactly minus the
 quantize/dequantize round-trip a real 4-bit/8-bit storage would add).
 """
+
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -108,17 +109,18 @@ def rmsnorm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
     return x * rrms * weight
 
 
-def gaussian_attention_torch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                             centers: torch.Tensor, sigmas: torch.Tensor) -> torch.Tensor:
+def gaussian_attention_torch(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, centers: torch.Tensor, sigmas: torch.Tensor
+) -> torch.Tensor:
     """Exact port of attention.hpp's gaussian_attention_forward: dot-
     product score * 1/sqrt(d), plus a per-query Gaussian positional
     bias -(j-center)^2/(2*sigma^2), softmax over keys, weighted V sum."""
     d = q.shape[-1]
-    scale = 1.0 / (d ** 0.5)
-    scores = (q @ k.transpose(-1, -2)) * scale                       # [T, K]
+    scale = 1.0 / (d**0.5)
+    scores = (q @ k.transpose(-1, -2)) * scale  # [T, K]
     K = scores.shape[-1]
     positions = torch.arange(K, dtype=torch.float32)
-    diff = positions.unsqueeze(0) - centers.unsqueeze(1)             # [T, K]
+    diff = positions.unsqueeze(0) - centers.unsqueeze(1)  # [T, K]
     scores = scores - diff.pow(2) / (2.0 * sigmas.unsqueeze(1).pow(2))
     attn = torch.softmax(scores, dim=-1)
     return attn @ v
@@ -135,23 +137,35 @@ class DISLDOTorchLinear:
     disldo_backward's own formula needs, with zero hand-derived
     backward-chain risk."""
 
-    def __init__(self, in_features: int, out_features: int,
-                 beta2: float = 0.999, eps: float = 1e-8,
-                 max_abs_delta: float = 2.0, max_ci: float = 100.0,
-                 min_decay_frac: float = 0.0, lr_per_row_nnz: bool = True,
-                 rng: Optional[np.random.Generator] = None,
-                 bias_correct_ci: bool = False, use_momentum: bool = False,
-                 momentum_beta1: float = 0.9, include_contrib_in_ci: bool = True,
-                 clip_raw_delta: bool = True, include_scale_chain_rule: bool = False,
-                 clip_pre_ci: bool = False, pre_ci_clip_value: Optional[float] = None,
-                 scale_grad_diag_fn: Optional[Callable] = None,
-                 use_magnitude_scale: bool = False, magnitude_scale_target: float = 16.0,
-                 magnitude_correction_rate: float = 0.01,
-                 fake_quantize_kind: Optional[str] = None,
-                 scale_invariant_chain_rule: bool = False,
-                 fake_quantize_stochastic: bool = False,
-                 magnitude_rescale_ema_beta: Optional[float] = None,
-                 magnitude_scale_both_axes: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        beta2: float = 0.999,
+        eps: float = 1e-8,
+        max_abs_delta: float = 2.0,
+        max_ci: float = 100.0,
+        min_decay_frac: float = 0.0,
+        lr_per_row_nnz: bool = True,
+        rng: np.random.Generator | None = None,
+        bias_correct_ci: bool = False,
+        use_momentum: bool = False,
+        momentum_beta1: float = 0.9,
+        include_contrib_in_ci: bool = True,
+        clip_raw_delta: bool = True,
+        include_scale_chain_rule: bool = False,
+        clip_pre_ci: bool = False,
+        pre_ci_clip_value: float | None = None,
+        scale_grad_diag_fn: Callable | None = None,
+        use_magnitude_scale: bool = False,
+        magnitude_scale_target: float = 16.0,
+        magnitude_correction_rate: float = 0.01,
+        fake_quantize_kind: str | None = None,
+        scale_invariant_chain_rule: bool = False,
+        fake_quantize_stochastic: bool = False,
+        magnitude_rescale_ema_beta: float | None = None,
+        magnitude_scale_both_axes: bool = False,
+    ):
         """The five bias_correct_ci/use_momentum/momentum_beta1/
         include_contrib_in_ci/clip_raw_delta args default to exactly
         the production C++ BoundedRMSpropSynapsePolicy's own behavior
@@ -240,9 +254,9 @@ class DISLDOTorchLinear:
         self.scale_invariant_chain_rule = scale_invariant_chain_rule
         self.fake_quantize_stochastic = fake_quantize_stochastic
         self.magnitude_rescale_ema_beta = magnitude_rescale_ema_beta
-        self.col_rms_ema: Optional[torch.Tensor] = None
+        self.col_rms_ema: torch.Tensor | None = None
         self.magnitude_scale_both_axes = magnitude_scale_both_axes
-        self.row_rms_ema: Optional[torch.Tensor] = None
+        self.row_rms_ema: torch.Tensor | None = None
 
         if rng is None:
             rng = np.random.default_rng()
@@ -261,15 +275,17 @@ class DISLDOTorchLinear:
         self.output_scale_state = torch.zeros(out_features, dtype=torch.float32)
         self.value_scale_step = 0
         self.output_scale_step = 0
-        self._pending: List[Tuple[torch.Tensor, torch.Tensor, float, bool]] = []
+        self._pending: list[tuple[torch.Tensor, torch.Tensor, float, bool]] = []
 
-    def forward(self, x: torch.Tensor, learning_rate: float,
-                damp_by_importance: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, learning_rate: float, damp_by_importance: bool = True) -> torch.Tensor:
         """x: [n_rows, in_features] (part of the SAME step's autograd
         graph -- must NOT be detached by the caller). Returns
         [n_rows, out_features], still part of that graph."""
-        true_weight = (self.w_stored * self.value_scale.unsqueeze(1)
-                       * self.output_scale.unsqueeze(0)).clone().requires_grad_(True)
+        true_weight = (
+            (self.w_stored * self.value_scale.unsqueeze(1) * self.output_scale.unsqueeze(0))
+            .clone()
+            .requires_grad_(True)
+        )
         true_weight.retain_grad()
         y = x @ true_weight
         self._pending.append((x, true_weight, learning_rate, damp_by_importance))
@@ -296,8 +312,8 @@ class DISLDOTorchLinear:
             row_degree = self.out_features  # fully dense: every row's true degree
             eff_lr = (lr / row_degree) if self.lr_per_row_nnz else lr
 
-            x_sum = x_det.sum(dim=0)                            # [in]
-            contrib = w_det * x_sum.unsqueeze(1)                # [in, out]
+            x_sum = x_det.sum(dim=0)  # [in]
+            contrib = w_det * x_sum.unsqueeze(1)  # [in, out]
 
             # S: dL/d(w_stored) = g*S, dL/d(value_scale[r]) needs
             # w_stored*output_scale, dL/d(output_scale[c]) needs
@@ -335,7 +351,7 @@ class DISLDOTorchLinear:
             self.ci_step += 1
 
             if self.bias_correct_ci:
-                bc2 = 1.0 - self.beta2 ** self.ci_step
+                bc2 = 1.0 - self.beta2**self.ci_step
                 ci_hat = self.ci / bc2 if bc2 > 0 else self.ci
             else:
                 ci_hat = self.ci
@@ -364,13 +380,15 @@ class DISLDOTorchLinear:
             # (not a one-off rescale patch) is the fix -- remove the
             # "S stays near 1" assumption, don't just compensate for it
             # after the fact.
-            numerator_for_ci_norm = -g if (self.scale_invariant_chain_rule and self.include_scale_chain_rule) else -g_for_w
+            numerator_for_ci_norm = (
+                -g if (self.scale_invariant_chain_rule and self.include_scale_chain_rule) else -g_for_w
+            )
 
             if self.use_momentum:
                 self.m = self.momentum_beta1 * self.m + (1.0 - self.momentum_beta1) * numerator_for_ci_norm
                 if self.bias_correct_ci:
-                    bc1 = 1.0 - self.momentum_beta1 ** self.ci_step
-                    numerator = (self.m / bc1 if bc1 > 0 else self.m)
+                    bc1 = 1.0 - self.momentum_beta1**self.ci_step
+                    numerator = self.m / bc1 if bc1 > 0 else self.m
                 else:
                     numerator = self.m
             else:
@@ -397,8 +415,9 @@ class DISLDOTorchLinear:
                 # let w_stored silently accumulate float precision
                 # between the RMSprop step and the magnitude-rescale
                 # step below, which isn't how the real system behaves.
-                self.w_stored = fake_quantize(self.w_stored, self.fake_quantize_kind,
-                                              stochastic=self.fake_quantize_stochastic)
+                self.w_stored = fake_quantize(
+                    self.w_stored, self.fake_quantize_kind, stochastic=self.fake_quantize_stochastic
+                )
 
             g_row = g_row_signal.sum(dim=1)
             contrib_row = contrib_row_signal.sum(dim=1)
@@ -459,7 +478,7 @@ class DISLDOTorchLinear:
         0.9) to track an EMA of col_rms across steps instead, filtering
         out per-step quantization jitter from the signal driving k."""
         with torch.no_grad():
-            instant_col_rms = torch.sqrt((self.w_stored ** 2).mean(dim=0) + self.eps)
+            instant_col_rms = torch.sqrt((self.w_stored**2).mean(dim=0) + self.eps)
             if self.magnitude_rescale_ema_beta is not None:
                 if self.col_rms_ema is None:
                     self.col_rms_ema = instant_col_rms.clone()
@@ -472,12 +491,8 @@ class DISLDOTorchLinear:
             k = (self.magnitude_scale_target / col_rms).clamp(min=1e-6) ** self.magnitude_correction_rate
             new_w = self.w_stored * k.unsqueeze(0)
             new_output_scale = self.output_scale / k
-            if self.scale_invariant_chain_rule:
-                new_ci = self.ci
-            else:
-                new_ci = self.ci / (k.unsqueeze(0) ** 2)
-            if (torch.isfinite(new_w).all() and torch.isfinite(new_output_scale).all()
-                    and torch.isfinite(new_ci).all()):
+            new_ci = self.ci if self.scale_invariant_chain_rule else self.ci / k.unsqueeze(0) ** 2
+            if torch.isfinite(new_w).all() and torch.isfinite(new_output_scale).all() and torch.isfinite(new_ci).all():
                 self.w_stored = new_w
                 self.output_scale = new_output_scale
                 self.ci = new_ci
@@ -485,8 +500,9 @@ class DISLDOTorchLinear:
                     # Same "no float shadow" reasoning as the RMSprop
                     # update site -- re-quantize immediately, this
                     # rescaled w_stored is what actually gets "stored".
-                    self.w_stored = fake_quantize(self.w_stored, self.fake_quantize_kind,
-                                                  stochastic=self.fake_quantize_stochastic)
+                    self.w_stored = fake_quantize(
+                        self.w_stored, self.fake_quantize_kind, stochastic=self.fake_quantize_stochastic
+                    )
 
             if self.magnitude_scale_both_axes:
                 # SAME treatment on the ROW axis (value_scale) -- per
@@ -503,7 +519,7 @@ class DISLDOTorchLinear:
                 # if a second SHARED axis doesn't help even when it's
                 # allowed to move freely, more basis vectors on the same
                 # axis structure are unlikely to help more.
-                row_rms_instant = torch.sqrt((self.w_stored ** 2).mean(dim=1) + self.eps)
+                row_rms_instant = torch.sqrt((self.w_stored**2).mean(dim=1) + self.eps)
                 if self.magnitude_rescale_ema_beta is not None:
                     if self.row_rms_ema is None:
                         self.row_rms_ema = row_rms_instant.clone()
@@ -516,21 +532,23 @@ class DISLDOTorchLinear:
                 k_row = (self.magnitude_scale_target / row_rms).clamp(min=1e-6) ** self.magnitude_correction_rate
                 new_w_row = self.w_stored * k_row.unsqueeze(1)
                 new_value_scale = self.value_scale / k_row
-                if self.scale_invariant_chain_rule:
-                    new_ci_row = self.ci
-                else:
-                    new_ci_row = self.ci / (k_row.unsqueeze(1) ** 2)
-                if (torch.isfinite(new_w_row).all() and torch.isfinite(new_value_scale).all()
-                        and torch.isfinite(new_ci_row).all()):
+                new_ci_row = self.ci if self.scale_invariant_chain_rule else self.ci / k_row.unsqueeze(1) ** 2
+                if (
+                    torch.isfinite(new_w_row).all()
+                    and torch.isfinite(new_value_scale).all()
+                    and torch.isfinite(new_ci_row).all()
+                ):
                     self.w_stored = new_w_row
                     self.value_scale = new_value_scale
                     self.ci = new_ci_row
                     if self.fake_quantize_kind is not None:
-                        self.w_stored = fake_quantize(self.w_stored, self.fake_quantize_kind,
-                                                      stochastic=self.fake_quantize_stochastic)
+                        self.w_stored = fake_quantize(
+                            self.w_stored, self.fake_quantize_kind, stochastic=self.fake_quantize_stochastic
+                        )
 
-    def _scale_update(self, name: str, g_agg: torch.Tensor, contrib_agg: torch.Tensor,
-                       eff_lr: float, step: int) -> None:
+    def _scale_update(
+        self, name: str, g_agg: torch.Tensor, contrib_agg: torch.Tensor, eff_lr: float, step: int
+    ) -> None:
         scale = getattr(self, name)
         state = getattr(self, f"{name}_state")
         if self.scale_invariant_chain_rule:
@@ -549,13 +567,13 @@ class DISLDOTorchLinear:
             log_grad = g_agg * scale
             log_contrib = contrib_agg * scale
             new_state = self.beta2 * state + (1.0 - self.beta2) * (log_grad * log_grad + log_contrib * log_contrib)
-            bias_correction = 1.0 - self.beta2 ** step
+            bias_correction = 1.0 - self.beta2**step
             state_hat = new_state / bias_correction if bias_correction > 0 else new_state
             log_step = eff_lr * log_grad / (torch.sqrt(state_hat) + self.eps)
             new_scale = scale * torch.exp(-log_step)
         else:
             new_state = self.beta2 * state + (1.0 - self.beta2) * (g_agg * g_agg + contrib_agg * contrib_agg)
-            bias_correction = 1.0 - self.beta2 ** step
+            bias_correction = 1.0 - self.beta2**step
             state_hat = new_state / bias_correction if bias_correction > 0 else new_state
             new_scale = scale - eff_lr * g_agg / (torch.sqrt(state_hat) + self.eps)
         if torch.isfinite(new_state).all() and torch.isfinite(new_scale).all():
@@ -570,10 +588,18 @@ class ToyTileRecurrenceRMTTorch:
     model/toy_tile_recurrence_rmt.py; every architectural/optimizer
     choice is intentionally identical."""
 
-    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
-                 num_tiles: int, num_memory_slots: int, rms_eps: float = 1e-6,
-                 clip_range: float = 6.0, l1_sparsity_coef: float = 0.0,
-                 rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_width: int,
+        column_neurons: int,
+        num_tiles: int,
+        num_memory_slots: int,
+        rms_eps: float = 1e-6,
+        clip_range: float = 6.0,
+        l1_sparsity_coef: float = 0.0,
+        rng: np.random.Generator | None = None,
+    ):
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -594,31 +620,31 @@ class ToyTileRecurrenceRMTTorch:
         self.v_proj = DISLDOTorchLinear(sw, sw, rng=rng)
         self.o_proj = DISLDOTorchLinear(sw, sw, rng=rng)
         self.lm_head = DISLDOTorchLinear(embed_width, vocab_size, rng=rng)
-        self._real_layers = [self.input_proj, self.q_proj, self.k_proj,
-                             self.v_proj, self.o_proj, self.lm_head]
+        self._real_layers = [self.input_proj, self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.lm_head]
 
         self.input_ln = torch.ones(sw, requires_grad=True)
         self.memory_ln = torch.ones(sw, requires_grad=True)
         self.state_ln = torch.ones(sw, requires_grad=True)
-        self.centers = torch.tensor([i + 0.5 for i in range(self.total_slots)],
-                                    dtype=torch.float32, requires_grad=True)
+        self.centers = torch.tensor([i + 0.5 for i in range(self.total_slots)], dtype=torch.float32, requires_grad=True)
         self.log_sigmas = torch.zeros(self.total_slots, requires_grad=True)
 
-    def parameters_for_optimizer(self) -> List[torch.Tensor]:
+    def parameters_for_optimizer(self) -> list[torch.Tensor]:
         return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
 
     def zero_grad(self) -> None:
         for p in self.parameters_for_optimizer():
             p.grad = None
 
-    def _l1_sparsity_split(self, layer: DISLDOTorchLinear, input_t: torch.Tensor,
-                           lr: float, coef: float) -> torch.Tensor:
+    def _l1_sparsity_split(
+        self, layer: DISLDOTorchLinear, input_t: torch.Tensor, lr: float, coef: float
+    ) -> torch.Tensor:
         out_aux = layer.forward(input_t, lr, damp_by_importance=False)
         n = float(out_aux.numel())
         return out_aux.abs().sum() * (coef / n)
 
-    def step(self, x_window: np.ndarray, memory_prev: np.ndarray,
-             learning_rate: float) -> Tuple[np.ndarray, torch.Tensor, Optional[torch.Tensor]]:
+    def step(
+        self, x_window: np.ndarray, memory_prev: np.ndarray, learning_rate: float
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor | None]:
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
         x_window_t = torch.tensor(x_window, dtype=torch.float32)
@@ -645,8 +671,12 @@ class ToyTileRecurrenceRMTTorch:
                 self._l1_sparsity_split(self.q_proj, combined_normed, learning_rate, self.l1_sparsity_coef),
                 self._l1_sparsity_split(self.k_proj, combined_normed, learning_rate, self.l1_sparsity_coef),
                 self._l1_sparsity_split(self.v_proj, combined_normed, learning_rate, self.l1_sparsity_coef),
-                self._l1_sparsity_split(self.o_proj, gaussian_attention_torch(q, k, v, self.centers, sigmas),
-                                         learning_rate, self.l1_sparsity_coef),
+                self._l1_sparsity_split(
+                    self.o_proj,
+                    gaussian_attention_torch(q, k, v, self.centers, sigmas),
+                    learning_rate,
+                    self.l1_sparsity_coef,
+                ),
             ]
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
@@ -680,5 +710,5 @@ class ToyTileRecurrenceRMTTorch:
             layer.apply_pending_updates()
 
 
-def clip_grad_norm_(params: List[torch.Tensor], max_norm: float) -> None:
+def clip_grad_norm_(params: list[torch.Tensor], max_norm: float) -> None:
     torch.nn.utils.clip_grad_norm_([p for p in params if p.grad is not None], max_norm)

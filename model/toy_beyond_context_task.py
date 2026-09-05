@@ -19,9 +19,8 @@ label (ordinary next-token prediction). vocab_size=3 (`0`, `1`, `'?'`
 mid-sequence, unlike an earlier 2-token design that had no way to
 distinguish those (direct correction).
 """
-from __future__ import annotations
 
-from typing import List, Tuple
+from __future__ import annotations
 
 import numpy as np
 
@@ -29,7 +28,7 @@ QUERY_TOKEN = 2
 VOCAB_SIZE = 3
 
 
-def generate_parity_sequence(rng: np.random.RandomState, n_bits: int) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+def generate_parity_sequence(rng: np.random.RandomState, n_bits: int) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """Returns (tokens [n_bits+2], pairs) -- tokens = n_bits random
     bits, then QUERY_TOKEN, then the running-parity answer bit (XOR of
     all n_bits). pairs = [(query_position, answer_bit)], directly
@@ -56,8 +55,9 @@ def generate_parity_sequence(rng: np.random.RandomState, n_bits: int) -> Tuple[n
 DEVIATION_BASE_PATTERN = np.array([1, 0, 1], dtype=np.int64)
 
 
-def generate_deviation_sequence(rng: np.random.RandomState, n_positions: int,
-                                deviation_prob: float = 0.5) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+def generate_deviation_sequence(
+    rng: np.random.RandomState, n_positions: int, deviation_prob: float = 0.5
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """Dense repeating base pattern (DEVIATION_BASE_PATTERN, fixed
     across all sequences) with at most ONE sparse deviation (a single
     flipped bit) inserted at a random position. Answer = 1 if any

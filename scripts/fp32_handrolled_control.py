@@ -22,6 +22,7 @@ real part of it), independent of precision.
 
 Run: python -m scripts.fp32_handrolled_control
 """
+
 from __future__ import annotations
 
 import sys
@@ -31,12 +32,18 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import (
-    DenseTensorLinear, rmsnorm_tensor, cross_entropy_sum, predicted_token,
-    apply_gradient_step, backward_with_grad_clip, lr_schedule,
-)
 from sili.tensor import Tensor, banded_attention, silu
+
+from model.toy_recall_models import (
+    DenseTensorLinear,
+    apply_gradient_step,
+    backward_with_grad_clip,
+    cross_entropy_sum,
+    lr_schedule,
+    predicted_token,
+    rmsnorm_tensor,
+)
+from model.toy_recall_task import generate_mqar_sequence
 
 
 class Fp32Layer:
@@ -94,8 +101,20 @@ class Fp32Transformer:
         return self.lm_head.forward(x)
 
 
-def train_and_eval(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, n_layers,
-                    train_steps, warmup_steps, peak_lr, max_grad_norm, eval_sequences, seed):
+def train_and_eval(
+    seq_len,
+    num_kv_pairs,
+    vocab,
+    hidden,
+    mlp_hidden,
+    n_layers,
+    train_steps,
+    warmup_steps,
+    peak_lr,
+    max_grad_norm,
+    eval_sequences,
+    seed,
+):
     rng = np.random.RandomState(seed)
     np.random.seed(seed)  # DenseTensorLinear's own init uses the global RNG
     model = Fp32Transformer(vocab, hidden, mlp_hidden, n_layers)
@@ -132,16 +151,29 @@ def main():
     eval_sequences = 60
     configs = [(16, 2, 20), (32, 4, 40)]
 
-    print(f"hidden={hidden} mlp_hidden={mlp_hidden} n_layers={n_layers} "
-          f"train_steps={train_steps} warmup={warmup_steps} peak_lr={peak_lr} "
-          f"max_grad_norm={max_grad_norm} precision=fp32 optimizer=hand-rolled-SGD+clip\n")
+    print(
+        f"hidden={hidden} mlp_hidden={mlp_hidden} n_layers={n_layers} "
+        f"train_steps={train_steps} warmup={warmup_steps} peak_lr={peak_lr} "
+        f"max_grad_norm={max_grad_norm} precision=fp32 optimizer=hand-rolled-SGD+clip\n"
+    )
     for seq_len, num_kv_pairs, vocab in configs:
         print(f"seq_len={seq_len} num_kv_pairs={num_kv_pairs} vocab={vocab}")
         t0 = time.time()
-        acc = train_and_eval(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, n_layers,
-                             train_steps, warmup_steps, peak_lr, max_grad_norm,
-                             eval_sequences, seed=1000 + seq_len)
-        print(f"  -> eval accuracy: {acc:.2f}  ({time.time()-t0:.1f}s)\n")
+        acc = train_and_eval(
+            seq_len,
+            num_kv_pairs,
+            vocab,
+            hidden,
+            mlp_hidden,
+            n_layers,
+            train_steps,
+            warmup_steps,
+            peak_lr,
+            max_grad_norm,
+            eval_sequences,
+            seed=1000 + seq_len,
+        )
+        print(f"  -> eval accuracy: {acc:.2f}  ({time.time() - t0:.1f}s)\n")
 
 
 if __name__ == "__main__":

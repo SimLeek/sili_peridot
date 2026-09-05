@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 import numpy as np
-
-from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, silu, power, tensor_abs
-from sili.sparse_rnn import DISLDOLayer
 from sili.energy import EnergyDynamics
+from sili.sparse_rnn import DISLDOLayer
+from sili.tensor import Tensor, exp, gaussian_attention, power, reduce_sum, tensor_abs
 
+from .toy_precision_models import _apply_energy, _toy_scale_energy
 from .toy_recall_models import rmsnorm_tensor, sigmoid_tensor
-from .toy_precision_models import _toy_scale_energy, _apply_energy
 
 
 class ToyTileRecurrenceRealFP4:
@@ -94,21 +91,33 @@ class ToyTileRecurrenceRealFP4:
     problem is in the task/embedding/harness, not this class's
     recurrence design specifically."""
 
-    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
-                 mlp_hidden: int, num_tiles: int, max_weights: int,
-                 num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer,
-                 use_energy: bool = False, energy_kwargs: Optional[dict] = None,
-                 use_attention: bool = True, o_proj_depth: int = 1,
-                 dense: bool = False, clip_range: float = 6.0,
-                 magnitude_penalty_coef: float = 0.0,
-                 spectral_norm_target: Optional[float] = None,
-                 spectral_norm_ema_decay: float = 0.9,
-                 l1_sparsity_coef: float = 0.0,
-                 cosine_lm_head: bool = False,
-                 gated_combine: bool = False,
-                 gated_update: bool = False,
-                 gate_floor: float = 0.1,
-                 rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_width: int,
+        column_neurons: int,
+        mlp_hidden: int,
+        num_tiles: int,
+        max_weights: int,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+        disldo_cls=DISLDOLayer,
+        use_energy: bool = False,
+        energy_kwargs: dict | None = None,
+        use_attention: bool = True,
+        o_proj_depth: int = 1,
+        dense: bool = False,
+        clip_range: float = 6.0,
+        magnitude_penalty_coef: float = 0.0,
+        spectral_norm_target: float | None = None,
+        spectral_norm_ema_decay: float = 0.9,
+        l1_sparsity_coef: float = 0.0,
+        cosine_lm_head: bool = False,
+        gated_combine: bool = False,
+        gated_update: bool = False,
+        gate_floor: float = 0.1,
+        rng: np.random.Generator | None = None,
+    ):
         """mlp_hidden is retained in the signature for API compatibility
         but is no longer used since the MLP block was removed.
 
@@ -349,9 +358,7 @@ class ToyTileRecurrenceRealFP4:
         self.use_attention = use_attention
         self.o_proj_depth = o_proj_depth
 
-        if not use_attention:
-            self.energy = None
-        elif not use_energy:
+        if not use_attention or not use_energy:
             self.energy = None
         elif energy_kwargs is not None:
             self.energy = EnergyDynamics(**energy_kwargs)
@@ -405,41 +412,104 @@ class ToyTileRecurrenceRealFP4:
         # problem it was never meant to solve, not an intentional design.
         # The wide state's actual content for a fresh token must come from
         # a real learned mapping, same as q/k/v/o_proj/lm_head.
-        self.input_proj = disldo_cls(embed_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+        self.input_proj = disldo_cls(
+            embed_width,
+            state_width,
+            max_weights,
+            num_cpus,
+            rng=np.random.default_rng(next(layer_seeds)),
+            **dense_kwargs,
+        )
 
         # 0.5. Gated combine (opt-in) -- see gated_combine's own docstring
         # above for the full rationale.
         if gated_combine:
-            self.gate_x_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                          rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-            self.gate_m_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                          rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+            self.gate_x_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
+            self.gate_m_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
         if gated_update:
-            self.update_forget_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                                 rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-            self.update_input_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                                rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+            self.update_forget_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
+            self.update_input_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
 
         # 1. Core Attention & Output Projections
         if use_attention:
-            self.q_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-            self.k_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-            self.v_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
+            self.q_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
+            self.k_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
+            self.v_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
         if o_proj_depth > 1:
             per_layer_weights = max(max_weights // o_proj_depth, state_width)
-            self.o_proj = [disldo_cls(state_width, state_width, per_layer_weights, num_cpus,
-                                      rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-                          for _ in range(o_proj_depth)]
+            self.o_proj = [
+                disldo_cls(
+                    state_width,
+                    state_width,
+                    per_layer_weights,
+                    num_cpus,
+                    rng=np.random.default_rng(next(layer_seeds)),
+                    **dense_kwargs,
+                )
+                for _ in range(o_proj_depth)
+            ]
         else:
-            self.o_proj = disldo_cls(state_width, state_width, max_weights, num_cpus,
-                                     rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-        self.lm_head = disldo_cls(embed_width, vocab_size, max_weights, num_cpus,
-                                  rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs)
-        
+            self.o_proj = disldo_cls(
+                state_width,
+                state_width,
+                max_weights,
+                num_cpus,
+                rng=np.random.default_rng(next(layer_seeds)),
+                **dense_kwargs,
+            )
+        self.lm_head = disldo_cls(
+            embed_width, vocab_size, max_weights, num_cpus, rng=np.random.default_rng(next(layer_seeds)), **dense_kwargs
+        )
+
         # 2. Norms & Gaussian Attention Params
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.state_ln = Tensor(np.ones(state_width, dtype=np.float32))
@@ -458,8 +528,7 @@ class ToyTileRecurrenceRealFP4:
         # reproducibility for code that never asked for this feature.
         if spectral_norm_target is not None:
             n_o_layers = o_proj_depth if o_proj_depth > 1 else 1
-            self._spectral_u = [rng.standard_normal(state_width).astype(np.float32)
-                                for _ in range(n_o_layers)]
+            self._spectral_u = [rng.standard_normal(state_width).astype(np.float32) for _ in range(n_o_layers)]
             self._spectral_u = [u / (np.linalg.norm(u) + 1e-8) for u in self._spectral_u]
             self._spectral_sigma_ema = [None] * n_o_layers
             # Warm-start: a single untrained random probe vector badly
@@ -477,7 +546,7 @@ class ToyTileRecurrenceRealFP4:
                 for idx, layer in enumerate(o_layers):
                     self._spectral_rescale_factor(layer, idx)
 
-    def parameters_for_optimizer(self) -> List[Tensor]:
+    def parameters_for_optimizer(self) -> list[Tensor]:
         """ONLY the plain leaf params (RMSNorm weights, gaussian
         centers/log_sigmas) -- DISLDOLayer-family layers' own big
         weight matrices train inline during backward(), never via an
@@ -489,21 +558,25 @@ class ToyTileRecurrenceRealFP4:
         print("\n=== Model Learning Diagnostics ===")
         params = self.parameters_for_optimizer()
         param_names = ["input_ln", "state_ln", "centers", "log_sigmas"]
-        
-        for name, p in zip(param_names, params):
+
+        for name, p in zip(param_names, params, strict=False):
             # Check if parameter data has variance (isn't completely zeroed out)
             data_active = np.any(p.data != 0)
             data_mean = np.mean(p.data)
-            
+
             if p.grad is not None:
                 # Use np.any to ensure gradients aren't getting squashed entirely to 0
                 grad_active = np.any(p.grad != 0)
                 grad_mean = np.mean(np.abs(p.grad))
                 has_nans = np.any(np.isnan(p.grad))
-                print(f"{name:12s} | Data Active: {data_active} (mean: {data_mean:.4f}) | "
-                      f"Grad Active: {grad_active} (mean |grad|: {grad_mean:.6e}) | NaN Grad: {has_nans}")
+                print(
+                    f"{name:12s} | Data Active: {data_active} (mean: {data_mean:.4f}) | "
+                    f"Grad Active: {grad_active} (mean |grad|: {grad_mean:.6e}) | NaN Grad: {has_nans}"
+                )
             else:
-                print(f"{name:12s} | Data Active: {data_active} (mean: {data_mean:.4f}) | Grad: NONE (Not computed yet)")
+                print(
+                    f"{name:12s} | Data Active: {data_active} (mean: {data_mean:.4f}) | Grad: NONE (Not computed yet)"
+                )
         print("==================================\n")
 
     def _spectral_rescale_factor(self, layer, idx: int) -> float:
@@ -547,8 +620,11 @@ class ToyTileRecurrenceRealFP4:
         sigma = float(np.linalg.norm(raw))
         self._spectral_u[idx] = raw / (sigma + eps)
         prev = self._spectral_sigma_ema[idx]
-        ema = sigma if prev is None else (
-            self.spectral_norm_ema_decay * prev + (1.0 - self.spectral_norm_ema_decay) * sigma)
+        ema = (
+            sigma
+            if prev is None
+            else (self.spectral_norm_ema_decay * prev + (1.0 - self.spectral_norm_ema_decay) * sigma)
+        )
         self._spectral_sigma_ema[idx] = ema
         return self.spectral_norm_target / max(ema, eps)
 
@@ -575,8 +651,9 @@ class ToyTileRecurrenceRealFP4:
             x = x * self._spectral_rescale_factor(self.o_proj, 0)
         return x
 
-    def step(self, x_window: np.ndarray, M_prev: np.ndarray,
-             learning_rate: float, debug: bool = False) -> Tuple[np.ndarray, Tensor, Optional[Tensor]]:
+    def step(
+        self, x_window: np.ndarray, M_prev: np.ndarray, learning_rate: float, debug: bool = False
+    ) -> tuple[np.ndarray, Tensor, Tensor | None]:
         """One recurrence tick. x_window: [num_tiles, embed_width] numpy
         (a real, narrow per-tile input -- e.g. a token embedding, or
         zeros for "nothing here yet" -- mapped into the wide state by
@@ -600,11 +677,16 @@ class ToyTileRecurrenceRealFP4:
         succeeds -- compare `_last_step_debug_stats` across a dense and
         a sparse model at the same seed/step to find exactly where
         their value distributions diverge."""
+
         def _stats(name, arr):
             a = np.asarray(arr)
-            return {"mean": float(a.mean()), "std": float(a.std()),
-                   "min": float(a.min()), "max": float(a.max()),
-                   "abs_max": float(np.abs(a).max())}
+            return {
+                "mean": float(a.mean()),
+                "std": float(a.std()),
+                "min": float(a.min()),
+                "max": float(a.max()),
+                "abs_max": float(np.abs(a).max()),
+            }
 
         dbg = {} if debug else None
 
@@ -618,8 +700,9 @@ class ToyTileRecurrenceRealFP4:
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         if self.gated_combine:
-            gate_logit = self.gate_x_proj.forward(x_normed, learning_rate) \
-                + self.gate_m_proj.forward(m_normed, learning_rate)
+            gate_logit = self.gate_x_proj.forward(x_normed, learning_rate) + self.gate_m_proj.forward(
+                m_normed, learning_rate
+            )
             gate_raw = sigmoid_tensor(gate_logit)
             gate = self.gate_floor + (1.0 - 2.0 * self.gate_floor) * gate_raw
             qkv_source = gate * x_normed + (1.0 - gate) * m_normed
@@ -641,8 +724,7 @@ class ToyTileRecurrenceRealFP4:
                 dbg["k"] = _stats("k", k.data)
                 dbg["v"] = _stats("v", v.data)
 
-            attn = gaussian_attention(q, k, v, self.centers, sigmas,
-                                      num_cpus=self.num_cpus, causal=False)
+            attn = gaussian_attention(q, k, v, self.centers, sigmas, num_cpus=self.num_cpus, causal=False)
             if debug:
                 dbg["attn_raw"] = _stats("attn_raw", attn.data)
             attn, aux_loss = _apply_energy(self.energy, attn, self.num_tiles, self.state_width)
@@ -656,8 +738,12 @@ class ToyTileRecurrenceRealFP4:
         if self.l1_sparsity_coef > 0.0:
             l1_terms = [self._l1_sparsity_split(self.input_proj, x_window_t, learning_rate, self.l1_sparsity_coef)]
             if self.gated_combine:
-                l1_terms.append(self._l1_sparsity_split(self.gate_x_proj, x_normed, learning_rate, self.l1_sparsity_coef))
-                l1_terms.append(self._l1_sparsity_split(self.gate_m_proj, m_normed, learning_rate, self.l1_sparsity_coef))
+                l1_terms.append(
+                    self._l1_sparsity_split(self.gate_x_proj, x_normed, learning_rate, self.l1_sparsity_coef)
+                )
+                l1_terms.append(
+                    self._l1_sparsity_split(self.gate_m_proj, m_normed, learning_rate, self.l1_sparsity_coef)
+                )
             if self.use_attention:
                 l1_terms.append(self._l1_sparsity_split(self.q_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
                 l1_terms.append(self._l1_sparsity_split(self.k_proj, qkv_source, learning_rate, self.l1_sparsity_coef))
@@ -668,7 +754,9 @@ class ToyTileRecurrenceRealFP4:
                     l1_terms.append(self._l1_sparsity_split(layer, cur, learning_rate, self.l1_sparsity_coef))
                     cur = layer.forward(cur, 0.0)
             else:
-                l1_terms.append(self._l1_sparsity_split(self.o_proj, o_proj_input, learning_rate, self.l1_sparsity_coef))
+                l1_terms.append(
+                    self._l1_sparsity_split(self.o_proj, o_proj_input, learning_rate, self.l1_sparsity_coef)
+                )
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
         # Forward clip on the residual UPDATE itself, not just the final
@@ -703,13 +791,15 @@ class ToyTileRecurrenceRealFP4:
             # (avoids needing concat), sigmoid, gate_floor-clamped pattern
             # as gated_combine, applied here instead/as well.
             M_prev_t = Tensor(M_prev.astype(np.float32))
-            forget_logit = self.update_forget_proj.forward(M_prev_t, learning_rate) \
-                + self.update_input_proj.forward(attn, learning_rate)
+            forget_logit = self.update_forget_proj.forward(M_prev_t, learning_rate) + self.update_input_proj.forward(
+                attn, learning_rate
+            )
             forget_raw = sigmoid_tensor(forget_logit)
             forget_gate = self.gate_floor + (1.0 - 2.0 * self.gate_floor) * forget_raw
             if self.l1_sparsity_coef > 0.0:
-                update_l1 = self._l1_sparsity_split(self.update_forget_proj, M_prev_t, learning_rate, self.l1_sparsity_coef) \
-                    + self._l1_sparsity_split(self.update_input_proj, attn, learning_rate, self.l1_sparsity_coef)
+                update_l1 = self._l1_sparsity_split(
+                    self.update_forget_proj, M_prev_t, learning_rate, self.l1_sparsity_coef
+                ) + self._l1_sparsity_split(self.update_input_proj, attn, learning_rate, self.l1_sparsity_coef)
                 aux_loss = update_l1 if aux_loss is None else aux_loss + update_l1
             M_new_t = forget_gate * M_prev_t + (1.0 - forget_gate) * attn
             if debug:
@@ -748,7 +838,7 @@ class ToyTileRecurrenceRealFP4:
             # always the LAST lm_head.forward() before backward.
             probes = Tensor(np.eye(self.embed_width, dtype=np.float32))
             probe_out = self.lm_head.forward(probes, 0.0).data  # [embed_width, vocab_size]
-            row_norms = np.sqrt((probe_out ** 2).sum(axis=0)) + self.rms_eps  # [vocab_size]
+            row_norms = np.sqrt((probe_out**2).sum(axis=0)) + self.rms_eps  # [vocab_size]
         if self.l1_sparsity_coef > 0.0:
             # lm_head's own direct escape route -- see l1_sparsity_coef's
             # docstring for why this can't just rely on q/k/v/o_proj's

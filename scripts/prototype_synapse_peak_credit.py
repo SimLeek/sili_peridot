@@ -12,13 +12,14 @@ tiny state width, should run in well under a second. Only worth
 building the C++ kernel / wiring into the real architecture if THIS
 shows the effect first.
 """
+
 import time
+
 import numpy as np
-
-from sili.sparse_rnn import DISLDOLayer
 from sili import _cpu
+from sili.sparse_rnn import DISLDOLayer
 
-VOCAB = 3          # 0, 1, '?' -- matches model/toy_beyond_context_task.py
+VOCAB = 3  # 0, 1, '?' -- matches model/toy_beyond_context_task.py
 STATE_WIDTH = 6
 IN_FEATURES = VOCAB + STATE_WIDTH
 MAX_WEIGHTS = 24
@@ -50,7 +51,7 @@ class PeakSynapseCell:
         self.layer = DISLDOLayer(in_features, out_features, max_weights, num_cpus)
         self.in_features = in_features
         self.peak_decay = peak_decay
-        self.peak = np.zeros(in_features, dtype=np.float32)      # signed
+        self.peak = np.zeros(in_features, dtype=np.float32)  # signed
         self.peak_mag = np.zeros(in_features, dtype=np.float32)  # |peak|
 
     def update_peak(self, x_row: np.ndarray) -> None:
@@ -65,8 +66,9 @@ class PeakSynapseCell:
         self.update_peak(x[0] if x.ndim == 2 else x)
         return self.layer.forward(x, learning_rate)
 
-    def correct_from_peaks(self, dy: np.ndarray, learning_rate: float,
-                           threshold: float = 0.3, backprop_p: float = 1.0) -> int:
+    def correct_from_peaks(
+        self, dy: np.ndarray, learning_rate: float, threshold: float = 0.3, backprop_p: float = 1.0
+    ) -> int:
         """Call AFTER the normal backward has already fired. Returns
         the number of rows corrected (for reporting)."""
         dy = np.asarray(dy, dtype=np.float32)[np.newaxis, :]
@@ -89,7 +91,7 @@ def get_row_weight_snapshot(layer: DISLDOLayer, row: int) -> np.ndarray:
     computed from the CSR structure (ptrs/indices index into the flat
     weights_vals array)."""
     ptrs = np.asarray(layer._c.ptrs)
-    indices = np.asarray(layer._c.indices)
+    np.asarray(layer._c.indices)
     vals = np.asarray(layer._c.weights_vals)
     lo, hi = ptrs[row], ptrs[row + 1]
     return vals[lo:hi].copy()
@@ -97,7 +99,7 @@ def get_row_weight_snapshot(layer: DISLDOLayer, row: int) -> np.ndarray:
 
 def main():
     t0 = time.time()
-    rng = np.random.RandomState(0)
+    np.random.RandomState(0)
 
     cell = PeakSynapseCell(IN_FEATURES, STATE_WIDTH, MAX_WEIGHTS, NUM_CPUS)
     M = np.zeros(STATE_WIDTH, dtype=np.float32)
@@ -124,7 +126,9 @@ def main():
     row_before = get_row_weight_snapshot(cell.layer, 1).copy()  # row 1 = the '1'-token onehot slot
     vs_before = cell.layer._c.get_value_scale(1)
     ptrs = np.asarray(cell.layer._c.ptrs)
-    print(f"row 1 has {ptrs[2]-ptrs[1]} connection(s), to columns {np.asarray(cell.layer._c.indices)[ptrs[1]:ptrs[2]]}")
+    print(
+        f"row 1 has {ptrs[2] - ptrs[1]} connection(s), to columns {np.asarray(cell.layer._c.indices)[ptrs[1] : ptrs[2]]}"
+    )
     peak_row1 = cell.peak[1]
     print(f"row 1 (the '1'-token input) remembered peak: {peak_row1:.3f}")
     print(f"row 1 weight values BEFORE any correction: {row_before}, value_scale: {vs_before:.6f}")
@@ -145,12 +149,14 @@ def main():
     # for this diagnostic specifically, to disambiguate "mechanism
     # doesn't fire at all" from "fires but too small to cross an FP4
     # quantization boundary in one step".
-    for i in range(20):
+    for _i in range(20):
         n = cell.correct_from_peaks(out_query.grad, learning_rate=1.0, threshold=0.3)
     row_after_peak_correction = get_row_weight_snapshot(cell.layer, 1).copy()
     vs_after = cell.layer._c.get_value_scale(1)
     print(f"rows corrected via peak mechanism (last call): {n}")
-    print(f"row 1 weight values AFTER 20x peak correction (lr=1.0): {row_after_peak_correction}, value_scale: {vs_after:.6f}")
+    print(
+        f"row 1 weight values AFTER 20x peak correction (lr=1.0): {row_after_peak_correction}, value_scale: {vs_after:.6f}"
+    )
     print(f"  weight changed from normal-only: {not np.allclose(row_after_normal, row_after_peak_correction)}")
     print(f"  value_scale changed: {vs_after != vs_before}")
     print(f"  finite: {np.all(np.isfinite(row_after_peak_correction))}")

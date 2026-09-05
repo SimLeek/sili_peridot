@@ -14,8 +14,9 @@ with-importance policy was built for -- a run that LOOKS stuck at
 Run: python3 scripts/fit_mqar_loss_curve.py <log_file>
   (reads the TRAJECTORY_JSON line printed by train_mqar_rmt_ablation.py)
 """
-import sys
+
 import json
+import sys
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -37,16 +38,17 @@ def fit_and_report(trajectory, label=""):
     loss0, loss_last = losses[0], losses[-1]
     p0 = [max(loss_last - 0.1, 0.0), max(loss0 - loss_last, 0.1), steps[-1] / 3]
     try:
-        popt, _ = curve_fit(exp_approach, steps, losses, p0=p0,
-                            bounds=([0.0, -20.0, 1.0], [20.0, 20.0, steps[-1] * 50]),
-                            maxfev=20000)
-        loss_inf, amplitude, tau = popt
+        popt, _ = curve_fit(
+            exp_approach, steps, losses, p0=p0, bounds=([0.0, -20.0, 1.0], [20.0, 20.0, steps[-1] * 50]), maxfev=20000
+        )
+        loss_inf, _amplitude, tau = popt
         pred = exp_approach(steps, *popt)
         ss_res = np.sum((losses - pred) ** 2)
         ss_tot = np.sum((losses - losses.mean()) ** 2)
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-        print(f"{label}: loss_inf={loss_inf:.4f}  tau={tau:.0f} steps  "
-              f"R^2={r2:.4f}  (last observed loss={loss_last:.4f})")
+        print(
+            f"{label}: loss_inf={loss_inf:.4f}  tau={tau:.0f} steps  R^2={r2:.4f}  (last observed loss={loss_last:.4f})"
+        )
         return {"loss_inf": loss_inf, "tau": tau, "r2": r2, "last_loss": loss_last}
     except Exception as e:
         print(f"{label}: fit failed - {type(e).__name__}: {e}")
@@ -57,11 +59,11 @@ def main():
     log_file = sys.argv[1]
     with open(log_file) as f:
         content = f.read()
-    line = next((l for l in content.splitlines() if l.startswith("TRAJECTORY_JSON ")), None)
+    line = next((ln for ln in content.splitlines() if ln.startswith("TRAJECTORY_JSON ")), None)
     if line is None:
         print("No TRAJECTORY_JSON line found in", log_file)
         return
-    trajectory = json.loads(line[len("TRAJECTORY_JSON "):])
+    trajectory = json.loads(line[len("TRAJECTORY_JSON ") :])
     fit_and_report(trajectory, label=log_file)
 
 

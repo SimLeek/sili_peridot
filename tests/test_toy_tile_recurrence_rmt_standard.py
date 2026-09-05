@@ -1,13 +1,14 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from model.toy_tile_recurrence_rmt_standard import ToyTileRecurrenceRMTStandard
-
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
@@ -29,6 +30,7 @@ class TestToyTileRecurrenceRMTStandard:
         assert torch.isfinite(memory_new).all()
         assert torch.isfinite(logits).all()
 
+    @pytest.mark.integration  # real training-convergence run
     def test_loss_decreases_on_a_single_repeated_example(self):
         model = _model()
         opt = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -50,4 +52,5 @@ class TestToyTileRecurrenceRMTStandard:
             min_loss = loss_val if min_loss is None else min(min_loss, loss_val)
 
         assert min_loss < first_loss * 0.5, (
-            f"loss never reached a real minimum: {first_loss:.3f} -> best {min_loss:.3f}")
+            f"loss never reached a real minimum: {first_loss:.3f} -> best {min_loss:.3f}"
+        )

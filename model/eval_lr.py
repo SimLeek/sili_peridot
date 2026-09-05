@@ -33,13 +33,14 @@ short train, return a scalar to MAXIMIZE). See tests/test_eval_lr.py for
 a worked adapter around scripts/l1_sparsity_probe.py's OriginalArchModel/
 run/evaluate, which is what this module replaces the manual version of.
 """
+
 from __future__ import annotations
 
 import math
 import statistics
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, List, Sequence, Tuple
 
 # Golden ratio conjugate (~0.618) -- both the expansion factor used while
 # bracketing and the interval-split ratio used while refining. Using the
@@ -66,7 +67,7 @@ class LRSearchResult:
     # (log(lr), mean_score) for every DISTINCT lr actually evaluated, in
     # the order tried -- lets a caller plot/inspect the search trajectory,
     # not just the final answer.
-    history: List[Tuple[float, float]] = field(default_factory=list)
+    history: list[tuple[float, float]] = field(default_factory=list)
 
 
 def find_optimal_lr(
@@ -97,7 +98,7 @@ def find_optimal_lr(
     """
     t_start = time.time()
     seeds = list(seeds)
-    history: List[Tuple[float, float]] = []
+    history: list[tuple[float, float]] = []
     cache: dict = {}  # rounded log(lr) -> score, avoids re-running an identical trial
     best_lr, best_score = initial_lr, float("-inf")
 
@@ -123,8 +124,7 @@ def find_optimal_lr(
     f_a = evaluate(log_a)
     stopped_reason = "max_bracket_steps"
     if deadline_hit():
-        return LRSearchResult(best_lr, best_score, len(history),
-                               time.time() - t_start, "time_budget", history)
+        return LRSearchResult(best_lr, best_score, len(history), time.time() - t_start, "time_budget", history)
 
     log_b = log_a + math.log(_GOLD_EXPAND)
     f_b = evaluate(log_b)
@@ -158,7 +158,7 @@ def find_optimal_lr(
         log_a, f_a = log_b, f_b
         log_b, f_b = log_c, f_c
     # Normalize so lo < hi regardless of which direction we expanded in.
-    lo, mid, hi = sorted([(log_a, f_a), (log_b, f_b), (log_c, f_c)], key=lambda t: t[0])
+    lo, _mid, hi = sorted([(log_a, f_a), (log_b, f_b), (log_c, f_c)], key=lambda t: t[0])
     log_lo, log_hi = lo[0], hi[0]
 
     # ── Phase 2: golden-section refinement ──────────────────────────────
@@ -183,5 +183,4 @@ def find_optimal_lr(
         else:
             stopped_reason = "converged"
 
-    return LRSearchResult(best_lr, best_score, len(history),
-                           time.time() - t_start, stopped_reason, history)
+    return LRSearchResult(best_lr, best_score, len(history), time.time() - t_start, stopped_reason, history)

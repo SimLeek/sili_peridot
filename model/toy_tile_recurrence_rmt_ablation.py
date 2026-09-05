@@ -36,16 +36,18 @@ the standard reference, not one of the four named here; disabling it
 uniformly across all 4 ablation runs keeps it out of this specific
 test rather than silently confounding it.
 """
-from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from __future__ import annotations
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 from .toy_tile_recurrence_rmt_torch import (
-    DISLDOTorchLinear, straight_through_clip, rmsnorm_torch, gaussian_attention_torch,
+    DISLDOTorchLinear,
+    gaussian_attention_torch,
+    rmsnorm_torch,
+    straight_through_clip,
 )
 
 
@@ -61,8 +63,7 @@ class PlainAdamLinear:
     def __init__(self, in_features: int, out_features: int):
         self.linear = nn.Linear(in_features, out_features, bias=False)
 
-    def forward(self, x: torch.Tensor, learning_rate: float,
-                damp_by_importance: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, learning_rate: float, damp_by_importance: bool = True) -> torch.Tensor:
         return self.linear(x)
 
     def apply_pending_updates(self) -> None:
@@ -73,13 +74,23 @@ class PlainAdamLinear:
 
 
 class ToyTileRecurrenceRMTAblation:
-    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
-                 num_tiles: int, num_memory_slots: int, rms_eps: float = 1e-6,
-                 clip_range: float = 6.0, l1_sparsity_coef: float = 0.0,
-                 use_custom_optimizer: bool = True, use_hard_clip: bool = True,
-                 use_gaussian_bias: bool = True, use_rmsnorm: bool = True,
-                 rng: Optional[np.random.Generator] = None,
-                 optimizer_kwargs: Optional[dict] = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_width: int,
+        column_neurons: int,
+        num_tiles: int,
+        num_memory_slots: int,
+        rms_eps: float = 1e-6,
+        clip_range: float = 6.0,
+        l1_sparsity_coef: float = 0.0,
+        use_custom_optimizer: bool = True,
+        use_hard_clip: bool = True,
+        use_gaussian_bias: bool = True,
+        use_rmsnorm: bool = True,
+        rng: np.random.Generator | None = None,
+        optimizer_kwargs: dict | None = None,
+    ):
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -100,8 +111,11 @@ class ToyTileRecurrenceRMTAblation:
         self.optimizer_kwargs = optimizer_kwargs or {}
 
         def make_linear(in_f, out_f):
-            return DISLDOTorchLinear(in_f, out_f, rng=rng, **self.optimizer_kwargs) \
-                if use_custom_optimizer else PlainAdamLinear(in_f, out_f)
+            return (
+                DISLDOTorchLinear(in_f, out_f, rng=rng, **self.optimizer_kwargs)
+                if use_custom_optimizer
+                else PlainAdamLinear(in_f, out_f)
+            )
 
         self.input_proj = make_linear(embed_width, sw)
         self.q_proj = make_linear(sw, sw)
@@ -109,10 +123,9 @@ class ToyTileRecurrenceRMTAblation:
         self.v_proj = make_linear(sw, sw)
         self.o_proj = make_linear(sw, sw)
         self.lm_head = make_linear(embed_width, vocab_size)
-        self._real_layers = [self.input_proj, self.q_proj, self.k_proj,
-                             self.v_proj, self.o_proj, self.lm_head]
+        self._real_layers = [self.input_proj, self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.lm_head]
 
-        self._adam_params: List[torch.Tensor] = []
+        self._adam_params: list[torch.Tensor] = []
 
         if use_rmsnorm:
             self.input_ln = torch.ones(sw, requires_grad=True)
@@ -128,8 +141,9 @@ class ToyTileRecurrenceRMTAblation:
             self._adam_params += list(self.state_ln_mod.parameters())
 
         if use_gaussian_bias:
-            self.centers = torch.tensor([i + 0.5 for i in range(self.total_slots)],
-                                        dtype=torch.float32, requires_grad=True)
+            self.centers = torch.tensor(
+                [i + 0.5 for i in range(self.total_slots)], dtype=torch.float32, requires_grad=True
+            )
             self.log_sigmas = torch.zeros(self.total_slots, requires_grad=True)
             self._adam_params += [self.centers, self.log_sigmas]
         else:
@@ -141,7 +155,7 @@ class ToyTileRecurrenceRMTAblation:
             for layer in self._real_layers:
                 self._adam_params += list(layer.parameters())
 
-    def parameters_for_optimizer(self) -> List[torch.Tensor]:
+    def parameters_for_optimizer(self) -> list[torch.Tensor]:
         return self._adam_params
 
     def zero_grad(self) -> None:
@@ -161,7 +175,7 @@ class ToyTileRecurrenceRMTAblation:
             sigmas = torch.exp(self.log_sigmas)
             return gaussian_attention_torch(q, k, v, self.centers, sigmas)
         d = q.shape[-1]
-        scores = (q @ k.transpose(-1, -2)) / (d ** 0.5)
+        scores = (q @ k.transpose(-1, -2)) / (d**0.5)
         return torch.softmax(scores, dim=-1) @ v
 
     def _l1_sparsity_split(self, layer, input_t: torch.Tensor, lr: float, coef: float) -> torch.Tensor:
@@ -169,8 +183,9 @@ class ToyTileRecurrenceRMTAblation:
         n = float(out_aux.numel())
         return out_aux.abs().sum() * (coef / n)
 
-    def step(self, x_window: np.ndarray, memory_prev: np.ndarray,
-             learning_rate: float) -> Tuple[np.ndarray, torch.Tensor, Optional[torch.Tensor]]:
+    def step(
+        self, x_window: np.ndarray, memory_prev: np.ndarray, learning_rate: float
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor | None]:
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
         x_window_t = torch.tensor(x_window, dtype=torch.float32)
@@ -227,5 +242,5 @@ class ToyTileRecurrenceRMTAblation:
             layer.apply_pending_updates()
 
 
-def clip_grad_norm_(params: List[torch.Tensor], max_norm: float) -> None:
+def clip_grad_norm_(params: list[torch.Tensor], max_norm: float) -> None:
     torch.nn.utils.clip_grad_norm_([p for p in params if p.grad is not None], max_norm)

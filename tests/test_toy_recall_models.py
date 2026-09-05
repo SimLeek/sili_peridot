@@ -1,19 +1,24 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-
-from model.toy_recall_models import (
-    ToySmallTransformer, ToyTileRecurrence,
-    cross_entropy_sum, predicted_token, apply_gradient_step,
-    rmsnorm_tensor, backward_with_grad_clip, lr_schedule,
-    DenseTensorLinear, AdamOptimizer, clip_grad_norm_,
-)
 from sili.tensor import Tensor
 
+from model.toy_recall_models import (
+    AdamOptimizer,
+    DenseTensorLinear,
+    ToySmallTransformer,
+    ToyTileRecurrence,
+    apply_gradient_step,
+    backward_with_grad_clip,
+    clip_grad_norm_,
+    cross_entropy_sum,
+    lr_schedule,
+    rmsnorm_tensor,
+)
 
 VOCAB, HIDDEN, MLP_HIDDEN = 10, 12, 16
 COLUMN_NEURONS = 2
@@ -26,8 +31,7 @@ def _dense_model(n_layers=2, num_cpus=2):
 
 
 def _tile_model(num_tiles=3, num_cpus=2):
-    return ToyTileRecurrence(VOCAB, HIDDEN, COLUMN_NEURONS, TILE_MLP_HIDDEN,
-                             num_tiles, num_cpus=num_cpus)
+    return ToyTileRecurrence(VOCAB, HIDDEN, COLUMN_NEURONS, TILE_MLP_HIDDEN, num_tiles, num_cpus=num_cpus)
 
 
 class TestRMSNormTensor:
@@ -78,10 +82,9 @@ class TestToySmallTransformerForward:
         # behavior -- every existing call site relies on unlimited
         # causal visibility, this must not silently change.
         tf_default = ToySmallTransformer(VOCAB, HIDDEN, MLP_HIDDEN, n_layers=2, num_cpus=2)
-        tf_explicit_full = ToySmallTransformer(VOCAB, HIDDEN, MLP_HIDDEN, n_layers=2, num_cpus=2,
-                                               half_bandwidth=8)
+        tf_explicit_full = ToySmallTransformer(VOCAB, HIDDEN, MLP_HIDDEN, n_layers=2, num_cpus=2, half_bandwidth=8)
         # copy weights so only half_bandwidth differs
-        for p_def, p_full in zip(tf_default.parameters(), tf_explicit_full.parameters()):
+        for p_def, p_full in zip(tf_default.parameters(), tf_explicit_full.parameters(), strict=False):
             p_full.data = p_def.data.copy()
         T = 8
         embedded = np.random.RandomState(1).randn(T, HIDDEN).astype(np.float32) * 0.1
@@ -137,6 +140,7 @@ class TestToySmallTransformerForward:
         after = tf.forward(probe).data
         assert not np.allclose(before, after), "output on a fixed probe never changed after training"
 
+    @pytest.mark.integration  # real training-convergence run
     def test_loss_decreases_on_a_single_repeated_example(self):
         # AdamOptimizer + clip_grad_norm_ -- the actual recommended
         # training path for DenseTensorLinear-based models (see module
@@ -166,8 +170,7 @@ class TestToySmallTransformerForward:
                 first_loss = float(loss.data)
             min_loss = float(loss.data) if min_loss is None else min(min_loss, float(loss.data))
 
-        assert min_loss < first_loss * 0.3, (
-            f"loss barely moved: {first_loss:.3f} -> best {min_loss:.3f}")
+        assert min_loss < first_loss * 0.3, f"loss barely moved: {first_loss:.3f} -> best {min_loss:.3f}"
 
 
 class TestToyTileRecurrenceStep:
@@ -214,13 +217,16 @@ class TestToyTileRecurrenceStep:
         loss.backward()
         assert model.q_proj.weight.grad is not None and np.any(model.q_proj.weight.grad != 0), (
             "loss on the pooled last-tile logits never reached q_proj -- "
-            "the column-mean pool isn't wired into the graph")
+            "the column-mean pool isn't wired into the graph"
+        )
         opt.step(model.parameters(), lr=0.05)
 
         after = model.step(probe_window, probe_M)[1].data
         assert not np.allclose(before, after), (
-            "training on the last tile's pooled logits never changed the shared weights")
+            "training on the last tile's pooled logits never changed the shared weights"
+        )
 
+    @pytest.mark.integration  # real training-convergence run
     def test_loss_decreases_on_a_single_repeated_example(self):
         model = _tile_model(num_tiles=3)
         opt = AdamOptimizer()
@@ -241,8 +247,7 @@ class TestToyTileRecurrenceStep:
                 first_loss = float(loss.data)
             min_loss = float(loss.data) if min_loss is None else min(min_loss, float(loss.data))
 
-        assert min_loss < first_loss * 0.3, (
-            f"loss barely moved: {first_loss:.3f} -> best {min_loss:.3f}")
+        assert min_loss < first_loss * 0.3, f"loss barely moved: {first_loss:.3f} -> best {min_loss:.3f}"
 
     def test_resetting_M_prev_changes_logits(self):
         # Statefulness check, same spirit as tile_recurrence.py's own
@@ -255,8 +260,7 @@ class TestToyTileRecurrenceStep:
         _M_a, logits_a = model.step(x_window, M_real)
         _M_b, logits_b = model.step(x_window, M_zero)
 
-        assert not np.allclose(logits_a.data, logits_b.data), (
-            "different M_prev produced identical logits")
+        assert not np.allclose(logits_a.data, logits_b.data), "different M_prev produced identical logits"
 
 
 class TestApplyGradientStep:

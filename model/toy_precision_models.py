@@ -43,19 +43,17 @@ raw update, without replacing importance's role anywhere. See
 AdamRowScaleDISLDOLayer's own docstring for the exact mechanism and
 its one real approximation.
 """
+
 from __future__ import annotations
 
 import functools
-from typing import List, Optional, Tuple
 
 import numpy as np
-
-from sili.tensor import Tensor, banded_attention, silu, _acc
-from sili.sparse_rnn import (DISLDOLayer, DISLDOLayer32, DISLDOLayer8,
-                             DISLDOLayer8Resync, DISLDOLayer8AdaMax)
 from sili.energy import EnergyDynamics
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer8AdaMax, DISLDOLayer8Resync, DISLDOLayer32
+from sili.tensor import Tensor, _acc, banded_attention, silu
 
-from .toy_recall_models import rmsnorm_tensor, AdamOptimizer, DenseTensorLinear
+from .toy_recall_models import AdamOptimizer, DenseTensorLinear, rmsnorm_tensor
 
 
 def _toy_scale_energy() -> EnergyDynamics:
@@ -71,12 +69,10 @@ def _toy_scale_energy() -> EnergyDynamics:
     toy model's own T*hidden), verified directly to behave far better
     here (aux_loss stays 0.005 -> ~0.3, loss reaches a real minimum
     instead of diverging)."""
-    return EnergyDynamics(drive=0.1, activation_cost=0.05, precision=0.01,
-                          density=0.05, p=0.3)
+    return EnergyDynamics(drive=0.1, activation_cost=0.05, precision=0.01, density=0.05, p=0.3)
 
 
-def _apply_energy(energy: Optional[EnergyDynamics], attn: Tensor,
-                  T: int, hidden: int) -> Tuple[Tensor, Optional[Tensor]]:
+def _apply_energy(energy: EnergyDynamics | None, attn: Tensor, T: int, hidden: int) -> tuple[Tensor, Tensor | None]:
     """Shared by both model classes below -- wraps attn [T, hidden]
     through EnergyDynamics (flatten/unflatten, matching
     model/tile_recurrence.py's own apply_tile_step convention) if
@@ -129,13 +125,12 @@ class ArtificialFP4Linear:
     fake_quantize_fp4."""
 
     def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
-        self.weight = Tensor(
-            (np.random.randn(in_features, out_features) * scale).astype(np.float32))
+        self.weight = Tensor((np.random.randn(in_features, out_features) * scale).astype(np.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         return x @ fake_quantize_fp4(self.weight)
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return [self.weight]
 
 
@@ -152,10 +147,9 @@ class _ArtificialFP4Layer:
         self.input_ln = Tensor(np.ones(hidden, dtype=np.float32))
         self.post_ln = Tensor(np.ones(hidden, dtype=np.float32))
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         params = [self.input_ln, self.post_ln]
-        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
-                      self.gate_proj, self.up_proj, self.down_proj):
+        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.gate_proj, self.up_proj, self.down_proj):
             params += layer.parameters()
         return params
 
@@ -173,23 +167,29 @@ class ToySmallTransformerArtificialFP4:
     use_energy=False, else must be added to the task loss before
     .backward() (same convention as ToySmallTransformerRealFP4)."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int,
-                 n_layers: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
         self.hidden = hidden
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
-        self.layers = [_ArtificialFP4Layer(hidden, mlp_hidden, use_energy)
-                       for _ in range(n_layers)]
+        self.layers = [_ArtificialFP4Layer(hidden, mlp_hidden, use_energy) for _ in range(n_layers)]
         self.lm_head = ArtificialFP4Linear(hidden, vocab_size)
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         params = []
         for layer in self.layers:
             params += layer.parameters()
         return params + self.lm_head.parameters()
 
-    def forward(self, embedded: np.ndarray) -> Tuple[Tensor, Optional[Tensor]]:
+    def forward(self, embedded: np.ndarray) -> tuple[Tensor, Tensor | None]:
         T = embedded.shape[0]
         x = Tensor(embedded.astype(np.float32))
         aux_loss_total = None
@@ -198,11 +198,13 @@ class ToySmallTransformerArtificialFP4:
             q = layer.q_proj.forward(normed)
             k = layer.k_proj.forward(normed)
             v = layer.v_proj.forward(normed)
-            attn = banded_attention(q, k, v, half_bandwidth=T,
-                                    num_cpus=self.num_cpus, causal=True)
+            attn = banded_attention(q, k, v, half_bandwidth=T, num_cpus=self.num_cpus, causal=True)
             attn, aux_loss = _apply_energy(layer.energy, attn, T, self.hidden)
-            aux_loss_total = aux_loss if aux_loss_total is None else (
-                aux_loss_total if aux_loss is None else aux_loss_total + aux_loss)
+            aux_loss_total = (
+                aux_loss
+                if aux_loss_total is None
+                else (aux_loss_total if aux_loss is None else aux_loss_total + aux_loss)
+            )
             attn = layer.o_proj.forward(attn)
             x = x + attn
             normed2 = rmsnorm_tensor(x, layer.post_ln, self.rms_eps)
@@ -224,8 +226,9 @@ class _RealFP4Layer:
     ToySmallTransformerRealFP4RowScaleAdam reuse this exact layer
     shape with AdamRowScaleDISLDOLayer in place of plain DISLDOLayer."""
 
-    def __init__(self, hidden: int, mlp_hidden: int, max_weights: int,
-                use_energy: bool, num_cpus: int, disldo_cls=DISLDOLayer):
+    def __init__(
+        self, hidden: int, mlp_hidden: int, max_weights: int, use_energy: bool, num_cpus: int, disldo_cls=DISLDOLayer
+    ):
         self.q_proj = disldo_cls(hidden, hidden, max_weights, num_cpus)
         self.k_proj = disldo_cls(hidden, hidden, max_weights, num_cpus)
         self.v_proj = disldo_cls(hidden, hidden, max_weights, num_cpus)
@@ -237,7 +240,7 @@ class _RealFP4Layer:
         self.input_ln = Tensor(np.ones(hidden, dtype=np.float32))
         self.post_ln = Tensor(np.ones(hidden, dtype=np.float32))
 
-    def trainable_leaf_parameters(self) -> List[Tensor]:
+    def trainable_leaf_parameters(self) -> list[Tensor]:
         return [self.input_ln, self.post_ln]
 
 
@@ -258,18 +261,27 @@ class ToySmallTransformerRealFP4:
     layer's own output) AND accumulates gradient for the plain leaf
     parameters (parameters_for_optimizer, below)."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6, disldo_cls=DISLDOLayer):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+        disldo_cls=DISLDOLayer,
+    ):
         self.hidden = hidden
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
-        self.layers = [_RealFP4Layer(hidden, mlp_hidden, max_weights, use_energy,
-                                     num_cpus, disldo_cls)
-                       for _ in range(n_layers)]
+        self.layers = [
+            _RealFP4Layer(hidden, mlp_hidden, max_weights, use_energy, num_cpus, disldo_cls) for _ in range(n_layers)
+        ]
         self.lm_head = disldo_cls(hidden, vocab_size, max_weights, num_cpus)
 
-    def parameters_for_optimizer(self) -> List[Tensor]:
+    def parameters_for_optimizer(self) -> list[Tensor]:
         """ONLY the plain leaf params (RMSNorm weights) -- DISLDOLayer's
         own big weight matrices train inline during backward(), never
         via an external optimizer step (see module/class docstrings)."""
@@ -278,7 +290,7 @@ class ToySmallTransformerRealFP4:
             params += layer.trainable_leaf_parameters()
         return params
 
-    def forward(self, embedded: np.ndarray, learning_rate: float) -> Tuple[Tensor, Optional[Tensor]]:
+    def forward(self, embedded: np.ndarray, learning_rate: float) -> tuple[Tensor, Tensor | None]:
         T = embedded.shape[0]
         x = Tensor(embedded.astype(np.float32))
         aux_loss_total = None
@@ -287,11 +299,13 @@ class ToySmallTransformerRealFP4:
             q = layer.q_proj.forward(normed, learning_rate)
             k = layer.k_proj.forward(normed, learning_rate)
             v = layer.v_proj.forward(normed, learning_rate)
-            attn = banded_attention(q, k, v, half_bandwidth=T,
-                                    num_cpus=self.num_cpus, causal=True)
+            attn = banded_attention(q, k, v, half_bandwidth=T, num_cpus=self.num_cpus, causal=True)
             attn, aux_loss = _apply_energy(layer.energy, attn, T, self.hidden)
-            aux_loss_total = aux_loss if aux_loss_total is None else (
-                aux_loss_total if aux_loss is None else aux_loss_total + aux_loss)
+            aux_loss_total = (
+                aux_loss
+                if aux_loss_total is None
+                else (aux_loss_total if aux_loss is None else aux_loss_total + aux_loss)
+            )
             attn = layer.o_proj.forward(attn, learning_rate)
             x = x + attn
             normed2 = rmsnorm_tensor(x, layer.post_ln, self.rms_eps)
@@ -332,9 +346,17 @@ class AdamRowScaleDISLDOLayer:
     on just the row-scale helps, not a claim that this is identical to
     running real Adam on the underlying gradient."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, beta1: float = 0.9, beta2: float = 0.999,
-                eps: float = 1e-8, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        eps: float = 1e-8,
+        rng: np.random.Generator | None = None,
+    ):
         self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.in_features = in_features
         self.beta1 = beta1
@@ -345,8 +367,7 @@ class AdamRowScaleDISLDOLayer:
         self.t = 0
 
     def _row_scales(self) -> np.ndarray:
-        return np.array([self._inner._c.get_value_scale(r) for r in range(self.in_features)],
-                        dtype=np.float32)
+        return np.array([self._inner._c.get_value_scale(r) for r in range(self.in_features)], dtype=np.float32)
 
     def forward(self, x, learning_rate: float = 0.0) -> Tensor:
         before = self._row_scales()
@@ -361,8 +382,8 @@ class AdamRowScaleDISLDOLayer:
             raw_delta = after - before
             grad_proxy = -raw_delta / learning_rate
             self.t += 1
-            bc1 = 1.0 - self.beta1 ** self.t
-            bc2 = 1.0 - self.beta2 ** self.t
+            bc1 = 1.0 - self.beta1**self.t
+            bc2 = 1.0 - self.beta2**self.t
             self.m = self.beta1 * self.m + (1.0 - self.beta1) * grad_proxy
             self.v = self.beta2 * self.v + (1.0 - self.beta2) * (grad_proxy * grad_proxy)
             m_hat = self.m / bc1
@@ -374,7 +395,7 @@ class AdamRowScaleDISLDOLayer:
         out._backward = _bwd
         return out
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return []  # nothing here is an external-optimizer-trainable Tensor leaf
 
 
@@ -398,9 +419,17 @@ class AdamRank1DISLDOLayer:
     re-normalizes an ALREADY-APPLIED delta, not the true pre-damping
     gradient."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, beta1: float = 0.9, beta2: float = 0.999,
-                eps: float = 1e-8, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        eps: float = 1e-8,
+        rng: np.random.Generator | None = None,
+    ):
         self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.in_features = in_features
         self.out_features = out_features
@@ -416,19 +445,18 @@ class AdamRank1DISLDOLayer:
             self._inner._c.set_output_scale_raw(c, 1.0)  # activates output_scale's own training
 
     def _row_scales(self) -> np.ndarray:
-        return np.array([self._inner._c.get_value_scale(r) for r in range(self.in_features)],
-                        dtype=np.float32)
+        return np.array([self._inner._c.get_value_scale(r) for r in range(self.in_features)], dtype=np.float32)
 
     def _col_scales(self) -> np.ndarray:
-        return np.array([self._inner._c.get_output_scale(c) for c in range(self.out_features)],
-                        dtype=np.float32)
+        return np.array([self._inner._c.get_output_scale(c) for c in range(self.out_features)], dtype=np.float32)
 
-    def _adam_step(self, before: np.ndarray, after: np.ndarray, m: np.ndarray, v: np.ndarray,
-                   learning_rate: float) -> np.ndarray:
+    def _adam_step(
+        self, before: np.ndarray, after: np.ndarray, m: np.ndarray, v: np.ndarray, learning_rate: float
+    ) -> np.ndarray:
         raw_delta = after - before
         grad_proxy = -raw_delta / learning_rate
-        bc1 = 1.0 - self.beta1 ** self.t
-        bc2 = 1.0 - self.beta2 ** self.t
+        bc1 = 1.0 - self.beta1**self.t
+        bc2 = 1.0 - self.beta2**self.t
         m[:] = self.beta1 * m + (1.0 - self.beta1) * grad_proxy
         v[:] = self.beta2 * v + (1.0 - self.beta2) * (grad_proxy * grad_proxy)
         m_hat = m / bc1
@@ -458,7 +486,7 @@ class AdamRank1DISLDOLayer:
         out._backward = _bwd
         return out
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return []  # nothing here is an external-optimizer-trainable Tensor leaf
 
 
@@ -468,12 +496,28 @@ class ToySmallTransformerRealFP4RowScaleAdam(ToySmallTransformerRealFP4):
     -driven per-weight training, only the row-scale gets Adam
     normalization on top. See AdamRowScaleDISLDOLayer's own docstring."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps,
-                         disldo_cls=AdamRowScaleDISLDOLayer)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        super().__init__(
+            vocab_size,
+            hidden,
+            mlp_hidden,
+            n_layers,
+            max_weights,
+            use_energy,
+            num_cpus,
+            rms_eps,
+            disldo_cls=AdamRowScaleDISLDOLayer,
+        )
 
 
 class ToySmallTransformerRealFP4Rank1Adam(ToySmallTransformerRealFP4):
@@ -481,12 +525,28 @@ class ToySmallTransformerRealFP4Rank1Adam(ToySmallTransformerRealFP4):
     plain DISLDOLayer -- row AND column scale both get Adam
     normalization. See AdamRank1DISLDOLayer's own docstring."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps,
-                         disldo_cls=AdamRank1DISLDOLayer)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        super().__init__(
+            vocab_size,
+            hidden,
+            mlp_hidden,
+            n_layers,
+            max_weights,
+            use_energy,
+            num_cpus,
+            rms_eps,
+            disldo_cls=AdamRank1DISLDOLayer,
+        )
 
 
 def row_scale_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, bits: int) -> np.ndarray:
@@ -510,8 +570,7 @@ def row_scale_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, bits: int) -> np
     return out
 
 
-def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
-                        n_out: int, bits: int) -> np.ndarray:
+def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray, n_out: int, bits: int) -> np.ndarray:
     """Row scale * col scale (rank-1 envelope, matching sili_peridot's
     own B5a fix for the shared-scale FP4 catastrophe): alternating
     max-fit, 3 passes. Fully vectorized (np.maximum.at scatter-max, no
@@ -540,8 +599,9 @@ def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
     return out.astype(np.float32)
 
 
-def rankn_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
-                        n_out: int, bits: int, rank: int = 2) -> np.ndarray:
+def rankn_fake_quantize(
+    vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray, n_out: int, bits: int, rank: int = 2
+) -> np.ndarray:
     """Generalizes rank1_fake_quantize's single shared row_scale/col_scale
     pair to `rank` independently-fit column-scale profiles, one per
     row-magnitude bucket (rows bucketed by their own max |w| into `rank`
@@ -619,8 +679,9 @@ def rankn_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
     return out.astype(np.float32)
 
 
-def residual_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
-                           n_out: int, bits_per_stage: int, n_stages: int) -> np.ndarray:
+def residual_fake_quantize(
+    vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray, n_out: int, bits_per_stage: int, n_stages: int
+) -> np.ndarray:
     """True residual/cascaded quantization -- matching neural-audio-codec
     RVQ (e.g. EnCodec/SoundStream): quantize vals via rank1_fake_quantize
     at bits_per_stage, then quantize the ROUNDING RESIDUAL (vals - q1)
@@ -645,15 +706,17 @@ def residual_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarr
     residual = vals.astype(np.float64).copy()
     reconstructed = np.zeros_like(residual)
     for _ in range(n_stages):
-        stage_q = rank1_fake_quantize(residual.astype(np.float32), ptrs, indices,
-                                      n_out, bits_per_stage).astype(np.float64)
+        stage_q = rank1_fake_quantize(residual.astype(np.float32), ptrs, indices, n_out, bits_per_stage).astype(
+            np.float64
+        )
         reconstructed += stage_q
         residual = residual - stage_q
     return reconstructed.astype(np.float32)
 
 
-def fixed_digit_residual_quantize(vals: np.ndarray, bits_per_stage: int, n_stages: int,
-                                  base: float = 12.0, e_shared: float = 1.0) -> np.ndarray:
+def fixed_digit_residual_quantize(
+    vals: np.ndarray, bits_per_stage: int, n_stages: int, base: float = 12.0, e_shared: float = 1.0
+) -> np.ndarray:
     """Zero-scaling-VECTOR residual quantization, literal closed-form
     digit-place-value construction per direct design discussion:
     `fp(4n) ~= e_shared * sum_i digit_i * base**-i`. NO row/col fit
@@ -772,13 +835,25 @@ class TrueMultiDigitLayer:
     not "chain-rule-matched" as an earlier draft of this docstring
     incorrectly claimed."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, digit_cls=DISLDOLayer, bits_per_stage: int = 4,
-                n_stages: int = 2, base: float = 12.0, e_shared: Optional[float] = None,
-                lr_power: float = 0.0, simulate_quantize: bool = False,
-                share_connectivity: bool = False, dense: bool = False,
-                scale_rank: int = 1, empty_init: bool = False,
-                rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        digit_cls=DISLDOLayer,
+        bits_per_stage: int = 4,
+        n_stages: int = 2,
+        base: float = 12.0,
+        e_shared: float | None = None,
+        lr_power: float = 0.0,
+        simulate_quantize: bool = False,
+        share_connectivity: bool = False,
+        dense: bool = False,
+        scale_rank: int = 1,
+        empty_init: bool = False,
+        rng: np.random.Generator | None = None,
+    ):
         # dense=True / scale_rank>1 / empty_init=True only forwarded when
         # set (not unconditionally) -- only DISLDOLayer/
         # DISLDOLayerDeterministic (sili__new) accept these kwargs at
@@ -793,8 +868,9 @@ class TrueMultiDigitLayer:
             digit_kwargs["scale_rank"] = scale_rank
         if empty_init:
             digit_kwargs["empty_init"] = True
-        self.digits = [digit_cls(in_features, out_features, max_weights, num_cpus, **digit_kwargs)
-                      for _ in range(n_stages)]
+        self.digits = [
+            digit_cls(in_features, out_features, max_weights, num_cpus, **digit_kwargs) for _ in range(n_stages)
+        ]
         # share_connectivity: per direct hypothesis check -- each digit's
         # OWN independent preseed/synaptogenesis (real DISLDOLayer, no
         # coordination between digits) means digit i's active (row,col)
@@ -823,7 +899,7 @@ class TrueMultiDigitLayer:
             for digit in self.digits[1:]:
                 dc = digit._c
                 fresh_rng = rng if rng is not None else np.random.default_rng()
-                values = (fresh_rng.standard_normal(nnz).astype(np.float32) * scale)
+                values = fresh_rng.standard_normal(nnz).astype(np.float32) * scale
                 dc.load_weights(ptrs0.astype(np.int32), idx0.astype(np.int32), values)
                 if hasattr(dc, "equalize_to_capacity"):
                     dc.equalize_to_capacity(per_row)
@@ -842,8 +918,14 @@ class TrueMultiDigitLayer:
         self._digit_step = e_shared / levels  # only used if simulate_quantize
         self._factors = [self.base ** (-i) for i in range(n_stages)]
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-               damp_by_importance: bool = True, **synapse_kwargs) -> Tensor:
+    def forward(
+        self,
+        x,
+        learning_rate: float = 0.0,
+        lr_per_row_nnz: bool = True,
+        damp_by_importance: bool = True,
+        **synapse_kwargs,
+    ) -> Tensor:
         # synapse_kwargs: passed straight through to each digit's own
         # forward() -- min_decay_frac/max_abs_delta/max_ci (see
         # sili.sparse_rnn.DISLDOLayer.forward's own docstring), or
@@ -852,8 +934,9 @@ class TrueMultiDigitLayer:
         outs = []
         for i, digit in enumerate(self.digits):
             eff_lr = learning_rate / (self.base ** (self.lr_power * i))
-            out_i = digit.forward(x, eff_lr, lr_per_row_nnz=lr_per_row_nnz,
-                                  damp_by_importance=damp_by_importance, **synapse_kwargs)
+            out_i = digit.forward(
+                x, eff_lr, lr_per_row_nnz=lr_per_row_nnz, damp_by_importance=damp_by_importance, **synapse_kwargs
+            )
             if learning_rate != 0.0 and self.simulate_quantize:
                 inner_bwd = out_i._backward
                 digit_i = digit
@@ -862,7 +945,9 @@ class TrueMultiDigitLayer:
                     def _bwd():
                         inner_bwd()  # real RMSprop update for THIS digit only
                         _quantize_raw_digit_inplace(digit_i, self.bits_per_stage, self._digit_step)
+
                     return _bwd
+
                 out_i._backward = _make_bwd()
             outs.append(out_i)
         total = outs[0] * self._factors[0]
@@ -883,8 +968,7 @@ class TrueMultiDigitLayer:
             if hasattr(digit, "synaptogenesis"):
                 digit.synaptogenesis(k, importance_cutoff, digit._max_row_weights)
 
-    def magnitude_rescale_output(self, target: float, correction_rate: float,
-                                 scale_invariant: bool = False) -> None:
+    def magnitude_rescale_output(self, target: float, correction_rate: float, scale_invariant: bool = False) -> None:
         """Delegate to each digit's own real magnitude_rescale_output
         (sili.sparse_rnn._SparseLayerBase.magnitude_rescale_output) --
         same independent-per-digit pattern as synaptogenesis above (no
@@ -893,7 +977,7 @@ class TrueMultiDigitLayer:
             if hasattr(digit, "_c") and hasattr(digit._c, "magnitude_rescale_output"):
                 digit.magnitude_rescale_output(target, correction_rate, scale_invariant)
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return []
 
 
@@ -921,22 +1005,31 @@ class TrueMultiDigitDenseLayer:
     max_weights, num_cpus)` call convention `ToyTileRecurrenceRealFP4`
     already uses for every other arm, no changes needed there."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: Optional[int] = None,
-                num_cpus: Optional[int] = None, bits_per_stage: int = 4, n_stages: int = 2,
-                base: float = 12.0, e_shared: Optional[float] = None, lr_power: float = 0.0,
-                rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int | None = None,
+        num_cpus: int | None = None,
+        bits_per_stage: int = 4,
+        n_stages: int = 2,
+        base: float = 12.0,
+        e_shared: float | None = None,
+        lr_power: float = 0.0,
+        rng: np.random.Generator | None = None,
+    ):
         levels = 2 ** (bits_per_stage - 1) - 1
         init_scale = (e_shared / levels) if e_shared is not None else 0.1
-        self.digits = [DenseTensorLinear(in_features, out_features, scale=init_scale)
-                      for _ in range(n_stages)]
+        self.digits = [DenseTensorLinear(in_features, out_features, scale=init_scale) for _ in range(n_stages)]
         self.opt = AdamOptimizer()
         self.n_stages = n_stages
         self.base = base
         self.lr_power = lr_power
         self._factors = [self.base ** (-i) for i in range(n_stages)]
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-               damp_by_importance: bool = True) -> Tensor:
+    def forward(
+        self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True, damp_by_importance: bool = True
+    ) -> Tensor:
         outs = [d.forward(x) for d in self.digits]
         total = outs[0] * self._factors[0]
         for i in range(1, self.n_stages):
@@ -949,17 +1042,24 @@ class TrueMultiDigitDenseLayer:
                 for i, d in enumerate(self.digits):
                     eff_lr = learning_rate / (self.base ** (self.lr_power * i))
                     self.opt.step(d.parameters(), lr=eff_lr)
+
             total._backward = _bwd
         return total
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return []  # trained internally via self.opt.step(), not an external optimizer
 
 
-def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
-                               quantize_importance: bool, rank: int = 1,
-                               n_stages: int = 1, base: float = 12.0,
-                               e_shared: float = 1.0) -> None:
+def _quantize_disldo32_inplace(
+    inner: DISLDOLayer32,
+    bits: int,
+    scheme: str,
+    quantize_importance: bool,
+    rank: int = 1,
+    n_stages: int = 1,
+    base: float = 12.0,
+    e_shared: float = 1.0,
+) -> None:
     c = inner._c
     ptrs = np.array(c.ptrs, copy=True)
     indices = np.array(c.indices, copy=True)
@@ -980,8 +1080,7 @@ def _quantize_disldo32_inplace(inner: DISLDOLayer32, bits: int, scheme: str,
         imp_q = residual_fake_quantize(imp, ptrs, indices, n_out, bits, n_stages) if quantize_importance else imp
     elif scheme == "fixed_digit_residual":
         w_q = fixed_digit_residual_quantize(w, bits, n_stages, base, e_shared)
-        imp_q = (fixed_digit_residual_quantize(imp, bits, n_stages, base, e_shared)
-                if quantize_importance else imp)
+        imp_q = fixed_digit_residual_quantize(imp, bits, n_stages, base, e_shared) if quantize_importance else imp
     else:
         raise ValueError(scheme)
     c.load_weights(ptrs, indices, w_q.astype(np.float32), imp_q.astype(np.float32))
@@ -1023,11 +1122,21 @@ class QuantizedDISLDOLayer32:
     ToySmallTransformerRealFP4/ToyTileRecurrenceRealFP4 with no
     changes needed there."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, bits: int = 8, scheme: str = "rank1",
-                quantize_importance: bool = True, rank: int = 1, n_stages: int = 1,
-                base: float = 12.0, e_shared: Optional[float] = None,
-                rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        bits: int = 8,
+        scheme: str = "rank1",
+        quantize_importance: bool = True,
+        rank: int = 1,
+        n_stages: int = 1,
+        base: float = 12.0,
+        e_shared: float | None = None,
+        rng: np.random.Generator | None = None,
+    ):
         self._inner = DISLDOLayer32(in_features, out_features, max_weights, num_cpus, rng=rng)
         self.bits = bits
         self.scheme = scheme
@@ -1049,23 +1158,32 @@ class QuantizedDISLDOLayer32:
                 e_shared = float(np.max(init_abs)) if init_abs.size and init_abs.max() > 1e-12 else 1.0
             self.e_shared = e_shared
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-               damp_by_importance: bool = True) -> Tensor:
-        out = self._inner.forward(x, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                  damp_by_importance=damp_by_importance)
+    def forward(
+        self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True, damp_by_importance: bool = True
+    ) -> Tensor:
+        out = self._inner.forward(
+            x, learning_rate, lr_per_row_nnz=lr_per_row_nnz, damp_by_importance=damp_by_importance
+        )
         inner_bwd = out._backward
 
         def _bwd():
             inner_bwd()  # real fp32 RMSprop update happens here first
             if learning_rate != 0.0:
-                _quantize_disldo32_inplace(self._inner, self.bits, self.scheme,
-                                           self.quantize_importance, self.rank,
-                                           self.n_stages, self.base, self.e_shared)
+                _quantize_disldo32_inplace(
+                    self._inner,
+                    self.bits,
+                    self.scheme,
+                    self.quantize_importance,
+                    self.rank,
+                    self.n_stages,
+                    self.base,
+                    self.e_shared,
+                )
 
         out._backward = _bwd
         return out
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return []  # nothing here is an external-optimizer-trainable Tensor leaf
 
 
@@ -1118,8 +1236,14 @@ class SeededRank1DISLDOLayer8(DISLDOLayer8):
     being insufficient (the toy simulation already showed the
     representation works when the envelope is well-fit)."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
         _seed_rank1_scale(self._c, in_features, out_features)
 
@@ -1137,8 +1261,14 @@ class SeededDISLDOLayer8Resync(DISLDOLayer8Resync):
     difference measured could just be "output_scale was active" rather
     than "the deferred-write fix helped"."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
         _seed_rank1_scale(self._c, in_features, out_features)
 
@@ -1148,8 +1278,14 @@ class SeededDISLDOLayer8AdaMax(DISLDOLayer8AdaMax):
     update (see AdaMaxScalePolicy's docstring, sili__new's
     delta_csr_types.hpp) instead of RMSprop."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
         _seed_rank1_scale(self._c, in_features, out_features)
 
@@ -1166,9 +1302,15 @@ class PeriodicSeedRank1DISLDOLayer8(DISLDOLayer8):
     itself RMSprop-style via value_scale_importance) genuinely can't
     hold a good fit between corrections even when repeatedly given one."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, reseed_every: int = 200,
-                rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        reseed_every: int = 200,
+        rng: np.random.Generator | None = None,
+    ):
         super().__init__(in_features, out_features, max_weights, num_cpus, rng=rng)
         self._reseed_in_features = in_features
         self._reseed_out_features = out_features
@@ -1176,10 +1318,10 @@ class PeriodicSeedRank1DISLDOLayer8(DISLDOLayer8):
         self._step_count = 0
         _seed_rank1_scale(self._c, in_features, out_features)
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-               damp_by_importance: bool = True) -> Tensor:
-        out = super().forward(x, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                              damp_by_importance=damp_by_importance)
+    def forward(
+        self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True, damp_by_importance: bool = True
+    ) -> Tensor:
+        out = super().forward(x, learning_rate, lr_per_row_nnz=lr_per_row_nnz, damp_by_importance=damp_by_importance)
         inner_bwd = out._backward
 
         def _bwd():
@@ -1201,12 +1343,28 @@ class ToySmallTransformerFP32Ref(ToySmallTransformerRealFP4):
     single-RNN-task reference the quantization scheme was originally
     validated on)."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps,
-                         disldo_cls=DISLDOLayer32)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        super().__init__(
+            vocab_size,
+            hidden,
+            mlp_hidden,
+            n_layers,
+            max_weights,
+            use_energy,
+            num_cpus,
+            rms_eps,
+            disldo_cls=DISLDOLayer32,
+        )
 
 
 class ToySmallTransformerQuant8Rank1(ToySmallTransformerRealFP4):
@@ -1215,13 +1373,21 @@ class ToySmallTransformerQuant8Rank1(ToySmallTransformerRealFP4):
     winner config) in place of plain DISLDOLayer. See
     QuantizedDISLDOLayer32's own docstring."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        cls = functools.partial(QuantizedDISLDOLayer32, bits=8, scheme="rank1",
-                                quantize_importance=True)
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=8, scheme="rank1", quantize_importance=True)
+        super().__init__(
+            vocab_size, hidden, mlp_hidden, n_layers, max_weights, use_energy, num_cpus, rms_eps, disldo_cls=cls
+        )
 
 
 class ToySmallTransformerQuant4Rank1(ToySmallTransformerRealFP4):
@@ -1229,13 +1395,21 @@ class ToySmallTransformerQuant4Rank1(ToySmallTransformerRealFP4):
     known-worse (but not broken) config, kept as a comparison point,
     not the recommended default."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rank1",
-                                quantize_importance=True)
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rank1", quantize_importance=True)
+        super().__init__(
+            vocab_size, hidden, mlp_hidden, n_layers, max_weights, use_energy, num_cpus, rms_eps, disldo_cls=cls
+        )
 
 
 class ToySmallTransformerQuant4Rank2(ToySmallTransformerRealFP4):
@@ -1244,26 +1418,42 @@ class ToySmallTransformerQuant4Rank2(ToySmallTransformerRealFP4):
     scaling -- tests whether the extra scale degree of freedom recovers
     some of 4-bit's real quality cost vs rank-1."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2,
-                                quantize_importance=True)
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2, quantize_importance=True)
+        super().__init__(
+            vocab_size, hidden, mlp_hidden, n_layers, max_weights, use_energy, num_cpus, rms_eps, disldo_cls=cls
+        )
 
 
 class ToySmallTransformerQuant4Rank4(ToySmallTransformerRealFP4):
     """Same as ToySmallTransformerQuant4Rank2 but rank=4 -- checks
     whether the trend (if any) continues past rank=2 or plateaus."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int, n_layers: int,
-                 max_weights: int, use_energy: bool = False,
-                 num_cpus: int = 2, rms_eps: float = 1e-6):
-        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=4,
-                                quantize_importance=True)
-        super().__init__(vocab_size, hidden, mlp_hidden, n_layers, max_weights,
-                         use_energy, num_cpus, rms_eps, disldo_cls=cls)
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        max_weights: int,
+        use_energy: bool = False,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
+        cls = functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=4, quantize_importance=True)
+        super().__init__(
+            vocab_size, hidden, mlp_hidden, n_layers, max_weights, use_energy, num_cpus, rms_eps, disldo_cls=cls
+        )
 
 
 class _PeakEligibilityTrace:
@@ -1286,9 +1476,9 @@ class _PeakEligibilityTrace:
     direction, not just magnitude -- this formulation was worked out
     directly with the user."""
 
-    def __init__(self, shape: Tuple[int, ...], decay: float = 0.9):
+    def __init__(self, shape: tuple[int, ...], decay: float = 0.9):
         self.decay = decay
-        self.peak = np.zeros(shape, dtype=np.float32)      # signed
+        self.peak = np.zeros(shape, dtype=np.float32)  # signed
         self.peak_mag = np.zeros(shape, dtype=np.float32)  # |peak|, tracked for comparison
 
     def update(self, x: np.ndarray) -> np.ndarray:
@@ -1347,12 +1537,13 @@ class PeakEligibilityDISLDOLayer:
     full dense array -- a real future efficiency angle at true
     MiniCPM5 scale, not needed at this toy width."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                num_cpus: int = 4, trace_decay: float = 0.9):
+    def __init__(
+        self, in_features: int, out_features: int, max_weights: int, num_cpus: int = 4, trace_decay: float = 0.9
+    ):
         self._inner = DISLDOLayer(in_features, out_features, max_weights, num_cpus)
         self.in_features = in_features
         self.trace_decay = trace_decay
-        self.trace: Optional[_PeakEligibilityTrace] = None  # lazily shaped to the first x
+        self.trace: _PeakEligibilityTrace | None = None  # lazily shaped to the first x
 
     def forward(self, x, learning_rate: float = 0.0) -> Tensor:
         if not isinstance(x, Tensor):
@@ -1369,5 +1560,5 @@ class PeakEligibilityDISLDOLayer:
             self._inner._c.last_input[...] = peak_snapshot
         return out
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return []  # nothing here is an external-optimizer-trainable Tensor leaf

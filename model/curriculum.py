@@ -20,13 +20,12 @@ routing through window_state.suffix_windows -- simpler, and avoids
 paying for the window machinery's extra indirection when recurrence is
 structurally impossible anyway.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 import numpy as np
-
 from sili.tensor import Tensor
 
 from .sili_block import grow_window_layer
@@ -38,7 +37,7 @@ class CurriculumStage:
     window_size: int
 
 
-def build_stage_list(n_folds: int) -> List[CurriculumStage]:
+def build_stage_list(n_folds: int) -> list[CurriculumStage]:
     """Stage i's window is the last (i+1) fold positions -- stage
     n_folds-1 is the final stage, the full column average."""
     return [CurriculumStage(index=i, window_size=i + 1) for i in range(n_folds)]
@@ -65,20 +64,21 @@ class WindowState:
     unchanged (as data, not a live autograd graph -- there's no
     backward call spanning a curriculum stage transition) when the
     window widens."""
-    suffix_windows: Dict[str, object] = field(default_factory=dict)
+
+    suffix_windows: dict[str, object] = field(default_factory=dict)
     window_size: int = 0
-    window_positions: List[int] = field(default_factory=list)
-    centers: Optional[Tensor] = None
-    log_sigmas: Optional[Tensor] = None
+    window_positions: list[int] = field(default_factory=list)
+    centers: Tensor | None = None
+    log_sigmas: Tensor | None = None
 
 
 def advance_window(
     window_state: WindowState,
-    step_layers: List[Dict[str, object]],
-    suffixes: List[str],
+    step_layers: list[dict[str, object]],
+    suffixes: list[str],
     n_folds: int,
     num_cpus: int = 4,
-    recurrent_bandwidth: Optional[int] = None,
+    recurrent_bandwidth: int | None = None,
 ) -> WindowState:
     """Grow the window by exactly one position -- the position
     immediately before window_state's current earliest one (or the
@@ -106,21 +106,23 @@ def advance_window(
     center/log_sigma value is carried forward UNCHANGED (as data, not a
     live autograd graph -- there is no backward call spanning a
     curriculum stage transition)."""
-    next_position = (window_state.window_positions[-1] - 1
-                      if window_state.window_positions else n_folds - 1)
+    next_position = window_state.window_positions[-1] - 1 if window_state.window_positions else n_folds - 1
     if next_position < 0:
-        raise ValueError("window already covers every fold position -- no earlier "
-                          "position left to add")
+        raise ValueError("window already covers every fold position -- no earlier position left to add")
 
-    new_windows: Dict[str, object] = {}
+    new_windows: dict[str, object] = {}
     for suffix in suffixes:
         new_layer = step_layers[next_position][suffix]
         in_dim, out_dim = new_layer.n_inputs, new_layer.n_outputs
         new_windows[suffix] = grow_window_layer(
-            new_layer, in_dim, out_dim, num_cpus=num_cpus,
+            new_layer,
+            in_dim,
+            out_dim,
+            num_cpus=num_cpus,
             recurrent_bandwidth=recurrent_bandwidth,
             existing_window_layer=window_state.suffix_windows.get(suffix),
-            existing_window_size=window_state.window_size)
+            existing_window_size=window_state.window_size,
+        )
 
     p = window_state.window_size
     new_center = np.float32(2.0 * p + 0.5)
@@ -129,14 +131,13 @@ def advance_window(
         centers = Tensor(np.array([new_center], dtype=np.float32))
         log_sigmas = Tensor(np.array([new_log_sigma], dtype=np.float32))
     else:
-        centers = Tensor(np.concatenate(
-            [window_state.centers.data, [new_center]]).astype(np.float32))
-        log_sigmas = Tensor(np.concatenate(
-            [window_state.log_sigmas.data, [new_log_sigma]]).astype(np.float32))
+        centers = Tensor(np.concatenate([window_state.centers.data, [new_center]]).astype(np.float32))
+        log_sigmas = Tensor(np.concatenate([window_state.log_sigmas.data, [new_log_sigma]]).astype(np.float32))
 
     return WindowState(
         suffix_windows=new_windows,
         window_size=window_state.window_size + 1,
-        window_positions=window_state.window_positions + [next_position],
+        window_positions=[*window_state.window_positions, next_position],
         centers=centers,
-        log_sigmas=log_sigmas)
+        log_sigmas=log_sigmas,
+    )

@@ -21,32 +21,32 @@ baseline.
 
 Writes real captured numbers to sili_v_torch.md at the repo root.
 """
-import ctypes
-import gc
+
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
+from conftest import trim_memory
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from model.config import MiniCPM5Config
 from model.checkpoint import load_minicpm5_checkpoint
+from model.config import MiniCPM5Config
+from model.eval_pruning import EVAL_TEXTS, evaluate_next_token_prediction
 from model.prune import (
-    prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    prune_state_dict_by_role,
     sparse_state_to_dense_state_dict,
 )
-from model.eval_pruning import evaluate_next_token_prediction, EVAL_TEXTS
 from model.sili_model import build_sili_model, evaluate_next_token_prediction_sili
-from conftest import trim_memory
 
-REAL_CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
-REPORT_PATH = os.path.join(os.path.dirname(__file__), '..', 'sili_v_torch.md')
+REAL_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "MiniCPM5-1B-Base")
+REPORT_PATH = os.path.join(os.path.dirname(__file__), "..", "sili_v_torch.md")
 
 
 def _rss_mb() -> float:
@@ -57,10 +57,10 @@ def _rss_mb() -> float:
     return -1.0
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestSiliVsTorchRealCheckpoint:
-
     def test_perplexity_accuracy_time_memory_head_to_head(self):
         cfg = MiniCPM5Config.from_json(os.path.join(REAL_CHECKPOINT_DIR, "config.json"))
         tokenizer = AutoTokenizer.from_pretrained(REAL_CHECKPOINT_DIR)
@@ -75,7 +75,7 @@ class TestSiliVsTorchRealCheckpoint:
         rss_after_prune = _rss_mb()
 
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
-        sparse_state_for_sili = {k: v for k, v in sparse_state.items()}
+        sparse_state_for_sili = dict(sparse_state.items())
         del sparse_state
         trim_memory()
 
@@ -104,8 +104,8 @@ class TestSiliVsTorchRealCheckpoint:
         max_seq_len = max(len(tokenizer(t)["input_ids"]) for t in EVAL_TEXTS)
         t0 = time.perf_counter()
         sili_result = evaluate_next_token_prediction_sili(
-            sili_model, tokenizer, cfg, half_bandwidth=max_seq_len,
-            texts=EVAL_TEXTS, num_cpus=NUM_CPUS)
+            sili_model, tokenizer, cfg, half_bandwidth=max_seq_len, texts=EVAL_TEXTS, num_cpus=NUM_CPUS
+        )
         t_eval_sili = time.perf_counter() - t0
         sili_seconds = t_build_sili + t_eval_sili
         rss_peak_sili = _rss_mb()
@@ -145,8 +145,8 @@ RSS checkpoints: start {rss_start:.0f} MB, after load+prune
 {rss_after_prune:.0f} MB, after freeing torch model+trim
 {rss_after_torch:.0f} MB.
 
-Per-text loss (torch): {[round(l, 4) for l in torch_result.per_text_loss]}
-Per-text loss (sili):  {[round(l, 4) for l in sili_result.per_text_loss]}
+Per-text loss (torch): {[round(x, 4) for x in torch_result.per_text_loss]}
+Per-text loss (sili):  {[round(x, 4) for x in sili_result.per_text_loss]}
 Per-text accuracy (torch): {[round(a, 4) for a in torch_result.per_text_accuracy]}
 Per-text accuracy (sili):  {[round(a, 4) for a in sili_result.per_text_accuracy]}
 
@@ -175,4 +175,4 @@ torch CSR call count both made it slower, not faster (reverted).
 
         assert np.isfinite(torch_result.perplexity) and np.isfinite(sili_result.perplexity)
         assert np.isfinite(torch_result.accuracy) and np.isfinite(sili_result.accuracy)
-        assert torch_result.accuracy > 0.4   # the already-validated B3b pruned baseline
+        assert torch_result.accuracy > 0.4  # the already-validated B3b pruned baseline

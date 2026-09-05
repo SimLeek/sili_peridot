@@ -20,10 +20,11 @@ grounds.
 
 Usage: PYTHONPATH=<sili_peridot repo root> python scripts/stochastic_scale_dense_confirmation.py
 """
+
 import numpy as np
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayerDeterministic
 
 from scripts.stochastic_stability_vs_scale_sparsity import _train_and_eval
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayerDeterministic
 
 EMBED_WIDTH = 32
 COLUMN_NEURONS = 16

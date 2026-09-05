@@ -9,6 +9,7 @@ digging into the real math instead of guessing at another scale fix.
 
 Usage: python3 scripts/diagnose_dense_vs_sparse.py [n_steps]
 """
+
 from __future__ import annotations
 
 import sys
@@ -17,14 +18,15 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
+import functools
+
 from sili import _cpu
 from sili.sparse_rnn import DISLDOLayerDeterministic
-from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import TrueMultiDigitLayer
-from model.toy_recall_models import cross_entropy_sum, AdamOptimizer, lr_schedule, clip_grad_norm_
-from scripts.train_tile_curriculum import generate_copy_sequence, _build_tile_window
 
-import functools
+from model.toy_precision_models import TrueMultiDigitLayer
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule
+from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
+from scripts.train_tile_curriculum import _build_tile_window, generate_copy_sequence
 
 VOCAB = 10
 EMBED_WIDTH = 16
@@ -36,8 +38,7 @@ MAX_GRAD_NORM = 1.0  # matches train_tile_curriculum.py's own fix -- see its doc
 WARMUP_STEPS = 50
 SEED = 1000
 
-STAGES = ["qkv_source", "q", "k", "v", "attn_raw", "attn_o_proj",
-         "pre_clip", "clip_fraction", "post_clip", "logits"]
+STAGES = ["qkv_source", "q", "k", "v", "attn_raw", "attn_o_proj", "pre_clip", "clip_fraction", "post_clip", "logits"]
 
 
 def build_model(dense: bool, seed: int) -> ToyTileRecurrenceRealFP4:
@@ -49,13 +50,23 @@ def build_model(dense: bool, seed: int) -> ToyTileRecurrenceRealFP4:
     # (confirmed directly: two invocations gave NaN at different steps).
     if hasattr(_cpu, "seed_fp4_stochastic_rng"):
         _cpu.seed_fp4_stochastic_rng(seed)
-    digit_cls = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-                                  n_stages=3, base=12.0, lr_power=0.0, dense=dense)
+    digit_cls = functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=12.0, lr_power=0.0, dense=dense
+    )
     rng = np.random.default_rng(seed)
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     return ToyTileRecurrenceRealFP4(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, state_width * 2, NUM_TILES, MAX_WEIGHTS,
-        num_cpus=1, disldo_cls=digit_cls, use_attention=True, rng=rng)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        state_width * 2,
+        NUM_TILES,
+        MAX_WEIGHTS,
+        num_cpus=1,
+        disldo_cls=digit_cls,
+        use_attention=True,
+        rng=rng,
+    )
 
 
 def _scale_stats(layer, n_in, n_out):
@@ -64,12 +75,17 @@ def _scale_stats(layer, n_in, n_out):
     the FIRST few steps' forward values look healthy."""
     vs = [layer._c.get_value_scale(r) for r in range(n_in)]
     os_ = [layer._c.get_output_scale(c) for c in range(n_out)]
-    return {"value_scale_mean": float(np.mean(vs)), "value_scale_max": float(np.max(np.abs(vs))),
-           "output_scale_mean": float(np.mean(os_)), "output_scale_max": float(np.max(np.abs(os_)))}
+    return {
+        "value_scale_mean": float(np.mean(vs)),
+        "value_scale_max": float(np.max(np.abs(vs))),
+        "output_scale_mean": float(np.mean(os_)),
+        "output_scale_max": float(np.max(np.abs(os_))),
+    }
 
 
-def run(model: ToyTileRecurrenceRealFP4, n_steps: int, seed: int, sample_every: int = 1,
-        detail_range: tuple | None = None):
+def run(
+    model: ToyTileRecurrenceRealFP4, n_steps: int, seed: int, sample_every: int = 1, detail_range: tuple | None = None
+):
     """Mirrors train_tile_curriculum.py main()'s training loop closely
     enough to be representative, minimal enough to stay readable.
 
@@ -121,8 +137,7 @@ def run(model: ToyTileRecurrenceRealFP4, n_steps: int, seed: int, sample_every: 
             # (untouched by any Python-level clip) is actually the one
             # exploding, now that clipping attn/M_new_t/gradients was
             # confirmed NOT sufficient to prevent the NaN divergence.
-            layers = {"q": model.q_proj, "k": model.k_proj, "v": model.v_proj,
-                     "o": model.o_proj, "lm": model.lm_head}
+            layers = {"q": model.q_proj, "k": model.k_proj, "v": model.v_proj, "o": model.o_proj, "lm": model.lm_head}
             entry["layer_scales"] = {}
             for name, layer in layers.items():
                 digit_maxes = []
@@ -130,8 +145,9 @@ def run(model: ToyTileRecurrenceRealFP4, n_steps: int, seed: int, sample_every: 
                     n_in, n_out = digit._c.n_inputs, digit._c.n_outputs
                     s = _scale_stats(digit, n_in, n_out)
                     w = np.asarray(digit._c.weights_vals)
-                    digit_maxes.append((s["output_scale_max"], s["value_scale_max"],
-                                        float(np.abs(w).max()) if w.size else 0.0))
+                    digit_maxes.append(
+                        (s["output_scale_max"], s["value_scale_max"], float(np.abs(w).max()) if w.size else 0.0)
+                    )
                 entry["layer_scales"][name] = digit_maxes
             # log_sigmas/sigmas: unbounded below in the C++ attention math
             # (gaussian_attention_backward's dSigmas has a 1/sigma^3 term,
@@ -161,24 +177,30 @@ def main():
     dense_model = build_model(dense=True, seed=SEED)
     sparse_model = build_model(dense=False, seed=SEED)
 
-    print(f"Running {n_steps} real training steps on each (sampled every {sample_every}"
-          f"{f', detail {detail_range}' if detail_range else ''})...")
+    print(
+        f"Running {n_steps} real training steps on each (sampled every {sample_every}"
+        f"{f', detail {detail_range}' if detail_range else ''})..."
+    )
     dense_hist = run(dense_model, n_steps, SEED, sample_every, detail_range)
     sparse_hist = run(sparse_model, n_steps, SEED, sample_every, detail_range)
 
     if sample_every == 1:
         for step_idx in range(len(dense_hist)):
             print(f"\n=== step {step_idx + 1} ===")
-            print(f"{'stage':<16} {'dense mean':<12} {'dense std':<12} {'dense |max|':<12} | "
-                  f"{'sparse mean':<12} {'sparse std':<12} {'sparse |max|':<12}")
+            print(
+                f"{'stage':<16} {'dense mean':<12} {'dense std':<12} {'dense |max|':<12} | "
+                f"{'sparse mean':<12} {'sparse std':<12} {'sparse |max|':<12}"
+            )
             for stage in STAGES:
                 d = dense_hist[step_idx].get(stage)
                 s = sparse_hist[step_idx].get(stage)
                 if stage == "clip_fraction":
                     print(f"{stage:<16} {d:<12.4f} {'':<12} {'':<12} | {s:<12.4f}")
                     continue
-                print(f"{stage:<16} {d['mean']:<12.4f} {d['std']:<12.4f} {d['abs_max']:<12.4f} | "
-                      f"{s['mean']:<12.4f} {s['std']:<12.4f} {s['abs_max']:<12.4f}")
+                print(
+                    f"{stage:<16} {d['mean']:<12.4f} {d['std']:<12.4f} {d['abs_max']:<12.4f} | "
+                    f"{s['mean']:<12.4f} {s['std']:<12.4f} {s['abs_max']:<12.4f}"
+                )
     else:
         # Longer-run trend view: logits std (collapsing to ~0 = dead model),
         # clip_fraction, and per-layer max(output_scale, value_scale, raw
@@ -194,7 +216,7 @@ def main():
         act_stages = ["qkv_source", "q", "k", "v", "attn_raw", "attn_o_proj"]
         header = f"{'step':<6} {'d.logstd':<10} {'d.clipf':<8}"
         for st in act_stages:
-            header += f" {'d.'+st+'.|max|':<16}"
+            header += f" {'d.' + st + '.|max|':<16}"
         header += f" {'d.centers[min,max]':<20}"
         print("\n" + header)
         for d in dense_hist:

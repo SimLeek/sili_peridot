@@ -30,6 +30,7 @@ rationale). Reported against the fp32 ToyTileRecurrence baseline
 
 Run: python -m scripts.train_toy_tile_precision_comparison
 """
+
 from __future__ import annotations
 
 import sys
@@ -39,11 +40,12 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule
-from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import AdamRowScaleDISLDOLayer, AdamRank1DISLDOLayer
 from sili.sparse_rnn import DISLDOLayer
+
+from model.toy_precision_models import AdamRank1DISLDOLayer, AdamRowScaleDISLDOLayer
+from model.toy_recall_models import AdamOptimizer, cross_entropy_sum, lr_schedule, predicted_token
+from model.toy_recall_task import generate_mqar_sequence
+from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
 
 TRAIN_STEPS = 3000
 WARMUP_STEPS = 100
@@ -51,17 +53,17 @@ PEAK_LR = 0.02
 EVAL_SEQUENCES = 60
 EMBED_WIDTH = 32
 MAX_WEIGHTS_PER_LAYER = 4096  # a FIXED sparse connection budget, independent of
-                              # column_neurons/state_width -- checked directly:
-                              # the original max_weights=state_width*mlp_hidden
-                              # gave per_row=512 at n_outputs=256 (state_width=8),
-                              # i.e. 100% dense -- every q/k/v/o layer was fully
-                              # dense while still paying DISLDOLayer's sparse
-                              # bookkeeping overhead on top, explaining timings far
-                              # worse than the ~3x-vs-dense DISLDOLayer overhead
-                              # normally seen. This value keeps real sparsity
-                              # (per_row well under n_outputs at every tested
-                              # column_neurons) -- the entire reason to route
-                              # tile-recurrence's wide state through sili at all.
+# column_neurons/state_width -- checked directly:
+# the original max_weights=state_width*mlp_hidden
+# gave per_row=512 at n_outputs=256 (state_width=8),
+# i.e. 100% dense -- every q/k/v/o layer was fully
+# dense while still paying DISLDOLayer's sparse
+# bookkeeping overhead on top, explaining timings far
+# worse than the ~3x-vs-dense DISLDOLayer overhead
+# normally seen. This value keeps real sparsity
+# (per_row well under n_outputs at every tested
+# column_neurons) -- the entire reason to route
+# tile-recurrence's wide state through sili at all.
 
 VARIANTS = {
     "plain-DISLDOLayer": DISLDOLayer,
@@ -78,26 +80,35 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
     return targets
 
 
-def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                       num_tiles: int, M_prev: np.ndarray, column_neurons: int) -> np.ndarray:
+def _build_tile_window(
+    embed_table: np.ndarray, tokens: np.ndarray, i: int, num_tiles: int, M_prev: np.ndarray, column_neurons: int
+) -> np.ndarray:
     state_width = embed_table.shape[1] * column_neurons
     window = np.empty((num_tiles, state_width), dtype=np.float32)
     for j in range(num_tiles):
         src = i - (num_tiles - 1) + j
-        window[j] = (np.repeat(embed_table[tokens[src]], column_neurons)
-                     if src >= 0 else M_prev[j])
+        window[j] = np.repeat(embed_table[tokens[src]], column_neurons) if src >= 0 else M_prev[j]
     return window
 
 
-def train_and_eval_tile_real_fp4(seq_len, num_kv_pairs, vocab, column_neurons, disldo_cls,
-                                 seed, train_steps=TRAIN_STEPS):
+def train_and_eval_tile_real_fp4(
+    seq_len, num_kv_pairs, vocab, column_neurons, disldo_cls, seed, train_steps=TRAIN_STEPS
+):
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * column_neurons
     mlp_hidden = state_width * 2
-    model = ToyTileRecurrenceRealFP4(vocab, EMBED_WIDTH, column_neurons, mlp_hidden, num_tiles,
-                                     MAX_WEIGHTS_PER_LAYER, num_cpus=4, disldo_cls=disldo_cls)
+    model = ToyTileRecurrenceRealFP4(
+        vocab,
+        EMBED_WIDTH,
+        column_neurons,
+        mlp_hidden,
+        num_tiles,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=4,
+        disldo_cls=disldo_cls,
+    )
     opt = AdamOptimizer()
     embed_table = rng.randn(vocab, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -131,8 +142,10 @@ def train_and_eval_tile_real_fp4(seq_len, num_kv_pairs, vocab, column_neurons, d
 
 
 def main():
-    print(f"train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} peak_lr={PEAK_LR} "
-          f"eval_sequences={EVAL_SEQUENCES} embed_width={EMBED_WIDTH}\n")
+    print(
+        f"train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} peak_lr={PEAK_LR} "
+        f"eval_sequences={EVAL_SEQUENCES} embed_width={EMBED_WIDTH}\n"
+    )
 
     print("Stage 1: optimizer variant sweep (column_neurons=8, seq_len=16/kv=2)")
     stage1 = {}
@@ -149,8 +162,7 @@ def main():
     stage2 = {}
     for cn in (8, 16):
         t0 = time.time()
-        acc = train_and_eval_tile_real_fp4(16, 2, 20, column_neurons=cn, disldo_cls=winner_cls,
-                                           seed=7000 + cn)
+        acc = train_and_eval_tile_real_fp4(16, 2, 20, column_neurons=cn, disldo_cls=winner_cls, seed=7000 + cn)
         print(f"  column_neurons={cn}: acc={acc:.2f}  ({time.time() - t0:.1f}s)")
         stage2[cn] = acc
     print()
@@ -159,14 +171,15 @@ def main():
     stage3 = {}
     for cn in (8, 16):
         t0 = time.time()
-        acc = train_and_eval_tile_real_fp4(32, 4, 40, column_neurons=cn, disldo_cls=winner_cls,
-                                           seed=8000 + cn)
+        acc = train_and_eval_tile_real_fp4(32, 4, 40, column_neurons=cn, disldo_cls=winner_cls, seed=8000 + cn)
         print(f"  column_neurons={cn}: acc={acc:.2f}  ({time.time() - t0:.1f}s)")
         stage3[cn] = acc
 
-    print("\nReference (already on record): fp32 ToyTileRecurrence "
-          "(DenseTensorLinear+Adam) = 0.10 (seq16) / 0.05 (seq32); "
-          "dense fp32 transformer ceiling = 0.57 (seq16) / 0.26 (seq32).")
+    print(
+        "\nReference (already on record): fp32 ToyTileRecurrence "
+        "(DenseTensorLinear+Adam) = 0.10 (seq16) / 0.05 (seq32); "
+        "dense fp32 transformer ceiling = 0.57 (seq16) / 0.26 (seq32)."
+    )
     return stage1, stage2, stage3
 
 

@@ -30,32 +30,51 @@ confirms the mechanism works at toy scale.
 Usage: PYTHONPATH=<sili_peridot root> python scripts/empty_init_synaptogenesis_ladder.py <tier>
   tier in {1, 2, 4, 8}
 """
-import sys, time
+
+import sys
+import time
+
 sys.path.insert(0, ".")
 import numpy as np
-from scripts.l1_sparsity_probe import OriginalArchModel, run, evaluate
+
+from scripts.l1_sparsity_probe import OriginalArchModel, evaluate, run
 
 
 def read_nnz(model):
-    return {name: sum(d._c.nnz for d in layer.digits)
-            for name, layer in (("q", model.q_proj), ("k", model.k_proj),
-                                 ("v", model.v_proj), ("o", model.o_proj),
-                                 ("lm", model.lm_head))}
+    return {
+        name: sum(d._c.nnz for d in layer.digits)
+        for name, layer in (
+            ("q", model.q_proj),
+            ("k", model.k_proj),
+            ("v", model.v_proj),
+            ("o", model.o_proj),
+            ("lm", model.lm_head),
+        )
+    }
 
 
 def tier1_smoke(seed=1000, n_steps=8000):
     """~1 min, 1 seed: does the full model grow real synapses and have
     them escape weight=0, with no crashes, under empty_init=True?"""
     t0 = time.time()
-    model = OriginalArchModel(seed, dense=False, o_proj_coef=0.0, all_layer_coef=0.0,
-                              l1_sparsity_coef=0.05, use_energy=False, empty_init=True,
-                              synap_k=3)
-    last_accs, skips, total, avg_step_time = run(model, n_steps, seed, verbose=False)
+    model = OriginalArchModel(
+        seed,
+        dense=False,
+        o_proj_coef=0.0,
+        all_layer_coef=0.0,
+        l1_sparsity_coef=0.05,
+        use_energy=False,
+        empty_init=True,
+        synap_k=3,
+    )
+    _last_accs, skips, total, _avg_step_time = run(model, n_steps, seed, verbose=False)
     nnz = read_nnz(model)
     acc = evaluate(model, 50, seed, verbose=True)
     dt = time.time() - t0
-    print(f"[tier1] seed={seed} n_steps={n_steps} wall={dt:.1f}s "
-          f"nnz={nnz} eval_acc={acc:.4f} skips={skips}/{total}", flush=True)
+    print(
+        f"[tier1] seed={seed} n_steps={n_steps} wall={dt:.1f}s nnz={nnz} eval_acc={acc:.4f} skips={skips}/{total}",
+        flush=True,
+    )
     return dt
 
 
@@ -64,9 +83,16 @@ def tier2_multiseed(seeds=(1000, 1001, 1002), n_steps=5500):
     single-seed fluke?"""
     t0 = time.time()
     for seed in seeds:
-        model = OriginalArchModel(seed, dense=False, o_proj_coef=0.0, all_layer_coef=0.0,
-                                  l1_sparsity_coef=0.05, use_energy=False, empty_init=True,
-                                  synap_k=3)
+        model = OriginalArchModel(
+            seed,
+            dense=False,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            empty_init=True,
+            synap_k=3,
+        )
         run(model, n_steps, seed, verbose=False)
         nnz = read_nnz(model)
         acc = evaluate(model, 50, seed)
@@ -84,19 +110,36 @@ def tier4_learning_signal(seeds=(1000, 1001, 1002), n_steps=12000):
     t0 = time.time()
     results = []
     for seed in seeds:
-        untrained = OriginalArchModel(seed, dense=False, o_proj_coef=0.0, all_layer_coef=0.0,
-                                      l1_sparsity_coef=0.05, use_energy=False, empty_init=True,
-                                      synap_k=3)
+        untrained = OriginalArchModel(
+            seed,
+            dense=False,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            empty_init=True,
+            synap_k=3,
+        )
         untrained_acc = evaluate(untrained, 100, seed)
-        model = OriginalArchModel(seed, dense=False, o_proj_coef=0.0, all_layer_coef=0.0,
-                                  l1_sparsity_coef=0.05, use_energy=False, empty_init=True,
-                                  synap_k=3)
+        model = OriginalArchModel(
+            seed,
+            dense=False,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            empty_init=True,
+            synap_k=3,
+        )
         run(model, n_steps, seed, verbose=False)
         trained_acc = evaluate(model, 100, seed)
         results.append((untrained_acc, trained_acc))
-        print(f"[tier4] seed={seed} untrained_acc={untrained_acc:.4f} "
-              f"trained_acc={trained_acc:.4f} delta={trained_acc-untrained_acc:+.4f} "
-              f"nnz={read_nnz(model)}", flush=True)
+        print(
+            f"[tier4] seed={seed} untrained_acc={untrained_acc:.4f} "
+            f"trained_acc={trained_acc:.4f} delta={trained_acc - untrained_acc:+.4f} "
+            f"nnz={read_nnz(model)}",
+            flush=True,
+        )
     dt = time.time() - t0
     mean_delta = np.mean([t - u for u, t in results])
     print(f"[tier4] total wall={dt:.1f}s mean_delta={mean_delta:+.4f}", flush=True)
@@ -111,16 +154,26 @@ def tier8_landmark_scale(seeds=(1000, 1001, 1002, 1003, 1004), n_steps=15000):
     t0 = time.time()
     accs = []
     for seed in seeds:
-        model = OriginalArchModel(seed, dense=False, o_proj_coef=0.0, all_layer_coef=0.0,
-                                  l1_sparsity_coef=0.05, use_energy=False, empty_init=True,
-                                  synap_k=3)
+        model = OriginalArchModel(
+            seed,
+            dense=False,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            empty_init=True,
+            synap_k=3,
+        )
         run(model, n_steps, seed, verbose=False)
         acc = evaluate(model, 100, seed)
         accs.append(acc)
         print(f"[tier8] seed={seed} eval_acc={acc:.4f} nnz={read_nnz(model)}", flush=True)
     dt = time.time() - t0
-    print(f"[tier8] total wall={dt:.1f}s mean_acc={np.mean(accs):.4f} "
-          f"std={np.std(accs):.4f} accs={[f'{a:.4f}' for a in accs]}", flush=True)
+    print(
+        f"[tier8] total wall={dt:.1f}s mean_acc={np.mean(accs):.4f} "
+        f"std={np.std(accs):.4f} accs={[f'{a:.4f}' for a in accs]}",
+        flush=True,
+    )
     return dt
 
 
@@ -131,4 +184,4 @@ if __name__ == "__main__":
     fn = TIERS[tier]
     t0 = time.time()
     fn()
-    print(f"=== tier {tier} grand total wall={time.time()-t0:.1f}s ===", flush=True)
+    print(f"=== tier {tier} grand total wall={time.time() - t0:.1f}s ===", flush=True)

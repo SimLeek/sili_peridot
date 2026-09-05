@@ -30,29 +30,37 @@ RMSNorm/RoPE weights are never part of the 7 folded suffixes (B3/B5 never
 prune or quantize them), so they're read directly from sparse_state as
 plain float32 vectors, not built into any SparseLinearLayer.
 """
+
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
-
 import numpy as np
-
 from sili import _cpu
 from sili.energy import EnergyDynamics
 from sili.sparse_rnn import fit_rank1_scale_envelope
-from sili.tensor import Tensor, banded_attention, gaussian_attention, exp
+from sili.tensor import Tensor, banded_attention, exp, gaussian_attention
 
 from .config import MiniCPM5Config
 from .fold import SUFFIXES, fold_suffix
 
 _FP4_MAX = 6.0
-_ATTN_SUFFIXES = (".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
-                  ".self_attn.v_proj.weight", ".self_attn.o_proj.weight")
-_MLP_SUFFIXES  = (".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight")
+_ATTN_SUFFIXES = (
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+)
+_MLP_SUFFIXES = (".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight")
 
 
 def _build_step_layer_from_arrays(
-    n_in: int, n_out: int, ptrs: np.ndarray, idx: np.ndarray, vals: np.ndarray, num_cpus: int,
-    value_scale_mode: str = "per_row", rank1_iters: int = 6,
+    n_in: int,
+    n_out: int,
+    ptrs: np.ndarray,
+    idx: np.ndarray,
+    vals: np.ndarray,
+    num_cpus: int,
+    value_scale_mode: str = "per_row",
+    rank1_iters: int = 6,
 ):
     """
     ptrs/idx/vals: one fold step's own [n_in, n_out] CSR, already sliced
@@ -78,7 +86,8 @@ def _build_step_layer_from_arrays(
     if value_scale_mode == "rank1":
         row_of_nnz = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs))
         row_env, col_env = fit_rank1_scale_envelope(
-            row_of_nnz, idx.astype(np.int64), np.abs(vals), n_in, n_out, n_iters=rank1_iters)
+            row_of_nnz, idx.astype(np.int64), np.abs(vals), n_in, n_out, n_iters=rank1_iters
+        )
         row_scales = (row_env / _FP4_MAX).astype(np.float32)
         col_scales = col_env.astype(np.float32)
         combined = row_scales[row_of_nnz] * col_scales[idx]
@@ -106,14 +115,14 @@ def _build_step_layer_from_arrays(
 
 
 def build_step_layers(
-    sparse_state: Dict[str, dict],
+    sparse_state: dict[str, dict],
     cfg: MiniCPM5Config,
     prefix: str = "model.layers.",
     band_half_width_override=None,
     num_cpus: int = 4,
     value_scale_mode: str = "per_row",
     rank1_iters: int = 6,
-) -> Tuple[List[Dict[str, object]], List[np.ndarray], List[np.ndarray]]:
+) -> tuple[list[dict[str, object]], list[np.ndarray], list[np.ndarray]]:
     """
     Build every fold step's real sili layers (one suffix-keyed dict per
     step) plus that step's own RMSNorm weight vectors, streaming one
@@ -144,7 +153,7 @@ def build_step_layers(
     real bottleneck hasn't been isolated yet. See JOURNAL.md.
     """
     n = cfg.num_hidden_layers
-    step_layers: List[Dict[str, object]] = [dict() for _ in range(n)]
+    step_layers: list[dict[str, object]] = [{} for _ in range(n)]
 
     for suffix in SUFFIXES:
         desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
@@ -155,20 +164,18 @@ def build_step_layers(
             csr_t = csr_slice.t().to_sparse_csr()
             n_in, out_dim = int(csr_t.shape[0]), int(csr_t.shape[1])
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
-            idx  = csr_t.col_indices().numpy().astype(np.int32)
+            idx = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy()
             step_layers[i][suffix] = _build_step_layer_from_arrays(
-                n_in, out_dim, ptrs, idx, vals, num_cpus,
-                value_scale_mode=value_scale_mode, rank1_iters=rank1_iters)
+                n_in, out_dim, ptrs, idx, vals, num_cpus, value_scale_mode=value_scale_mode, rank1_iters=rank1_iters
+            )
         del desc
 
     input_ln = []
-    post_ln  = []
+    post_ln = []
     for i in range(n):
-        input_ln.append(sparse_state.pop(f"{prefix}{i}.input_layernorm.weight")["raw"]
-                        .float().numpy().copy())
-        post_ln.append(sparse_state.pop(f"{prefix}{i}.post_attention_layernorm.weight")["raw"]
-                       .float().numpy().copy())
+        input_ln.append(sparse_state.pop(f"{prefix}{i}.input_layernorm.weight")["raw"].float().numpy().copy())
+        post_ln.append(sparse_state.pop(f"{prefix}{i}.post_attention_layernorm.weight")["raw"].float().numpy().copy())
     return step_layers, input_ln, post_ln
 
 
@@ -176,7 +183,8 @@ def build_step_layers(
 # time, as B8a's curriculum widens the window. Never built for positions
 # outside the window -- see module docstring.
 
-def _extract_true_csr(layer: "_cpu.SparseLinearLayer"):
+
+def _extract_true_csr(layer: _cpu.SparseLinearLayer):
     """Read a SparseLinearLayer's stored (ptrs, indices, values) back out
     in TRUE units (true_w = weights_vals * value_scale[row] *
     output_scale[col], see cpu_backend.cpp) -- same pattern
@@ -186,15 +194,15 @@ def _extract_true_csr(layer: "_cpu.SparseLinearLayer"):
     want to inspect a layer's real weight values."""
     n_in, n_out = layer.n_inputs, layer.n_outputs
     ptrs = np.asarray(layer.ptrs).astype(np.int32)
-    idx  = np.asarray(layer.indices).astype(np.int32)
-    row  = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs.astype(np.int64)))
+    idx = np.asarray(layer.indices).astype(np.int32)
+    row = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs.astype(np.int64)))
     row_scale = np.array([layer.get_value_scale(r) for r in range(n_in)], dtype=np.float32)
     col_scale = np.array([layer.get_output_scale(c) for c in range(n_out)], dtype=np.float32)
     vals = np.asarray(layer.weights_vals).astype(np.float32) * row_scale[row] * col_scale[idx]
     return ptrs, idx, vals
 
 
-def _raw_stored_csr(layer: "_cpu.SparseLinearLayer"):
+def _raw_stored_csr(layer: _cpu.SparseLinearLayer):
     """Read (ptrs, indices, weights_vals) EXACTLY as stored -- FP4-nominal
     units, NOT multiplied by value_scale/output_scale -- plus the
     per-row and per-column scale arrays, with no dequantization
@@ -211,14 +219,14 @@ def _raw_stored_csr(layer: "_cpu.SparseLinearLayer"):
     already set)."""
     n_in, n_out = layer.n_inputs, layer.n_outputs
     ptrs = np.asarray(layer.ptrs).astype(np.int64)
-    idx  = np.asarray(layer.indices).astype(np.int32)
+    idx = np.asarray(layer.indices).astype(np.int32)
     stored = np.asarray(layer.weights_vals).astype(np.float32)
     row_scale = np.array([layer.get_value_scale(r) for r in range(n_in)], dtype=np.float32)
     col_scale = np.array([layer.get_output_scale(c) for c in range(n_out)], dtype=np.float32)
     return ptrs, idx, stored, row_scale, col_scale
 
 
-def _fixed_band_span(row: int, in_dim: int, out_dim: int, bw: int) -> Tuple[int, int]:
+def _fixed_band_span(row: int, in_dim: int, out_dim: int, bw: int) -> tuple[int, int]:
     """This row's recurrent-band reach in absolute output-column units,
     using its OWN position's fixed in/out ratio -- NOT recentered
     against however large total_in/total_out have grown to since. An
@@ -236,12 +244,14 @@ def _fixed_band_span(row: int, in_dim: int, out_dim: int, bw: int) -> Tuple[int,
 
 
 def grow_window_layer(
-    new_position_layer: "_cpu.SparseLinearLayer",
-    in_dim: int, out_dim: int, num_cpus: int = 4,
-    recurrent_bandwidth: Optional[int] = None,
-    existing_window_layer: Optional["_cpu.SparseLinearLayer"] = None,
+    new_position_layer: _cpu.SparseLinearLayer,
+    in_dim: int,
+    out_dim: int,
+    num_cpus: int = 4,
+    recurrent_bandwidth: int | None = None,
+    existing_window_layer: _cpu.SparseLinearLayer | None = None,
     existing_window_size: int = 0,
-) -> "_cpu.SparseLinearLayer":
+) -> _cpu.SparseLinearLayer:
     """
     Add ONE position to the window's combined matrix. `new_position_layer`
     is that position's own already-built, already-quantized small layer
@@ -296,10 +306,11 @@ def grow_window_layer(
     """
     assert (existing_window_layer is None) == (existing_window_size == 0), (
         "existing_window_layer and existing_window_size must agree: both "
-        "absent (first position) or both present (growing further)")
-    total_in  = (existing_window_size + 1) * in_dim
+        "absent (first position) or both present (growing further)"
+    )
+    total_in = (existing_window_size + 1) * in_dim
     total_out = (existing_window_size + 1) * out_dim
-    off_in  = existing_window_size * in_dim
+    off_in = existing_window_size * in_dim
     off_out = existing_window_size * out_dim
     bw = recurrent_bandwidth if recurrent_bandwidth is not None else max(1, min(in_dim, out_dim) // 8)
 
@@ -314,8 +325,8 @@ def grow_window_layer(
     row_scale = np.empty(total_in, dtype=np.float32)
     col_scale = np.empty(total_out, dtype=np.float32)
     col_scale[off_out:total_out] = new_col_scale
-    idx_chunks: List[np.ndarray] = []
-    val_chunks: List[np.ndarray] = []
+    idx_chunks: list[np.ndarray] = []
+    val_chunks: list[np.ndarray] = []
 
     for r in range(off_in):
         s, e = int(old_ptrs[r]), int(old_ptrs[r + 1])
@@ -337,9 +348,9 @@ def grow_window_layer(
     if off_in > 0:
         col_scale[0:off_out] = old_col_scale
 
-    for l in range(in_dim):
-        r = off_in + l
-        s, e = int(new_ptrs[l]), int(new_ptrs[l + 1])
+    for col in range(in_dim):
+        r = off_in + col
+        s, e = int(new_ptrs[col]), int(new_ptrs[col + 1])
         idx_parts = [new_idx[s:e].astype(np.int64) + off_out]
         val_parts = [new_stored[s:e]]
         lo, hi = _fixed_band_span(r, in_dim, out_dim, bw)
@@ -354,7 +365,7 @@ def grow_window_layer(
         idx_chunks.append(row_idx[order].astype(np.int32))
         val_chunks.append(row_val[order])
         ptrs[r + 1] = ptrs[r] + row_idx.shape[0]
-        row_scale[r] = new_row_scale[l]
+        row_scale[r] = new_row_scale[col]
 
     u_idx = np.concatenate(idx_chunks)
     u_val = np.concatenate(val_chunks)
@@ -376,17 +387,18 @@ def grow_window_layer(
 # No sparsity, no learned structure beyond a per-channel scale vector --
 # sili doesn't claim these as ops, plain numpy is the right tool.
 
+
 def rmsnorm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
     """x: [T, hidden]. Matches sili__new's model_reconstruct.py _LlamaRMSNorm."""
     var = np.mean(x.astype(np.float32) ** 2, axis=-1, keepdims=True)
     return (x * (1.0 / np.sqrt(var + eps))).astype(np.float32) * weight
 
 
-def rope_cos_sin(seq_len: int, head_dim: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
+def rope_cos_sin(seq_len: int, head_dim: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
     inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
     t = np.arange(seq_len, dtype=np.float32)
-    freqs = np.outer(t, inv_freq)                        # [T, head_dim/2]
-    emb = np.concatenate([freqs, freqs], axis=-1)         # [T, head_dim]
+    freqs = np.outer(t, inv_freq)  # [T, head_dim/2]
+    emb = np.concatenate([freqs, freqs], axis=-1)  # [T, head_dim]
     return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
 
 
@@ -404,7 +416,7 @@ def silu(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(-x))
 
 
-def _forward(layer, x: np.ndarray, activation_density: Optional[float]) -> np.ndarray:
+def _forward(layer, x: np.ndarray, activation_density: float | None) -> np.ndarray:
     """
     activation_density=None (default): dense DISLDO forward_dense, current
     behavior, unchanged.
@@ -427,7 +439,7 @@ def _forward(layer, x: np.ndarray, activation_density: Optional[float]) -> np.nd
     T, n_features = x.shape
     k = max(1, round(activation_density * n_features))
     abs_x = np.abs(x)
-    top_idx = np.argpartition(abs_x, n_features - k, axis=1)[:, n_features - k:]
+    top_idx = np.argpartition(abs_x, n_features - k, axis=1)[:, n_features - k :]
     top_idx = np.sort(top_idx, axis=1)
     top_vals = np.take_along_axis(x, top_idx, axis=1)
     idx = top_idx.ravel().astype(np.int32)
@@ -436,10 +448,10 @@ def _forward(layer, x: np.ndarray, activation_density: Optional[float]) -> np.nd
     return layer.forward_sparse(ptrs, idx, vals, T)
 
 
-_ActivationDensity = Union[None, float, Dict[str, Optional[float]]]
+_ActivationDensity = float | dict[str, float | None] | None
 
 
-def _density_for_suffix(step_density: _ActivationDensity, suffix: str) -> Optional[float]:
+def _density_for_suffix(step_density: _ActivationDensity, suffix: str) -> float | None:
     """step_density is either a single value (None/float, applies to every
     projection this step -- the original global behavior) or a dict
     {suffix: None/float} that isolates individual projections (q/k/v/o/
@@ -453,13 +465,15 @@ def _density_for_suffix(step_density: _ActivationDensity, suffix: str) -> Option
 
 # ── One fold step: RMSNorm -> GQA causal attention (RoPE) -> RMSNorm -> SwiGLU MLP
 
+
 def apply_fold_step(
-    x: np.ndarray,               # [T, hidden] = original input + accumulated state
-    layers: Dict[str, object],   # this step's {suffix: SparseLinearLayer}
+    x: np.ndarray,  # [T, hidden] = original input + accumulated state
+    layers: dict[str, object],  # this step's {suffix: SparseLinearLayer}
     input_ln_weight: np.ndarray,
     post_attn_ln_weight: np.ndarray,
     cfg: MiniCPM5Config,
-    cos: np.ndarray, sin: np.ndarray,   # from rope_cos_sin(T, head_dim, rope_theta)
+    cos: np.ndarray,
+    sin: np.ndarray,  # from rope_cos_sin(T, head_dim, rope_theta)
     half_bandwidth: int,
     num_cpus: int = 4,
     activation_density: _ActivationDensity = None,
@@ -469,18 +483,20 @@ def apply_fold_step(
     also be a dict keyed by suffix to sparsify only some projections --
     see _density_for_suffix."""
     T = x.shape[0]
-    n_heads, n_kv_heads, head_dim = (cfg.num_attention_heads,
-                                     cfg.num_key_value_heads, cfg.head_dim)
+    n_heads, n_kv_heads, head_dim = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim)
     groups = n_heads // n_kv_heads
 
     normed = rmsnorm(x, input_ln_weight, cfg.rms_norm_eps)
 
-    q = _forward(layers[".self_attn.q_proj.weight"], normed,
-                 _density_for_suffix(activation_density, ".self_attn.q_proj.weight"))
-    k = _forward(layers[".self_attn.k_proj.weight"], normed,
-                 _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))
-    v = _forward(layers[".self_attn.v_proj.weight"], normed,
-                 _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))
+    q = _forward(
+        layers[".self_attn.q_proj.weight"], normed, _density_for_suffix(activation_density, ".self_attn.q_proj.weight")
+    )
+    k = _forward(
+        layers[".self_attn.k_proj.weight"], normed, _density_for_suffix(activation_density, ".self_attn.k_proj.weight")
+    )
+    v = _forward(
+        layers[".self_attn.v_proj.weight"], normed, _density_for_suffix(activation_density, ".self_attn.v_proj.weight")
+    )
 
     q = q.reshape(T, n_heads, head_dim)
     k = k.reshape(T, n_kv_heads, head_dim)
@@ -492,41 +508,48 @@ def apply_fold_step(
         qh = Tensor(apply_rotary(q[:, h, :], cos, sin))
         kh = Tensor(apply_rotary(k[:, kv_h, :], cos, sin))
         vh = Tensor(np.ascontiguousarray(v[:, kv_h, :]))
-        out_h = banded_attention(qh, kh, vh, half_bandwidth=half_bandwidth,
-                                 num_cpus=num_cpus, causal=True)
+        out_h = banded_attention(qh, kh, vh, half_bandwidth=half_bandwidth, num_cpus=num_cpus, causal=True)
         attn_out[:, h, :] = out_h.data
 
     attn_out = attn_out.reshape(T, n_heads * head_dim)
-    attn_out = _forward(layers[".self_attn.o_proj.weight"], attn_out,
-                        _density_for_suffix(activation_density, ".self_attn.o_proj.weight"))
+    attn_out = _forward(
+        layers[".self_attn.o_proj.weight"],
+        attn_out,
+        _density_for_suffix(activation_density, ".self_attn.o_proj.weight"),
+    )
 
     x = x + attn_out
     normed2 = rmsnorm(x, post_attn_ln_weight, cfg.rms_norm_eps)
 
-    gate = _forward(layers[".mlp.gate_proj.weight"], normed2,
-                    _density_for_suffix(activation_density, ".mlp.gate_proj.weight"))
-    up   = _forward(layers[".mlp.up_proj.weight"], normed2,
-                    _density_for_suffix(activation_density, ".mlp.up_proj.weight"))
-    mlp_out = _forward(layers[".mlp.down_proj.weight"], silu(gate) * up,
-                       _density_for_suffix(activation_density, ".mlp.down_proj.weight"))
+    gate = _forward(
+        layers[".mlp.gate_proj.weight"], normed2, _density_for_suffix(activation_density, ".mlp.gate_proj.weight")
+    )
+    up = _forward(
+        layers[".mlp.up_proj.weight"], normed2, _density_for_suffix(activation_density, ".mlp.up_proj.weight")
+    )
+    mlp_out = _forward(
+        layers[".mlp.down_proj.weight"],
+        silu(gate) * up,
+        _density_for_suffix(activation_density, ".mlp.down_proj.weight"),
+    )
 
     return attn_out + mlp_out
 
 
 def apply_window_step(
-    x_common_t: np.ndarray,        # [hidden] -- ONE token, SAME starting input for every window position
-    carried_state: np.ndarray,     # [window_size, hidden] -- persisted from the PREVIOUS token step
-    window_layers: Dict[str, object],   # {suffix: combined layer spanning window_size positions}
+    x_common_t: np.ndarray,  # [hidden] -- ONE token, SAME starting input for every window position
+    carried_state: np.ndarray,  # [window_size, hidden] -- persisted from the PREVIOUS token step
+    window_layers: dict[str, object],  # {suffix: combined layer spanning window_size positions}
     window_size: int,
-    input_ln_weights: List[np.ndarray],       # window order (index 0 = last fold-step)
-    post_attn_ln_weights: List[np.ndarray],   # window order, same indexing
+    input_ln_weights: list[np.ndarray],  # window order (index 0 = last fold-step)
+    post_attn_ln_weights: list[np.ndarray],  # window order, same indexing
     cfg: MiniCPM5Config,
     energy_dynamics: EnergyDynamics,
-    centers: Tensor,                # [window_size] -- see WindowState.centers
-    log_sigmas: Tensor,              # [window_size] -- see WindowState.log_sigmas
+    centers: Tensor,  # [window_size] -- see WindowState.centers
+    log_sigmas: Tensor,  # [window_size] -- see WindowState.log_sigmas
     num_cpus: int = 4,
     activation_density: _ActivationDensity = None,
-) -> Tuple[np.ndarray, np.ndarray, Tensor]:
+) -> tuple[np.ndarray, np.ndarray, Tensor]:
     """The in-window counterpart to apply_fold_step -- per the MAJOR
     PIVOT (2026-08-02), scoped to the window ONLY and no longer a
     T-token-batched causal-attention block. Processes ONE token at a
@@ -588,14 +611,13 @@ def apply_window_step(
     safely ignorable in forward-only use).
     """
     hidden = cfg.hidden_size
-    n_heads, n_kv_heads, head_dim = (cfg.num_attention_heads,
-                                     cfg.num_key_value_heads, cfg.head_dim)
+    n_heads, n_kv_heads, head_dim = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim)
     groups = n_heads // n_kv_heads
-    q_proj_out, kv_proj_out = cfg.q_proj_out, cfg.kv_proj_out
+    q_proj_out, _kv_proj_out = cfg.q_proj_out, cfg.kv_proj_out
 
-    ln_stack = np.stack(input_ln_weights[:window_size])                  # [window_size, hidden]
+    ln_stack = np.stack(input_ln_weights[:window_size])  # [window_size, hidden]
     x_common_stack = np.broadcast_to(x_common_t, (window_size, hidden))
-    normed = rmsnorm(x_common_stack, ln_stack, cfg.rms_norm_eps)         # [window_size, hidden]
+    normed = rmsnorm(x_common_stack, ln_stack, cfg.rms_norm_eps)  # [window_size, hidden]
     carried_normed = rmsnorm(carried_state, ln_stack, cfg.rms_norm_eps)  # [window_size, hidden]
 
     normed_flat = normed.reshape(1, window_size * hidden)
@@ -613,26 +635,41 @@ def apply_window_step(
     # contribution -- genuine internal dynamics, not a dead gate.
     qk_source_flat = (normed + carried_normed).reshape(1, window_size * hidden)
 
-    q = _forward(window_layers[".self_attn.q_proj.weight"], qk_source_flat,
-                 _density_for_suffix(activation_density, ".self_attn.q_proj.weight"))[0]
-    k_new = _forward(window_layers[".self_attn.k_proj.weight"], normed_flat,
-                     _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))[0]
-    k_state = _forward(window_layers[".self_attn.k_proj.weight"], carried_flat,
-                       _density_for_suffix(activation_density, ".self_attn.k_proj.weight"))[0]
-    v_new = _forward(window_layers[".self_attn.v_proj.weight"], normed_flat,
-                     _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))[0]
-    v_state = _forward(window_layers[".self_attn.v_proj.weight"], carried_flat,
-                       _density_for_suffix(activation_density, ".self_attn.v_proj.weight"))[0]
+    q = _forward(
+        window_layers[".self_attn.q_proj.weight"],
+        qk_source_flat,
+        _density_for_suffix(activation_density, ".self_attn.q_proj.weight"),
+    )[0]
+    k_new = _forward(
+        window_layers[".self_attn.k_proj.weight"],
+        normed_flat,
+        _density_for_suffix(activation_density, ".self_attn.k_proj.weight"),
+    )[0]
+    k_state = _forward(
+        window_layers[".self_attn.k_proj.weight"],
+        carried_flat,
+        _density_for_suffix(activation_density, ".self_attn.k_proj.weight"),
+    )[0]
+    v_new = _forward(
+        window_layers[".self_attn.v_proj.weight"],
+        normed_flat,
+        _density_for_suffix(activation_density, ".self_attn.v_proj.weight"),
+    )[0]
+    v_state = _forward(
+        window_layers[".self_attn.v_proj.weight"],
+        carried_flat,
+        _density_for_suffix(activation_density, ".self_attn.v_proj.weight"),
+    )[0]
 
-    q       = q.reshape(window_size, n_heads, head_dim)
-    k_new   = k_new.reshape(window_size, n_kv_heads, head_dim)
+    q = q.reshape(window_size, n_heads, head_dim)
+    k_new = k_new.reshape(window_size, n_kv_heads, head_dim)
     k_state = k_state.reshape(window_size, n_kv_heads, head_dim)
-    v_new   = v_new.reshape(window_size, n_kv_heads, head_dim)
+    v_new = v_new.reshape(window_size, n_kv_heads, head_dim)
     v_state = v_state.reshape(window_size, n_kv_heads, head_dim)
 
-    k_new_exp   = np.repeat(k_new,   groups, axis=1)  # [window_size, n_heads, head_dim]
+    k_new_exp = np.repeat(k_new, groups, axis=1)  # [window_size, n_heads, head_dim]
     k_state_exp = np.repeat(k_state, groups, axis=1)
-    v_new_exp   = np.repeat(v_new,   groups, axis=1)
+    v_new_exp = np.repeat(v_new, groups, axis=1)
     v_state_exp = np.repeat(v_state, groups, axis=1)
 
     # Interleave fresh-token/carried-state entries: index 2p = position
@@ -657,8 +694,11 @@ def apply_window_step(
 
     blended_flat = blended.reshape(1, window_size * q_proj_out)
 
-    attn_out = _forward(window_layers[".self_attn.o_proj.weight"], blended_flat,
-                        _density_for_suffix(activation_density, ".self_attn.o_proj.weight"))
+    attn_out = _forward(
+        window_layers[".self_attn.o_proj.weight"],
+        blended_flat,
+        _density_for_suffix(activation_density, ".self_attn.o_proj.weight"),
+    )
     attn_out = attn_out.reshape(window_size, hidden)
 
     pre_gate_state = (x_common_stack + attn_out).reshape(-1).astype(np.float32)  # [window_size*hidden]
@@ -668,12 +708,21 @@ def apply_window_step(
     normed2 = rmsnorm(new_carried_state, np.stack(post_attn_ln_weights[:window_size]), cfg.rms_norm_eps)
     normed2_flat = normed2.reshape(1, window_size * hidden)
 
-    gate_mlp = _forward(window_layers[".mlp.gate_proj.weight"], normed2_flat,
-                        _density_for_suffix(activation_density, ".mlp.gate_proj.weight"))
-    up_mlp   = _forward(window_layers[".mlp.up_proj.weight"], normed2_flat,
-                        _density_for_suffix(activation_density, ".mlp.up_proj.weight"))
-    mlp_out = _forward(window_layers[".mlp.down_proj.weight"], silu(gate_mlp) * up_mlp,
-                       _density_for_suffix(activation_density, ".mlp.down_proj.weight"))
+    gate_mlp = _forward(
+        window_layers[".mlp.gate_proj.weight"],
+        normed2_flat,
+        _density_for_suffix(activation_density, ".mlp.gate_proj.weight"),
+    )
+    up_mlp = _forward(
+        window_layers[".mlp.up_proj.weight"],
+        normed2_flat,
+        _density_for_suffix(activation_density, ".mlp.up_proj.weight"),
+    )
+    mlp_out = _forward(
+        window_layers[".mlp.down_proj.weight"],
+        silu(gate_mlp) * up_mlp,
+        _density_for_suffix(activation_density, ".mlp.down_proj.weight"),
+    )
     mlp_out = mlp_out.reshape(window_size, hidden)
 
     delta = (new_carried_state - x_common_stack) + mlp_out
@@ -703,7 +752,7 @@ def default_window_energy(percent_active: float = 0.25) -> EnergyDynamics:
     )
 
 
-def default_window_gaussian_params(window_size: int) -> Tuple[Tensor, Tensor]:
+def default_window_gaussian_params(window_size: int) -> tuple[Tensor, Tensor]:
     """Fresh, from-scratch `centers`/`log_sigmas` for a `window_size`-wide
     window: `center[p] = 2p + 0.5` (own fresh-token/carried-state pair's
     midpoint in apply_window_step's interleaved `2*window_size` key
@@ -720,19 +769,19 @@ def default_window_gaussian_params(window_size: int) -> Tuple[Tensor, Tensor]:
 
 
 def run_folded_recurrence(
-    x: np.ndarray,                          # [T, hidden] embedded input
-    step_layers: List[Dict[str, object]],
-    input_ln_weights: List[np.ndarray],
-    post_attn_ln_weights: List[np.ndarray],
+    x: np.ndarray,  # [T, hidden] embedded input
+    step_layers: list[dict[str, object]],
+    input_ln_weights: list[np.ndarray],
+    post_attn_ln_weights: list[np.ndarray],
     final_norm_weight: np.ndarray,
     cfg: MiniCPM5Config,
     half_bandwidth: int,
     num_cpus: int = 4,
-    activation_density: Union[_ActivationDensity, List[_ActivationDensity]] = None,
-    window_state=None,               # curriculum.WindowState, or None -- see below
+    activation_density: _ActivationDensity | list[_ActivationDensity] = None,
+    window_state=None,  # curriculum.WindowState, or None -- see below
     window_activation_density: _ActivationDensity = None,
-    window_energy: Optional[EnergyDynamics] = None,
-    window_carried_state: Optional[np.ndarray] = None,
+    window_energy: EnergyDynamics | None = None,
+    window_carried_state: np.ndarray | None = None,
 ) -> np.ndarray:
     """state=0; for step: out=block(x+state); state+=out -- see
     RNNFoldedBlock.forward's docstring in sili__new for why this recurrence
@@ -818,7 +867,8 @@ def run_folded_recurrence(
     if per_step and len(activation_density) != cfg.num_hidden_layers:
         raise ValueError(
             f"activation_density list has {len(activation_density)} entries, "
-            f"expected cfg.num_hidden_layers={cfg.num_hidden_layers}")
+            f"expected cfg.num_hidden_layers={cfg.num_hidden_layers}"
+        )
 
     has_window = window_state is not None and window_state.window_size > 0
     pre_window_end = window_state.window_positions[-1] if has_window else cfg.num_hidden_layers
@@ -827,8 +877,17 @@ def run_folded_recurrence(
     for i in range(pre_window_end):
         step_density = activation_density[i] if per_step else activation_density
         out = apply_fold_step(
-            x + state, step_layers[i], input_ln_weights[i], post_attn_ln_weights[i],
-            cfg, cos, sin, half_bandwidth, num_cpus, step_density)
+            x + state,
+            step_layers[i],
+            input_ln_weights[i],
+            post_attn_ln_weights[i],
+            cfg,
+            cos,
+            sin,
+            half_bandwidth,
+            num_cpus,
+            step_density,
+        )
         state = state + out
 
     if not has_window:
@@ -841,24 +900,45 @@ def run_folded_recurrence(
     if window_size == 1:
         pos = positions[0]
         out = apply_fold_step(
-            x_common, step_layers[pos], input_ln_weights[pos], post_attn_ln_weights[pos],
-            cfg, cos, sin, half_bandwidth, num_cpus, window_activation_density)
+            x_common,
+            step_layers[pos],
+            input_ln_weights[pos],
+            post_attn_ln_weights[pos],
+            cfg,
+            cos,
+            sin,
+            half_bandwidth,
+            num_cpus,
+            window_activation_density,
+        )
         mean_column = state + out
     else:
         hidden = cfg.hidden_size
         energy = window_energy if window_energy is not None else default_window_energy()
-        carried_state = (window_carried_state.copy() if window_carried_state is not None
-                         else np.zeros((window_size, hidden), dtype=np.float32))
+        carried_state = (
+            window_carried_state.copy()
+            if window_carried_state is not None
+            else np.zeros((window_size, hidden), dtype=np.float32)
+        )
         window_ln = [input_ln_weights[p] for p in positions]
         window_post_ln = [post_attn_ln_weights[p] for p in positions]
 
         mean_column = np.empty((T, hidden), dtype=np.float32)
         for t in range(T):
             delta, carried_state, _aux_loss = apply_window_step(
-                x_common[t], carried_state, window_state.suffix_windows, window_size,
-                window_ln, window_post_ln, cfg, energy,
-                window_state.centers, window_state.log_sigmas,
-                num_cpus, window_activation_density)
+                x_common[t],
+                carried_state,
+                window_state.suffix_windows,
+                window_size,
+                window_ln,
+                window_post_ln,
+                cfg,
+                energy,
+                window_state.centers,
+                window_state.log_sigmas,
+                num_cpus,
+                window_activation_density,
+            )
             columns_t = state[t][None, :] + delta  # [window_size, hidden]
             mean_column[t] = columns_t.mean(axis=0)
 

@@ -29,30 +29,39 @@ Run: python3 scripts/train_mqar_rmt_synapse_ablation.py <config_name> <precision
   config_name: production | clip_off | nocaps
   precision: fp4 | fp32 | fp8
 """
+
 from __future__ import annotations
 
+import json
 import sys
 import time
-import json
-import functools
 
 import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
 from sili import _cpu
+
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule, predicted_token
 from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule, clip_grad_norm_
 from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
-from model.toy_precision_models import TrueMultiDigitLayer
-from scripts.train_tile_curriculum import _build_tile_window
 from scripts.train_mqar_rmt_reference import (
-    DISLDO_CLS_BY_PRECISION, seq_len_for_k, _build_targets,
-    EMBED_WIDTH, COLUMN_NEURONS, NUM_MEMORY_SLOTS, MAX_WEIGHTS_PER_LAYER,
-    NUM_CPUS, VOCAB, WARMUP_STEPS, MAX_GRAD_NORM, EVAL_SEQUENCES,
-    L1_SPARSITY_COEF, CLIP_RANGE,
+    CLIP_RANGE,
+    COLUMN_NEURONS,
+    DISLDO_CLS_BY_PRECISION,
+    EMBED_WIDTH,
+    EVAL_SEQUENCES,
+    L1_SPARSITY_COEF,
+    MAX_GRAD_NORM,
+    MAX_WEIGHTS_PER_LAYER,
+    NUM_CPUS,
+    NUM_MEMORY_SLOTS,
+    VOCAB,
+    WARMUP_STEPS,
+    _build_targets,
+    seq_len_for_k,
 )
+from scripts.train_tile_curriculum import _build_tile_window
 
 # lr=0.03, not this project's own PEAK_LR=0.01 default -- task #235's
 # LR sweep (torch ablation) found 0.01 was never well-tuned for the
@@ -63,7 +72,7 @@ from scripts.train_mqar_rmt_reference import (
 DEFAULT_PEAK_LR = 0.03
 
 CONFIGS = {
-    "production": {},                    # C++'s own tuned defaults (max_abs_delta=2.0)
+    "production": {},  # C++'s own tuned defaults (max_abs_delta=2.0)
     "clip_off": {"max_abs_delta": 1e30},  # effectively no clip
     # torch-side multi-seed sweep (this conversation) found clip_off alone
     # (max_abs_delta only) fixes ONE failure mode (single-step ci spike to
@@ -81,9 +90,16 @@ CONFIGS = {
 }
 
 
-def train_and_eval(config_name: str, precision: str, num_kv_pairs: int, seed: int,
-                   train_steps: int, peak_lr: float = DEFAULT_PEAK_LR,
-                   log_every: int = 500, log_fn=None) -> dict:
+def train_and_eval(
+    config_name: str,
+    precision: str,
+    num_kv_pairs: int,
+    seed: int,
+    train_steps: int,
+    peak_lr: float = DEFAULT_PEAK_LR,
+    log_every: int = 500,
+    log_fn=None,
+) -> dict:
     synapse_kwargs = CONFIGS[config_name]
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
@@ -98,10 +114,20 @@ def train_and_eval(config_name: str, precision: str, num_kv_pairs: int, seed: in
     model_rng = np.random.default_rng(seed)
 
     model = ToyTileRecurrenceRMT(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
-        MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
-        dense=dense, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=synapse_kwargs, rng=model_rng)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        num_tiles,
+        NUM_MEMORY_SLOTS,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=disldo_cls,
+        dense=dense,
+        clip_range=CLIP_RANGE,
+        l1_sparsity_coef=L1_SPARSITY_COEF,
+        synapse_kwargs=synapse_kwargs,
+        rng=model_rng,
+    )
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -127,7 +153,7 @@ def train_and_eval(config_name: str, precision: str, num_kv_pairs: int, seed: in
         lr = lr_schedule(step, train_steps, peak_lr, WARMUP_STEPS)
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         for i in range(seq_len):
             window = _build_tile_window(embed_table, tokens, i, num_tiles)
@@ -163,9 +189,13 @@ def train_and_eval(config_name: str, precision: str, num_kv_pairs: int, seed: in
                 correct += int(pred == mqar_by_pos[i])
                 total += 1
 
-    return {"config": config_name, "precision": precision,
-            "acc": correct / total if total else 0.0,
-            "elapsed_s": time.time() - t0, "trajectory": trajectory}
+    return {
+        "config": config_name,
+        "precision": precision,
+        "acc": correct / total if total else 0.0,
+        "elapsed_s": time.time() - t0,
+        "trajectory": trajectory,
+    }
 
 
 def main():
@@ -175,17 +205,22 @@ def main():
     seed = int(sys.argv[4]) if len(sys.argv) > 4 else 1000
     peak_lr = float(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_PEAK_LR
 
-    print(f"# ToyTileRecurrenceRMT synapse ablation config={config_name} precision={precision} "
-          f"train_steps={train_steps} seed={seed} peak_lr={peak_lr} "
-          f"synapse_kwargs={CONFIGS[config_name]}", flush=True)
+    print(
+        f"# ToyTileRecurrenceRMT synapse ablation config={config_name} precision={precision} "
+        f"train_steps={train_steps} seed={seed} peak_lr={peak_lr} "
+        f"synapse_kwargs={CONFIGS[config_name]}",
+        flush=True,
+    )
 
     def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc):
-        print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
-              f"quick_acc={quick_acc:.4f}  ({elapsed:.0f}s elapsed)", flush=True)
+        print(
+            f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
+            f"quick_acc={quick_acc:.4f}  ({elapsed:.0f}s elapsed)",
+            flush=True,
+        )
 
     r = train_and_eval(config_name, precision, 1, seed, train_steps, peak_lr=peak_lr, log_fn=log_fn)
-    print(f"\nFINAL config={config_name} precision={precision} acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)",
-          flush=True)
+    print(f"\nFINAL config={config_name} precision={precision} acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)", flush=True)
     print("TRAJECTORY_JSON " + json.dumps(r["trajectory"]), flush=True)
 
 

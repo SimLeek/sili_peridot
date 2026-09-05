@@ -1,0 +1,47 @@
+# Runs on every commit. Hard gates: ruff, format, bandit, codespell,
+# gitleaks. No C++ here (pure Python repo), so no clang-format/clang-tidy/
+# cppcheck/shellcheck sections (mirrors sili__new's setup, minus the
+# C++-only tools). Advisory-only tools (mypy, pydoclint, vulture, radon,
+# lizard) live in tools/lint_all.sh instead -- mypy strict-mode found 219
+# pre-existing errors across 28 files in model/ (never annotated before
+# this lint setup existed); making it a hard gate now would block any
+# future commit touching those files until a dedicated typing pass
+# happens. Same story for pydoclint (dozens of docstring/signature
+# mismatches) and comment-limit (37 of ~90 files in model/+scripts/ are
+# over 30% comments -- this is a research codebase with narrative
+# embedded inline; a dedicated comment-to-research-doc reorganization
+# pass is scheduled separately, not something to fix as a side effect of
+# adding lint hooks). Promote each to a hard gate once its target is clean.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.2
+    hooks:
+      - id: bandit
+        args: ["-c", ".bandit", "-r", "model", "scripts"]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+      - id: codespell
+        args: ["--skip", "*.sst,*.safetensors,*.log"]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: pytest-fast
+        name: pytest (fast suite, <10s -- excludes integration)
+        entry: python3 -m pytest
+        language: system
+        pass_filenames: false
+        always_run: true

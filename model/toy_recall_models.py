@@ -25,14 +25,22 @@ distinct, not-revisited-here concern (already partially validated
 elsewhere per direct feedback -- importance-driven training behaves
 similarly to other optimizers).
 """
+
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
-
 from sili.tensor import (
-    Tensor, banded_attention, gaussian_attention, exp, log, neg, power, reduce_sum, silu, gather, _topo_sort,
+    Tensor,
+    _topo_sort,
+    banded_attention,
+    exp,
+    gather,
+    gaussian_attention,
+    log,
+    neg,
+    power,
+    reduce_sum,
+    silu,
 )
 
 
@@ -43,13 +51,12 @@ class DenseTensorLinear:
     inline-self-updating primitive."""
 
     def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
-        self.weight = Tensor(
-            (np.random.randn(in_features, out_features) * scale).astype(np.float32))
+        self.weight = Tensor((np.random.randn(in_features, out_features) * scale).astype(np.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         return x @ self.weight
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         return [self.weight]
 
 
@@ -58,9 +65,9 @@ def rmsnorm_tensor(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     built from Tensor ops so gradient flows through it (needed here,
     unlike sili_block's frozen-inference plain-numpy version)."""
     hidden = x.data.shape[-1]
-    mean_sq = reduce_sum(x * x, axis=-1) * (1.0 / hidden)   # [T]
-    mean_sq = mean_sq.reshape((x.data.shape[0], 1))          # [T, 1]
-    rrms = (mean_sq + eps) ** -0.5                           # [T, 1]
+    mean_sq = reduce_sum(x * x, axis=-1) * (1.0 / hidden)  # [T]
+    mean_sq = mean_sq.reshape((x.data.shape[0], 1))  # [T, 1]
+    rrms = (mean_sq + eps) ** -0.5  # [T, 1]
     return (x * rrms) * weight
 
 
@@ -73,7 +80,7 @@ def sigmoid_tensor(x: Tensor) -> Tensor:
     return power(exp(neg(x)) + 1.0, -1.0)
 
 
-def cross_entropy_sum(logits: Tensor, row_target_pairs: List[Tuple[int, int]]) -> Tensor:
+def cross_entropy_sum(logits: Tensor, row_target_pairs: list[tuple[int, int]]) -> Tensor:
     """logits: [N, vocab_size] Tensor. row_target_pairs: [(row, target_
     token_id), ...] -- returns the SUM of softmax cross-entropy loss
     over each pair (caller divides by len(...) for a mean).
@@ -101,12 +108,12 @@ def cross_entropy_sum(logits: Tensor, row_target_pairs: List[Tuple[int, int]]) -
     gradient had to flow through the max, which it doesn't."""
     vocab_size = logits.data.shape[-1]
     row_max = logits.data.max(axis=-1, keepdims=True).astype(np.float32)  # [N,1], detached
-    shifted = logits + Tensor(-row_max)                                  # [N,vocab], stable
+    shifted = logits + Tensor(-row_max)  # [N,vocab], stable
     log_sum_exp = log(reduce_sum(exp(shifted), axis=-1)) + Tensor(row_max.reshape(-1))  # [N]
     rows = [r for r, _t in row_target_pairs]
-    log_sum_exp_rows = gather(log_sum_exp, rows)                  # [len(pairs)]
+    log_sum_exp_rows = gather(log_sum_exp, rows)  # [len(pairs)]
     flat_target_idx = [r * vocab_size + t for r, t in row_target_pairs]
-    target_logits = gather(logits, flat_target_idx)                # [len(pairs)]
+    target_logits = gather(logits, flat_target_idx)  # [len(pairs)]
     return reduce_sum(log_sum_exp_rows - target_logits)
 
 
@@ -116,7 +123,7 @@ def predicted_token(logits: Tensor, row: int) -> int:
     return int(np.argmax(logits.data[row]))
 
 
-def apply_gradient_step(params: List[Tensor], lr: float) -> None:
+def apply_gradient_step(params: list[Tensor], lr: float) -> None:
     """Plain SGD step + zero_grad for ordinary Tensor leaves. Kept for
     tests/comparison -- superseded by AdamOptimizer for real training
     (see module docstring: plain per-node-clipped SGD, no momentum, was
@@ -154,14 +161,14 @@ class AdamOptimizer:
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
-        self.m: Dict[int, np.ndarray] = {}
-        self.v: Dict[int, np.ndarray] = {}
+        self.m: dict[int, np.ndarray] = {}
+        self.v: dict[int, np.ndarray] = {}
         self.t = 0
 
-    def step(self, params: List[Tensor], lr: float) -> None:
+    def step(self, params: list[Tensor], lr: float) -> None:
         self.t += 1
-        bc1 = 1.0 - self.beta1 ** self.t
-        bc2 = 1.0 - self.beta2 ** self.t
+        bc1 = 1.0 - self.beta1**self.t
+        bc2 = 1.0 - self.beta2**self.t
         for p in params:
             if p.grad is None:
                 continue
@@ -205,8 +212,7 @@ def backward_with_grad_clip(loss: Tensor, max_grad_norm: float) -> None:
         node._backward()
 
 
-def lr_schedule(step: int, total_steps: int, peak_lr: float,
-                 warmup_steps: int, min_lr_ratio: float = 0.1) -> float:
+def lr_schedule(step: int, total_steps: int, peak_lr: float, warmup_steps: int, min_lr_ratio: float = 0.1) -> float:
     """Linear warmup + cosine decay, matching nanoGPT's own convention
     (widely-used, well-tested defaults for small transformer training --
     looked up rather than guessed, per direct decision)."""
@@ -217,7 +223,7 @@ def lr_schedule(step: int, total_steps: int, peak_lr: float,
     return float(peak_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine))
 
 
-def clip_grad_norm_(params: List[Tensor], max_norm: float) -> float:
+def clip_grad_norm_(params: list[Tensor], max_norm: float) -> float:
     """Textbook GLOBAL gradient-norm clipping -- the total L2 norm
     ACROSS ALL of `params`' gradients combined is capped to `max_norm`
     (matching torch.nn.utils.clip_grad_norm_ exactly, including the
@@ -244,7 +250,7 @@ def clip_grad_norm_(params: List[Tensor], max_norm: float) -> float:
     for p in params:
         if p.grad is not None:
             total_sq += float(np.sum(np.asarray(p.grad, dtype=np.float64) ** 2))
-    total_norm = total_sq ** 0.5
+    total_norm = total_sq**0.5
     if not np.isfinite(total_norm):
         # `total_norm > max_norm` and `total_norm > 0` are BOTH False when
         # total_norm is NaN (IEEE 754) -- a NaN/Inf gradient would silently
@@ -271,6 +277,7 @@ def clip_grad_norm_(params: List[Tensor], max_norm: float) -> float:
 #  ToySmallTransformer -- the "pre-converted transformer" baseline
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 class _ToyTransformerLayer:
     def __init__(self, hidden: int, mlp_hidden: int):
         self.q_proj = DenseTensorLinear(hidden, hidden)
@@ -283,10 +290,9 @@ class _ToyTransformerLayer:
         self.input_ln = Tensor(np.ones(hidden, dtype=np.float32))
         self.post_ln = Tensor(np.ones(hidden, dtype=np.float32))
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         params = [self.input_ln, self.post_ln]
-        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
-                      self.gate_proj, self.up_proj, self.down_proj):
+        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj, self.gate_proj, self.up_proj, self.down_proj):
             params += layer.parameters()
         return params
 
@@ -307,9 +313,16 @@ class ToySmallTransformer:
     own `num_tiles` already plays this same role, no equivalent knob
     needed there."""
 
-    def __init__(self, vocab_size: int, hidden: int, mlp_hidden: int,
-                 n_layers: int, num_cpus: int = 2, rms_eps: float = 1e-6,
-                 half_bandwidth: Optional[int] = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden: int,
+        mlp_hidden: int,
+        n_layers: int,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+        half_bandwidth: int | None = None,
+    ):
         self.hidden = hidden
         self.rms_eps = rms_eps
         self.num_cpus = num_cpus
@@ -317,7 +330,7 @@ class ToySmallTransformer:
         self.layers = [_ToyTransformerLayer(hidden, mlp_hidden) for _ in range(n_layers)]
         self.lm_head = DenseTensorLinear(hidden, vocab_size)
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         params = []
         for layer in self.layers:
             params += layer.parameters()
@@ -334,8 +347,7 @@ class ToySmallTransformer:
             q = layer.q_proj.forward(normed)
             k = layer.k_proj.forward(normed)
             v = layer.v_proj.forward(normed)
-            attn = banded_attention(q, k, v, half_bandwidth=half_bandwidth,
-                                    num_cpus=self.num_cpus, causal=True)
+            attn = banded_attention(q, k, v, half_bandwidth=half_bandwidth, num_cpus=self.num_cpus, causal=True)
             attn = layer.o_proj.forward(attn)
             x = x + attn
             normed2 = rmsnorm_tensor(x, layer.post_ln, self.rms_eps)
@@ -349,6 +361,7 @@ class ToySmallTransformer:
 # ═══════════════════════════════════════════════════════════════════════════
 #  ToyTileRecurrence
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 class ToyTileRecurrence:
     """One shared tile network (DenseTensorLinear q/k/v/o/gate/up/down),
@@ -371,8 +384,16 @@ class ToyTileRecurrence:
     exactly why the width-reduction has to be the parameter-free
     column-mean, not a new learned down-projection."""
 
-    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
-                 mlp_hidden: int, num_tiles: int, num_cpus: int = 2, rms_eps: float = 1e-6):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_width: int,
+        column_neurons: int,
+        mlp_hidden: int,
+        num_tiles: int,
+        num_cpus: int = 2,
+        rms_eps: float = 1e-6,
+    ):
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -393,14 +414,22 @@ class ToyTileRecurrence:
         self.centers = Tensor(np.array([i + 0.5 for i in range(num_tiles)], dtype=np.float32))
         self.log_sigmas = Tensor(np.zeros(num_tiles, dtype=np.float32))
 
-    def parameters(self) -> List[Tensor]:
+    def parameters(self) -> list[Tensor]:
         params = [self.input_ln, self.post_ln, self.centers, self.log_sigmas]
-        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
-                      self.gate_proj, self.up_proj, self.down_proj, self.lm_head):
+        for layer in (
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.gate_proj,
+            self.up_proj,
+            self.down_proj,
+            self.lm_head,
+        ):
             params += layer.parameters()
         return params
 
-    def step(self, x_window: np.ndarray, M_prev: np.ndarray) -> Tuple[np.ndarray, Tensor]:
+    def step(self, x_window: np.ndarray, M_prev: np.ndarray) -> tuple[np.ndarray, Tensor]:
         """One recurrence tick. x_window, M_prev: [num_tiles,
         state_width] numpy, DETACHED (no BPTT, matching
         tile_recurrence.py's own design) -- both already widened to
@@ -425,8 +454,7 @@ class ToyTileRecurrence:
         k = self.k_proj.forward(qkv_source)
         v = self.v_proj.forward(qkv_source)
         sigmas = exp(self.log_sigmas)
-        attn = gaussian_attention(q, k, v, self.centers, sigmas,
-                                  num_cpus=self.num_cpus, causal=False)
+        attn = gaussian_attention(q, k, v, self.centers, sigmas, num_cpus=self.num_cpus, causal=False)
         attn = self.o_proj.forward(attn)
 
         M_new_t = Tensor(M_prev.astype(np.float32)) + attn

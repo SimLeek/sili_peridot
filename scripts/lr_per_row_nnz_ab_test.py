@@ -28,8 +28,10 @@ to tell a real regression from sampling noise.
 
 Usage: PYTHONPATH=<sili_peridot repo root> python scripts/lr_per_row_nnz_ab_test.py
 """
+
 import statistics
-from scripts.l1_sparsity_probe import OriginalArchModel, run, evaluate
+
+from scripts.l1_sparsity_probe import OriginalArchModel, evaluate, run
 
 SEEDS = [1000, 1001, 1002, 1003, 1004]
 N_STEPS = 15000
@@ -37,15 +39,15 @@ N_EVAL = 100
 COEF = 0.05
 
 CONFIGS = [
-    ("baseline",          dict(use_energy=False, all_zero_init=False)),
-    ("baseline_energy",   dict(use_energy=True,  all_zero_init=False)),
-    ("baseline_zeroinit", dict(use_energy=False, all_zero_init=True)),
-    ("zeroinit_energy",   dict(use_energy=True,  all_zero_init=True)),
+    ("baseline", {"use_energy": False, "all_zero_init": False}),
+    ("baseline_energy", {"use_energy": True, "all_zero_init": False}),
+    ("baseline_zeroinit", {"use_energy": False, "all_zero_init": True}),
+    ("zeroinit_energy", {"use_energy": True, "all_zero_init": True}),
 ]
 
 LR_ARMS = [
-    ("damped_true",    dict(lr_per_row_nnz=True)),
-    ("undamped_false", dict(lr_per_row_nnz=False)),
+    ("damped_true", {"lr_per_row_nnz": True}),
+    ("undamped_false", {"lr_per_row_nnz": False}),
 ]
 
 
@@ -55,18 +57,26 @@ def run_arm(config_name, config_kwargs, arm_name, arm_kwargs, seeds, n_steps, n_
     tot_skips = tot_calls = 0
     for seed in seeds:
         model = OriginalArchModel(
-            seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-            l1_sparsity_coef=COEF, **config_kwargs, **arm_kwargs,
+            seed,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=COEF,
+            **config_kwargs,
+            **arm_kwargs,
         )
         print(f"[{config_name}/{arm_name}] starting seed={seed} ({n_steps} steps)...", flush=True)
-        accs, skips, total, avg_step_time = run(model, n_steps, seed, verbose=True)
+        accs, skips, total, _avg_step_time = run(model, n_steps, seed, verbose=True)
         old_style_per_seed.append(statistics.mean(accs[-3:]))
         tot_skips += skips
         tot_calls += total
         eval_acc = evaluate(model, n_eval, seed)
         eval_per_seed.append(eval_acc)
-        print(f"[{config_name}/{arm_name}] seed={seed} done: "
-              f"old_style={old_style_per_seed[-1]:.4f} eval_acc({n_eval})={eval_acc:.4f}", flush=True)
+        print(
+            f"[{config_name}/{arm_name}] seed={seed} done: "
+            f"old_style={old_style_per_seed[-1]:.4f} eval_acc({n_eval})={eval_acc:.4f}",
+            flush=True,
+        )
     skip_rate = tot_skips / tot_calls if tot_calls else 0.0
     return {
         "eval_mean": statistics.mean(eval_per_seed),
@@ -78,14 +88,15 @@ def run_arm(config_name, config_kwargs, arm_name, arm_kwargs, seeds, n_steps, n_
 
 
 def main():
-    print(f"lr_per_row_nnz A/B test (both arms correctly implemented): "
-          f"{len(SEEDS)} seeds x {N_STEPS} steps x {N_EVAL}-eval, coef={COEF}\n")
+    print(
+        f"lr_per_row_nnz A/B test (both arms correctly implemented): "
+        f"{len(SEEDS)} seeds x {N_STEPS} steps x {N_EVAL}-eval, coef={COEF}\n"
+    )
     results = {}
     for config_name, config_kwargs in CONFIGS:
         for arm_name, arm_kwargs in LR_ARMS:
             key = f"{config_name}/{arm_name}"
-            results[key] = run_arm(config_name, config_kwargs, arm_name, arm_kwargs,
-                                    SEEDS, N_STEPS, N_EVAL)
+            results[key] = run_arm(config_name, config_kwargs, arm_name, arm_kwargs, SEEDS, N_STEPS, N_EVAL)
 
     print("\n" + "=" * 100)
     print(f"{'config/arm':<32} {'eval_mean':>10} {'old_style':>10} {'skip_rate':>10}")
