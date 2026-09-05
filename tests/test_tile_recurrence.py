@@ -2,28 +2,39 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
 import pytest
 
+torch = pytest.importorskip("torch")
+
 from sili import _cpu
-from sili.tensor import Tensor, gaussian_attention, exp
+from sili.tensor import Tensor, exp, gaussian_attention
 
 from model.config import MiniCPM5Config
 from model.sili_block import build_step_layers, default_window_energy
 from model.tile_recurrence import (
-    TileState, default_tile_gaussian_params, bootstrap_tile_layers,
-    build_tile_window, apply_tile_step, run_tile_recurrence,
+    TileState,
+    apply_tile_step,
+    bootstrap_tile_layers,
+    build_tile_window,
+    default_tile_gaussian_params,
+    run_tile_recurrence,
 )
 
 
 def _tiny_config(n_layers=4) -> MiniCPM5Config:
     return MiniCPM5Config(
-        hidden_size=8, intermediate_size=12, num_hidden_layers=n_layers,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=4,
-        vocab_size=10, rms_norm_eps=1e-6, rope_theta=10000.0,
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=n_layers,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=10,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
         tie_word_embeddings=False,
     )
 
@@ -33,14 +44,35 @@ def _fake_sparse_state(cfg: MiniCPM5Config, seed=3) -> dict:
     sd = {}
     for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
-        sd[p + ".self_attn.q_proj.weight"] = {"raw": torch.randn(cfg.q_proj_out, cfg.attn_in), "shape": (cfg.q_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.k_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.v_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.o_proj.weight"] = {"raw": torch.randn(cfg.attn_out, cfg.o_proj_in), "shape": (cfg.attn_out, cfg.o_proj_in)}
-        sd[p + ".mlp.gate_proj.weight"]    = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.up_proj.weight"]      = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.down_proj.weight"]    = {"raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden), "shape": (cfg.mlp_out, cfg.mlp_hidden)}
-        sd[p + ".input_layernorm.weight"]         = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
+        sd[p + ".self_attn.q_proj.weight"] = {
+            "raw": torch.randn(cfg.q_proj_out, cfg.attn_in),
+            "shape": (cfg.q_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.k_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.v_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.o_proj.weight"] = {
+            "raw": torch.randn(cfg.attn_out, cfg.o_proj_in),
+            "shape": (cfg.attn_out, cfg.o_proj_in),
+        }
+        sd[p + ".mlp.gate_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.up_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.down_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden),
+            "shape": (cfg.mlp_out, cfg.mlp_hidden),
+        }
+        sd[p + ".input_layernorm.weight"] = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
         sd[p + ".post_attention_layernorm.weight"] = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
     return sd
 
@@ -134,9 +166,19 @@ class TestApplyTileStepBehavior:
         M = tile_state.M
         for i in range(T):
             x_window = build_tile_window(x, i, num_tiles, M)
-            M, logits, aux_loss = apply_tile_step(
-                x_window, i, M, tile_layers, in_ln, post_ln, cfg,
-                tile_state.centers, tile_state.log_sigmas, energy, num_cpus=2)
+            M, logits, _aux_loss = apply_tile_step(
+                x_window,
+                i,
+                M,
+                tile_layers,
+                in_ln,
+                post_ln,
+                cfg,
+                tile_state.centers,
+                tile_state.log_sigmas,
+                energy,
+                num_cpus=2,
+            )
             assert M.shape == (num_tiles, cfg.hidden_size)
             assert np.all(np.isfinite(M))
             assert logits is None  # no lm_head given
@@ -149,8 +191,8 @@ class TestApplyTileStepBehavior:
         lm_head = np.random.RandomState(23).randn(cfg.vocab_size, cfg.hidden_size).astype(np.float32)
 
         M_final, logits = run_tile_recurrence(
-            x, num_tiles, tile_state, tile_layers, in_ln, post_ln, cfg, energy,
-            lm_head=lm_head, num_cpus=2)
+            x, num_tiles, tile_state, tile_layers, in_ln, post_ln, cfg, energy, lm_head=lm_head, num_cpus=2
+        )
 
         assert M_final.shape == (num_tiles, cfg.hidden_size)
         assert logits.shape == (T, cfg.vocab_size)
@@ -170,8 +212,18 @@ class TestApplyTileStepBehavior:
         for i in range(x.shape[0]):
             x_window = build_tile_window(x, i, num_tiles, M)
             M, _logits, _aux = apply_tile_step(
-                x_window, i, M, tile_layers, in_ln, post_ln, cfg,
-                tile_state.centers, tile_state.log_sigmas, energy, num_cpus=2)
+                x_window,
+                i,
+                M,
+                tile_layers,
+                in_ln,
+                post_ln,
+                cfg,
+                tile_state.centers,
+                tile_state.log_sigmas,
+                energy,
+                num_cpus=2,
+            )
             seen.append(M.copy())
 
         # consecutive states must differ at least once past the first tick
@@ -182,7 +234,7 @@ class TestApplyTileStepBehavior:
         # Statefulness check, same spirit as B8's own
         # test_carried_state_actually_affects_output.
         num_tiles = 4
-        cfg, tile_layers, in_ln, post_ln, tile_state, energy = self._setup(num_tiles=num_tiles, seed=40)
+        cfg, tile_layers, in_ln, post_ln, tile_state, _energy = self._setup(num_tiles=num_tiles, seed=40)
         lm_head = np.random.RandomState(41).randn(cfg.vocab_size, cfg.hidden_size).astype(np.float32)
         x_t = np.random.RandomState(42).randn(cfg.hidden_size).astype(np.float32)
         x_window = np.tile(x_t, (num_tiles, 1)).astype(np.float32)
@@ -193,18 +245,40 @@ class TestApplyTileStepBehavior:
         np.random.seed(999)
         energy_a = default_window_energy()
         _M_a, logits_a, _ = apply_tile_step(
-            x_window, num_tiles - 1, M_real, tile_layers, in_ln, post_ln, cfg,
-            tile_state.centers, tile_state.log_sigmas, energy_a, lm_head=lm_head, num_cpus=2)
+            x_window,
+            num_tiles - 1,
+            M_real,
+            tile_layers,
+            in_ln,
+            post_ln,
+            cfg,
+            tile_state.centers,
+            tile_state.log_sigmas,
+            energy_a,
+            lm_head=lm_head,
+            num_cpus=2,
+        )
 
         np.random.seed(999)
         energy_b = default_window_energy()
         _M_b, logits_b, _ = apply_tile_step(
-            x_window, num_tiles - 1, M_zero, tile_layers, in_ln, post_ln, cfg,
-            tile_state.centers, tile_state.log_sigmas, energy_b, lm_head=lm_head, num_cpus=2)
+            x_window,
+            num_tiles - 1,
+            M_zero,
+            tile_layers,
+            in_ln,
+            post_ln,
+            cfg,
+            tile_state.centers,
+            tile_state.log_sigmas,
+            energy_b,
+            lm_head=lm_head,
+            num_cpus=2,
+        )
 
         assert not np.allclose(logits_a, logits_b), (
-            "different M_prev produced identical logits -- the mechanism "
-            "isn't actually using carried state")
+            "different M_prev produced identical logits -- the mechanism isn't actually using carried state"
+        )
 
 
 def _fast_sparse_layer(n_in, n_out, density, rng, num_cpus=4):
@@ -213,12 +287,12 @@ def _fast_sparse_layer(n_in, n_out, density, rng, num_cpus=4):
     entirely (measured far too slow for fully-dense random weights at
     real dims earlier this session), matching the technique used for
     this session's own compute-growth benchmarks."""
-    k = max(1, int(round(density * n_out)))
+    k = max(1, round(density * n_out))
     ptrs = np.arange(0, (n_in + 1) * k, k, dtype=np.int32)
     idx = np.empty(n_in * k, dtype=np.int32)
     for r in range(n_in):
-        idx[r*k:(r+1)*k] = rng.choice(n_out, size=k, replace=False).astype(np.int32)
-        idx[r*k:(r+1)*k].sort()
+        idx[r * k : (r + 1) * k] = rng.choice(n_out, size=k, replace=False).astype(np.int32)
+        idx[r * k : (r + 1) * k].sort()
     vals = (rng.randn(n_in * k) * 0.02).astype(np.float32)
     layer = _cpu.SparseLinearLayer(n_in, n_out, int(vals.shape[0] * 1.3) + 64, num_cpus)
     layer.load_weights(ptrs, idx, vals)
@@ -232,9 +306,15 @@ def test_real_dims_smoke(num_tiles):
     wall time -- see the approved plan's Sizing section, which needs
     real data (not a guess) to inform num_tiles choices later."""
     cfg = MiniCPM5Config(
-        hidden_size=1536, intermediate_size=4608, num_hidden_layers=1,
-        num_attention_heads=16, num_key_value_heads=2, head_dim=128,
-        vocab_size=10, rms_norm_eps=1e-6, rope_theta=10000.0,
+        hidden_size=1536,
+        intermediate_size=4608,
+        num_hidden_layers=1,
+        num_attention_heads=16,
+        num_key_value_heads=2,
+        head_dim=128,
+        vocab_size=10,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
         tie_word_embeddings=False,
     )
     rng = np.random.RandomState(0)
@@ -259,8 +339,18 @@ def test_real_dims_smoke(num_tiles):
     for i in range(T):
         x_window = build_tile_window(x, i, num_tiles, M)
         M, _logits, _aux = apply_tile_step(
-            x_window, i, M, tile_layers, input_ln, post_ln, cfg,
-            tile_state.centers, tile_state.log_sigmas, energy, num_cpus=4)
+            x_window,
+            i,
+            M,
+            tile_layers,
+            input_ln,
+            post_ln,
+            cfg,
+            tile_state.centers,
+            tile_state.log_sigmas,
+            energy,
+            num_cpus=4,
+        )
     per_tick_ms = (time.time() - t0) / T * 1000
     print(f"\n[real-dims smoke] num_tiles={num_tiles}: {per_tick_ms:.2f} ms/tick")
 

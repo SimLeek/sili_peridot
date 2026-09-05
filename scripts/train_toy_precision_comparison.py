@@ -32,6 +32,7 @@ final MQAR recall accuracy for every arm.
 
 Run: python -m scripts.train_toy_precision_comparison
 """
+
 from __future__ import annotations
 
 import sys
@@ -41,14 +42,19 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import (
-    cross_entropy_sum, predicted_token, AdamOptimizer, clip_grad_norm_, lr_schedule,
-)
 from model.toy_precision_models import (
-    ToySmallTransformerArtificialFP4, ToySmallTransformerRealFP4,
+    ToySmallTransformerArtificialFP4,
+    ToySmallTransformerRealFP4,
     ToySmallTransformerRealFP4RowScaleAdam,
 )
+from model.toy_recall_models import (
+    AdamOptimizer,
+    clip_grad_norm_,
+    cross_entropy_sum,
+    lr_schedule,
+    predicted_token,
+)
+from model.toy_recall_task import generate_mqar_sequence
 
 TRAIN_STEPS = 3000
 WARMUP_STEPS = 100
@@ -63,12 +69,10 @@ CONFIGS = [
 ]
 
 
-def train_and_eval_artificial_fp4(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden,
-                                  use_energy, seed):
+def train_and_eval_artificial_fp4(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, use_energy, seed):
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
-    model = ToySmallTransformerArtificialFP4(vocab, hidden, mlp_hidden, n_layers=2,
-                                             use_energy=use_energy, num_cpus=2)
+    model = ToySmallTransformerArtificialFP4(vocab, hidden, mlp_hidden, n_layers=2, use_energy=use_energy, num_cpus=2)
     opt = AdamOptimizer()
     embed_table = rng.randn(vocab, hidden).astype(np.float32) * 0.3
 
@@ -99,13 +103,13 @@ def train_and_eval_artificial_fp4(seq_len, num_kv_pairs, vocab, hidden, mlp_hidd
     return correct / total, loss_curve
 
 
-def train_and_eval_real_fp4(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden,
-                            use_energy, seed, model_cls=ToySmallTransformerRealFP4):
+def train_and_eval_real_fp4(
+    seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, use_energy, seed, model_cls=ToySmallTransformerRealFP4
+):
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
     max_weights = hidden * mlp_hidden
-    model = model_cls(vocab, hidden, mlp_hidden, n_layers=2, max_weights=max_weights,
-                      use_energy=use_energy, num_cpus=2)
+    model = model_cls(vocab, hidden, mlp_hidden, n_layers=2, max_weights=max_weights, use_energy=use_energy, num_cpus=2)
     opt = AdamOptimizer()
     embed_table = rng.randn(vocab, hidden).astype(np.float32) * 0.3
 
@@ -141,45 +145,57 @@ def _fmt_curve(curve):
 
 def main():
     hidden, mlp_hidden = 32, 48
-    print(f"hidden={hidden} mlp_hidden={mlp_hidden} train_steps={TRAIN_STEPS} "
-          f"warmup={WARMUP_STEPS} peak_lr={PEAK_LR} eval_sequences={EVAL_SEQUENCES}\n")
+    print(
+        f"hidden={hidden} mlp_hidden={mlp_hidden} train_steps={TRAIN_STEPS} "
+        f"warmup={WARMUP_STEPS} peak_lr={PEAK_LR} eval_sequences={EVAL_SEQUENCES}\n"
+    )
     results = []
     for seq_len, num_kv_pairs, vocab in CONFIGS:
         print(f"=== seq_len={seq_len} kv_pairs={num_kv_pairs} vocab={vocab} ===")
         t0 = time.time()
         a_acc, a_curve = train_and_eval_artificial_fp4(
-            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, False, seed=3000 + seq_len)
+            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, False, seed=3000 + seq_len
+        )
         t1 = time.time()
         b_acc, b_curve = train_and_eval_artificial_fp4(
-            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, True, seed=3500 + seq_len)
+            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, True, seed=3500 + seq_len
+        )
         t2 = time.time()
         c_acc, c_curve = train_and_eval_real_fp4(
-            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, False, seed=4000 + seq_len)
+            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, False, seed=4000 + seq_len
+        )
         t3 = time.time()
         d_acc, d_curve = train_and_eval_real_fp4(
-            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, True, seed=4500 + seq_len)
+            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, True, seed=4500 + seq_len
+        )
         t4 = time.time()
         e_acc, e_curve = train_and_eval_real_fp4(
-            seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, False, seed=5000 + seq_len,
-            model_cls=ToySmallTransformerRealFP4RowScaleAdam)
+            seq_len,
+            num_kv_pairs,
+            vocab,
+            hidden,
+            mlp_hidden,
+            False,
+            seed=5000 + seq_len,
+            model_cls=ToySmallTransformerRealFP4RowScaleAdam,
+        )
         t5 = time.time()
 
-        print(f"  (A) Adam+artificial-FP4, no energy:      acc={a_acc:.2f}  ({t1-t0:.1f}s)")
+        print(f"  (A) Adam+artificial-FP4, no energy:      acc={a_acc:.2f}  ({t1 - t0:.1f}s)")
         print(f"      loss curve: {_fmt_curve(a_curve)}")
-        print(f"  (B) Adam+artificial-FP4, + energy:        acc={b_acc:.2f}  ({t2-t1:.1f}s)")
+        print(f"  (B) Adam+artificial-FP4, + energy:        acc={b_acc:.2f}  ({t2 - t1:.1f}s)")
         print(f"      loss curve: {_fmt_curve(b_curve)}")
-        print(f"  (C) importance+real-FP4, no energy:       acc={c_acc:.2f}  ({t3-t2:.1f}s)")
+        print(f"  (C) importance+real-FP4, no energy:       acc={c_acc:.2f}  ({t3 - t2:.1f}s)")
         print(f"      loss curve: {_fmt_curve(c_curve)}")
-        print(f"  (D) importance+real-FP4, + energy:        acc={d_acc:.2f}  ({t4-t3:.1f}s)")
+        print(f"  (D) importance+real-FP4, + energy:        acc={d_acc:.2f}  ({t4 - t3:.1f}s)")
         print(f"      loss curve: {_fmt_curve(d_curve)}")
-        print(f"  (E) importance+real-FP4, row-scale-Adam:  acc={e_acc:.2f}  ({t5-t4:.1f}s)")
+        print(f"  (E) importance+real-FP4, row-scale-Adam:  acc={e_acc:.2f}  ({t5 - t4:.1f}s)")
         print(f"      loss curve: {_fmt_curve(e_curve)}\n")
         results.append((seq_len, num_kv_pairs, vocab, a_acc, b_acc, c_acc, d_acc, e_acc))
 
     print(f"{'seq_len':>8}  {'kv':>4}  {'vocab':>6}  {'A':>6}  {'B':>6}  {'C':>6}  {'D':>6}  {'E':>6}")
     for seq_len, num_kv_pairs, vocab, a, b, c, d, e in results:
-        print(f"{seq_len:>8}  {num_kv_pairs:>4}  {vocab:>6}  {a:>6.2f}  {b:>6.2f}  "
-              f"{c:>6.2f}  {d:>6.2f}  {e:>6.2f}")
+        print(f"{seq_len:>8}  {num_kv_pairs:>4}  {vocab:>6}  {a:>6.2f}  {b:>6.2f}  {c:>6.2f}  {d:>6.2f}  {e:>6.2f}")
     return results
 
 

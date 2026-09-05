@@ -96,30 +96,40 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
     is Python-kwarg-only, not CLI-exposed -- use train_curriculum()
     directly for that.
 """
+
 from __future__ import annotations
 
-import sys
-import time
 import json
 import resource
-from typing import Optional, Tuple
+import sys
+import time
 
 import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili import _cpu
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, clip_grad_norm_
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili.tensor import combine_losses
-from scripts.train_tile_curriculum import _build_tile_window
+
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, predicted_token
+from model.toy_recall_task import generate_mqar_sequence
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
 from scripts.train_mqar_rmt_reference import (
-    seq_len_for_k, _build_targets,
-    EMBED_WIDTH, COLUMN_NEURONS, NUM_MEMORY_SLOTS, MAX_WEIGHTS_PER_LAYER,
-    NUM_CPUS, VOCAB, WARMUP_STEPS, MAX_GRAD_NORM, CLIP_RANGE, L1_SPARSITY_COEF,
+    CLIP_RANGE,
+    COLUMN_NEURONS,
+    EMBED_WIDTH,
+    L1_SPARSITY_COEF,
+    MAX_GRAD_NORM,
+    MAX_WEIGHTS_PER_LAYER,
+    NUM_CPUS,
+    NUM_MEMORY_SLOTS,
+    VOCAB,
+    WARMUP_STEPS,
+    _build_targets,
+    seq_len_for_k,
 )
+from scripts.train_tile_curriculum import _build_tile_window
 
 PRECISION_CLS = {"fp4": DISLDOLayer, "fp8": DISLDOLayer8, "fp32": DISLDOLayer32}
 
@@ -137,6 +147,8 @@ def _default_graded_dy_schedule(num_tiles: int, floor: float = 0.02) -> list:
     if num_tiles <= 1:
         return [1.0] * num_tiles
     return [floor + (1.0 - floor) * (i / (num_tiles - 1)) for i in range(num_tiles)]
+
+
 NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 # FP8 needs a real (non-infinite) max_abs_delta -- see conversation/
 # sili__new's linear_disldo.hpp fix: FP4's block4 backward computed cw
@@ -179,27 +191,27 @@ NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0}
 PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS_FP32}
 
 DEFAULT_PEAK_LR = 0.015
-DEFAULT_NUM_TILES = 16         # fixed local-attention window (model param, not a task param)
-LEVEL_UP_TOKEN = VOCAB - 2     # 126 -- reserved, never chosen as an MQAR key/value
-LEVEL_DOWN_TOKEN = VOCAB - 1   # 127 -- reserved, never chosen as an MQAR key/value
-TASK_VOCAB_MAX = VOCAB - 2     # curriculum vocab_size grows up to (not including) this,
-                                # so [0, TASK_VOCAB_MAX) never collides with the level tokens
-VOCAB_START = 8                # min viable: must exceed seq_len_for_k(1)=4
-VOCAB_GROWTH_FACTOR = 2.0      # doubles each promotion: 8->16->32->64->126(clamped)
+DEFAULT_NUM_TILES = 16  # fixed local-attention window (model param, not a task param)
+LEVEL_UP_TOKEN = VOCAB - 2  # 126 -- reserved, never chosen as an MQAR key/value
+LEVEL_DOWN_TOKEN = VOCAB - 1  # 127 -- reserved, never chosen as an MQAR key/value
+TASK_VOCAB_MAX = VOCAB - 2  # curriculum vocab_size grows up to (not including) this,
+# so [0, TASK_VOCAB_MAX) never collides with the level tokens
+VOCAB_START = 8  # min viable: must exceed seq_len_for_k(1)=4
+VOCAB_GROWTH_FACTOR = 2.0  # doubles each promotion: 8->16->32->64->126(clamped)
 K_START = 1
 DEFAULT_K_MAX = 10
-STREAK_THRESHOLD = 10          # consecutive correct queries to advance a stage
-WRONG_STREAK_THRESHOLD = 5     # consecutive wrong queries to regress a stage
+STREAK_THRESHOLD = 10  # consecutive correct queries to advance a stage
+WRONG_STREAK_THRESHOLD = 5  # consecutive wrong queries to regress a stage
 MIN_QUERIES_BEFORE_REGRESS = 30  # grace period: a fresh stage gets this many query
-                                  # attempts before regression can trigger at all --
-                                  # without this, ordinary first-contact difficulty
-                                  # on a harder stage (expected, not "isn't learning")
-                                  # was hitting WRONG_STREAK_THRESHOLD almost
-                                  # immediately and thrashing level_up/level_down
-                                  # every ~10-15 steps -- confirmed directly (smoke
-                                  # test oscillated vocab 16<->32 repeatedly).
+# attempts before regression can trigger at all --
+# without this, ordinary first-contact difficulty
+# on a harder stage (expected, not "isn't learning")
+# was hitting WRONG_STREAK_THRESHOLD almost
+# immediately and thrashing level_up/level_down
+# every ~10-15 steps -- confirmed directly (smoke
+# test oscillated vocab 16<->32 repeatedly).
 MIN_LR_FRAC = 0.05
-LOSS_EMA_DECAY = 0.98          # kept for logging only; LR itself is accuracy-driven
+LOSS_EMA_DECAY = 0.98  # kept for logging only; LR itself is accuracy-driven
 ACC_EMA_DECAY = 0.98
 
 # Advantage actor-critic (task #272): the critic predicts the per-vocab-
@@ -325,16 +337,24 @@ def _check_finite_or_raise(model, logits, step: int, i: int, loss_ema) -> None:
         bad_arrs = {k: v for k, v in arrs.items() if v[0] > 0}
         if bad_arrs:
             health_lines.append(f"  {lname}: {bad_arrs}")
-    trace_lines = [f"  step={e['step']} i={e['i']} loss_ema={e['loss_ema']} " +
-                   " ".join(f"{k}={v:.4g}" for k, v in e.items()
-                           if k not in ("step", "i", "loss_ema"))
-                  for e in _magnitude_trace]
-    report = (f"NON-FINITE at step={step} i={i}\n  " + "\n  ".join(bad) +
-             "\nLayer weight health (nonfinite_count, total) for layers with issues:\n" +
-             ("\n".join(health_lines) if health_lines else "  (none -- corruption is in activations only, not stored weights)") +
-             f"\nranks={model.report_ranks()}" +
-             f"\nMagnitude trace, last {len(_magnitude_trace)} positions (max|finite value| per stage):\n" +
-             "\n".join(trace_lines))
+    trace_lines = [
+        f"  step={e['step']} i={e['i']} loss_ema={e['loss_ema']} "
+        + " ".join(f"{k}={v:.4g}" for k, v in e.items() if k not in ("step", "i", "loss_ema"))
+        for e in _magnitude_trace
+    ]
+    report = (
+        f"NON-FINITE at step={step} i={i}\n  "
+        + "\n  ".join(bad)
+        + "\nLayer weight health (nonfinite_count, total) for layers with issues:\n"
+        + (
+            "\n".join(health_lines)
+            if health_lines
+            else "  (none -- corruption is in activations only, not stored weights)"
+        )
+        + f"\nranks={model.report_ranks()}"
+        + f"\nMagnitude trace, last {len(_magnitude_trace)} positions (max|finite value| per stage):\n"
+        + "\n".join(trace_lines)
+    )
     raise RuntimeError(report)
 
 
@@ -349,16 +369,16 @@ def k_indicator_token(k: int) -> int:
     return k
 
 
-def next_vocab(vocab_size: int, vocab_step: Optional[int] = None) -> int:
+def next_vocab(vocab_size: int, vocab_step: int | None = None) -> int:
     if vocab_step is not None:
         return min(TASK_VOCAB_MAX, vocab_size + vocab_step)
-    return min(TASK_VOCAB_MAX, int(round(vocab_size * VOCAB_GROWTH_FACTOR)))
+    return min(TASK_VOCAB_MAX, round(vocab_size * VOCAB_GROWTH_FACTOR))
 
 
-def prev_vocab(vocab_size: int, vocab_step: Optional[int] = None) -> int:
+def prev_vocab(vocab_size: int, vocab_step: int | None = None) -> int:
     if vocab_step is not None:
         return max(VOCAB_START, vocab_size - vocab_step)
-    return max(VOCAB_START, int(round(vocab_size / VOCAB_GROWTH_FACTOR)))
+    return max(VOCAB_START, round(vocab_size / VOCAB_GROWTH_FACTOR))
 
 
 def _backward_with_critic(model, logits, target_token: int, row: int, aux) -> None:
@@ -392,8 +412,9 @@ def _backward_with_critic(model, logits, target_token: int, row: int, aux) -> No
     # Treating a non-finite prediction as "no correction" (advantage=0)
     # rather than propagating it also protects the critic's OWN gradient
     # below, since g_critic reuses this same sanitized pred_row.
-    pred_row = np.nan_to_num(np.asarray(critic_pred.data[row], dtype=np.float32),
-                             nan=0.0, posinf=ADVANTAGE_CLIP, neginf=-ADVANTAGE_CLIP)
+    pred_row = np.nan_to_num(
+        np.asarray(critic_pred.data[row], dtype=np.float32), nan=0.0, posinf=ADVANTAGE_CLIP, neginf=-ADVANTAGE_CLIP
+    )
     advantage = np.clip(true_loss_vec - pred_row, -ADVANTAGE_CLIP, ADVANTAGE_CLIP)
 
     g_logits = np.zeros_like(logits.data)
@@ -467,48 +488,56 @@ def _ema_grad_scale(params, ratio_threshold: float, decay: float) -> None:
         p._grad_norm_ema = g_norm if ema is None else (decay * ema + (1.0 - decay) * g_norm)
 
 
-def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
-                     num_tiles: int, k_max: int, log_every: int = 200,
-                     log_fn=None, additive_rank: int = 1,
-                     dynamic_rank_control: bool = True,
-                     rank_grace_period_steps: int = 50,
-                     rank_additive_grace_period_steps: int = 5000,
-                     use_critic: bool = False,
-                     magnitude_clip_penalty_coef: float = 0.0,
-                     recurrent_only_output: bool = False,
-                     embed_width: int = EMBED_WIDTH,
-                     input_sparsity_p: Optional[float] = None,
-                     wide_max_weights: Optional[int] = None,
-                     dy_sparsity_p: Optional[float] = None,
-                     use_tile_cache: bool = False,
-                     output_dy_sparsity_p: Optional[float] = None,
-                     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
-                     streak_threshold: int = STREAK_THRESHOLD,
-                     vocab_step: Optional[int] = None,
-                     require_new_vocab_before_levelup: bool = False,
-                     query_debug_fn=None,
-                     sigma_grad_debug_fn=None,
-                     clip_range: float = CLIP_RANGE,
-                     grad_ema_ratio_threshold: Optional[float] = None,
-                     grad_ema_decay: float = 0.9,
-                     embed_table_builder=None,
-                     embed_learning_rate: Optional[float] = None,
-                     k_first_target: Optional[int] = None,
-                     k_first_vocab: Optional[int] = None,
-                     l2_decay_chunk_size: Optional[int] = None,
-                     l2_decay_adaptation_rate: float = 0.3,
-                     dy_r_target: Optional[float] = None,
-                     dy_k_min: int = 0,
-                     dy_k_max: Optional[int] = None,
-                     dy_surprise_alpha: Optional[float] = None,
-                     dy_surprise_beta: float = 0.99,
-                     x_r_target: Optional[float] = None,
-                     x_k_min: int = 0,
-                     x_k_max: Optional[int] = None,
-                     target_steps_per_sec: Optional[float] = None,
-                     trajectory_log_every: Optional[int] = None,
-                     trajectory_log_steps: Optional[Tuple[int, int]] = None,
-                     trajectory_log_fn=None) -> dict:
+def train_curriculum(
+    precision: str,
+    max_steps: int,
+    seed: int,
+    peak_lr: float,
+    num_tiles: int,
+    k_max: int,
+    log_every: int = 200,
+    log_fn=None,
+    additive_rank: int = 1,
+    dynamic_rank_control: bool = True,
+    rank_grace_period_steps: int = 50,
+    rank_additive_grace_period_steps: int = 5000,
+    use_critic: bool = False,
+    magnitude_clip_penalty_coef: float = 0.0,
+    recurrent_only_output: bool = False,
+    embed_width: int = EMBED_WIDTH,
+    input_sparsity_p: float | None = None,
+    wide_max_weights: int | None = None,
+    dy_sparsity_p: float | None = None,
+    use_tile_cache: bool = False,
+    output_dy_sparsity_p: float | None = None,
+    wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
+    streak_threshold: int = STREAK_THRESHOLD,
+    vocab_step: int | None = None,
+    require_new_vocab_before_levelup: bool = False,
+    query_debug_fn=None,
+    sigma_grad_debug_fn=None,
+    clip_range: float = CLIP_RANGE,
+    grad_ema_ratio_threshold: float | None = None,
+    grad_ema_decay: float = 0.9,
+    embed_table_builder=None,
+    embed_learning_rate: float | None = None,
+    k_first_target: int | None = None,
+    k_first_vocab: int | None = None,
+    l2_decay_chunk_size: int | None = None,
+    l2_decay_adaptation_rate: float = 0.3,
+    dy_r_target: float | None = None,
+    dy_k_min: int = 0,
+    dy_k_max: int | None = None,
+    dy_surprise_alpha: float | None = None,
+    dy_surprise_beta: float = 0.99,
+    x_r_target: float | None = None,
+    x_k_min: int = 0,
+    x_k_max: int | None = None,
+    target_steps_per_sec: float | None = None,
+    trajectory_log_every: int | None = None,
+    trajectory_log_steps: tuple[int, int] | None = None,
+    trajectory_log_fn=None,
+) -> dict:
     # query_debug_fn (direct instruction, explainable-AI investigation):
     # optional callback fired at EVERY query step (not just periodic log
     # points or LEVEL_UP/DOWN events) with (step, correct, logit_row,
@@ -581,20 +610,38 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     # curriculum's vocab/K stage grows -- this is the whole point of
     # decoupling the model's local window from the task.
     model = ToyTileRecurrenceRMT(
-        VOCAB, embed_width, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
-        MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
-        dense=True, clip_range=clip_range, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]), scale_rank=1,
-        additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
+        VOCAB,
+        embed_width,
+        COLUMN_NEURONS,
+        num_tiles,
+        NUM_MEMORY_SLOTS,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=disldo_cls,
+        dense=True,
+        clip_range=clip_range,
+        l1_sparsity_coef=L1_SPARSITY_COEF,
+        synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]),
+        scale_rank=1,
+        additive_rank=additive_rank,
+        dynamic_rank_control=dynamic_rank_control,
         use_critic=use_critic,
         magnitude_clip_penalty_coef=magnitude_clip_penalty_coef,
         recurrent_only_output=recurrent_only_output,
-        input_sparsity_p=input_sparsity_p, wide_max_weights=wide_max_weights,
-        dy_sparsity_p=dy_sparsity_p, output_dy_sparsity_p=output_dy_sparsity_p,
-        dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
-        dy_surprise_alpha=dy_surprise_alpha, dy_surprise_beta=dy_surprise_beta,
-        x_r_target=x_r_target, x_k_min=x_k_min, x_k_max=x_k_max,
-        rng=model_rng)
+        input_sparsity_p=input_sparsity_p,
+        wide_max_weights=wide_max_weights,
+        dy_sparsity_p=dy_sparsity_p,
+        output_dy_sparsity_p=output_dy_sparsity_p,
+        dy_r_target=dy_r_target,
+        dy_k_min=dy_k_min,
+        dy_k_max=dy_k_max,
+        dy_surprise_alpha=dy_surprise_alpha,
+        dy_surprise_beta=dy_surprise_beta,
+        x_r_target=x_r_target,
+        x_k_min=x_k_min,
+        x_k_max=x_k_max,
+        rng=model_rng,
+    )
     opt = AdamOptimizer()
     # embed_table_builder (direct instruction, wide-model SDR redesign):
     # None (default) preserves today's exact dense-random-projection
@@ -768,22 +815,25 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         # fire on old vocab alone, without repeatedly forcing new vocab on
         # every re-entry into the level (see streak_has_new_vocab comment
         # above for the full rationale, direct instruction).
-        force_this_step = (require_new_vocab_before_levelup and phase == "vocab"
-                            and len(new_key_ids) > 0
-                            and streak == streak_threshold - 1
-                            and not streak_has_new_vocab)
+        force_this_step = (
+            require_new_vocab_before_levelup
+            and phase == "vocab"
+            and len(new_key_ids) > 0
+            and streak == streak_threshold - 1
+            and not streak_has_new_vocab
+        )
         tokens, mqar_pairs = generate_mqar_sequence(
-            rng, vocab_size, seq_len, k,
-            forced_keys=(new_key_ids if force_this_step else None))
+            rng, vocab_size, seq_len, k, forced_keys=(new_key_ids if force_this_step else None)
+        )
         # Per-query-position new-vocab membership (not a step-wide OR):
         # each query's own key, so streak_has_new_vocab tracks whether
         # THIS SPECIFIC query touched the new vocab, not just any query
         # somewhere in the same step's window.
         new_vocab_query_positions = (
-            set(pos for pos, _ in mqar_pairs if int(tokens[pos]) in new_key_ids)
-            if new_key_ids else set())
+            {pos for pos, _ in mqar_pairs if int(tokens[pos]) in new_key_ids} if new_key_ids else set()
+        )
         targets = _build_targets(tokens, mqar_pairs, k)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
 
         # Persistent level-indicator prefix (direct instruction): every
         # sequence gets an explicit signal of (current vocab, current k),
@@ -803,13 +853,13 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         # same token ID appearing later as a genuine in-sequence value.
         level_prefix = [vocab_size - 1, k_indicator_token(k)]
         if pending_level_token is not None:
-            level_prefix = [pending_level_token] + level_prefix
+            level_prefix = [pending_level_token, *level_prefix]
             pending_level_token = None
         offset = len(level_prefix)
         combined_tokens = np.concatenate((level_prefix, tokens))
         targets = {pos + offset: tgt for pos, tgt in targets.items()}
-        query_positions = set(pos + offset for pos in query_positions)
-        new_vocab_query_positions = set(pos + offset for pos in new_vocab_query_positions)
+        query_positions = {pos + offset for pos in query_positions}
+        new_vocab_query_positions = {pos + offset for pos in new_vocab_query_positions}
 
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         tile_cache = None  # reset every sequence, same as memory
@@ -841,8 +891,12 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             if use_tile_cache and (i in targets):
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
                 memory, logits, aux = model.step(
-                    window, memory, lr, requires_grad=True,
-                    content_dy_sparsity_schedule=_default_graded_dy_schedule(num_tiles))
+                    window,
+                    memory,
+                    lr,
+                    requires_grad=True,
+                    content_dy_sparsity_schedule=_default_graded_dy_schedule(num_tiles),
+                )
                 logit_row = num_tiles - 1
                 # Refresh tile_cache from this step's own freshly-recomputed
                 # k/v (model.last_debug["k"/"v"] are the FULL [total_slots, sw]
@@ -852,11 +906,12 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 # step_cached() itself uses.
                 k_content = model.last_debug["k"][NUM_MEMORY_SLOTS:]
                 v_content = model.last_debug["v"][NUM_MEMORY_SLOTS:]
-                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy()))
+                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), strict=False))
             elif use_tile_cache:
                 new_embed = embed_table[combined_tokens[i]]
                 memory, logits, aux, tile_cache = model.step_cached(
-                    new_embed, memory, lr, tile_cache, requires_grad=False)
+                    new_embed, memory, lr, tile_cache, requires_grad=False
+                )
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
@@ -866,20 +921,25 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
             if i in targets:
                 loss = cross_entropy_sum(logits, [(logit_row, targets[i])])
-                loss_ema = float(loss.data) if loss_ema is None else (
-                    LOSS_EMA_DECAY * loss_ema + (1.0 - LOSS_EMA_DECAY) * float(loss.data))
+                loss_ema = (
+                    float(loss.data)
+                    if loss_ema is None
+                    else (LOSS_EMA_DECAY * loss_ema + (1.0 - LOSS_EMA_DECAY) * float(loss.data))
+                )
                 if i in query_positions:
                     correct = predicted_token(logits, logit_row) == targets[i]
-                    acc_ema = float(correct) if acc_ema is None else (
-                        ACC_EMA_DECAY * acc_ema + (1.0 - ACC_EMA_DECAY) * float(correct))
+                    acc_ema = (
+                        float(correct)
+                        if acc_ema is None
+                        else (ACC_EMA_DECAY * acc_ema + (1.0 - ACC_EMA_DECAY) * float(correct))
+                    )
                     if query_debug_fn is not None:
                         # logits.data[logit_row]/targets[i] added (direct
                         # instruction): lets a caller compute real
                         # confidence/hedging signals (target-token
                         # probability, entropy) itself instead of only
                         # seeing the binary correct/incorrect outcome.
-                        query_debug_fn(step, correct, logit_row, model.last_debug,
-                                       logits.data[logit_row], targets[i])
+                        query_debug_fn(step, correct, logit_row, model.last_debug, logits.data[logit_row], targets[i])
                     queries_since_level_change += 1
                     if i in new_vocab_query_positions:
                         streak_has_new_vocab = True
@@ -924,8 +984,7 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                                 g = g * active_mask[tok]
                             embed_table[tok] -= embed_learning_rate * g
                 if grad_ema_ratio_threshold is not None:
-                    _ema_grad_scale(model.parameters_for_optimizer(),
-                                     grad_ema_ratio_threshold, grad_ema_decay)
+                    _ema_grad_scale(model.parameters_for_optimizer(), grad_ema_ratio_threshold, grad_ema_decay)
                 if sigma_grad_debug_fn is not None:
                     # Fired BEFORE clip_grad_norm_ -- raw gradient (after
                     # any per-tensor EMA scaling above, before the shared
@@ -948,7 +1007,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,
-                        additive_grace_period_steps=rank_additive_grace_period_steps)
+                        additive_grace_period_steps=rank_additive_grace_period_steps,
+                    )
                     rank_mutation_count += sum(1 for m in mutated.values() if m)
                     # AQRS channel-diversity pass (task #295 follow-up,
                     # chosen over residual-targeted growth -- direct
@@ -982,18 +1042,18 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
             # vocab clamped at TASK_VOCAB_MAX (_advance_stage's own wrap
             # guard degenerates into pure k-growth once that happens) and
             # k having grown past k_first_target on top of that.
-            graduated_now = ((phase_now == "kcycle" and vocab_now >= TASK_VOCAB_MAX
-                             and k_now > k_first_target)
-                             if k_first_target is not None
-                             else (phase_now == "k" and k_now > k_max))
+            graduated_now = (
+                (phase_now == "kcycle" and vocab_now >= TASK_VOCAB_MAX and k_now > k_first_target)
+                if k_first_target is not None
+                else (phase_now == "k" and k_now > k_max)
+            )
             if graduated_now:
                 # _advance_stage already logged ranks for this exact step
                 ranks = model.report_ranks() if dynamic_rank_control else None
                 if log_fn is not None:
                     log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema, ranks=ranks)
                 break
-        elif (wrong_streak >= wrong_streak_threshold
-              and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS):
+        elif wrong_streak >= wrong_streak_threshold and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS:
             _regress_stage(step)
 
         # Fine-grained trajectory logging (task #369, direct instruction:
@@ -1009,8 +1069,8 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
         # accumulator needed here).
         if trajectory_log_fn is not None and (
             (trajectory_log_every is not None and step % trajectory_log_every == 0)
-            or (trajectory_log_steps is not None
-                and trajectory_log_steps[0] <= step <= trajectory_log_steps[1])):
+            or (trajectory_log_steps is not None and trajectory_log_steps[0] <= step <= trajectory_log_steps[1])
+        ):
             trajectory_log_fn(step, model)
 
         if step % log_every == 0:
@@ -1042,9 +1102,20 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
                 # drift across the whole run.
                 model.reset_layer_timing()
             if log_fn is not None:
-                log_fn(step, vocab_size, k, phase, "", loss_ema, acc_ema, ranks=ranks,
-                      steps_per_sec=steps_per_sec, max_streak=max_streak_seen,
-                      dy_r_target=model.dy_r_target, x_r_target=model.x_r_target)
+                log_fn(
+                    step,
+                    vocab_size,
+                    k,
+                    phase,
+                    "",
+                    loss_ema,
+                    acc_ema,
+                    ranks=ranks,
+                    steps_per_sec=steps_per_sec,
+                    max_streak=max_streak_seen,
+                    dy_r_target=model.dy_r_target,
+                    x_r_target=model.x_r_target,
+                )
             max_streak_seen = 0
 
     elapsed_s = time.time() - t0
@@ -1053,14 +1124,19 @@ def train_curriculum(precision: str, max_steps: int, seed: int, peak_lr: float,
     return {
         "steps_per_sec": (step / elapsed_s) if elapsed_s > 0 else 0.0,
         "peak_rss_mb": peak_rss_mb,
-        "precision": precision, "final_vocab": final_vocab, "final_k": final_k,
-        "final_phase": final_phase, "peak_stage": peak_stage,
-        "graduated": ((final_phase == "kcycle" and final_vocab >= TASK_VOCAB_MAX
-                       and final_k > k_first_target)
-                      if k_first_target is not None
-                      else (final_phase == "k" and final_k > k_max)),
+        "precision": precision,
+        "final_vocab": final_vocab,
+        "final_k": final_k,
+        "final_phase": final_phase,
+        "peak_stage": peak_stage,
+        "graduated": (
+            (final_phase == "kcycle" and final_vocab >= TASK_VOCAB_MAX and final_k > k_first_target)
+            if k_first_target is not None
+            else (final_phase == "k" and final_k > k_max)
+        ),
         "total_steps": step,
-        "elapsed_s": elapsed_s, "stage_history": stage_history,
+        "elapsed_s": elapsed_s,
+        "stage_history": stage_history,
         "dynamic_rank_control": dynamic_rank_control,
         "rank_mutation_count": rank_mutation_count,
         "final_ranks": model.report_ranks() if hasattr(model, "report_ranks") else {},
@@ -1153,8 +1229,7 @@ def main():
     # and get bounced back to easy data than to commit to genuinely harder
     # representations. -1 sentinel keeps today's default (5) unchanged.
     _wrong_streak_threshold_arg = int(sys.argv[18]) if len(sys.argv) > 18 else -1
-    wrong_streak_threshold = (_wrong_streak_threshold_arg if _wrong_streak_threshold_arg >= 0
-                              else WRONG_STREAK_THRESHOLD)
+    wrong_streak_threshold = _wrong_streak_threshold_arg if _wrong_streak_threshold_arg >= 0 else WRONG_STREAK_THRESHOLD
     # dy_r_target/dy_k_min/dy_k_max/target_steps_per_sec (task #367/#368,
     # nucleus/energy-threshold grad sparsification -- see JOURNAL.md's
     # "nucleus/energy-threshold top-k math" + "Grad-side k_t design,
@@ -1204,21 +1279,22 @@ def main():
     _trajectory_log_every_arg = int(sys.argv[26]) if len(sys.argv) > 26 else -1
     trajectory_log_every = _trajectory_log_every_arg if _trajectory_log_every_arg > 0 else None
 
-    print(f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
-          f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
-          f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
-          f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
-          f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
-          f"dy_sparsity_p={dy_sparsity_p} use_tile_cache={use_tile_cache} "
-          f"output_dy_sparsity_p={output_dy_sparsity_p} "
-          f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
-          f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
-          f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha} "
-          f"x_r_target={x_r_target} x_k_min={x_k_min} trajectory_log_every={trajectory_log_every}",
-          flush=True)
+    print(
+        f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
+        f"peak_lr={peak_lr} num_tiles={num_tiles} k_max={k_max} additive_rank={additive_rank} "
+        f"dynamic_rank_control={dynamic_rank_control} rank_grace_period_steps={rank_grace_period_steps} "
+        f"use_critic={use_critic} recurrent_only_output={recurrent_only_output} "
+        f"embed_width={embed_width} input_sparsity_p={input_sparsity_p} wide_max_weights={wide_max_weights} "
+        f"dy_sparsity_p={dy_sparsity_p} use_tile_cache={use_tile_cache} "
+        f"output_dy_sparsity_p={output_dy_sparsity_p} "
+        f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
+        f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
+        f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha} "
+        f"x_r_target={x_r_target} x_k_min={x_k_min} trajectory_log_every={trajectory_log_every}",
+        flush=True,
+    )
 
-    _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k",
-                   "v_proj": "v", "o_proj": "o", "lm_head": "lm"}
+    _SHORT_NAME = {"input_proj": "in", "q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "lm_head": "lm"}
 
     def _ranks_str(ranks):
         if not ranks:
@@ -1226,8 +1302,20 @@ def main():
         parts = [f"{_SHORT_NAME.get(n, n)}={s}/{a}" for n, (s, a) in ranks.items()]
         return "  ranks[" + " ".join(parts) + "]"
 
-    def log_fn(step, vocab_size, k, phase, event, loss_ema, acc_ema, ranks=None, steps_per_sec=None,
-               max_streak=None, dy_r_target=None, x_r_target=None):
+    def log_fn(
+        step,
+        vocab_size,
+        k,
+        phase,
+        event,
+        loss_ema,
+        acc_ema,
+        ranks=None,
+        steps_per_sec=None,
+        max_streak=None,
+        dy_r_target=None,
+        x_r_target=None,
+    ):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
@@ -1245,14 +1333,15 @@ def main():
             _set = {n: v for n, v in d.items() if v is not None}
             if not _set:
                 return ""
-            return ("  " + label + "[" +
-                    " ".join(f"{_SHORT_NAME.get(n, n)}={v:.3f}" for n, v in _set.items()) +
-                    "]")
+            return "  " + label + "[" + " ".join(f"{_SHORT_NAME.get(n, n)}={v:.3f}" for n, v in _set.items()) + "]"
 
         dy_r_s = _r_target_str("dy_r_target", dy_r_target)
         x_r_s = _r_target_str("x_r_target", x_r_target)
-        print(f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-              f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}", flush=True)
+        print(
+            f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
+            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}",
+            flush=True,
+        )
 
     def trajectory_log_fn_default(step, model) -> None:
         # Task #369: default fine-grained printer -- one line per axis,
@@ -1272,7 +1361,9 @@ def main():
                 continue
             surprise = model._layer_surprise.get(name)
             if surprise is not None:
-                dy_parts.append(f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f},E{surprise['E_t']:.2g},L{surprise['Lbar']:.2g}")
+                dy_parts.append(
+                    f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f},E{surprise['E_t']:.2g},L{surprise['Lbar']:.2g}"
+                )
             else:
                 dy_parts.append(f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f}")
         x_parts = []
@@ -1281,7 +1372,9 @@ def main():
                 continue
             sel = model.last_input_selection.get(name)
             if sel is not None:
-                x_parts.append(f"{_SHORT_NAME.get(name, name)}=target{x_target:.3f},R{sel['R_mean']:.3f},k{sel['k_mean']:.1f}")
+                x_parts.append(
+                    f"{_SHORT_NAME.get(name, name)}=target{x_target:.3f},R{sel['R_mean']:.3f},k{sel['k_mean']:.1f}"
+                )
             else:
                 x_parts.append(f"{_SHORT_NAME.get(name, name)}=target{x_target:.3f}")
         if dy_parts:
@@ -1289,29 +1382,49 @@ def main():
         if x_parts:
             print(f"    [TRAJ] step={step:>7} axis=x  " + " ".join(x_parts), flush=True)
 
-    r = train_curriculum(precision, max_steps, seed, peak_lr, num_tiles, k_max, log_fn=log_fn,
-                         trajectory_log_every=trajectory_log_every,
-                         trajectory_log_fn=(trajectory_log_fn_default
-                                            if trajectory_log_every is not None else None),
-                         additive_rank=additive_rank, dynamic_rank_control=dynamic_rank_control,
-                         rank_grace_period_steps=rank_grace_period_steps, use_critic=use_critic,
-                         recurrent_only_output=recurrent_only_output,
-                         embed_width=embed_width, input_sparsity_p=input_sparsity_p,
-                         wide_max_weights=wide_max_weights, dy_sparsity_p=dy_sparsity_p,
-                         use_tile_cache=use_tile_cache,
-                         output_dy_sparsity_p=output_dy_sparsity_p,
-                         wrong_streak_threshold=wrong_streak_threshold,
-                         dy_r_target=dy_r_target, dy_k_min=dy_k_min, dy_k_max=dy_k_max,
-                         dy_surprise_alpha=dy_surprise_alpha,
-                         x_r_target=x_r_target, x_k_min=x_k_min,
-                         target_steps_per_sec=target_steps_per_sec)
-    print(f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
-          f"final_phase={r['final_phase']} graduated={r['graduated']} "
-          f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
-          f"peak_rss_mb={r['peak_rss_mb']:.1f} "
-          f"({r['elapsed_s']:.0f}s)", flush=True)
-    print(f"PEAK precision={precision} peak_vocab={r['peak_stage']['vocab']} "
-          f"peak_k={r['peak_stage']['k']} peak_phase={r['peak_stage']['phase']}", flush=True)
+    r = train_curriculum(
+        precision,
+        max_steps,
+        seed,
+        peak_lr,
+        num_tiles,
+        k_max,
+        log_fn=log_fn,
+        trajectory_log_every=trajectory_log_every,
+        trajectory_log_fn=(trajectory_log_fn_default if trajectory_log_every is not None else None),
+        additive_rank=additive_rank,
+        dynamic_rank_control=dynamic_rank_control,
+        rank_grace_period_steps=rank_grace_period_steps,
+        use_critic=use_critic,
+        recurrent_only_output=recurrent_only_output,
+        embed_width=embed_width,
+        input_sparsity_p=input_sparsity_p,
+        wide_max_weights=wide_max_weights,
+        dy_sparsity_p=dy_sparsity_p,
+        use_tile_cache=use_tile_cache,
+        output_dy_sparsity_p=output_dy_sparsity_p,
+        wrong_streak_threshold=wrong_streak_threshold,
+        dy_r_target=dy_r_target,
+        dy_k_min=dy_k_min,
+        dy_k_max=dy_k_max,
+        dy_surprise_alpha=dy_surprise_alpha,
+        x_r_target=x_r_target,
+        x_k_min=x_k_min,
+        target_steps_per_sec=target_steps_per_sec,
+    )
+    print(
+        f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
+        f"final_phase={r['final_phase']} graduated={r['graduated']} "
+        f"total_steps={r['total_steps']} steps_per_sec={r['steps_per_sec']:.1f} "
+        f"peak_rss_mb={r['peak_rss_mb']:.1f} "
+        f"({r['elapsed_s']:.0f}s)",
+        flush=True,
+    )
+    print(
+        f"PEAK precision={precision} peak_vocab={r['peak_stage']['vocab']} "
+        f"peak_k={r['peak_stage']['k']} peak_phase={r['peak_stage']['phase']}",
+        flush=True,
+    )
     if r["dynamic_rank_control"]:
         print(f"RANK_MUTATIONS precision={precision} count={r['rank_mutation_count']}", flush=True)
         for name, (scale_r, add_r) in r["final_ranks"].items():

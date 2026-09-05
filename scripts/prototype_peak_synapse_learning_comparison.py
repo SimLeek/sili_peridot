@@ -100,20 +100,21 @@ column-averaging design principle), not yet tested here.
 
 Run: python -m scripts.prototype_peak_synapse_learning_comparison
 """
+
 import time
+
 import numpy as np
 from scipy import stats as scipy_stats
-
-from sili.sparse_rnn import DISLDOLayer
 from sili import _cpu
-from sili.tensor import Tensor
 from sili.energy import EnergyDynamics
+from sili.sparse_rnn import DISLDOLayer
+from sili.tensor import Tensor
 
-from model.toy_beyond_context_task import generate_deviation_sequence, VOCAB_SIZE
-from model.toy_recall_models import cross_entropy_sum, predicted_token, lr_schedule
+from model.toy_beyond_context_task import VOCAB_SIZE, generate_deviation_sequence
+from model.toy_recall_models import cross_entropy_sum, lr_schedule, predicted_token
 
-W = 2                    # in-context window (tiny, on purpose)
-OUT_OF_CONTEXT_MAX = 6   # 3x the window
+W = 2  # in-context window (tiny, on purpose)
+OUT_OF_CONTEXT_MAX = 6  # 3x the window
 STATE_WIDTH = 16
 # NUM_CPUS=1, not 2: _cpu.seed_fp4_stochastic_rng only reseeds the
 # CALLING thread's RNG state (checked directly, not assumed -- its own
@@ -178,8 +179,14 @@ EVAL_N_VALUES = [2, 3, 4, 6]
 # -- reverted to 0.005, the config that actually performed better
 # across the full seed set, not the one that looked better on paper
 # for a single case.
-GENTLE_ENERGY_CONFIG = dict(drive=0.005, activation_cost=0.01, precision=0.0002,
-                            density=0.75, exploration=0.0001, p=0.99)
+GENTLE_ENERGY_CONFIG = {
+    "drive": 0.005,
+    "activation_cost": 0.01,
+    "precision": 0.0002,
+    "density": 0.75,
+    "exploration": 0.0001,
+    "p": 0.99,
+}
 
 
 def onehot(tok):
@@ -194,7 +201,7 @@ def decay_from_horizon(horizon: int, retain_fraction: float) -> float:
     `horizon` further ticks with no replacement (decay**horizon ==
     retain_fraction). E.g. decay_from_horizon(100, 0.1) ~= 0.977 --
     "I want tags to plausibly survive out to 100 ticks, retaining at
-    least 10% of their original score.\""""
+    least 10% of their original score.\" """
     if not (0.0 < retain_fraction < 1.0):
         raise ValueError(f"retain_fraction must be in (0,1), got {retain_fraction}")
     if horizon < 1:
@@ -300,8 +307,8 @@ class PeakSynapseCell:
         self.energy = EnergyDynamics(**GENTLE_ENERGY_CONFIG) if use_energy else None
         self.peak_decay = peak_decay
         self.correction_lr_mult = correction_lr_mult
-        self.peak = np.zeros(IN_FEATURES, dtype=np.float32)         # signed x_r at the winning tick
-        self.peak_score = np.zeros(IN_FEATURES, dtype=np.float32)   # |x_r| * |state_change| at that tick
+        self.peak = np.zeros(IN_FEATURES, dtype=np.float32)  # signed x_r at the winning tick
+        self.peak_score = np.zeros(IN_FEATURES, dtype=np.float32)  # |x_r| * |state_change| at that tick
 
     def _update_peak(self, x_row, state_change_scale):
         score = np.abs(x_row) * state_change_scale
@@ -330,7 +337,7 @@ class PeakSynapseCell:
         return x_row, delta, delta_gated, aux_loss
 
     def step(self, tok, M_prev, lr):
-        x_row, delta, delta_gated, _aux = self._cell_step(tok, M_prev, lr)
+        x_row, _delta, delta_gated, _aux = self._cell_step(tok, M_prev, lr)
         state_change_scale = float(np.mean(np.abs(delta_gated.data)))
         self._update_peak(x_row, state_change_scale)
         M_new = Tensor(M_prev[None, :].astype(np.float32)) + delta_gated
@@ -370,8 +377,7 @@ class PeakSynapseCell:
                     continue  # no real historical peak to credit
                 x_1hot = np.zeros((1, IN_FEATURES), dtype=np.float32)
                 x_1hot[0, r] = self.peak[r]
-                self.cell._c.backward_sparse(x_1hot, dp, di, dv, 1, lr * self.correction_lr_mult,
-                                             lr_per_row_nnz=True)
+                self.cell._c.backward_sparse(x_1hot, dp, di, dv, 1, lr * self.correction_lr_mult, lr_per_row_nnz=True)
         return M_new.data[0], logits
 
 
@@ -421,8 +427,10 @@ def main():
         for n in EVAL_N_VALUES:
             plain_agg[n].append(pr[n])
             peak_agg[n].append(kr[n])
-        print(f"seed {s}: plain={ {n: round(pr[n],2) for n in EVAL_N_VALUES} }  "
-              f"peak={ {n: round(kr[n],2) for n in EVAL_N_VALUES} }")
+        print(
+            f"seed {s}: plain={ {n: round(pr[n], 2) for n in EVAL_N_VALUES} }  "
+            f"peak={ {n: round(kr[n], 2) for n in EVAL_N_VALUES} }"
+        )
 
     # Paired tests: plain[s] and peak[s] share the same eval-sequence
     # seed (5000+s) at each s, so a paired test uses that shared
@@ -432,8 +440,10 @@ def main():
     # non-parametric cross-check against the t-test's normality
     # assumption (accuracy is itself a mean over EVAL_SEQUENCES binary
     # trials, not obviously normal at N=50).
-    print(f"\n{'n_bits':>8}  {'in_ctx':>7}  {'plain mean+-std':>17}  {'peak mean+-std':>17}  "
-          f"{'diff':>7}  {'paired-t':>9}  {'p(t)':>7}  {'p(Wilcoxon)':>11}")
+    print(
+        f"\n{'n_bits':>8}  {'in_ctx':>7}  {'plain mean+-std':>17}  {'peak mean+-std':>17}  "
+        f"{'diff':>7}  {'paired-t':>9}  {'p(t)':>7}  {'p(Wilcoxon)':>11}"
+    )
     for n_bits in EVAL_N_VALUES:
         in_ctx = "yes" if n_bits <= W else "NO"
         p_arr = np.array(plain_agg[n_bits])
@@ -445,11 +455,15 @@ def main():
             _w_stat, w_p = scipy_stats.wilcoxon(k_arr, p_arr)
         except ValueError:
             w_p = float("nan")  # all-zero differences -- degenerate, not an error
-        print(f"{n_bits:>8}  {in_ctx:>7}  {pm:>8.3f} +- {ps:<5.3f}  {km:>8.3f} +- {ks:<5.3f}  "
-              f"{km - pm:>+7.4f}  {t_stat:>9.3f}  {t_p:>7.4f}  {w_p:>11.4f}")
-    print(f"\n(chance = 0.5, {N_SEEDS} seeds x {EVAL_SEQUENCES} eval sequences each; "
-          f"p-values are two-sided, NOT corrected for testing {len(EVAL_N_VALUES)} points)")
-    print(f"total time: {time.time()-t0:.1f}s")
+        print(
+            f"{n_bits:>8}  {in_ctx:>7}  {pm:>8.3f} +- {ps:<5.3f}  {km:>8.3f} +- {ks:<5.3f}  "
+            f"{km - pm:>+7.4f}  {t_stat:>9.3f}  {t_p:>7.4f}  {w_p:>11.4f}"
+        )
+    print(
+        f"\n(chance = 0.5, {N_SEEDS} seeds x {EVAL_SEQUENCES} eval sequences each; "
+        f"p-values are two-sided, NOT corrected for testing {len(EVAL_N_VALUES)} points)"
+    )
+    print(f"total time: {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":

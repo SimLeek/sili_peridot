@@ -1,19 +1,25 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from model.toy_tile_recurrence_rmt_ablation import ToyTileRecurrenceRMTAblation, clip_grad_norm_
-
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
 
-BASE = dict(use_custom_optimizer=True, use_hard_clip=True, use_gaussian_bias=True,
-           use_rmsnorm=True, l1_sparsity_coef=0.05)
+BASE = {
+    "use_custom_optimizer": True,
+    "use_hard_clip": True,
+    "use_gaussian_bias": True,
+    "use_rmsnorm": True,
+    "l1_sparsity_coef": 0.05,
+}
 
 
 def _swap(**overrides):
@@ -29,8 +35,13 @@ ALL_CONFIGS = {
     "swap_attn_bias": _swap(use_gaussian_bias=False),
     "swap_norm": _swap(use_rmsnorm=False),
     "swap_l1_sparsity": _swap(l1_sparsity_coef=0.0),
-    "baseline_b": dict(use_custom_optimizer=False, use_hard_clip=False,
-                       use_gaussian_bias=False, use_rmsnorm=False, l1_sparsity_coef=0.0),
+    "baseline_b": {
+        "use_custom_optimizer": False,
+        "use_hard_clip": False,
+        "use_gaussian_bias": False,
+        "use_rmsnorm": False,
+        "l1_sparsity_coef": 0.0,
+    },
 }
 
 
@@ -38,8 +49,9 @@ class TestToyTileRecurrenceRMTAblation:
     def test_every_config_runs_forward_backward_update_finite(self):
         for name, cfg in ALL_CONFIGS.items():
             torch.manual_seed(0)
-            model = ToyTileRecurrenceRMTAblation(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                                 rng=np.random.default_rng(0), **cfg)
+            model = ToyTileRecurrenceRMTAblation(
+                VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM, rng=np.random.default_rng(0), **cfg
+            )
             adam_params = model.parameters_for_optimizer()
             opt = torch.optim.Adam(adam_params) if adam_params else None
             x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
@@ -63,8 +75,9 @@ class TestToyTileRecurrenceRMTAblation:
             assert np.all(np.isfinite(memory)), f"{name}: non-finite memory"
 
     def test_baseline_a_weights_change_after_a_step(self):
-        model = ToyTileRecurrenceRMTAblation(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                             rng=np.random.default_rng(0), **BASE)
+        model = ToyTileRecurrenceRMTAblation(
+            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM, rng=np.random.default_rng(0), **BASE
+        )
         probe_window = np.random.RandomState(3).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         probe_memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         before = model.step(probe_window, probe_memory, 0.0)[1].detach().clone()
@@ -81,4 +94,5 @@ class TestToyTileRecurrenceRMTAblation:
 
         after = model.step(probe_window, probe_memory, 0.0)[1].detach()
         assert not torch.allclose(before, after), (
-            "output on a fixed probe never changed -- inline weight update never fired")
+            "output on a fixed probe never changed -- inline weight update never fired"
+        )

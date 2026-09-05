@@ -1,28 +1,41 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import torch
 import pytest
 
-from sili.tensor import Tensor, gaussian_attention, exp
+torch = pytest.importorskip("torch")
+
+from sili.tensor import Tensor, exp, gaussian_attention
 
 from model.config import MiniCPM5Config
+from model.curriculum import CurriculumStage, WindowState, advance_window, build_stage_list
 from model.sili_block import (
-    build_step_layers, _extract_true_csr, run_folded_recurrence,
-    apply_fold_step, apply_window_step, default_window_energy,
-    default_window_gaussian_params, rope_cos_sin, rmsnorm,
+    _extract_true_csr,
+    apply_fold_step,
+    apply_window_step,
+    build_step_layers,
+    default_window_energy,
+    default_window_gaussian_params,
+    rmsnorm,
+    rope_cos_sin,
+    run_folded_recurrence,
 )
-from model.curriculum import CurriculumStage, build_stage_list, WindowState, advance_window
 
 
 def _tiny_config(n_layers=4) -> MiniCPM5Config:
     return MiniCPM5Config(
-        hidden_size=8, intermediate_size=12, num_hidden_layers=n_layers,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=4,
-        vocab_size=10, rms_norm_eps=1e-6, rope_theta=10000.0,
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=n_layers,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=10,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
         tie_word_embeddings=False,
     )
 
@@ -32,22 +45,47 @@ def _fake_sparse_state(cfg: MiniCPM5Config, seed=3) -> dict:
     sd = {}
     for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
-        sd[p + ".self_attn.q_proj.weight"] = {"raw": torch.randn(cfg.q_proj_out, cfg.attn_in), "shape": (cfg.q_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.k_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.v_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.o_proj.weight"] = {"raw": torch.randn(cfg.attn_out, cfg.o_proj_in), "shape": (cfg.attn_out, cfg.o_proj_in)}
-        sd[p + ".mlp.gate_proj.weight"]    = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.up_proj.weight"]      = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.down_proj.weight"]    = {"raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden), "shape": (cfg.mlp_out, cfg.mlp_hidden)}
-        sd[p + ".input_layernorm.weight"]         = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
+        sd[p + ".self_attn.q_proj.weight"] = {
+            "raw": torch.randn(cfg.q_proj_out, cfg.attn_in),
+            "shape": (cfg.q_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.k_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.v_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.o_proj.weight"] = {
+            "raw": torch.randn(cfg.attn_out, cfg.o_proj_in),
+            "shape": (cfg.attn_out, cfg.o_proj_in),
+        }
+        sd[p + ".mlp.gate_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.up_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.down_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden),
+            "shape": (cfg.mlp_out, cfg.mlp_hidden),
+        }
+        sd[p + ".input_layernorm.weight"] = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
         sd[p + ".post_attention_layernorm.weight"] = {"raw": torch.ones(cfg.hidden_size), "shape": (cfg.hidden_size,)}
     return sd
 
 
 SUFFIXES = [
-    ".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
-    ".self_attn.v_proj.weight", ".self_attn.o_proj.weight",
-    ".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight",
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
 ]
 
 
@@ -134,7 +172,8 @@ class TestAdvanceWindow:
         np.testing.assert_allclose(
             dense_block(ptrs1, idx1, vals1, 0, in_dim, 0, out_dim),
             dense_block(ptrs3, idx3, vals3, 0, in_dim, 0, out_dim),
-            atol=1e-6)
+            atol=1e-6,
+        )
 
 
 class TestRunFoldedRecurrenceWindowed:
@@ -164,13 +203,13 @@ class TestRunFoldedRecurrenceWindowed:
         T = 5
         x = np.random.RandomState(61).randn(T, cfg.hidden_size).astype(np.float32)
 
-        plain = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
-                                      cfg, half_bandwidth=T)
+        plain = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm, cfg, half_bandwidth=T)
 
         state = WindowState()
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
-        windowed = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
-                                         cfg, half_bandwidth=T, window_state=state)
+        windowed = run_folded_recurrence(
+            x, step_layers, input_ln, post_ln, final_norm, cfg, half_bandwidth=T, window_state=state
+        )
 
         np.testing.assert_allclose(windowed, plain, rtol=1e-5, atol=1e-5)
 
@@ -195,8 +234,9 @@ class TestRunFoldedRecurrenceWindowed:
         assert state.window_positions == [3, 2]
 
         np.random.seed(12345)
-        windowed = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
-                                         cfg, half_bandwidth=T, window_state=state)
+        windowed = run_folded_recurrence(
+            x, step_layers, input_ln, post_ln, final_norm, cfg, half_bandwidth=T, window_state=state
+        )
 
         # Manual reference: pre-window positions 0,1 run exactly the
         # plain sequential loop (unaffected by the pivot); then the
@@ -204,8 +244,9 @@ class TestRunFoldedRecurrenceWindowed:
         cos, sin = rope_cos_sin(T, cfg.head_dim, cfg.rope_theta)
         pre_state = np.zeros_like(x)
         for i in range(2):
-            out = apply_fold_step(x + pre_state, step_layers[i], input_ln[i], post_ln[i],
-                                  cfg, cos, sin, half_bandwidth=T)
+            out = apply_fold_step(
+                x + pre_state, step_layers[i], input_ln[i], post_ln[i], cfg, cos, sin, half_bandwidth=T
+            )
             pre_state = pre_state + out
         x_common = x + pre_state
 
@@ -219,9 +260,18 @@ class TestRunFoldedRecurrenceWindowed:
         np.random.seed(12345)
         for t in range(T):
             delta, carried, _aux = apply_window_step(
-                x_common[t], carried, state.suffix_windows, 2,
-                window_ln, window_post_ln, cfg, energy,
-                state.centers, state.log_sigmas, num_cpus=4)
+                x_common[t],
+                carried,
+                state.suffix_windows,
+                2,
+                window_ln,
+                window_post_ln,
+                cfg,
+                energy,
+                state.centers,
+                state.log_sigmas,
+                num_cpus=4,
+            )
             columns_t = pre_state[t][None, :] + delta
             mean_column[t] = columns_t.mean(axis=0)
         expected = rmsnorm(mean_column, final_norm, cfg.rms_norm_eps)
@@ -235,7 +285,7 @@ class TestRunFoldedRecurrenceWindowed:
         # from a version where carried_state is reset to zero right
         # before it (simulating "no memory") -- confirms the mechanism
         # isn't silently degenerating to a stateless per-token function.
-        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=90)
+        cfg, step_layers, input_ln, post_ln, _final_norm = self._built(n_layers=3, seed=90)
         state = WindowState()
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
@@ -248,25 +298,66 @@ class TestRunFoldedRecurrenceWindowed:
         energy_a = default_window_energy()
         carried_a = np.zeros((2, hidden), dtype=np.float32)
         _delta1, carried_a, _ = apply_window_step(
-            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a,
-            state.centers, state.log_sigmas, num_cpus=2)
+            x_t,
+            carried_a,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_a,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
         delta2_with_memory, _, _ = apply_window_step(
-            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a,
-            state.centers, state.log_sigmas, num_cpus=2)
+            x_t,
+            carried_a,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_a,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
 
         np.random.seed(555)
         energy_b = default_window_energy()
         carried_b = np.zeros((2, hidden), dtype=np.float32)
         _delta1b, _carried_b, _ = apply_window_step(
-            x_t, carried_b, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
-            state.centers, state.log_sigmas, num_cpus=2)
+            x_t,
+            carried_b,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_b,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
         delta2_no_memory, _, _ = apply_window_step(
-            x_t, np.zeros((2, hidden), dtype=np.float32), state.suffix_windows, 2,
-            window_ln, window_post_ln, cfg, energy_b, state.centers, state.log_sigmas, num_cpus=2)
+            x_t,
+            np.zeros((2, hidden), dtype=np.float32),
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_b,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
 
         assert not np.allclose(delta2_with_memory, delta2_no_memory), (
             "resetting carried_state to zero before the second token didn't "
-            "change the output -- the mechanism isn't using carried state")
+            "change the output -- the mechanism isn't using carried state"
+        )
 
     def test_no_input_still_produces_nontrivial_state_driven_output(self):
         # "Sleep"/consolidation capability: with x_common_t all zero (no
@@ -276,7 +367,7 @@ class TestRunFoldedRecurrenceWindowed:
         # gate. Confirms the mechanism can keep running purely off
         # carried_state -- a non-trivial (nonzero, non-degenerate)
         # output that actually depends on what's in memory.
-        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=95)
+        cfg, step_layers, input_ln, post_ln, _final_norm = self._built(n_layers=3, seed=95)
         state = WindowState()
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
@@ -292,23 +383,45 @@ class TestRunFoldedRecurrenceWindowed:
         np.random.seed(777)
         energy_1 = default_window_energy()
         delta_1, new_carried_1, _ = apply_window_step(
-            x_zero, carried_1, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_1,
-            state.centers, state.log_sigmas, num_cpus=2)
+            x_zero,
+            carried_1,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_1,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
 
         np.random.seed(777)
         energy_2 = default_window_energy()
-        delta_2, new_carried_2, _ = apply_window_step(
-            x_zero, carried_2, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_2,
-            state.centers, state.log_sigmas, num_cpus=2)
+        delta_2, _new_carried_2, _ = apply_window_step(
+            x_zero,
+            carried_2,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_2,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
 
         assert np.all(np.isfinite(delta_1)) and np.all(np.isfinite(new_carried_1))
         assert not np.allclose(delta_1, 0.0), (
             "zero input produced a zero (dead) output -- the mechanism "
-            "isn't running self-sustained dynamics off carried_state alone")
+            "isn't running self-sustained dynamics off carried_state alone"
+        )
         assert not np.allclose(delta_1, delta_2), (
             "two DIFFERENT carried_state values gave the same output under "
             "zero input -- Q/K aren't actually depending on carried_state "
-            "when there's no real input")
+            "when there's no real input"
+        )
 
     def test_gaussian_attention_concentrates_on_own_pair_at_init(self):
         # Phase 2.7b's own init claim: center[p] = 2p+0.5, sigma[p] = 1.0
@@ -335,7 +448,8 @@ class TestRunFoldedRecurrenceWindowed:
             own_pair_mass = weights[p, 2 * p] + weights[p, 2 * p + 1]
             assert own_pair_mass > 0.5, (
                 f"position {p}: own-pair attention mass {own_pair_mass:.3f} "
-                f"did not dominate at init (expected >0.5, roughly 68%)")
+                f"did not dominate at init (expected >0.5, roughly 68%)"
+            )
             other_pair_mass = 1.0 - own_pair_mass
             assert own_pair_mass > other_pair_mass
 
@@ -346,7 +460,7 @@ class TestRunFoldedRecurrenceWindowed:
         # positions -- there is no "off" state to test for. Confirm
         # this directly: changing ONLY position 1's carried_state (not
         # position 0's own) still changes position 0's own delta.
-        cfg, step_layers, input_ln, post_ln, final_norm = self._built(n_layers=3, seed=104)
+        cfg, step_layers, input_ln, post_ln, _final_norm = self._built(n_layers=3, seed=104)
         state = WindowState()
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
         state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
@@ -361,20 +475,41 @@ class TestRunFoldedRecurrenceWindowed:
         np.random.seed(404)
         energy_a = default_window_energy()
         delta_a, _, _ = apply_window_step(
-            x_t, carried_a, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_a,
-            state.centers, state.log_sigmas, num_cpus=2)
+            x_t,
+            carried_a,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_a,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
 
         np.random.seed(404)
         energy_b = default_window_energy()
         delta_b, _, _ = apply_window_step(
-            x_t, carried_b, state.suffix_windows, 2, window_ln, window_post_ln, cfg, energy_b,
-            state.centers, state.log_sigmas, num_cpus=2)
+            x_t,
+            carried_b,
+            state.suffix_windows,
+            2,
+            window_ln,
+            window_post_ln,
+            cfg,
+            energy_b,
+            state.centers,
+            state.log_sigmas,
+            num_cpus=2,
+        )
 
         assert np.all(np.isfinite(delta_a)) and np.all(np.isfinite(delta_b))
         assert not np.allclose(delta_a[0], delta_b[0]), (
             "changing only position 1's carried_state didn't change position "
             "0's own delta -- gaussian_attention isn't genuinely mixing "
-            "across window positions")
+            "across window positions"
+        )
 
     def test_centers_and_log_sigmas_receive_gradients_from_a_toy_backward(self):
         # Phase 2.7's whole point: centers/log_sigmas are ordinary
@@ -408,8 +543,9 @@ class TestRunFoldedRecurrenceWindowed:
             state = advance_window(state, step_layers, SUFFIXES, cfg.num_hidden_layers, num_cpus=2)
         assert state.window_size == 4
 
-        out = run_folded_recurrence(x, step_layers, input_ln, post_ln, final_norm,
-                                    cfg, half_bandwidth=T, window_state=state)
+        out = run_folded_recurrence(
+            x, step_layers, input_ln, post_ln, final_norm, cfg, half_bandwidth=T, window_state=state
+        )
 
         assert out.shape == (T, cfg.hidden_size)
         assert np.all(np.isfinite(out))

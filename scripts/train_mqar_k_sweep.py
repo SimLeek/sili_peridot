@@ -43,6 +43,7 @@ scaling up.
 
 Run: python3 scripts/train_mqar_k_sweep.py [train_steps] [seed] [k_values_csv]
 """
+
 from __future__ import annotations
 
 import sys
@@ -52,28 +53,30 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import DISLDOLayer
-from sili import _cpu
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule, clip_grad_norm_
-from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import TrueMultiDigitLayer
-from scripts.train_tile_curriculum import _build_tile_window
 import functools
+
+from sili import _cpu
+from sili.sparse_rnn import DISLDOLayer
+
+from model.toy_precision_models import TrueMultiDigitLayer
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule, predicted_token
+from model.toy_recall_task import generate_mqar_sequence
+from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
+from scripts.train_tile_curriculum import _build_tile_window
 
 EMBED_WIDTH = 16
 COLUMN_NEURONS = 8
 MAX_WEIGHTS_PER_LAYER = 512  # dense=True loads full density into block4
-                             # regardless (see block4_load_dense) --
-                             # this budget is not the connectivity
-                             # bottleneck for the dense path, kept
-                             # modest just for headroom bookkeeping.
+# regardless (see block4_load_dense) --
+# this budget is not the connectivity
+# bottleneck for the dense path, kept
+# modest just for headroom bookkeeping.
 NUM_CPUS = 4
-VOCAB = 128                 # must exceed seq_len (generate_mqar_sequence's
-                            # own requirement) and needs a large enough
-                            # key-vocab half (vocab//2) to draw K unique
-                            # keys without replacement at the largest K
-                            # tested below.
+VOCAB = 128  # must exceed seq_len (generate_mqar_sequence's
+# own requirement) and needs a large enough
+# key-vocab half (vocab//2) to draw K unique
+# keys without replacement at the largest K
+# tested below.
 PEAK_LR = 0.01
 WARMUP_STEPS = 100
 MAX_GRAD_NORM = 1.0
@@ -81,8 +84,9 @@ EVAL_SEQUENCES = 60
 L1_SPARSITY_COEF = 0.05
 CLIP_RANGE = 6.0
 
-DISLDO_CLS = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                               n_stages=3, base=12.0, lr_power=0.0, dense=True)
+DISLDO_CLS = functools.partial(
+    TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=12.0, lr_power=0.0, dense=True
+)
 
 
 def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> dict:
@@ -112,10 +116,18 @@ def seq_len_for_k(num_kv_pairs: int) -> int:
     return minimum + (minimum % 2)
 
 
-def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
-                   pool_size: int = 1, refresh_every: int = 1, eval_every: int = None,
-                   cosine_lm_head: bool = False, gated_combine: bool = False,
-                   gated_update: bool = False) -> dict:
+def train_and_eval(
+    num_kv_pairs: int,
+    seed: int,
+    train_steps: int,
+    log_fn=None,
+    pool_size: int = 1,
+    refresh_every: int = 1,
+    eval_every: int | None = None,
+    cosine_lm_head: bool = False,
+    gated_combine: bool = False,
+    gated_update: bool = False,
+) -> dict:
     """pool_size/refresh_every: sample-efficiency fix, per direct diagnosis
     (see conversation) -- drawing a brand-new random MQAR sequence every
     single step gives each specific key/value/gap pattern exactly ONE
@@ -148,11 +160,21 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
     model_rng = np.random.default_rng(seed)
 
     model = ToyTileRecurrenceRealFP4(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, 0, num_tiles, MAX_WEIGHTS_PER_LAYER,
-        num_cpus=NUM_CPUS, disldo_cls=DISLDO_CLS, rng=model_rng,
-        clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        cosine_lm_head=cosine_lm_head, gated_combine=gated_combine,
-        gated_update=gated_update)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        0,
+        num_tiles,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=DISLDO_CLS,
+        rng=model_rng,
+        clip_range=CLIP_RANGE,
+        l1_sparsity_coef=L1_SPARSITY_COEF,
+        cosine_lm_head=cosine_lm_head,
+        gated_combine=gated_combine,
+        gated_update=gated_update,
+    )
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -172,10 +194,10 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
         return correct / total if total else 0.0
 
     t0 = time.time()
-    recent_query_loss = []   # raw cross-entropy on QUERY positions only, no aux --
-                             # isolates task-learning signal from the L1 penalty's
-                             # own magnitude, which would otherwise mask whether the
-                             # main task loss is moving at all.
+    recent_query_loss = []  # raw cross-entropy on QUERY positions only, no aux --
+    # isolates task-learning signal from the L1 penalty's
+    # own magnitude, which would otherwise mask whether the
+    # main task loss is moving at all.
     pool: list = []
     for step in range(1, train_steps + 1):
         lr = lr_schedule(step, train_steps, PEAK_LR, WARMUP_STEPS)
@@ -183,7 +205,7 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
             pool = [generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs) for _ in range(pool_size)]
         tokens, mqar_pairs = pool[(step - 1) % pool_size]
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
         M = np.zeros((num_tiles, state_width), dtype=np.float32)
         for i in range(seq_len):
             window = _build_tile_window(embed_table, tokens, i, num_tiles)
@@ -217,33 +239,41 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, log_fn=None,
                 correct += int(pred == mqar_by_pos[i])
                 total += 1
 
-    return {"num_kv_pairs": num_kv_pairs, "seq_len": seq_len, "acc": correct / total if total else 0.0,
-            "elapsed_s": time.time() - t0}
+    return {
+        "num_kv_pairs": num_kv_pairs,
+        "seq_len": seq_len,
+        "acc": correct / total if total else 0.0,
+        "elapsed_s": time.time() - t0,
+    }
 
 
 def main():
     train_steps = int(sys.argv[1]) if len(sys.argv) > 1 else 3000
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
-    k_values = ([int(k) for k in sys.argv[3].split(",")] if len(sys.argv) > 3
-                else [1, 2, 4, 8])
+    k_values = [int(k) for k in sys.argv[3].split(",")] if len(sys.argv) > 3 else [1, 2, 4, 8]
 
-    print(f"# train_steps={train_steps} seed={seed} k_values={k_values} "
-          f"embed_width={EMBED_WIDTH} column_neurons={COLUMN_NEURONS} "
-          f"state_width={EMBED_WIDTH*COLUMN_NEURONS} vocab={VOCAB} "
-          f"l1_sparsity_coef={L1_SPARSITY_COEF} peak_lr={PEAK_LR}", flush=True)
+    print(
+        f"# train_steps={train_steps} seed={seed} k_values={k_values} "
+        f"embed_width={EMBED_WIDTH} column_neurons={COLUMN_NEURONS} "
+        f"state_width={EMBED_WIDTH * COLUMN_NEURONS} vocab={VOCAB} "
+        f"l1_sparsity_coef={L1_SPARSITY_COEF} peak_lr={PEAK_LR}",
+        flush=True,
+    )
 
     def log_fn(k, step, total_steps, elapsed, mean_q_loss, quick_acc=None):
         acc_str = f"  quick_acc={quick_acc:.4f}" if quick_acc is not None else ""
-        print(f"  [K={k}] step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  "
-              f"({elapsed:.0f}s elapsed, {elapsed/step:.4f}s/step)", flush=True)
+        print(
+            f"  [K={k}] step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  "
+            f"({elapsed:.0f}s elapsed, {elapsed / step:.4f}s/step)",
+            flush=True,
+        )
 
     results = []
     for k in k_values:
         print(f"\n=== K={k} (seq_len={seq_len_for_k(k)}) ===", flush=True)
         r = train_and_eval(k, seed, train_steps, log_fn=log_fn)
         results.append(r)
-        print(f"K={k:>3}  seq_len={r['seq_len']:>4}  acc={r['acc']:.4f}  "
-              f"({r['elapsed_s']:.0f}s)", flush=True)
+        print(f"K={k:>3}  seq_len={r['seq_len']:>4}  acc={r['acc']:.4f}  ({r['elapsed_s']:.0f}s)", flush=True)
 
     print("\n# SUMMARY")
     print(f"{'K':>4}  {'seq_len':>8}  {'acc':>8}")

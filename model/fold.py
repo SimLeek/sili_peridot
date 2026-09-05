@@ -21,20 +21,20 @@ exposes band_half_width_override so B6 can supply it, defaulting to
 None (the current, known-wrong-for-RoPE auto-heuristic) so folding
 itself doesn't block on that decision.
 """
+
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-from sili.conversion.rnn_fold import fold_block_group, FoldedBlockDescriptor
+from sili.conversion.rnn_fold import FoldedBlockDescriptor, fold_block_group
 from sili.sparse_rnn import FoldedLayer
 
 from .config import MiniCPM5Config
 
-SUFFIXES: List[str] = [
+SUFFIXES: list[str] = [
     ".self_attn.q_proj.weight",
     ".self_attn.k_proj.weight",
     ".self_attn.v_proj.weight",
@@ -47,23 +47,23 @@ SUFFIXES: List[str] = [
 # Which MiniCPM5Config property each suffix's per-fold-step out_dim
 # should match -- checked at fold time so a shape mismatch fails loudly
 # here, not as a confusing error deep in FoldedLayer construction later.
-_EXPECTED_OUT_DIM_PROPERTY: Dict[str, str] = {
+_EXPECTED_OUT_DIM_PROPERTY: dict[str, str] = {
     ".self_attn.q_proj.weight": "q_proj_out",
     ".self_attn.k_proj.weight": "kv_proj_out",
     ".self_attn.v_proj.weight": "kv_proj_out",
     ".self_attn.o_proj.weight": "attn_out",
-    ".mlp.gate_proj.weight":    "mlp_hidden",
-    ".mlp.up_proj.weight":      "mlp_hidden",
-    ".mlp.down_proj.weight":    "mlp_out",
+    ".mlp.gate_proj.weight": "mlp_hidden",
+    ".mlp.up_proj.weight": "mlp_hidden",
+    ".mlp.down_proj.weight": "mlp_out",
 }
 
 
 def fold_suffix(
-    sparse_state: Dict[str, dict],
+    sparse_state: dict[str, dict],
     suffix: str,
     cfg: MiniCPM5Config,
     prefix: str = "model.layers.",
-    band_half_width_override: Optional[int] = None,
+    band_half_width_override: int | None = None,
 ) -> FoldedBlockDescriptor:
     """
     Fold ONE suffix's per-layer tensors (e.g. every layer's own
@@ -74,12 +74,13 @@ def fold_suffix(
     names = [f"{prefix}{i}{suffix}" for i in range(cfg.num_hidden_layers)]
     missing = [n for n in names if n not in sparse_state]
     if missing:
-        raise KeyError(f"missing {len(missing)} tensor(s) for suffix {suffix!r}, "
-                       f"e.g. {missing[0]!r}")
+        raise KeyError(f"missing {len(missing)} tensor(s) for suffix {suffix!r}, e.g. {missing[0]!r}")
     filtered = {n: sparse_state[n] for n in names}
 
     desc = fold_block_group(
-        list(range(cfg.num_hidden_layers)), filtered, prefix,
+        list(range(cfg.num_hidden_layers)),
+        filtered,
+        prefix,
         band_half_width_override=band_half_width_override,
     )
 
@@ -95,27 +96,24 @@ def fold_suffix(
 
 
 def fold_all_suffixes(
-    sparse_state: Dict[str, dict],
+    sparse_state: dict[str, dict],
     cfg: MiniCPM5Config,
-    suffixes: List[str] = SUFFIXES,
+    suffixes: list[str] = SUFFIXES,
     prefix: str = "model.layers.",
-    band_half_width_override: Optional[int] = None,
-) -> Dict[str, FoldedBlockDescriptor]:
+    band_half_width_override: int | None = None,
+) -> dict[str, FoldedBlockDescriptor]:
     """Fold all 7 MiniCPM5 suffixes independently: {suffix: descriptor},
     each descriptor covering exactly one suffix's own weights stacked
     across all cfg.num_hidden_layers layers."""
-    return {
-        suffix: fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
-        for suffix in suffixes
-    }
+    return {suffix: fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override) for suffix in suffixes}
 
 
 def build_folded_layers(
-    descriptors: Dict[str, FoldedBlockDescriptor],
+    descriptors: dict[str, FoldedBlockDescriptor],
     learning_rate: float = 0.01,
     num_cpus: int = 4,
     value_scale_mode: str = "rank1",
-) -> Dict[str, FoldedLayer]:
+) -> dict[str, FoldedLayer]:
     """
     B5: turn each suffix's FoldedBlockDescriptor into a real sili
     FoldedLayer (sili.sparse_rnn.FoldedLayer.from_descriptor). One
@@ -138,22 +136,22 @@ def build_folded_layers(
     """
     return {
         suffix: FoldedLayer.from_descriptor(
-            desc, learning_rate=learning_rate, num_cpus=num_cpus,
-            value_scale_mode=value_scale_mode)
+            desc, learning_rate=learning_rate, num_cpus=num_cpus, value_scale_mode=value_scale_mode
+        )
         for suffix, desc in descriptors.items()
     }
 
 
 def build_folded_layers_streaming(
-    sparse_state: Dict[str, dict],
+    sparse_state: dict[str, dict],
     cfg: MiniCPM5Config,
-    suffixes: List[str] = SUFFIXES,
+    suffixes: list[str] = SUFFIXES,
     prefix: str = "model.layers.",
     learning_rate: float = 0.01,
     num_cpus: int = 4,
-    band_half_width_override: Optional[int] = None,
+    band_half_width_override: int | None = None,
     value_scale_mode: str = "rank1",
-) -> Dict[str, FoldedLayer]:
+) -> dict[str, FoldedLayer]:
     """
     Fold and build a real sili FoldedLayer for each suffix ONE AT A
     TIME, popping that suffix's 24 raw per-layer tensors out of
@@ -179,14 +177,14 @@ def build_folded_layers_streaming(
     dict you don't need afterward, or use fold_all_suffixes if you need
     to keep sparse_state intact and can afford the extra memory.
     """
-    layers: Dict[str, FoldedLayer] = {}
+    layers: dict[str, FoldedLayer] = {}
     for suffix in suffixes:
         desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
         for i in range(cfg.num_hidden_layers):
             del sparse_state[f"{prefix}{i}{suffix}"]
         layers[suffix] = FoldedLayer.from_descriptor(
-            desc, learning_rate=learning_rate, num_cpus=num_cpus,
-            value_scale_mode=value_scale_mode)
+            desc, learning_rate=learning_rate, num_cpus=num_cpus, value_scale_mode=value_scale_mode
+        )
         del desc
     return layers
 
@@ -204,16 +202,16 @@ def _save_folded_layer_state_dict(suffix: str, layer: FoldedLayer, out_dir: str)
 
 
 def build_and_save_folded_layers(
-    sparse_state: Dict[str, dict],
+    sparse_state: dict[str, dict],
     cfg: MiniCPM5Config,
     out_dir: str,
-    suffixes: List[str] = SUFFIXES,
+    suffixes: list[str] = SUFFIXES,
     prefix: str = "model.layers.",
     learning_rate: float = 0.01,
     num_cpus: int = 4,
-    band_half_width_override: Optional[int] = None,
+    band_half_width_override: int | None = None,
     value_scale_mode: str = "rank1",
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """
     Same one-suffix-at-a-time streaming discipline as
     build_folded_layers_streaming (MUTATES `sparse_state` in place,
@@ -232,14 +230,14 @@ def build_and_save_folded_layers(
 
     Returns {suffix: saved .npz path}.
     """
-    paths: Dict[str, str] = {}
+    paths: dict[str, str] = {}
     for suffix in suffixes:
         desc = fold_suffix(sparse_state, suffix, cfg, prefix, band_half_width_override)
         for i in range(cfg.num_hidden_layers):
             del sparse_state[f"{prefix}{i}{suffix}"]
         layer = FoldedLayer.from_descriptor(
-            desc, learning_rate=learning_rate, num_cpus=num_cpus,
-            value_scale_mode=value_scale_mode)
+            desc, learning_rate=learning_rate, num_cpus=num_cpus, value_scale_mode=value_scale_mode
+        )
         del desc
         paths[suffix] = _save_folded_layer_state_dict(suffix, layer, out_dir)
         del layer
@@ -247,7 +245,9 @@ def build_and_save_folded_layers(
 
 
 def reference_fold_forward(
-    descriptor: FoldedBlockDescriptor, suffix: str, x: np.ndarray,
+    descriptor: FoldedBlockDescriptor,
+    suffix: str,
+    x: np.ndarray,
 ) -> np.ndarray:
     """
     The UNQUANTIZED analytic fold-sum for one suffix: x @ W^T per fold
@@ -261,11 +261,11 @@ def reference_fold_forward(
     between the two, only quantization does.
     """
     stacked = descriptor.stacked_weights[suffix]
-    dense = stacked.to_dense().numpy().astype(np.float32)   # [n_folds*out_dim, in_dim]
+    dense = stacked.to_dense().numpy().astype(np.float32)  # [n_folds*out_dim, in_dim]
     n_folds = descriptor.n_folds
     out_dim = descriptor.out_dims[suffix]
     batch = x.shape[0]
-    raw = x.astype(np.float32) @ dense.T                    # [batch, n_folds*out_dim]
+    raw = x.astype(np.float32) @ dense.T  # [batch, n_folds*out_dim]
     return raw.reshape(batch, n_folds, out_dim).sum(axis=1)
 
 
@@ -278,9 +278,9 @@ def _true_nnz(entry: dict) -> int:
 
 @dataclass
 class FoldReport:
-    n_folds:                int
-    per_suffix_nnz_before:  Dict[str, int] = field(default_factory=dict)
-    per_suffix_nnz_after:   Dict[str, int] = field(default_factory=dict)
+    n_folds: int
+    per_suffix_nnz_before: dict[str, int] = field(default_factory=dict)
+    per_suffix_nnz_after: dict[str, int] = field(default_factory=dict)
 
     @property
     def lossless(self) -> bool:
@@ -288,8 +288,8 @@ class FoldReport:
 
 
 def verify_lossless(
-    sparse_state: Dict[str, dict],
-    descriptors: Dict[str, FoldedBlockDescriptor],
+    sparse_state: dict[str, dict],
+    descriptors: dict[str, FoldedBlockDescriptor],
     cfg: MiniCPM5Config,
     prefix: str = "model.layers.",
 ) -> FoldReport:
@@ -298,13 +298,10 @@ def verify_lossless(
     duplicate real weight values, only change their storage layout."""
     report = FoldReport(n_folds=cfg.num_hidden_layers)
     for suffix, desc in descriptors.items():
-        before = sum(
-            _true_nnz(sparse_state[f"{prefix}{i}{suffix}"])
-            for i in range(cfg.num_hidden_layers)
-        )
+        before = sum(_true_nnz(sparse_state[f"{prefix}{i}{suffix}"]) for i in range(cfg.num_hidden_layers))
         after = int(desc.stacked_weights[suffix].values().numel())
         report.per_suffix_nnz_before[suffix] = before
-        report.per_suffix_nnz_after[suffix]  = after
+        report.per_suffix_nnz_after[suffix] = after
     return report
 
 
@@ -314,6 +311,6 @@ def print_fold_report(report: FoldReport) -> None:
     print("-" * (CW + 12 + 12 + 9 + 4))
     for suffix in report.per_suffix_nnz_before:
         before = report.per_suffix_nnz_before[suffix]
-        after  = report.per_suffix_nnz_after[suffix]
-        print(f"  {suffix:<{CW}} {before:>12,} {after:>12,} {str(before == after):>9}")
+        after = report.per_suffix_nnz_after[suffix]
+        print(f"  {suffix:<{CW}} {before:>12,} {after:>12,} {before == after!s:>9}")
     print(f"[summary] n_folds={report.n_folds}  lossless={report.lossless}")

@@ -29,6 +29,7 @@ confirmed directly while testing task #369).
 
 Usage: PYTHONPATH=<repo root> python3 scripts/mqar_multi_seed_validation.py [num_seeds] [base_seed]
 """
+
 import statistics
 import sys
 
@@ -46,17 +47,23 @@ MAX_STEPS = 3000
 # (confirmed directly: train_curriculum's own defaults of additive_rank=1/
 # dynamic_rank_control=True TypeError on layer construction for fp32),
 # unlike fp4/fp8's DISLDOLayer/DISLDOLayer8.
-BASE_KWARGS = dict(
-    precision="fp32", max_steps=MAX_STEPS, peak_lr=0.02, num_tiles=8,
-    k_max=4, embed_width=48, additive_rank=0, dynamic_rank_control=False,
-)
+BASE_KWARGS = {
+    "precision": "fp32",
+    "max_steps": MAX_STEPS,
+    "peak_lr": 0.02,
+    "num_tiles": 8,
+    "k_max": 4,
+    "embed_width": 48,
+    "additive_rank": 0,
+    "dynamic_rank_control": False,
+}
 
 # task #366: fixed-fraction top-k (today's baseline) vs per-layer nucleus
 # selection (x_r_target), matched at ~10% density on input, dense (1.0)
 # on grad -- isolates the INPUT axis only, same as arm F itself did.
 ARMS = [
-    ("fixed_fraction_p10", dict(input_sparsity_p=0.10, dy_sparsity_p=1.0)),
-    ("nucleus_r_target",   dict(x_r_target=0.90, x_k_min=1, dy_sparsity_p=1.0)),
+    ("fixed_fraction_p10", {"input_sparsity_p": 0.10, "dy_sparsity_p": 1.0}),
+    ("nucleus_r_target", {"x_r_target": 0.90, "x_k_min": 1, "dy_sparsity_p": 1.0}),
 ]
 
 
@@ -76,9 +83,12 @@ def run_arm(name, kwargs, seeds):
             "elapsed_s": r["elapsed_s"],
         }
         per_seed.append(row)
-        print(f"[{name}] seed={seed} done: peak_vocab={row['peak_vocab']} "
-              f"peak_k={row['peak_k']} sps={row['steps_per_sec']:.3f} "
-              f"elapsed={row['elapsed_s']:.0f}s", flush=True)
+        print(
+            f"[{name}] seed={seed} done: peak_vocab={row['peak_vocab']} "
+            f"peak_k={row['peak_k']} sps={row['steps_per_sec']:.3f} "
+            f"elapsed={row['elapsed_s']:.0f}s",
+            flush=True,
+        )
     return per_seed
 
 
@@ -98,12 +108,11 @@ def noise_floor_verdict(a_vals, b_vals):
         return "need >=2 seeds per arm to compare"
     ma, mb = statistics.mean(a_vals), statistics.mean(b_vals)
     sa, sb = statistics.stdev(a_vals), statistics.stdev(b_vals)
-    se = (sa ** 2 / len(a_vals) + sb ** 2 / len(b_vals)) ** 0.5
+    se = (sa**2 / len(a_vals) + sb**2 / len(b_vals)) ** 0.5
     if se == 0:
         return f"delta={ma - mb:+.3f}, zero combined spread"
     z = abs(ma - mb) / se
-    verdict = ("likely real, not just noise" if z >= 2.0
-               else "indistinguishable from noise at this seed count")
+    verdict = "likely real, not just noise" if z >= 2.0 else "indistinguishable from noise at this seed count"
     return f"delta={ma - mb:+.3f}, z={z:.2f} -> {verdict}"
 
 
@@ -112,8 +121,7 @@ def main():
     base_seed = int(sys.argv[2]) if len(sys.argv) > 2 else BASE_SEED
     seeds = [base_seed + i for i in range(num_seeds)]
 
-    print(f"multi-seed validation: {len(ARMS)} arms x {num_seeds} seeds "
-          f"(seeds={seeds}), max_steps={MAX_STEPS}\n")
+    print(f"multi-seed validation: {len(ARMS)} arms x {num_seeds} seeds (seeds={seeds}), max_steps={MAX_STEPS}\n")
 
     results = {name: run_arm(name, kwargs, seeds) for name, kwargs in ARMS}
 
@@ -125,8 +133,7 @@ def main():
         pk_mean, _, _ = summarize(per_seed, "peak_k")
         sps_mean, _, _ = summarize(per_seed, "steps_per_sec")
         grad_rate = sum(1 for r in per_seed if r["graduated"]) / len(per_seed)
-        print(f"{name:<24} {pv_mean:>8.2f}±{pv_std:<5.2f} {pk_mean:>10.2f} "
-              f"{sps_mean:>10.3f} {grad_rate:>9.1%}")
+        print(f"{name:<24} {pv_mean:>8.2f}±{pv_std:<5.2f} {pk_mean:>10.2f} {sps_mean:>10.3f} {grad_rate:>9.1%}")
         print(f"    peak_vocab_per_seed={pv_vals}")
 
     if len(ARMS) == 2:

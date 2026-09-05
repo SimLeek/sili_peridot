@@ -37,30 +37,41 @@ Run: python3 scripts/train_mqar_precision_sweep.py <precision> <scale_rank> <mag
   scale_rank: 1 | 2 (ignored for fp32 -- DISLDOLayer32 has no scale_rank concept)
   magnitude_scale: 0 | 1 (ignored for fp32)
 """
+
 from __future__ import annotations
 
+import functools
+import json
 import sys
 import time
-import json
-import functools
 
 import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili import _cpu
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule, clip_grad_norm_
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
+
 from model.toy_precision_models import TrueMultiDigitLayer
-from scripts.train_tile_curriculum import _build_tile_window
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule, predicted_token
+from model.toy_recall_task import generate_mqar_sequence
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
 from scripts.train_mqar_rmt_reference import (
-    seq_len_for_k, _build_targets,
-    EMBED_WIDTH, COLUMN_NEURONS, NUM_MEMORY_SLOTS, MAX_WEIGHTS_PER_LAYER,
-    NUM_CPUS, VOCAB, WARMUP_STEPS, MAX_GRAD_NORM, EVAL_SEQUENCES,
-    L1_SPARSITY_COEF, CLIP_RANGE,
+    CLIP_RANGE,
+    COLUMN_NEURONS,
+    EMBED_WIDTH,
+    EVAL_SEQUENCES,
+    L1_SPARSITY_COEF,
+    MAX_GRAD_NORM,
+    MAX_WEIGHTS_PER_LAYER,
+    NUM_CPUS,
+    NUM_MEMORY_SLOTS,
+    VOCAB,
+    WARMUP_STEPS,
+    _build_targets,
+    seq_len_for_k,
 )
+from scripts.train_tile_curriculum import _build_tile_window
 
 DEFAULT_PEAK_LR = 0.03  # see train_mqar_rmt_synapse_ablation.py's own rationale
 NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
@@ -70,23 +81,29 @@ LOSS_CHANCE = float(np.log(VOCAB))  # near-chance query cross-entropy, quality-L
 
 PRECISION_CLS = {
     "fp4": DISLDOLayer,
-    "fp4_dual": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                  n_stages=2, base=12.0, lr_power=0.0),
+    "fp4_dual": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=2, base=12.0, lr_power=0.0),
     "fp8": DISLDOLayer8,
     "fp32": DISLDOLayer32,
 }
 
 
-def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
-                   num_kv_pairs: int, seed: int, train_steps: int,
-                   peak_lr: float = DEFAULT_PEAK_LR,
-                   log_every: int = 500, log_fn=None,
-                   scale_invariant: bool = False,
-                   lr_mode: str = "step",
-                   min_lr_frac: float = 0.05,
-                   loss_ema_decay: float = 0.98,
-                   acc_ema_decay: float = 0.98,
-                   additive_rank: int = 0) -> dict:
+def train_and_eval(
+    precision: str,
+    scale_rank: int,
+    magnitude_scale: bool,
+    num_kv_pairs: int,
+    seed: int,
+    train_steps: int,
+    peak_lr: float = DEFAULT_PEAK_LR,
+    log_every: int = 500,
+    log_fn=None,
+    scale_invariant: bool = False,
+    lr_mode: str = "step",
+    min_lr_frac: float = 0.05,
+    loss_ema_decay: float = 0.98,
+    acc_ema_decay: float = 0.98,
+    additive_rank: int = 0,
+) -> dict:
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
@@ -121,11 +138,22 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
         synapse_kwargs["scale_invariant"] = True
 
     model = ToyTileRecurrenceRMT(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
-        MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
-        dense=dense, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=synapse_kwargs, scale_rank=effective_rank,
-        additive_rank=effective_additive_rank, rng=model_rng)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        num_tiles,
+        NUM_MEMORY_SLOTS,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=disldo_cls,
+        dense=dense,
+        clip_range=CLIP_RANGE,
+        l1_sparsity_coef=L1_SPARSITY_COEF,
+        synapse_kwargs=synapse_kwargs,
+        scale_rank=effective_rank,
+        additive_rank=effective_additive_rank,
+        rng=model_rng,
+    )
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -179,17 +207,16 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                 else:
                     frac = max(min_lr_frac, min(1.0, 1.0 - acc_ema))
                     lr = peak_lr * frac
+            elif loss_ema is None:
+                lr = peak_lr
             else:
-                if loss_ema is None:
-                    lr = peak_lr
-                else:
-                    frac = max(min_lr_frac, min(1.0, loss_ema / LOSS_CHANCE))
-                    lr = peak_lr * frac
+                frac = max(min_lr_frac, min(1.0, loss_ema / LOSS_CHANCE))
+                lr = peak_lr * frac
         else:
             lr = lr_schedule(step, train_steps, peak_lr, WARMUP_STEPS)
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         for i in range(seq_len):
             window = _build_tile_window(embed_table, tokens, i, num_tiles)
@@ -198,11 +225,15 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
                 loss = cross_entropy_sum(logits, [(num_tiles - 1, targets[i])])
                 if i in query_positions:
                     recent_query_loss.append(float(loss.data))
-                    loss_ema = float(loss.data) if loss_ema is None else (
-                        loss_ema_decay * loss_ema + (1.0 - loss_ema_decay) * float(loss.data))
+                    loss_ema = (
+                        float(loss.data)
+                        if loss_ema is None
+                        else (loss_ema_decay * loss_ema + (1.0 - loss_ema_decay) * float(loss.data))
+                    )
                     correct = float(predicted_token(logits, num_tiles - 1) == targets[i])
-                    acc_ema = correct if acc_ema is None else (
-                        acc_ema_decay * acc_ema + (1.0 - acc_ema_decay) * correct)
+                    acc_ema = (
+                        correct if acc_ema is None else (acc_ema_decay * acc_ema + (1.0 - acc_ema_decay) * correct)
+                    )
                 if aux is not None:
                     loss = loss + aux
                 loss.backward()
@@ -248,11 +279,16 @@ def train_and_eval(precision: str, scale_rank: int, magnitude_scale: bool,
     # landed on the zero sentinel code.
     collapse_detected = len(query_logit_top5) >= 2 and len(set(query_logit_top5)) == 1
 
-    return {"precision": precision, "scale_rank": effective_rank, "magnitude_scale": use_magscale,
-            "additive_rank": effective_additive_rank,
-            "acc": correct / total if total else 0.0,
-            "collapse_detected": collapse_detected,
-            "elapsed_s": time.time() - t0, "trajectory": trajectory}
+    return {
+        "precision": precision,
+        "scale_rank": effective_rank,
+        "magnitude_scale": use_magscale,
+        "additive_rank": effective_additive_rank,
+        "acc": correct / total if total else 0.0,
+        "collapse_detected": collapse_detected,
+        "elapsed_s": time.time() - t0,
+        "trajectory": trajectory,
+    }
 
 
 def main():
@@ -266,22 +302,40 @@ def main():
     lr_mode = sys.argv[8] if len(sys.argv) > 8 else "step"
     additive_rank = int(sys.argv[9]) if len(sys.argv) > 9 else 0
 
-    print(f"# MQAR precision sweep precision={precision} scale_rank={scale_rank} "
-          f"magnitude_scale={magnitude_scale} train_steps={train_steps} seed={seed} "
-          f"peak_lr={peak_lr} scale_invariant={scale_invariant} lr_mode={lr_mode} "
-          f"additive_rank={additive_rank} config=nocaps", flush=True)
+    print(
+        f"# MQAR precision sweep precision={precision} scale_rank={scale_rank} "
+        f"magnitude_scale={magnitude_scale} train_steps={train_steps} seed={seed} "
+        f"peak_lr={peak_lr} scale_invariant={scale_invariant} lr_mode={lr_mode} "
+        f"additive_rank={additive_rank} config=nocaps",
+        flush=True,
+    )
 
     def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc, lr):
-        print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
-              f"quick_acc={quick_acc:.4f}  lr={lr:.5f}  ({elapsed:.0f}s elapsed)", flush=True)
+        print(
+            f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
+            f"quick_acc={quick_acc:.4f}  lr={lr:.5f}  ({elapsed:.0f}s elapsed)",
+            flush=True,
+        )
 
-    r = train_and_eval(precision, scale_rank, magnitude_scale, 1, seed, train_steps,
-                       peak_lr=peak_lr, log_fn=log_fn, scale_invariant=scale_invariant,
-                       lr_mode=lr_mode, additive_rank=additive_rank)
-    print(f"\nFINAL precision={precision} scale_rank={r['scale_rank']} "
-          f"magnitude_scale={r['magnitude_scale']} additive_rank={r['additive_rank']} "
-          f"acc={r['acc']:.4f} collapse_detected={r['collapse_detected']} ({r['elapsed_s']:.0f}s)",
-          flush=True)
+    r = train_and_eval(
+        precision,
+        scale_rank,
+        magnitude_scale,
+        1,
+        seed,
+        train_steps,
+        peak_lr=peak_lr,
+        log_fn=log_fn,
+        scale_invariant=scale_invariant,
+        lr_mode=lr_mode,
+        additive_rank=additive_rank,
+    )
+    print(
+        f"\nFINAL precision={precision} scale_rank={r['scale_rank']} "
+        f"magnitude_scale={r['magnitude_scale']} additive_rank={r['additive_rank']} "
+        f"acc={r['acc']:.4f} collapse_detected={r['collapse_detected']} ({r['elapsed_s']:.0f}s)",
+        flush=True,
+    )
     print("TRAJECTORY_JSON " + json.dumps(r["trajectory"]), flush=True)
 
 

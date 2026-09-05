@@ -15,14 +15,17 @@ repeated across widths instead of at one fixed size.
 
 Usage: PYTHONPATH=<sili_peridot repo root> python scripts/superposition_width_sweep.py
 """
+
 import numpy as np
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayerDeterministic
 
 from model.eval_rank_floor import FullRankDenseLayer
 from model.eval_superposition import (
-    feature_importance, measure_superposition, no_superposition_baseline,
+    feature_importance,
+    measure_superposition,
+    no_superposition_baseline,
 )
 from model.toy_recall_models import AdamOptimizer, clip_grad_norm_
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayerDeterministic
 
 DENSITY = 0.05
 BASE_N_STEPS = 800
@@ -44,7 +47,7 @@ def _importance_decay_for_width(hidden_width: int) -> float:
     meaningless at large width. Scaling decay keeps the SHAPE of the
     packing problem (how much importance sits past the bottleneck, in units
     of hidden_width) comparable at every scale."""
-    return (0.9 ** BASE_HIDDEN_WIDTH) ** (1.0 / hidden_width)
+    return (0.9**BASE_HIDDEN_WIDTH) ** (1.0 / hidden_width)
 
 
 def _n_steps_for_width(hidden_width: int) -> int:
@@ -68,33 +71,79 @@ def run_width(hidden_width: int, seed: int = 4000):
     float_encoder = FullRankDenseLayer(n_features, hidden_width, rng)
     float_decoder = FullRankDenseLayer(hidden_width, n_features, rng)
     float_report = measure_superposition(
-        float_encoder, float_decoder, n_features, hidden_width, DENSITY, n_steps, LR, seed=seed,
+        float_encoder,
+        float_decoder,
+        n_features,
+        hidden_width,
+        DENSITY,
+        n_steps,
+        LR,
+        seed=seed,
         importance_decay=decay,
-        opt=AdamOptimizer(), opt_step=lambda o, p, l: o.step(p, lr=l), clip_grad_norm=clip_grad_norm_)
+        opt=AdamOptimizer(),
+        opt_step=lambda o, p, lr: o.step(p, lr=lr),
+        clip_grad_norm=clip_grad_norm_,
+    )
 
-    fp4_det_encoder = DISLDOLayerDeterministic(n_features, hidden_width, n_features * hidden_width,
-                                               num_cpus=1, rng=np.random.default_rng(seed + 1), dense=True)
-    fp4_det_decoder = DISLDOLayerDeterministic(hidden_width, n_features, hidden_width * n_features,
-                                               num_cpus=1, rng=np.random.default_rng(seed + 2), dense=True)
-    fp4_det_report = measure_superposition(fp4_det_encoder, fp4_det_decoder, n_features, hidden_width,
-                                           DENSITY, n_steps, LR, seed=seed + 3, importance_decay=decay)
+    fp4_det_encoder = DISLDOLayerDeterministic(
+        n_features, hidden_width, n_features * hidden_width, num_cpus=1, rng=np.random.default_rng(seed + 1), dense=True
+    )
+    fp4_det_decoder = DISLDOLayerDeterministic(
+        hidden_width, n_features, hidden_width * n_features, num_cpus=1, rng=np.random.default_rng(seed + 2), dense=True
+    )
+    fp4_det_report = measure_superposition(
+        fp4_det_encoder,
+        fp4_det_decoder,
+        n_features,
+        hidden_width,
+        DENSITY,
+        n_steps,
+        LR,
+        seed=seed + 3,
+        importance_decay=decay,
+    )
 
-    fp4_stoch_encoder = DISLDOLayer(n_features, hidden_width, n_features * hidden_width,
-                                    num_cpus=1, rng=np.random.default_rng(seed + 4), dense=True)
-    fp4_stoch_decoder = DISLDOLayer(hidden_width, n_features, hidden_width * n_features,
-                                    num_cpus=1, rng=np.random.default_rng(seed + 5), dense=True)
-    fp4_stoch_report = measure_superposition(fp4_stoch_encoder, fp4_stoch_decoder, n_features, hidden_width,
-                                              DENSITY, n_steps, LR, seed=seed + 6, importance_decay=decay)
+    fp4_stoch_encoder = DISLDOLayer(
+        n_features, hidden_width, n_features * hidden_width, num_cpus=1, rng=np.random.default_rng(seed + 4), dense=True
+    )
+    fp4_stoch_decoder = DISLDOLayer(
+        hidden_width, n_features, hidden_width * n_features, num_cpus=1, rng=np.random.default_rng(seed + 5), dense=True
+    )
+    fp4_stoch_report = measure_superposition(
+        fp4_stoch_encoder,
+        fp4_stoch_decoder,
+        n_features,
+        hidden_width,
+        DENSITY,
+        n_steps,
+        LR,
+        seed=seed + 6,
+        importance_decay=decay,
+    )
 
-    fp32_encoder = DISLDOLayer32(n_features, hidden_width, n_features * hidden_width,
-                                 num_cpus=1, rng=np.random.default_rng(seed + 7))
-    fp32_decoder = DISLDOLayer32(hidden_width, n_features, hidden_width * n_features,
-                                 num_cpus=1, rng=np.random.default_rng(seed + 8))
-    fp32_report = measure_superposition(fp32_encoder, fp32_decoder, n_features, hidden_width,
-                                        DENSITY, n_steps, LR, seed=seed + 9, importance_decay=decay)
+    fp32_encoder = DISLDOLayer32(
+        n_features, hidden_width, n_features * hidden_width, num_cpus=1, rng=np.random.default_rng(seed + 7)
+    )
+    fp32_decoder = DISLDOLayer32(
+        hidden_width, n_features, hidden_width * n_features, num_cpus=1, rng=np.random.default_rng(seed + 8)
+    )
+    fp32_report = measure_superposition(
+        fp32_encoder,
+        fp32_decoder,
+        n_features,
+        hidden_width,
+        DENSITY,
+        n_steps,
+        LR,
+        seed=seed + 9,
+        importance_decay=decay,
+    )
 
     return {
-        "hidden_width": hidden_width, "n_features": n_features, "n_steps": n_steps, "baseline": baseline,
+        "hidden_width": hidden_width,
+        "n_features": n_features,
+        "n_steps": n_steps,
+        "baseline": baseline,
         "float_adam": float_report.best_weighted_loss,
         "fp4_det": fp4_det_report.best_weighted_loss,
         "fp4_stoch": fp4_stoch_report.best_weighted_loss,
@@ -103,14 +152,20 @@ def run_width(hidden_width: int, seed: int = 4000):
 
 
 if __name__ == "__main__":
-    print(f"{'hidden_w':>9} {'n_steps':>8} {'baseline':>9} {'float_adam':>11} "
-          f"{'fp4_det':>9} {'fp4_stoch':>10} {'fp32':>9} "
-          f"{'det/fp32':>9} {'stoch/fp32':>11} "
-          f"{'det_beats_base':>15} {'stoch_beats_base':>17}", flush=True)
+    print(
+        f"{'hidden_w':>9} {'n_steps':>8} {'baseline':>9} {'float_adam':>11} "
+        f"{'fp4_det':>9} {'fp4_stoch':>10} {'fp32':>9} "
+        f"{'det/fp32':>9} {'stoch/fp32':>11} "
+        f"{'det_beats_base':>15} {'stoch_beats_base':>17}",
+        flush=True,
+    )
     for hw in WIDTHS:
         r = run_width(hw)
-        print(f"{r['hidden_width']:>9} {r['n_steps']:>8} {r['baseline']:>9.4f} "
-              f"{r['float_adam']:>11.4f} {r['fp4_det']:>9.4f} {r['fp4_stoch']:>10.4f} "
-              f"{r['fp32']:>9.4f} {r['fp4_det'] / r['fp32']:>9.3f} {r['fp4_stoch'] / r['fp32']:>11.3f} "
-              f"{str(r['fp4_det'] < r['baseline']):>15} "
-              f"{str(r['fp4_stoch'] < r['baseline']):>17}", flush=True)
+        print(
+            f"{r['hidden_width']:>9} {r['n_steps']:>8} {r['baseline']:>9.4f} "
+            f"{r['float_adam']:>11.4f} {r['fp4_det']:>9.4f} {r['fp4_stoch']:>10.4f} "
+            f"{r['fp32']:>9.4f} {r['fp4_det'] / r['fp32']:>9.3f} {r['fp4_stoch'] / r['fp32']:>11.3f} "
+            f"{r['fp4_det'] < r['baseline']!s:>15} "
+            f"{r['fp4_stoch'] < r['baseline']!s:>17}",
+            flush=True,
+        )

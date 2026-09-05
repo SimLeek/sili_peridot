@@ -12,7 +12,8 @@ learning actually starts.
 
 Usage: PYTHONPATH=<sili_peridot repo root> python scripts/zeroinit_minimal_repro.py
 """
-from scripts.l1_sparsity_probe import OriginalArchModel, run, evaluate
+
+from scripts.l1_sparsity_probe import OriginalArchModel, evaluate, run
 
 SEEDS = [1000, 1001, 1002]
 N_STEPS = 1500
@@ -25,18 +26,32 @@ def main():
     print("--- untrained (0 steps) reference ---", flush=True)
     untrained = {}
     for seed in SEEDS:
-        model = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-                                   l1_sparsity_coef=0.05, use_energy=False, all_zero_init=True,
-                                   scale_rank=1)
+        model = OriginalArchModel(
+            seed,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            all_zero_init=True,
+            scale_rank=1,
+        )
         acc = evaluate(model, N_EVAL, seed, verbose=True)
         untrained[seed] = acc
         print(f"seed={seed} untrained eval_acc={acc:.4f}", flush=True)
 
     print("\n--- trained (rank=1, no energy) ---", flush=True)
     for seed in SEEDS:
-        model = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-                                   l1_sparsity_coef=0.05, use_energy=False, all_zero_init=True,
-                                   scale_rank=1)
+        model = OriginalArchModel(
+            seed,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            all_zero_init=True,
+            scale_rank=1,
+        )
         run(model, N_STEPS, seed, verbose=False)
         acc = evaluate(model, N_EVAL, seed, verbose=True)
         delta = acc - untrained[seed]
@@ -45,9 +60,16 @@ def main():
 
     print("\n--- trained (rank=2, no energy) ---", flush=True)
     for seed in SEEDS:
-        model = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-                                   l1_sparsity_coef=0.05, use_energy=False, all_zero_init=True,
-                                   scale_rank=2)
+        model = OriginalArchModel(
+            seed,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            all_zero_init=True,
+            scale_rank=2,
+        )
         run(model, N_STEPS, seed, verbose=False)
         acc = evaluate(model, N_EVAL, seed, verbose=True)
         delta = acc - untrained[seed]

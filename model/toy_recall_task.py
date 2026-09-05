@@ -14,9 +14,8 @@ planted as the following real token, so this is an ordinary "predict
 the next real token" target, not a synthetic label bolted on
 separately).
 """
-from __future__ import annotations
 
-from typing import Tuple
+from __future__ import annotations
 
 import numpy as np
 
@@ -26,7 +25,7 @@ def generate_sequence(
     vocab_size: int,
     seq_len: int,
     lag: int,
-) -> Tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int]:
     """Returns (tokens [seq_len] int, induction_pos) -- the correct
     next-token prediction at `induction_pos` (i.e. tokens[induction_pos+1])
     is the well-defined recall target B, requiring the model to have
@@ -38,8 +37,7 @@ def generate_sequence(
     if lag < 2:
         raise ValueError(f"lag must be >= 2, got {lag}")
     if seq_len < lag + 3:
-        raise ValueError(f"seq_len={seq_len} too short for lag={lag} "
-                          f"(need seq_len >= lag+3)")
+        raise ValueError(f"seq_len={seq_len} too short for lag={lag} (need seq_len >= lag+3)")
 
     tokens = rng.randint(0, vocab_size, size=seq_len).astype(np.int64)
     cue_pos = int(rng.randint(0, seq_len - 2 - lag + 1))
@@ -69,7 +67,7 @@ def generate_mqar_sequence(
     power_a: float = 0.01,
     random_non_queries: bool = True,
     forced_keys: np.ndarray = None,
-) -> Tuple[np.ndarray, list]:
+) -> tuple[np.ndarray, list]:
     """Standard Multi-Query Associative Recall task (Arora, Eyuboglu et
     al., "Zoology: Measuring and Improving Recall in Efficient Language
     Models", 2023, arXiv:2312.04927) -- per direct decision, adopted
@@ -110,8 +108,8 @@ def generate_mqar_sequence(
     context_size = num_kv_pairs * 2
     if context_size * 2 > seq_len:
         raise ValueError(
-            f"seq_len={seq_len} too short for num_kv_pairs={num_kv_pairs} "
-            f"(need seq_len >= 4*num_kv_pairs)")
+            f"seq_len={seq_len} too short for num_kv_pairs={num_kv_pairs} (need seq_len >= 4*num_kv_pairs)"
+        )
 
     key_vocab_size = vocab_size // 2
     key_choices = np.arange(1, key_vocab_size)
@@ -129,8 +127,11 @@ def generate_mqar_sequence(
             valid_forced = rng.choice(valid_forced, size=n_forced, replace=False)
         remaining_choices = np.setdiff1d(key_choices, valid_forced)
         n_remaining = num_kv_pairs - n_forced
-        rest = (rng.choice(remaining_choices, size=n_remaining, replace=False)
-                if n_remaining > 0 else np.array([], dtype=np.int64))
+        rest = (
+            rng.choice(remaining_choices, size=n_remaining, replace=False)
+            if n_remaining > 0
+            else np.array([], dtype=np.int64)
+        )
         keys = np.concatenate([valid_forced, rest])
         rng.shuffle(keys)
     else:
@@ -158,5 +159,5 @@ def generate_mqar_sequence(
             tokens[zero_mask] = rng.randint(0, vocab_size, size=n_zero)
 
     query_positions = context_size + gaps * 2
-    pairs = [(int(pos), int(val)) for pos, val in zip(query_positions, values)]
+    pairs = [(int(pos), int(val)) for pos, val in zip(query_positions, values, strict=False)]
     return tokens, pairs

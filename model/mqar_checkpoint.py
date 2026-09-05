@@ -15,11 +15,11 @@ additive-branch state -- built with fp4-AQRS conversion testing in mind
 fresh AQRS layer, see how much accuracy survives with zero further
 training) even though today's only caller saves a plain fp32 model.
 """
+
 from __future__ import annotations
 
 import pickle
 from pathlib import Path
-from typing import Optional, Union
 
 import numpy as np
 
@@ -32,7 +32,8 @@ def layer_state_dict(c) -> dict:
     output_scale/additive_u/additive_v/ranks are only included if the
     layer actually has that concept (fp32's DISLDOLayerV does not)."""
     d = {
-        "n_inputs": c.n_inputs, "n_outputs": c.n_outputs,
+        "n_inputs": c.n_inputs,
+        "n_outputs": c.n_outputs,
         "ptrs": np.asarray(c.ptrs).copy(),
         "indices": np.asarray(c.indices).copy(),
         "weights_vals": np.asarray(c.weights_vals).copy(),
@@ -44,15 +45,11 @@ def layer_state_dict(c) -> dict:
         d["scale_rank_max"] = c.get_scale_rank_max()
         d["additive_rank"] = additive_rank
         d["additive_rank_max"] = c.get_additive_rank_max()
-        d["value_scale_k"] = [np.asarray(c.get_value_scale_raw_vector(k)).copy()
-                              for k in range(scale_rank)]
-        d["output_scale_k"] = [np.asarray(c.get_output_scale_raw_vector(k)).copy()
-                               for k in range(scale_rank)]
+        d["value_scale_k"] = [np.asarray(c.get_value_scale_raw_vector(k)).copy() for k in range(scale_rank)]
+        d["output_scale_k"] = [np.asarray(c.get_output_scale_raw_vector(k)).copy() for k in range(scale_rank)]
         if additive_rank > 0:
-            d["additive_u_k"] = [np.asarray(c.get_additive_u_raw_vector(k)).copy()
-                                 for k in range(additive_rank)]
-            d["additive_v_k"] = [np.asarray(c.get_additive_v_raw_vector(k)).copy()
-                                 for k in range(additive_rank)]
+            d["additive_u_k"] = [np.asarray(c.get_additive_u_raw_vector(k)).copy() for k in range(additive_rank)]
+            d["additive_v_k"] = [np.asarray(c.get_additive_v_raw_vector(k)).copy() for k in range(additive_rank)]
     return d
 
 
@@ -74,7 +71,8 @@ def layer_from_state_dict(d: dict, c_class, num_cpus: int = 4):
     c.load_weights(
         np.asarray(d["ptrs"], dtype=np.int32),
         np.asarray(d["indices"], dtype=np.int32),
-        np.asarray(d["weights_vals"], dtype=np.float32))
+        np.asarray(d["weights_vals"], dtype=np.float32),
+    )
     if "scale_rank" in d:
         for k, vec in enumerate(d["value_scale_k"]):
             c.set_value_scale_raw_vector(k, np.asarray(vec, dtype=np.float32))
@@ -87,9 +85,16 @@ def layer_from_state_dict(d: dict, c_class, num_cpus: int = 4):
     return c
 
 
-def save_mqar_model(path: Union[str, Path], model, embed_table: np.ndarray,
-                    step: int, vocab: int, k: int, num_cpus: int = 4,
-                    extra: Optional[dict] = None) -> None:
+def save_mqar_model(
+    path: str | Path,
+    model,
+    embed_table: np.ndarray,
+    step: int,
+    vocab: int,
+    k: int,
+    num_cpus: int = 4,
+    extra: dict | None = None,
+) -> None:
     """Save a ToyTileRecurrenceRMT model's full state -- every real
     weight layer (model._named_real_layers()), norm/attention params
     (model.parameters_for_optimizer()), and the caller's own embed_table
@@ -97,9 +102,10 @@ def save_mqar_model(path: Union[str, Path], model, embed_table: np.ndarray,
     path + rename), matching training_checkpoint.py's own convention."""
     payload = {
         "num_cpus": num_cpus,
-        "step": step, "vocab": vocab, "k": k,
-        "layers": {name: layer_state_dict(layer._c)
-                   for name, layer in model._named_real_layers()},
+        "step": step,
+        "vocab": vocab,
+        "k": k,
+        "layers": {name: layer_state_dict(layer._c) for name, layer in model._named_real_layers()},
         "input_ln": np.asarray(model.input_ln.data).copy(),
         "memory_ln": np.asarray(model.memory_ln.data).copy(),
         "state_ln": np.asarray(model.state_ln.data).copy(),
@@ -116,7 +122,7 @@ def save_mqar_model(path: Union[str, Path], model, embed_table: np.ndarray,
     tmp_path.replace(path)
 
 
-def load_mqar_model_payload(path: Union[str, Path]) -> dict:
+def load_mqar_model_payload(path: str | Path) -> dict:
     """Returns the raw payload dict (layers as state-dicts, not yet
     reconstructed into C++ objects -- reconstruction needs the caller's
     target class per layer, e.g. fp32 source -> fp4 AQRS target, so it's

@@ -35,13 +35,13 @@ differs (see [[feedback_do_science_correctly]]):
     exact storage): upper bound, should approach ~0 loss regardless
     of scale_rank (nothing there to get stuck on).
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, List, Optional
 
 import numpy as np
-
 from sili.tensor import Tensor, reduce_sum
 
 
@@ -65,7 +65,7 @@ def eckart_young_floor(target: np.ndarray, rank: int) -> float:
     the sum of squared singular values beyond `rank`."""
     singular_values = np.linalg.svd(target, compute_uv=False)
     discarded = singular_values[rank:]
-    return float(np.sum(discarded ** 2))
+    return float(np.sum(discarded**2))
 
 
 class LowRankDenseLayer:
@@ -83,7 +83,7 @@ class LowRankDenseLayer:
     def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
         return x @ self.U @ self.V
 
-    def trainable_params(self) -> List[Tensor]:
+    def trainable_params(self) -> list[Tensor]:
         return [self.U, self.V]
 
 
@@ -98,7 +98,7 @@ class FullRankDenseLayer:
     def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
         return x @ self.W
 
-    def trainable_params(self) -> List[Tensor]:
+    def trainable_params(self) -> list[Tensor]:
         return [self.W]
 
 
@@ -113,11 +113,19 @@ class RankFloorReport:
     beat_floor: bool  # best_sse meaningfully below ey_floor (real rank escape)
 
 
-def measure_rank_floor(layer, target: np.ndarray, n_steps: int, lr: float,
-                        rank: int, opt=None, opt_step: Optional[Callable] = None,
-                        clip_grad_norm: Optional[Callable] = None,
-                        beat_floor_tol: float = 0.9, eval_every: int = 1,
-                        lr_decay: float = 0.99) -> RankFloorReport:
+def measure_rank_floor(
+    layer,
+    target: np.ndarray,
+    n_steps: int,
+    lr: float,
+    rank: int,
+    opt=None,
+    opt_step: Callable | None = None,
+    clip_grad_norm: Callable | None = None,
+    beat_floor_tol: float = 0.9,
+    eval_every: int = 1,
+    lr_decay: float = 0.99,
+) -> RankFloorReport:
     """Trains `layer` (any object with `.forward(x: Tensor, learning_rate)
     -> Tensor` and `.trainable_params() -> List[Tensor]`) to reproduce
     `target` (n x n) via full-batch regression against all n standard
@@ -189,20 +197,20 @@ def measure_rank_floor(layer, target: np.ndarray, n_steps: int, lr: float,
     def _evaluate() -> float:
         sse = 0.0
         for i in range(n):
-            x = Tensor(basis[i:i + 1])
+            x = Tensor(basis[i : i + 1])
             y_pred = layer.forward(x, 0.0)
             sse += float(np.sum((y_pred.data.reshape(-1) - target[i]) ** 2))
         return sse
 
     best_sse = float("inf")
     for step in range(n_steps):
-        effective_lr = lr * (lr_decay ** step)
+        effective_lr = lr * (lr_decay**step)
         for i in range(n):
-            x = Tensor(basis[i:i + 1])
+            x = Tensor(basis[i : i + 1])
             y_pred = layer.forward(x, effective_lr)
-            y_true = Tensor(target[i:i + 1])
+            y_true = Tensor(target[i : i + 1])
             diff = y_pred - y_true
-            sq_err = reduce_sum(diff ** 2)
+            sq_err = reduce_sum(diff**2)
             sq_err.backward()
             if params:
                 if clip_grad_norm is not None:
@@ -220,6 +228,11 @@ def measure_rank_floor(layer, target: np.ndarray, n_steps: int, lr: float,
     floor = eckart_young_floor(target, rank)
     ratio = best_sse / floor if floor > 0 else float("inf")
     return RankFloorReport(
-        n=n, rank=rank, ey_floor=floor, final_sse=final_sse, best_sse=best_sse,
-        ratio_to_floor=ratio, beat_floor=(floor > 0 and best_sse < beat_floor_tol * floor),
+        n=n,
+        rank=rank,
+        ey_floor=floor,
+        final_sse=final_sse,
+        best_sse=best_sse,
+        ratio_to_floor=ratio,
+        beat_floor=(floor > 0 and best_sse < beat_floor_tol * floor),
     )

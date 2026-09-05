@@ -42,16 +42,18 @@ that plateaued.\""
 
 Run: python3 scripts/mqar_k1_precision_control.py [train_steps] [seed] [eval_every]
 """
+
 from __future__ import annotations
 
+import functools
 import sys
 import time
-import functools
 
 sys.path.insert(0, ".")
 
-import scripts.train_mqar_k_sweep as m
 from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
+
+import scripts.train_mqar_k_sweep as m
 from model.toy_precision_models import TrueMultiDigitLayer
 
 LOG_PATH = "mqar_k1_precision_control.log"
@@ -93,14 +95,17 @@ def main():
     # introduced. num_cpus=1 has no concurrency, sidesteps it entirely.
     m.NUM_CPUS = 1
 
-    log(f"# K=1 precision control: train_steps={train_steps} seed={seed} eval_every={eval_every} "
+    log(
+        f"# K=1 precision control: train_steps={train_steps} seed={seed} eval_every={eval_every} "
         f"embed_width={m.EMBED_WIDTH} column_neurons={m.COLUMN_NEURONS} "
-        f"state_width={m.EMBED_WIDTH*m.COLUMN_NEURONS} vocab={m.VOCAB} "
-        f"l1_sparsity_coef={m.L1_SPARSITY_COEF} peak_lr={m.PEAK_LR}")
+        f"state_width={m.EMBED_WIDTH * m.COLUMN_NEURONS} vocab={m.VOCAB} "
+        f"l1_sparsity_coef={m.L1_SPARSITY_COEF} peak_lr={m.PEAK_LR}"
+    )
 
     arms = {
-        "sparse_fp4_multi_digit": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                                     n_stages=3, base=12.0, lr_power=0.0),  # dense=False (default)
+        "sparse_fp4_multi_digit": functools.partial(
+            TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=12.0, lr_power=0.0
+        ),  # dense=False (default)
         "sparse_fp32": DISLDOLayer32,
     }
 
@@ -111,13 +116,14 @@ def main():
 
         def log_fn(k, step, total, elapsed, loss, acc, _name=name):
             acc_s = f"  acc={acc:.4f}" if acc is not None else ""
-            log(f"  [{_name}] step={step:>6}/{total}  mean_query_loss={loss:.4f}{acc_s}  "
-                f"({elapsed:.0f}s elapsed, {elapsed/step:.4f}s/step)")
+            log(
+                f"  [{_name}] step={step:>6}/{total}  mean_query_loss={loss:.4f}{acc_s}  "
+                f"({elapsed:.0f}s elapsed, {elapsed / step:.4f}s/step)"
+            )
 
         t0 = time.time()
-        r = m.train_and_eval(1, seed, train_steps, log_fn=log_fn,
-                             pool_size=1, refresh_every=1, eval_every=eval_every)
-        log(f"{name} FINAL: {r}  (total {time.time()-t0:.0f}s)")
+        r = m.train_and_eval(1, seed, train_steps, log_fn=log_fn, pool_size=1, refresh_every=1, eval_every=eval_every)
+        log(f"{name} FINAL: {r}  (total {time.time() - t0:.0f}s)")
         results[name] = r
 
     log("\n# SUMMARY")

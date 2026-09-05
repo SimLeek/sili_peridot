@@ -16,27 +16,29 @@ Run: python3 scripts/train_mqar_rmt_reference.py [train_steps] [seed] [precision
   (DISLDOLayer32, unlimited precision, matching this project's own
   established fp32-control convention).
 """
+
 from __future__ import annotations
 
+import functools
 import sys
 import time
-import functools
 
 import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32, DISLDOLayer8
 from sili import _cpu
-from model.toy_recall_task import generate_mqar_sequence
-from model.toy_recall_models import cross_entropy_sum, predicted_token, AdamOptimizer, lr_schedule, clip_grad_norm_
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
+
 from model.toy_precision_models import TrueMultiDigitLayer
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule, predicted_token
+from model.toy_recall_task import generate_mqar_sequence
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
 from scripts.train_tile_curriculum import _build_tile_window
 
 EMBED_WIDTH = 16
 COLUMN_NEURONS = 8
-NUM_MEMORY_SLOTS = 2   # RMT's own experiments use a small handful; not yet tuned for this task
+NUM_MEMORY_SLOTS = 2  # RMT's own experiments use a small handful; not yet tuned for this task
 MAX_WEIGHTS_PER_LAYER = 512
 NUM_CPUS = 4
 VOCAB = 128
@@ -48,8 +50,9 @@ L1_SPARSITY_COEF = 0.05
 CLIP_RANGE = 6.0
 
 DISLDO_CLS_BY_PRECISION = {
-    "fp4": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                             n_stages=3, base=12.0, lr_power=0.0, dense=True),
+    "fp4": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=12.0, lr_power=0.0, dense=True
+    ),
     "fp32": DISLDOLayer32,
     # Single-digit real FP8 E4M3 (fp8quant.hpp), NOT wrapped in
     # TrueMultiDigitLayer -- per conversation, E4M3's own native
@@ -75,13 +78,14 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
     return targets
 
 
-def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, precision: str = "fp4",
-                   log_fn=None, eval_every: int = None) -> dict:
+def train_and_eval(
+    num_kv_pairs: int, seed: int, train_steps: int, precision: str = "fp4", log_fn=None, eval_every: int | None = None
+) -> dict:
     seq_len = seq_len_for_k(num_kv_pairs)
     num_tiles = seq_len
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     disldo_cls = DISLDO_CLS_BY_PRECISION[precision]
-    dense = (precision == "fp4")
+    dense = precision == "fp4"
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
@@ -90,10 +94,19 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, precision: st
     model_rng = np.random.default_rng(seed)
 
     model = ToyTileRecurrenceRMT(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
-        MAX_WEIGHTS_PER_LAYER, num_cpus=NUM_CPUS, disldo_cls=disldo_cls,
-        dense=dense, clip_range=CLIP_RANGE, l1_sparsity_coef=L1_SPARSITY_COEF,
-        rng=model_rng)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        num_tiles,
+        NUM_MEMORY_SLOTS,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=disldo_cls,
+        dense=dense,
+        clip_range=CLIP_RANGE,
+        l1_sparsity_coef=L1_SPARSITY_COEF,
+        rng=model_rng,
+    )
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
@@ -118,7 +131,7 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, precision: st
         lr = lr_schedule(step, train_steps, PEAK_LR, WARMUP_STEPS)
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         for i in range(seq_len):
             window = _build_tile_window(embed_table, tokens, i, num_tiles)
@@ -152,8 +165,13 @@ def train_and_eval(num_kv_pairs: int, seed: int, train_steps: int, precision: st
                 correct += int(pred == mqar_by_pos[i])
                 total += 1
 
-    return {"num_kv_pairs": num_kv_pairs, "seq_len": seq_len, "precision": precision,
-            "acc": correct / total if total else 0.0, "elapsed_s": time.time() - t0}
+    return {
+        "num_kv_pairs": num_kv_pairs,
+        "seq_len": seq_len,
+        "precision": precision,
+        "acc": correct / total if total else 0.0,
+        "elapsed_s": time.time() - t0,
+    }
 
 
 def main():
@@ -161,15 +179,20 @@ def main():
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
     precision = sys.argv[3] if len(sys.argv) > 3 else "fp4"
 
-    print(f"# ToyTileRecurrenceRMT reference (K=1) train_steps={train_steps} seed={seed} "
-          f"precision={precision} num_memory_slots={NUM_MEMORY_SLOTS} "
-          f"embed_width={EMBED_WIDTH} column_neurons={COLUMN_NEURONS} "
-          f"state_width={EMBED_WIDTH*COLUMN_NEURONS} vocab={VOCAB}", flush=True)
+    print(
+        f"# ToyTileRecurrenceRMT reference (K=1) train_steps={train_steps} seed={seed} "
+        f"precision={precision} num_memory_slots={NUM_MEMORY_SLOTS} "
+        f"embed_width={EMBED_WIDTH} column_neurons={COLUMN_NEURONS} "
+        f"state_width={EMBED_WIDTH * COLUMN_NEURONS} vocab={VOCAB}",
+        flush=True,
+    )
 
     def log_fn(k, step, total_steps, elapsed, mean_q_loss, quick_acc=None):
         acc_str = f"  quick_acc={quick_acc:.4f}" if quick_acc is not None else ""
-        print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  "
-              f"({elapsed:.0f}s elapsed)", flush=True)
+        print(
+            f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}{acc_str}  ({elapsed:.0f}s elapsed)",
+            flush=True,
+        )
 
     r = train_and_eval(1, seed, train_steps, precision=precision, log_fn=log_fn, eval_every=max(train_steps // 10, 1))
     print(f"\nFINAL acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)", flush=True)

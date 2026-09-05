@@ -38,18 +38,17 @@ count instead of pretending otherwise.
 
 Run: python -m scripts.disldo_tanh_sparse_ablation
 """
+
 from __future__ import annotations
 
 import time
 
 import numpy as np
-
-from sili.sparse_rnn import DISLDOLayer
 from sili import _cpu
-from sili.tensor import Tensor
+from sili.sparse_rnn import DISLDOLayer
 
-from model.toy_beyond_context_task import generate_deviation_sequence, VOCAB_SIZE
-from model.toy_recall_models import cross_entropy_sum, predicted_token, lr_schedule
+from model.toy_beyond_context_task import VOCAB_SIZE, generate_deviation_sequence
+from model.toy_recall_models import cross_entropy_sum, lr_schedule, predicted_token
 
 HIDDEN = 128
 NUM_CPUS = 1
@@ -68,8 +67,7 @@ HEAD_MAX_WEIGHTS = HIDDEN * VOCAB_SIZE
 class DisldoTanhSparseControl:
     def __init__(self, seed: int):
         embed_rng = np.random.RandomState(seed)
-        self.embed_matrix = (embed_rng.randn(VOCAB_SIZE, HIDDEN)
-                              * (1.0 / np.sqrt(HIDDEN))).astype(np.float32)
+        self.embed_matrix = (embed_rng.randn(VOCAB_SIZE, HIDDEN) * (1.0 / np.sqrt(HIDDEN))).astype(np.float32)
         rng1 = np.random.default_rng(seed + 1)
         rng2 = np.random.default_rng(seed + 2)
         self.cell = DISLDOLayer(HIDDEN * 2, HIDDEN, CELL_MAX_WEIGHTS, NUM_CPUS, rng=rng1)
@@ -130,9 +128,11 @@ def train_and_eval(seed: int):
 
 
 def main():
-    print(f"hidden={HIDDEN} per_row_k={PER_ROW_K} cell_params={CELL_MAX_WEIGHTS} "
-          f"train_steps={TRAIN_STEPS} peak_lr={PEAK_LR} eval_sequences={EVAL_SEQUENCES} "
-          f"(DISLDO, tanh full-overwrite, SPARSE, no BPTT, no curriculum)\n")
+    print(
+        f"hidden={HIDDEN} per_row_k={PER_ROW_K} cell_params={CELL_MAX_WEIGHTS} "
+        f"train_steps={TRAIN_STEPS} peak_lr={PEAK_LR} eval_sequences={EVAL_SEQUENCES} "
+        f"(DISLDO, tanh full-overwrite, SPARSE, no BPTT, no curriculum)\n"
+    )
     N_SEEDS = 5
     agg = {n: [] for n in EVAL_N_VALUES}
     t0 = time.time()
@@ -140,9 +140,8 @@ def main():
         results, final_loss = train_and_eval(seed=1000 + s)
         for n in EVAL_N_VALUES:
             agg[n].append(results[n])
-        print(f"seed {s}: final_loss(last100)={final_loss:.4f}  "
-              f"{ {n: round(results[n], 2) for n in EVAL_N_VALUES} }")
-    print(f"\n({time.time()-t0:.1f}s total)")
+        print(f"seed {s}: final_loss(last100)={final_loss:.4f}  { {n: round(results[n], 2) for n in EVAL_N_VALUES} }")
+    print(f"\n({time.time() - t0:.1f}s total)")
     print(f"{'n_bits':>8}  {'mean':>6}  {'std':>6}")
     for n in EVAL_N_VALUES:
         arr = np.array(agg[n])

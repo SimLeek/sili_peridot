@@ -35,6 +35,7 @@ in-progress run (reads whatever's on disk at invocation time; only
 returns fits for (width, arm) pairs with at least MIN_POINTS logged
 checkpoints).
 """
+
 import os
 import re
 import sys
@@ -47,10 +48,8 @@ LOG_PATH_DEFAULT = os.path.join(os.path.dirname(__file__), "..", "superposition_
 MIN_POINTS = 8
 SKIP_FRAC = 0.5
 
-LINE_RE = re.compile(
-    r"hw=\s*(\d+)\s+(\S+)\s+step=\s*(\d+)/(\d+)\s+current=([\d.]+)\s+best=([\d.]+)")
-BASELINE_RE = re.compile(
-    r"hidden_width=(\d+) n_features=\d+ n_steps=\d+ decay=[\d.]+ baseline=([\d.]+)")
+LINE_RE = re.compile(r"hw=\s*(\d+)\s+(\S+)\s+step=\s*(\d+)/(\d+)\s+current=([\d.]+)\s+best=([\d.]+)")
+BASELINE_RE = re.compile(r"hidden_width=(\d+) n_features=\d+ n_steps=\d+ decay=[\d.]+ baseline=([\d.]+)")
 
 
 def parse_log(log_path: str):
@@ -66,7 +65,7 @@ def parse_log(log_path: str):
                 continue
             m = LINE_RE.search(line)
             if m:
-                hw, arm, step, total, current, best = m.groups()
+                hw, arm, step, _total, _current, best = m.groups()
                 series[(int(hw), arm)].append((int(step), float(best)))
     return series, baselines
 
@@ -125,12 +124,14 @@ def estimate_crossing_step(l_inf: float, a: float, p: float, baseline: float, ma
 
 def main(log_path: str = LOG_PATH_DEFAULT):
     series, baselines = parse_log(log_path)
-    widths = sorted({hw for hw, _ in series.keys()})
-    print(f"{'hw':>4} {'arm':<12} {'n_pts':>6} {'L_inf':>9} {'A':>10} {'p':>6} {'R2':>6} "
-          f"{'baseline':>9} {'crossing_step':>15}")
+    widths = sorted({hw for hw, _ in series})
+    print(
+        f"{'hw':>4} {'arm':<12} {'n_pts':>6} {'L_inf':>9} {'A':>10} {'p':>6} {'R2':>6} "
+        f"{'baseline':>9} {'crossing_step':>15}"
+    )
     for hw in widths:
         baseline = baselines.get(hw)
-        arms = sorted({arm for w, arm in series.keys() if w == hw})
+        arms = sorted({arm for w, arm in series if w == hw})
         for arm in arms:
             pts = sorted(series[(hw, arm)])
             n = len(pts)
@@ -151,8 +152,10 @@ def main(log_path: str = LOG_PATH_DEFAULT):
                         already_crossed_step = s
                         break
             if already_crossed_step is not None:
-                print(f"{hw:>4} {arm:<12} {n:>6} {'':>9} {'':>10} {'':>6} {'':>6} "
-                      f"{baseline_str:>9} {'already@' + str(already_crossed_step):>15}")
+                print(
+                    f"{hw:>4} {arm:<12} {n:>6} {'':>9} {'':>10} {'':>6} {'':>6} "
+                    f"{baseline_str:>9} {'already@' + str(already_crossed_step):>15}"
+                )
                 continue
 
             skip = int(n * SKIP_FRAC)
@@ -163,16 +166,17 @@ def main(log_path: str = LOG_PATH_DEFAULT):
                 print(f"{hw:>4} {arm:<12} {n:>6} -- flat / no fittable trend over fit window")
                 continue
             l_inf, a, p, r2 = fit
-            crossing = (estimate_crossing_step(l_inf, a, p, baseline, steps.max())
-                        if baseline is not None else None)
+            crossing = estimate_crossing_step(l_inf, a, p, baseline, steps.max()) if baseline is not None else None
             if crossing is None:
                 crossing_str = f"never (L_inf={l_inf:.4f}>baseline)" if baseline is not None else "n/a"
             elif crossing == float("inf"):
                 crossing_str = "unreliable (>>1000x fit window)"
             else:
                 crossing_str = f"{crossing:.0f}"
-            print(f"{hw:>4} {arm:<12} {n:>6} {l_inf:>9.4f} {a:>10.4f} {p:>6.3f} {r2:>6.3f} "
-                  f"{baseline_str:>9} {crossing_str:>15}")
+            print(
+                f"{hw:>4} {arm:<12} {n:>6} {l_inf:>9.4f} {a:>10.4f} {p:>6.3f} {r2:>6.3f} "
+                f"{baseline_str:>9} {crossing_str:>15}"
+            )
 
 
 if __name__ == "__main__":

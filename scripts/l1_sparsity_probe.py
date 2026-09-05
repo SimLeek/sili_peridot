@@ -62,16 +62,21 @@ into train_tile_curriculum.py's CLI -- this file remains the
 reference/reproduction implementation for the validated result above.
 Zero-init + energy_rl + L1-sparsity is a promising but NOT yet
 full-scale-validated follow-up (short-run signal only)."""
-import sys, functools, statistics, time
+
+import functools
+import statistics
+import sys
+import time
+
 sys.path.insert(0, ".")
 import numpy as np
-
 from sili import _cpu
-from sili.tensor import Tensor, gaussian_attention, exp, reduce_sum, power, tensor_abs
-from sili.sparse_rnn import DISLDOLayerDeterministic, DISLDOLayer
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayerDeterministic
+from sili.tensor import Tensor, exp, gaussian_attention, power, reduce_sum, tensor_abs
+
 from model.toy_precision_models import TrueMultiDigitLayer, _apply_energy
-from model.toy_recall_models import rmsnorm_tensor, cross_entropy_sum, AdamOptimizer, lr_schedule, clip_grad_norm_
-from scripts.train_tile_curriculum import generate_copy_sequence, _build_tile_window
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule, rmsnorm_tensor
+from scripts.train_tile_curriculum import _build_tile_window, generate_copy_sequence
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, MAX_WEIGHTS = 10, 8, 4, 4, 128
 STEPS_PER_STAGE = 500
@@ -90,11 +95,27 @@ class OriginalArchModel:
     # op (see __init__'s energy-construction comment).
     _ENERGY_TAPS = ("input", "q", "k", "v", "attn", "raw", "logits")
 
-    def __init__(self, seed, dense, o_proj_coef, all_layer_coef=0.0, l1_sparsity_coef=0.0,
-                 all_zero_init=False, zero_init_importance_code=1, use_energy=False,
-                 energy_kwargs=None, scale_clip_max=None, log_sigma_clip_max=None,
-                 stochastic_qkv=False, stochastic_o=False, lr_per_row_nnz=True,
-                 scale_rank=1, empty_init=False, synap_k=3, synap_importance_cutoff=0.0):
+    def __init__(
+        self,
+        seed,
+        dense,
+        o_proj_coef,
+        all_layer_coef=0.0,
+        l1_sparsity_coef=0.0,
+        all_zero_init=False,
+        zero_init_importance_code=1,
+        use_energy=False,
+        energy_kwargs=None,
+        scale_clip_max=None,
+        log_sigma_clip_max=None,
+        stochastic_qkv=False,
+        stochastic_o=False,
+        lr_per_row_nnz=True,
+        scale_rank=1,
+        empty_init=False,
+        synap_k=3,
+        synap_importance_cutoff=0.0,
+    ):
         # empty_init: the GENUINE zero-weight-init design -- every layer
         # starts with literally zero connections (not all_zero_init's
         # dense-grid-preloaded-with-0 hack, a different synthetic arm --
@@ -149,9 +170,16 @@ class OriginalArchModel:
         self.lr_per_row_nnz = bool(lr_per_row_nnz)
         if hasattr(_cpu, "seed_fp4_stochastic_rng"):
             _cpu.seed_fp4_stochastic_rng(seed)
-        digit_cls = functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-                                      n_stages=3, base=12.0, lr_power=0.0, dense=dense,
-                                      scale_rank=scale_rank, empty_init=empty_init)
+        digit_cls = functools.partial(
+            TrueMultiDigitLayer,
+            digit_cls=DISLDOLayerDeterministic,
+            n_stages=3,
+            base=12.0,
+            lr_power=0.0,
+            dense=dense,
+            scale_rank=scale_rank,
+            empty_init=empty_init,
+        )
         # stochastic_qkv/stochastic_o: use stochastic-rounding storage
         # (DISLDOLayer) instead of deterministic (DISLDOLayerDeterministic)
         # for the selected layers -- lm_head always stays deterministic
@@ -174,14 +202,34 @@ class OriginalArchModel:
         # were in, so it needs the same fix. This project's own prior
         # findings show stochastic rounding can hurt final accuracy
         # broadly, so keep it opt-in per layer rather than always-on.
-        qkv_digit_cls = (functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                           n_stages=3, base=12.0, lr_power=0.0, dense=dense,
-                                           scale_rank=scale_rank, empty_init=empty_init)
-                          if stochastic_qkv else digit_cls)
-        o_digit_cls = (functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                         n_stages=3, base=12.0, lr_power=0.0, dense=dense,
-                                         scale_rank=scale_rank, empty_init=empty_init)
-                       if stochastic_o else digit_cls)
+        qkv_digit_cls = (
+            functools.partial(
+                TrueMultiDigitLayer,
+                digit_cls=DISLDOLayer,
+                n_stages=3,
+                base=12.0,
+                lr_power=0.0,
+                dense=dense,
+                scale_rank=scale_rank,
+                empty_init=empty_init,
+            )
+            if stochastic_qkv
+            else digit_cls
+        )
+        o_digit_cls = (
+            functools.partial(
+                TrueMultiDigitLayer,
+                digit_cls=DISLDOLayer,
+                n_stages=3,
+                base=12.0,
+                lr_power=0.0,
+                dense=dense,
+                scale_rank=scale_rank,
+                empty_init=empty_init,
+            )
+            if stochastic_o
+            else digit_cls
+        )
         rng = np.random.default_rng(seed)
         self.state_width = EMBED_WIDTH * COLUMN_NEURONS
         sw = self.state_width
@@ -247,6 +295,7 @@ class OriginalArchModel:
         self.energies = {}
         if use_energy:
             from sili.energy import EnergyDynamics
+
             def _make_energy():
                 if energy_kwargs is not None:
                     # EnergyDynamics' own exploration-noise draw is unseeded
@@ -258,9 +307,10 @@ class OriginalArchModel:
                     ek = dict(energy_kwargs)
                     ek.setdefault("rng", np.random.default_rng(rng.integers(2**31)))
                     return EnergyDynamics(**ek)
-                else:
-                    from model.toy_precision_models import _toy_scale_energy
-                    return _toy_scale_energy()
+                from model.toy_precision_models import _toy_scale_energy
+
+                return _toy_scale_energy()
+
             for name in self._ENERGY_TAPS:
                 self.energies[name] = _make_energy()
 
@@ -394,6 +444,7 @@ class OriginalArchModel:
             for energy in self.energies.values():
                 energy.fire_wake_gradient = compensated
         energy_aux_terms = []
+
         def tap(name, tensor, n_hidden=self.state_width):
             # Plain op, always called -- _apply_energy(None, tensor, ...)
             # is already a no-op pass-through when use_energy=False, so
@@ -446,8 +497,9 @@ class OriginalArchModel:
             # nonzero from upstream. This term gives it the same direct,
             # pooled-independent escape route q/k/v/o_proj already have.
             reg_terms.append(self._l1_sparsity_split(self.lm_head, pooled, lmhead_lr, self.l1_sparsity_coef))
-        logits = tap("logits", self.lm_head.forward(pooled, lmhead_lr, lr_per_row_nnz=self.lr_per_row_nnz),
-                     n_hidden=VOCAB)
+        logits = tap(
+            "logits", self.lm_head.forward(pooled, lmhead_lr, lr_per_row_nnz=self.lr_per_row_nnz), n_hidden=VOCAB
+        )
 
         total_aux = reg_terms[0] if reg_terms else None
         for extra in reg_terms[1:]:
@@ -501,7 +553,7 @@ def evaluate(model, n_eval, seed, verbose=False):
         M = np.zeros((NUM_TILES, state_width), dtype=np.float32)
         for i in range(NUM_TILES):
             window = _build_tile_window(embed_table, tokens, i, NUM_TILES, COLUMN_NEURONS)
-            M, logits, aux = model.step(window, M, 0.0)
+            M, logits, _aux = model.step(window, M, 0.0)
             if i in targets:
                 pred = int(np.argmax(logits.data[NUM_TILES - 1]))
                 ntgt += 1
@@ -563,7 +615,8 @@ def run(model, n_steps, seed, verbose=False, periodic_eval_n=20, peak_lr=0.002):
                 total_aux = aux if total_aux is None else total_aux + aux
             if i in targets:
                 pred = int(np.argmax(logits.data[NUM_TILES - 1]))
-                ntgt += 1; correct += int(pred == targets[i])
+                ntgt += 1
+                correct += int(pred == targets[i])
                 tgt_loss = cross_entropy_sum(logits, [(NUM_TILES - 1, targets[i])])
                 total_loss = tgt_loss if total_loss is None else total_loss + tgt_loss
         if total_aux is not None:
@@ -597,9 +650,11 @@ def run(model, n_steps, seed, verbose=False, periodic_eval_n=20, peak_lr=0.002):
                 # docstring).
                 periodic_eval = evaluate(model, periodic_eval_n, seed) if periodic_eval_n > 0 else None
                 eval_str = f" eval({periodic_eval_n})={periodic_eval:.3f}" if periodic_eval is not None else ""
-                print(f"  [seed={seed}] step={step}/{n_steps} "
-                      f"avg_step={avg_step*1000:.1f}ms elapsed={elapsed:.0f}s eta={eta:.0f}s{eval_str}",
-                      flush=True)
+                print(
+                    f"  [seed={seed}] step={step}/{n_steps} "
+                    f"avg_step={avg_step * 1000:.1f}ms elapsed={elapsed:.0f}s eta={eta:.0f}s{eval_str}",
+                    flush=True,
+                )
     avg_step_time = (time.time() - t_start) / n_steps
     return last_accs, skips, total, avg_step_time
 
@@ -607,17 +662,21 @@ def run(model, n_steps, seed, verbose=False, periodic_eval_n=20, peak_lr=0.002):
 if __name__ == "__main__":
     # Reproduces the landmark result: mean=1.0000 across 5 seeds.
     import statistics
+
     SEEDS = [1000, 1001, 1002, 1003, 1004]
     N_STEPS = 15000
     for coef in [0.05, 0.07]:
         per_seed = []
         tot_skips = tot_calls = 0
         for seed in SEEDS:
-            model = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-                                       l1_sparsity_coef=coef)
+            model = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0, l1_sparsity_coef=coef)
             accs, skips, total, avg_step_time = run(model, N_STEPS, seed, verbose=True)
             per_seed.append(statistics.mean(accs[-3:]))
-            tot_skips += skips; tot_calls += total
-        print(f"l1_sparsity_coef={coef}  mean={statistics.mean(per_seed):.4f}  "
-              f"std={statistics.stdev(per_seed):.4f}  per_seed={[round(v,4) for v in per_seed]}  "
-              f"skip_rate={tot_skips/tot_calls:.3%}", flush=True)
+            tot_skips += skips
+            tot_calls += total
+        print(
+            f"l1_sparsity_coef={coef}  mean={statistics.mean(per_seed):.4f}  "
+            f"std={statistics.stdev(per_seed):.4f}  per_seed={[round(v, 4) for v in per_seed]}  "
+            f"skip_rate={tot_skips / tot_calls:.3%}",
+            flush=True,
+        )

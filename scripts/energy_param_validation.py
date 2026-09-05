@@ -17,23 +17,38 @@ existing already-tuned-low ENERGY_KWARGS baseline.
 
 Usage: python3 scripts/energy_param_validation.py [n_steps] [n_seeds]
 """
+
 from __future__ import annotations
 
+import statistics
 import sys
 import time
-import statistics
 
 sys.path.insert(0, ".")
 
 import numpy as np
-
 from sili import _cpu
+
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
 from scripts.train_tile_curriculum import (
-    ARMS, VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
-    PEAK_LR, WARMUP_STEPS, MAX_GRAD_NORM, STEPS_PER_STAGE_DEFAULT,
-    current_seq_len, evaluate, generate_copy_sequence, _build_tile_window,
-    cross_entropy_sum, AdamOptimizer, lr_schedule, clip_grad_norm_,
+    ARMS,
+    COLUMN_NEURONS,
+    EMBED_WIDTH,
+    MAX_GRAD_NORM,
+    MAX_WEIGHTS_PER_LAYER,
+    NUM_TILES,
+    PEAK_LR,
+    STEPS_PER_STAGE_DEFAULT,
+    VOCAB,
+    WARMUP_STEPS,
+    AdamOptimizer,
+    _build_tile_window,
+    clip_grad_norm_,
+    cross_entropy_sum,
+    current_seq_len,
+    evaluate,
+    generate_copy_sequence,
+    lr_schedule,
 )
 
 DENSE_ARMS = {
@@ -44,16 +59,26 @@ DENSE_ARMS = {
 }
 SEEDS = [1000, 1001, 1002, 1003, 1004]
 
-ENERGY_KWARGS_CANDIDATE = dict(drive=0.00535, activation_cost=0.02, precision=0.01,
-                               density=0.005, p=0.995, reactivity=0.0001)
+ENERGY_KWARGS_CANDIDATE = {
+    "drive": 0.00535,
+    "activation_cost": 0.02,
+    "precision": 0.01,
+    "density": 0.005,
+    "p": 0.995,
+    "reactivity": 0.0001,
+}
 
 DENSE_NOFIX_REFERENCE = {
-    "base4_dense":  0.0938, "base6_dense":  0.1171,
-    "base12_dense": 0.1050, "base24_dense": 0.0979,
+    "base4_dense": 0.0938,
+    "base6_dense": 0.1171,
+    "base12_dense": 0.1050,
+    "base24_dense": 0.0979,
 }
 SPARSE_REFERENCE = {
-    "base4_dense": 0.6417, "base6_dense": 0.6929,
-    "base12_dense": 0.7296, "base24_dense": 0.6775,
+    "base4_dense": 0.6417,
+    "base6_dense": 0.6929,
+    "base12_dense": 0.7296,
+    "base24_dense": 0.6775,
 }
 
 
@@ -64,10 +89,21 @@ def run_one(arm_key: str, seed: int, n_steps: int, checkpoint_every: int) -> flo
     state_width = EMBED_WIDTH * COLUMN_NEURONS
     mlp_hidden = state_width * 2
     model = ToyTileRecurrenceRealFP4(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
-        num_cpus=2, disldo_cls=ARMS[DENSE_ARMS[arm_key]],
-        use_energy=True, energy_kwargs=ENERGY_KWARGS_CANDIDATE,
-        use_attention=True, o_proj_depth=1, rng=model_rng, clip_range=6.0)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        mlp_hidden,
+        NUM_TILES,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=2,
+        disldo_cls=ARMS[DENSE_ARMS[arm_key]],
+        use_energy=True,
+        energy_kwargs=ENERGY_KWARGS_CANDIDATE,
+        use_attention=True,
+        o_proj_depth=1,
+        rng=model_rng,
+        clip_range=6.0,
+    )
     opt = AdamOptimizer()
     rng = np.random.RandomState(seed)
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
@@ -106,23 +142,25 @@ def main():
         for seed in seeds:
             acc = run_one(arm_key, seed, n_steps, checkpoint_every)
             results[arm_key][seed] = acc
-            print(f"{arm_key:<12} seed={seed}  final_acc={acc:.4f}  "
-                  f"({time.time()-t0:.0f}s elapsed)", flush=True)
+            print(f"{arm_key:<12} seed={seed}  final_acc={acc:.4f}  ({time.time() - t0:.0f}s elapsed)", flush=True)
 
-    print(f"\narm            mean    std     per-seed  "
-          f"(activation_cost=0.02, precision=0.01)")
+    print("\narm            mean    std     per-seed  (activation_cost=0.02, precision=0.01)")
     for arm_key in DENSE_ARMS:
         per_seed = [results[arm_key][s] for s in seeds]
-        print(f"{arm_key:<14} {statistics.mean(per_seed):.4f}  "
-              f"{statistics.stdev(per_seed) if len(per_seed) > 1 else 0.0:.4f}  "
-              f"{[round(v, 4) for v in per_seed]}")
+        print(
+            f"{arm_key:<14} {statistics.mean(per_seed):.4f}  "
+            f"{statistics.stdev(per_seed) if len(per_seed) > 1 else 0.0:.4f}  "
+            f"{[round(v, 4) for v in per_seed]}"
+        )
 
     print("\ncandidate-energy vs no-fix vs sparse-echo:")
     print(f"{'arm':<14} {'candidate mean':<16} {'nofix':<10} {'sparse':<10}")
     for arm_key in DENSE_ARMS:
         per_seed = [results[arm_key][s] for s in seeds]
-        print(f"{arm_key:<14} {statistics.mean(per_seed):<16.4f} "
-              f"{DENSE_NOFIX_REFERENCE[arm_key]:<10.4f} {SPARSE_REFERENCE[arm_key]:<10.4f}")
+        print(
+            f"{arm_key:<14} {statistics.mean(per_seed):<16.4f} "
+            f"{DENSE_NOFIX_REFERENCE[arm_key]:<10.4f} {SPARSE_REFERENCE[arm_key]:<10.4f}"
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ One opt-in test wires snapshot_multi_digit_state to the actual
 `baseline` OriginalArchModel's q_proj before/after a real
 (calibrated-lr) training interval.
 """
+
 import os
 import sys
 
@@ -20,7 +21,8 @@ import numpy as np
 import pytest
 
 from model.eval_stuck_weights import (
-    check_stuck_weights, snapshot_layer_state, snapshot_multi_digit_state,
+    check_stuck_weights,
+    snapshot_multi_digit_state,
 )
 
 RUN_ENV_VAR = "SILI_RUN_LR_SEARCH"
@@ -31,7 +33,7 @@ def _snapshot(weights, importance):
     tests don't care about real (row, col) structure, just stable keys."""
     weights = np.asarray(weights, dtype=np.float64)
     importance = np.asarray(importance, dtype=np.float64)
-    return {(0, i): (float(w), float(imp)) for i, (w, imp) in enumerate(zip(weights, importance))}
+    return {(0, i): (float(w), float(imp)) for i, (w, imp) in enumerate(zip(weights, importance, strict=False))}
 
 
 class TestCheckStuckWeightsSynthetic:
@@ -51,7 +53,7 @@ class TestCheckStuckWeightsSynthetic:
         high_imp_idx = np.where(~low_imp_mask)[0]
         rng.shuffle(high_imp_idx)
         half = len(high_imp_idx) // 2
-        frozen_idx = high_imp_idx[:half]
+        high_imp_idx[:half]
         moving_high_idx = high_imp_idx[half:]
         w_after[moving_high_idx] += rng.standard_normal(len(moving_high_idx)) * 0.5
         # frozen_idx: w_after left exactly equal to w_before -- truly stuck.
@@ -98,8 +100,8 @@ class TestCheckStuckWeightsSynthetic:
         after = {(0, i): (float(i) + (1.0 if i >= 5 else 0.0), 1.0) for i in range(5, 15)}
         report = check_stuck_weights([before], [after])
         assert report.n_synapses == 5  # keys 5..9, the true intersection
-        assert report.n_died == 5      # keys 0..4
-        assert report.n_new == 5       # keys 10..14
+        assert report.n_died == 5  # keys 0..4
+        assert report.n_new == 5  # keys 10..14
         assert report.churn_fraction == pytest.approx(10 / 5)
 
     def test_pools_multiple_layers(self):
@@ -125,28 +127,34 @@ class TestCheckStuckWeightsSynthetic:
         assert report.stuck_fraction == pytest.approx(1.0)
 
 
-@pytest.mark.skipif(not os.environ.get(RUN_ENV_VAR),
-                    reason=f"real short training run, opt in via {RUN_ENV_VAR}=1")
+@pytest.mark.skipif(not os.environ.get(RUN_ENV_VAR), reason=f"real short training run, opt in via {RUN_ENV_VAR}=1")
 class TestStuckWeightsRealModel:
     def test_baseline_config_before_after_training(self):
         from scripts.l1_sparsity_probe import OriginalArchModel, run
 
         model = OriginalArchModel(
-            1000, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-            l1_sparsity_coef=0.05, use_energy=False, all_zero_init=False,
+            1000,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            all_zero_init=False,
         )
         before = snapshot_multi_digit_state(model.q_proj)
         run(model, 1500, 1000, verbose=False, peak_lr=0.0483)
         after = snapshot_multi_digit_state(model.q_proj)
 
         report = check_stuck_weights(before, after)
-        print(f"\nstuck-weights report (q_proj, 1500 steps @ calibrated lr): "
-              f"n_synapses={report.n_synapses} n_new={report.n_new} n_died={report.n_died} "
-              f"n_high_importance={report.n_high_importance} "
-              f"stuck_fraction={report.stuck_fraction:.3f} "
-              f"excess_stuck_ratio={report.excess_stuck_ratio:.2f} "
-              f"mean_delta_w_high_imp={report.mean_delta_w_for_high_importance:.5f} "
-              f"mean_delta_w_overall={report.mean_delta_w_overall:.5f}")
+        print(
+            f"\nstuck-weights report (q_proj, 1500 steps @ calibrated lr): "
+            f"n_synapses={report.n_synapses} n_new={report.n_new} n_died={report.n_died} "
+            f"n_high_importance={report.n_high_importance} "
+            f"stuck_fraction={report.stuck_fraction:.3f} "
+            f"excess_stuck_ratio={report.excess_stuck_ratio:.2f} "
+            f"mean_delta_w_high_imp={report.mean_delta_w_for_high_importance:.5f} "
+            f"mean_delta_w_overall={report.mean_delta_w_overall:.5f}"
+        )
         assert report.n_synapses > 0
         assert np.isfinite(report.stuck_fraction)
         assert np.isfinite(report.excess_stuck_ratio)

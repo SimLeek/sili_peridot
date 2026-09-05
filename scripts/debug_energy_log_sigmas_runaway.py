@@ -41,11 +41,23 @@ clamp fix lands and makes the RAW unbounded-drift failure unreproducible:
     step 1000-1100) back up through 1.0 in the same step window as the
     failure is a notable but NOT yet confirmed-causal coincidence.
 """
+
 import numpy as np
-from scripts.l1_sparsity_probe import (OriginalArchModel, VOCAB, EMBED_WIDTH, COLUMN_NEURONS,
-                                        NUM_TILES, _build_tile_window, cross_entropy_sum,
-                                        clip_grad_norm_, AdamOptimizer, STEPS_PER_STAGE,
-                                        generate_copy_sequence, lr_schedule)
+
+from scripts.l1_sparsity_probe import (
+    COLUMN_NEURONS,
+    EMBED_WIDTH,
+    NUM_TILES,
+    STEPS_PER_STAGE,
+    VOCAB,
+    AdamOptimizer,
+    OriginalArchModel,
+    _build_tile_window,
+    clip_grad_norm_,
+    cross_entropy_sum,
+    generate_copy_sequence,
+    lr_schedule,
+)
 
 seed = 1000
 N_STEPS = 15000
@@ -53,8 +65,7 @@ task_rng = np.random.RandomState(seed)
 embed_table = task_rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 state_width = EMBED_WIDTH * COLUMN_NEURONS
 
-m = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-                       l1_sparsity_coef=0.05, use_energy=True)
+m = OriginalArchModel(seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0, l1_sparsity_coef=0.05, use_energy=True)
 opt = AdamOptimizer()
 
 first_nonfinite = None
@@ -84,8 +95,10 @@ for step in range(1, N_STEPS + 1):
             opt.step(m.parameters_for_optimizer(), lr=lr)
     if step % 100 == 0 or step <= 20 or (first_nonfinite and step <= first_nonfinite + 3):
         m_ok = np.all(np.isfinite(M))
-        print(f"step={step}: aux_loss={aux_val} M_absmax={np.max(np.abs(M)) if m_ok else 'NaN'} "
-              f"log_sigmas={m.log_sigmas.data} input_ln_absmax={np.max(np.abs(m.input_ln.data)):.4f}")
+        print(
+            f"step={step}: aux_loss={aux_val} M_absmax={np.max(np.abs(M)) if m_ok else 'NaN'} "
+            f"log_sigmas={m.log_sigmas.data} input_ln_absmax={np.max(np.abs(m.input_ln.data)):.4f}"
+        )
     if first_nonfinite is not None and step > first_nonfinite + 10:
         break
 

@@ -23,12 +23,12 @@ Run: python3 scripts/train_mqar_rmt_ablation.py <config_name> [train_steps] [see
   config_name: baseline_a | swap_optimizer | swap_clip | swap_attn_bias
              | swap_norm | swap_l1_sparsity | baseline_b
 """
+
 from __future__ import annotations
 
+import json
 import sys
 import time
-import json
-from typing import Optional
 
 import numpy as np
 import torch
@@ -58,10 +58,20 @@ WARMUP_STEPS = 100
 MAX_GRAD_NORM = 1.0
 EVAL_SEQUENCES = 60
 
-_BASE = dict(use_custom_optimizer=True, use_hard_clip=True, use_gaussian_bias=True,
-            use_rmsnorm=True, l1_sparsity_coef=0.05)
-_END = dict(use_custom_optimizer=False, use_hard_clip=False, use_gaussian_bias=False,
-           use_rmsnorm=False, l1_sparsity_coef=0.0)
+_BASE = {
+    "use_custom_optimizer": True,
+    "use_hard_clip": True,
+    "use_gaussian_bias": True,
+    "use_rmsnorm": True,
+    "l1_sparsity_coef": 0.05,
+}
+_END = {
+    "use_custom_optimizer": False,
+    "use_hard_clip": False,
+    "use_gaussian_bias": False,
+    "use_rmsnorm": False,
+    "l1_sparsity_coef": 0.0,
+}
 
 
 def _swap(**overrides):
@@ -120,8 +130,15 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
     return targets
 
 
-def train_and_eval(config_name: str, num_kv_pairs: int, seed: int, train_steps: int,
-                   log_every: int = 500, log_fn=None, peak_lr: Optional[float] = None) -> dict:
+def train_and_eval(
+    config_name: str,
+    num_kv_pairs: int,
+    seed: int,
+    train_steps: int,
+    log_every: int = 500,
+    log_fn=None,
+    peak_lr: float | None = None,
+) -> dict:
     cfg = CONFIGS[config_name]
     if peak_lr is None:
         peak_lr = _ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR
@@ -134,8 +151,8 @@ def train_and_eval(config_name: str, num_kv_pairs: int, seed: int, train_steps: 
     model_rng = np.random.default_rng(seed)
 
     model = ToyTileRecurrenceRMTAblation(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS,
-        rng=model_rng, **cfg)
+        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, num_tiles, NUM_MEMORY_SLOTS, rng=model_rng, **cfg
+    )
     adam_params = model.parameters_for_optimizer()
     opt = torch.optim.Adam(adam_params) if adam_params else None
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
@@ -167,14 +184,14 @@ def train_and_eval(config_name: str, num_kv_pairs: int, seed: int, train_steps: 
                 g["lr"] = lr
         tokens, mqar_pairs = generate_mqar_sequence(rng, VOCAB, seq_len, num_kv_pairs)
         targets = _build_targets(tokens, mqar_pairs, num_kv_pairs)
-        query_positions = set(pos for pos, _ in mqar_pairs)
+        query_positions = {pos for pos, _ in mqar_pairs}
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         for i in range(seq_len):
             window = _build_tile_window(embed_table, tokens, i, num_tiles)
             _mp, logits, aux = model.step(window, memory, lr)
             if i in targets:
                 target = torch.tensor([targets[i]], dtype=torch.long)
-                loss = torch.nn.functional.cross_entropy(logits[num_tiles - 1:num_tiles], target)
+                loss = torch.nn.functional.cross_entropy(logits[num_tiles - 1 : num_tiles], target)
                 if i in query_positions:
                     recent_query_loss.append(float(loss))
                 total_loss = loss if aux is None else loss + aux
@@ -211,8 +228,12 @@ def train_and_eval(config_name: str, num_kv_pairs: int, seed: int, train_steps: 
                     correct += int(pred == mqar_by_pos[i])
                     total += 1
 
-    return {"config": config_name, "acc": correct / total if total else 0.0,
-            "elapsed_s": time.time() - t0, "trajectory": trajectory}
+    return {
+        "config": config_name,
+        "acc": correct / total if total else 0.0,
+        "elapsed_s": time.time() - t0,
+        "trajectory": trajectory,
+    }
 
 
 def main():
@@ -221,14 +242,23 @@ def main():
     seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
     peak_lr_override = float(sys.argv[4]) if len(sys.argv) > 4 else None
 
-    resolved_lr = peak_lr_override if peak_lr_override is not None else (
-        _ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR)
-    print(f"# ToyTileRecurrenceRMTAblation config={config_name} train_steps={train_steps} "
-          f"seed={seed} peak_lr={resolved_lr} cfg={CONFIGS[config_name]}", flush=True)
+    resolved_lr = (
+        peak_lr_override
+        if peak_lr_override is not None
+        else (_ADAM_ONLY_PEAK_LR if config_name in NEEDS_ADAM_LR else PEAK_LR)
+    )
+    print(
+        f"# ToyTileRecurrenceRMTAblation config={config_name} train_steps={train_steps} "
+        f"seed={seed} peak_lr={resolved_lr} cfg={CONFIGS[config_name]}",
+        flush=True,
+    )
 
     def log_fn(step, total_steps, elapsed, mean_q_loss, quick_acc):
-        print(f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
-              f"quick_acc={quick_acc:.4f}  ({elapsed:.0f}s elapsed)", flush=True)
+        print(
+            f"  step={step:>6}/{total_steps}  mean_query_loss={mean_q_loss:.4f}  "
+            f"quick_acc={quick_acc:.4f}  ({elapsed:.0f}s elapsed)",
+            flush=True,
+        )
 
     r = train_and_eval(config_name, 1, seed, train_steps, log_fn=log_fn, peak_lr=peak_lr_override)
     print(f"\nFINAL config={config_name} acc={r['acc']:.4f} ({r['elapsed_s']:.0f}s)", flush=True)

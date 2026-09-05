@@ -19,28 +19,40 @@ assuming the whole architecture is broken.
 Usage: python3 train_tile_curriculum.py <arm> <use_energy 0|1> <use_attention 0|1> <total_steps> [checkpoint_every] [seed]
   arm: rank1 | rank2 | fp8
 """
+
 from __future__ import annotations
 
+import functools
 import sys
 import time
-import functools
 
 import numpy as np
 
 sys.path.insert(0, ".")
 
-from sili.sparse_rnn import (DISLDOLayer, DISLDOLayer8, DISLDOLayer32,
-                             DISLDOLayerResync, DISLDOLayerNoScale,
-                             DISLDOLayerDeterministic, DISLDOLayerResyncDeterministic,
-                             DISLDOLayerNoScaleDeterministic)
 from sili import _cpu
+from sili.sparse_rnn import (
+    DISLDOLayer,
+    DISLDOLayer8,
+    DISLDOLayer32,
+    DISLDOLayerDeterministic,
+    DISLDOLayerNoScale,
+    DISLDOLayerNoScaleDeterministic,
+    DISLDOLayerResync,
+    DISLDOLayerResyncDeterministic,
+)
+
+from model.toy_precision_models import (
+    PeriodicSeedRank1DISLDOLayer8,
+    QuantizedDISLDOLayer32,
+    SeededDISLDOLayer8AdaMax,
+    SeededDISLDOLayer8Resync,
+    SeededRank1DISLDOLayer8,
+    TrueMultiDigitDenseLayer,
+    TrueMultiDigitLayer,
+)
+from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, lr_schedule, predicted_token
 from model.toy_tile_precision_models import ToyTileRecurrenceRealFP4
-from model.toy_precision_models import (QuantizedDISLDOLayer32, SeededRank1DISLDOLayer8,
-                                        PeriodicSeedRank1DISLDOLayer8,
-                                        SeededDISLDOLayer8Resync, SeededDISLDOLayer8AdaMax,
-                                        TrueMultiDigitLayer, TrueMultiDigitDenseLayer)
-from model.toy_recall_models import (cross_entropy_sum, predicted_token, AdamOptimizer,
-                                     lr_schedule, clip_grad_norm_)
 
 
 def generate_copy_sequence(rng: np.random.RandomState, vocab: int, seq_len: int):
@@ -56,16 +68,17 @@ def generate_copy_sequence(rng: np.random.RandomState, vocab: int, seq_len: int)
     pairs = [(seq_len - 1, int(tokens[0]))]
     return tokens, pairs
 
+
 EMBED_WIDTH = 8
 COLUMN_NEURONS = 4
-MLP_HIDDEN_MULT = 2            # unused (MLP removed), kept for API compat
-NUM_TILES = 4                  # ~= num_cores per direct suggestion; ALSO the
-                               # curriculum's in-context ceiling (seq_len<=this)
-VOCAB = 10                     # small vocab too -- chance=0.1, not 0.025, so a
-                               # trivial task doesn't need thousands of steps
-                               # just to beat noise
-MAX_WEIGHTS_PER_LAYER = 128    # per_row=32 at state_width=32 -- generous at
-                               # this tiny scale, not the bottleneck being tested
+MLP_HIDDEN_MULT = 2  # unused (MLP removed), kept for API compat
+NUM_TILES = 4  # ~= num_cores per direct suggestion; ALSO the
+# curriculum's in-context ceiling (seq_len<=this)
+VOCAB = 10  # small vocab too -- chance=0.1, not 0.025, so a
+# trivial task doesn't need thousands of steps
+# just to beat noise
+MAX_WEIGHTS_PER_LAYER = 128  # per_row=32 at state_width=32 -- generous at
+# this tiny scale, not the bottleneck being tested
 NUM_CPUS = 1
 PEAK_LR = 0.002
 WARMUP_STEPS = 50
@@ -88,113 +101,133 @@ SEQ_LEN_START = 2
 SEQ_LEN_MAX = NUM_TILES
 STEPS_PER_STAGE_DEFAULT = 500
 
-ENERGY_KWARGS = dict(drive=0.00535, activation_cost=0.005, precision=0.001,
-                     density=0.005, p=0.995, reactivity=0.0001)
+ENERGY_KWARGS = {
+    "drive": 0.00535,
+    "activation_cost": 0.005,
+    "precision": 0.001,
+    "density": 0.005,
+    "p": 0.995,
+    "reactivity": 0.0001,
+}
 
 ARMS = {
     "rank1": DISLDOLayer,
-    "rank2": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2,
-                               quantize_importance=True),
-    "fp8":   DISLDOLayer8,
-    "fp32":  DISLDOLayer32,  # precision ceiling reference -- isolates FP4 quantization
-                            # coarseness from architecture/training-dynamics limits
-    "rank1_8bit": functools.partial(QuantizedDISLDOLayer32, bits=8, scheme="rank1",
-                                    quantize_importance=True),  # the exact scheme that
-                            # reached 1.0 at every out-of-context distance on the
-                            # earlier tanh-cell task (JOURNAL.md) -- direct retest here
+    "rank2": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=2, quantize_importance=True),
+    "fp8": DISLDOLayer8,
+    "fp32": DISLDOLayer32,  # precision ceiling reference -- isolates FP4 quantization
+    # coarseness from architecture/training-dynamics limits
+    "rank1_8bit": functools.partial(
+        QuantizedDISLDOLayer32, bits=8, scheme="rank1", quantize_importance=True
+    ),  # the exact scheme that
+    # reached 1.0 at every out-of-context distance on the
+    # earlier tanh-cell task (JOURNAL.md) -- direct retest here
     # Alternative 4-bit scale representations -- same bit budget as "rank2"
     # (bits=4, scheme=rankn, rank=2 above), different envelope shape, to see
     # which specific scale scheme (not bit-depth) recovers out-of-context
     # accuracy at 4-bit.
-    "row_4bit":   functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="row",
-                                    quantize_importance=True),   # plain per-row max-abs
-    "rank1_4bit": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rank1",
-                                    quantize_importance=True),   # row x col envelope, rank1
-    "rank4_4bit": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=4,
-                                    quantize_importance=True),   # higher-rank envelope
-    "multi_fp4": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="residual",
-                                   n_stages=2, quantize_importance=True),  # true residual/
-                            # cascaded quantization: 2 stages of real 4-bit each, summed
-                            # -- 8 bits/weight total, a fair fight against rank1_8bit's
-                            # single 8-bit code, not the earlier ruled-out envelope-of
-                            # -envelope idea
+    "row_4bit": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="row", quantize_importance=True
+    ),  # plain per-row max-abs
+    "rank1_4bit": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="rank1", quantize_importance=True
+    ),  # row x col envelope, rank1
+    "rank4_4bit": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="rankn", rank=4, quantize_importance=True
+    ),  # higher-rank envelope
+    "multi_fp4": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="residual", n_stages=2, quantize_importance=True
+    ),  # true residual/
+    # cascaded quantization: 2 stages of real 4-bit each, summed
+    # -- 8 bits/weight total, a fair fight against rank1_8bit's
+    # single 8-bit code, not the earlier ruled-out envelope-of
+    # -envelope idea
     "fp8_seeded": SeededRank1DISLDOLayer8,  # real DISLDOLayer8 (true C++ E4M3 + rank-1
-                            # value_scale/output_scale), scale seeded from a real
-                            # closed-form fit at init instead of left at 1.0 -- tests
-                            # whether real fp8's out-of-context collapse is a
-                            # cold-start/undertrained-scale problem, not the
-                            # representation itself
+    # value_scale/output_scale), scale seeded from a real
+    # closed-form fit at init instead of left at 1.0 -- tests
+    # whether real fp8's out-of-context collapse is a
+    # cold-start/undertrained-scale problem, not the
+    # representation itself
     "fp8_reseeded": functools.partial(PeriodicSeedRank1DISLDOLayer8, reseed_every=250),
-                            # real DISLDOLayer8, scale re-seeded from a fresh closed
-                            # -form fit every 250 training backward() calls -- tests
-                            # whether REPEATED correction (no change to the real
-                            # weight-update math) substitutes for the simulation's
-                            # every-step refit
+    # real DISLDOLayer8, scale re-seeded from a fresh closed
+    # -form fit every 250 training backward() calls -- tests
+    # whether REPEATED correction (no change to the real
+    # weight-update math) substitutes for the simulation's
+    # every-step refit
     "fp8_resync": SeededDISLDOLayer8Resync,  # REAL C++ fix (not a Python approximation):
-                            # sili__new's disldo_backward now defers each touched
-                            # entry's store until value_scale/output_scale are BOTH
-                            # finalized for the call, instead of storing under the
-                            # stale pre-update scale. Seeded like fp8_seeded for a
-                            # fair comparison (isolates the deferred-write fix, not
-                            # "was output_scale active at all").
+    # sili__new's disldo_backward now defers each touched
+    # entry's store until value_scale/output_scale are BOTH
+    # finalized for the call, instead of storing under the
+    # stale pre-update scale. Seeded like fp8_seeded for a
+    # fair comparison (isolates the deferred-write fix, not
+    # "was output_scale active at all").
     "fp8_adamax": SeededDISLDOLayer8AdaMax,  # same deferred-write fix, but
-                            # value_scale/output_scale use an AdaMax-style decayed
-                            # running-max update instead of RMSprop -- see
-                            # AdaMaxScalePolicy's docstring in sili__new.
-    "fixed_digit_2": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual",
-                                       n_stages=2, base=4.0, quantize_importance=True),
-                            # ZERO trained/fitted scale anywhere (no row/col vector, no
-                            # per-call data-dependent recompute) -- 2 fixed FP4 "digit"
-                            # stages, base=4.0 derived directly from real FP4 (E2M1)'s own
-                            # 1-mantissa-bit relative precision, e_shared derived ONCE from
-                            # init weights and frozen for the whole run. 8 bits/weight
-                            # total, same budget as rank1_8bit/multi_fp4 -- direct test of
-                            # whether the whole trained-scale mechanism (and its staleness
-                            # bug) can be skipped entirely, per direct design discussion.
-    "fixed_digit_3": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual",
-                                       n_stages=3, base=4.0, quantize_importance=True),
-                            # same, 3 stages / 12 bits -- checks whether more digits closes
-                            # any remaining gap to rank1_8bit/multi_fp4's near-1.0 result.
-    "fixed_digit_4": functools.partial(QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual",
-                                       n_stages=4, base=4.0, quantize_importance=True),
-                            # 4 stages / 16 bits -- finer quantization removes more of the
-                            # implicit noise-filtering coarse rounding was providing (found
-                            # directly: fixed_digit_3 needed half the PEAK_LR to stabilize),
-                            # so this arm likely also needs a reduced --peak_lr to be fair.
-    "true_multi_digit_lr0": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                              n_stages=3, base=4.0, lr_power=0.0),
-                            # Genuinely SEPARATE per-digit training, REAL FP4 (DISLDOLayer)
-                            # per digit -- no hidden fp32 shadow, no extra Python-side
-                            # quantization step (real disldo_backward already stores FP4
-                            # natively). lr_power=0: chain-rule-only scaling (the ordinary
-                            # `out_i*factor_i` gradient reduction, nothing extra on top) --
-                            # this is the natural baseline, NOT an unscaled naive one, see
-                            # TrueMultiDigitLayer's own corrected docstring.
-    "true_multi_digit_lr1": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                              n_stages=3, base=4.0, lr_power=1.0),
-                            # lr_power=1: digit i's rate ALSO divided by base**i on top of
-                            # the chain rule's own reduction -- extra damping beyond natural.
-    "true_multi_digit_lr2": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-                                              n_stages=3, base=4.0, lr_power=2.0),
-                            # lr_power=2: divided by base**(2i) on top -- more extra damping.
-    "true_multi_digit_fp32_ref": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayer32,
-                                                   n_stages=3, base=4.0, lr_power=0.0,
-                                                   simulate_quantize=True, bits_per_stage=4),
-                            # REFERENCE/ceiling control (per direct request: disldo vs a
-                            # non-quantized-storage comparison catches whether real FP4
-                            # storage itself, not the residual-digit architecture, explains
-                            # any gap) -- same digit-residual structure and training
-                            # dynamics, fp32-EXACT storage with a fake-quantize simulation
-                            # step matching fixed_digit_residual_quantize's own grid.
-    "true_multi_digit_dense": functools.partial(TrueMultiDigitDenseLayer,
-                                                n_stages=3, base=4.0, lr_power=0.0),
-                            # DISLDO vs ordinary-Adam-trained control (per direct request):
-                            # same digit-residual architecture, dense fp32 weights, trained
-                            # via a standard external AdamOptimizer instead of DISLDO's own
-                            # inline importance-based update -- catches whether something
-                            # about DISLDO's OWN mechanism (not the architecture) explains
-                            # any gap vs a well-understood, trusted baseline optimizer.
-
+    # value_scale/output_scale use an AdaMax-style decayed
+    # running-max update instead of RMSprop -- see
+    # AdaMaxScalePolicy's docstring in sili__new.
+    "fixed_digit_2": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual", n_stages=2, base=4.0, quantize_importance=True
+    ),
+    # ZERO trained/fitted scale anywhere (no row/col vector, no
+    # per-call data-dependent recompute) -- 2 fixed FP4 "digit"
+    # stages, base=4.0 derived directly from real FP4 (E2M1)'s own
+    # 1-mantissa-bit relative precision, e_shared derived ONCE from
+    # init weights and frozen for the whole run. 8 bits/weight
+    # total, same budget as rank1_8bit/multi_fp4 -- direct test of
+    # whether the whole trained-scale mechanism (and its staleness
+    # bug) can be skipped entirely, per direct design discussion.
+    "fixed_digit_3": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual", n_stages=3, base=4.0, quantize_importance=True
+    ),
+    # same, 3 stages / 12 bits -- checks whether more digits closes
+    # any remaining gap to rank1_8bit/multi_fp4's near-1.0 result.
+    "fixed_digit_4": functools.partial(
+        QuantizedDISLDOLayer32, bits=4, scheme="fixed_digit_residual", n_stages=4, base=4.0, quantize_importance=True
+    ),
+    # 4 stages / 16 bits -- finer quantization removes more of the
+    # implicit noise-filtering coarse rounding was providing (found
+    # directly: fixed_digit_3 needed half the PEAK_LR to stabilize),
+    # so this arm likely also needs a reduced --peak_lr to be fair.
+    "true_multi_digit_lr0": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=4.0, lr_power=0.0
+    ),
+    # Genuinely SEPARATE per-digit training, REAL FP4 (DISLDOLayer)
+    # per digit -- no hidden fp32 shadow, no extra Python-side
+    # quantization step (real disldo_backward already stores FP4
+    # natively). lr_power=0: chain-rule-only scaling (the ordinary
+    # `out_i*factor_i` gradient reduction, nothing extra on top) --
+    # this is the natural baseline, NOT an unscaled naive one, see
+    # TrueMultiDigitLayer's own corrected docstring.
+    "true_multi_digit_lr1": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=4.0, lr_power=1.0
+    ),
+    # lr_power=1: digit i's rate ALSO divided by base**i on top of
+    # the chain rule's own reduction -- extra damping beyond natural.
+    "true_multi_digit_lr2": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=4.0, lr_power=2.0
+    ),
+    # lr_power=2: divided by base**(2i) on top -- more extra damping.
+    "true_multi_digit_fp32_ref": functools.partial(
+        TrueMultiDigitLayer,
+        digit_cls=DISLDOLayer32,
+        n_stages=3,
+        base=4.0,
+        lr_power=0.0,
+        simulate_quantize=True,
+        bits_per_stage=4,
+    ),
+    # REFERENCE/ceiling control (per direct request: disldo vs a
+    # non-quantized-storage comparison catches whether real FP4
+    # storage itself, not the residual-digit architecture, explains
+    # any gap) -- same digit-residual structure and training
+    # dynamics, fp32-EXACT storage with a fake-quantize simulation
+    # step matching fixed_digit_residual_quantize's own grid.
+    "true_multi_digit_dense": functools.partial(TrueMultiDigitDenseLayer, n_stages=3, base=4.0, lr_power=0.0),
+    # DISLDO vs ordinary-Adam-trained control (per direct request):
+    # same digit-residual architecture, dense fp32 weights, trained
+    # via a standard external AdamOptimizer instead of DISLDO's own
+    # inline importance-based update -- catches whether something
+    # about DISLDO's OWN mechanism (not the architecture) explains
+    # any gap vs a well-understood, trusted baseline optimizer.
     # Root-cause follow-up to true_multi_digit_lr0's chance-level collapse:
     # plain DISLDOLayer (FP4) was found to still call disldo_backward with
     # the DEFAULT ScalePolicy/DeferredScaleWrite=false args -- the exact
@@ -202,38 +235,37 @@ ARMS = {
     # These two arms are the single-digit (n_stages=1, no residual
     # composition at all) direct test: is plain real FP4's out-of-context
     # collapse (row_4bit, etc.) explained by this same bug?
-    "row_4bit_resync": DISLDOLayerResync,   # DeferredScaleWrite fix only
-    "row_4bit_noscale": DISLDOLayerNoScale, # value_scale/output_scale forced
-                            # to 1.0 forever -- direct real-hardware test of
-                            # "zero trained scale" (per direct request:
-                            # "Can we just add an option to remove the
-                            # scaling too?"), not just fixing staleness.
-
-    "true_multi_digit_resync": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerResync,
-                                                 n_stages=3, base=4.0, lr_power=0.0),
-                            # Same architecture as true_multi_digit_lr0, but each digit is a
-                            # real FP4 DISLDOLayerResync instead of plain DISLDOLayer.
-    "true_multi_digit_noscale": functools.partial(TrueMultiDigitLayer, digit_cls=DISLDOLayerNoScale,
-                                                  n_stages=3, base=4.0, lr_power=0.0),
-                            # Same architecture, each digit's OWN internal value_scale/
-                            # output_scale forced off -- our external per-digit factor_i
-                            # composition is then the ONLY scale in play, matching the
-                            # zero-trained-scale design intent exactly.
-
+    "row_4bit_resync": DISLDOLayerResync,  # DeferredScaleWrite fix only
+    "row_4bit_noscale": DISLDOLayerNoScale,  # value_scale/output_scale forced
+    # to 1.0 forever -- direct real-hardware test of
+    # "zero trained scale" (per direct request:
+    # "Can we just add an option to remove the
+    # scaling too?"), not just fixing staleness.
+    "true_multi_digit_resync": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerResync, n_stages=3, base=4.0, lr_power=0.0
+    ),
+    # Same architecture as true_multi_digit_lr0, but each digit is a
+    # real FP4 DISLDOLayerResync instead of plain DISLDOLayer.
+    "true_multi_digit_noscale": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerNoScale, n_stages=3, base=4.0, lr_power=0.0
+    ),
+    # Same architecture, each digit's OWN internal value_scale/
+    # output_scale forced off -- our external per-digit factor_i
+    # composition is then the ONLY scale in play, matching the
+    # zero-trained-scale design intent exactly.
     # row_4bit_resync/noscale both STILL collapsed to chance -- value_scale
     # staleness/presence isn't the explanation after all. Remaining candidate:
     # real FP4 uses STOCHASTIC rounding on every store (fp4_quantize_stochastic,
     # real per-step noise); the things that DID succeed (fixed_digit_2,
     # true_multi_digit_fp32_ref's simulate_quantize) both use DETERMINISTIC
     # round-to-nearest. Direct single-variable isolation, single digit first:
-    "row_4bit_deterministic": DISLDOLayerDeterministic,          # same RMSprop
-                            # scale as plain DISLDOLayer, rounding only changed.
+    "row_4bit_deterministic": DISLDOLayerDeterministic,  # same RMSprop
+    # scale as plain DISLDOLayer, rounding only changed.
     "row_4bit_resync_deterministic": DISLDOLayerResyncDeterministic,
     "row_4bit_noscale_deterministic": DISLDOLayerNoScaleDeterministic,
-                            # closest real-hardware match to fixed_digit_residual_
-                            # quantize's own design: zero trained scale AND
-                            # deterministic rounding together.
-
+    # closest real-hardware match to fixed_digit_residual_
+    # quantize's own design: zero trained scale AND
+    # deterministic rounding together.
     # base=12.0: exact digit-range tiling (E2M1 math, see
     # fixed_digit_residual_quantize's docstring), the project's working
     # default. IMPORTANT: the single-seed sweep that first picked this
@@ -249,9 +281,9 @@ ARMS = {
     # (see tests/test_residual_base_sweep.py) before this default is
     # fully trusted. Kept as the default in the meantime since the
     # theoretical argument (exact tiling) is independent of that bug.
-    "true_multi_digit_deterministic": functools.partial(TrueMultiDigitLayer,
-                                                        digit_cls=DISLDOLayerDeterministic,
-                                                        n_stages=3, base=12.0, lr_power=0.0),
+    "true_multi_digit_deterministic": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=12.0, lr_power=0.0
+    ),
     # STOCHASTIC rounding, otherwise identical config (sparse, base=12,
     # n_stages=3) to true_multi_digit_deterministic above -- per direct
     # instruction (see conversation), stochastic rounding is now the
@@ -267,9 +299,9 @@ ARMS = {
     # name, matching this file's own established _base4/_base6/_dense
     # convention (direct, paired comparison points, not silent
     # replacement) -- deterministic remains available for comparison.
-    "true_multi_digit_stochastic": functools.partial(TrueMultiDigitLayer,
-                                                      digit_cls=DISLDOLayer,
-                                                      n_stages=3, base=12.0, lr_power=0.0),
+    "true_multi_digit_stochastic": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=12.0, lr_power=0.0
+    ),
     # "fp4+fp4 dual" -- exactly TWO real stochastic-FP4 digits (n_stages=2)
     # instead of three, per direct instruction to replace the fixed-base
     # 3-digit scheme with this as the new precision option used going
@@ -281,28 +313,27 @@ ARMS = {
     # Kept as its own separate arm (not a modification of
     # true_multi_digit_stochastic), matching this file's own established
     # non-destructive-comparison convention.
-    "true_multi_digit_dual": functools.partial(TrueMultiDigitLayer,
-                                                digit_cls=DISLDOLayer,
-                                                n_stages=2, base=12.0, lr_power=0.0),
+    "true_multi_digit_dual": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=2, base=12.0, lr_power=0.0
+    ),
     # base=4.0 was the ORIGINAL default, derived from real FP4 (E2M1)'s
     # own worst-case relative rounding error (~1/4) -- kept as an explicit
     # comparison point now that base=12 is the default above. Same
     # digit_cls/n_stages/lr_power as true_multi_digit_deterministic --
     # base is the only varied axis.
     "true_multi_digit_deterministic_base4": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=4.0, lr_power=0.0),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=4.0, lr_power=0.0
+    ),
     # base=6.0: halfway between base=4 (overlapping digit ranges) and
     # base=12 (exact tiling) -- added per direct request to fill in the
     # sparse 4/12/24 sweep with a point between the two closest-together
     # candidates.
     "true_multi_digit_deterministic_base6": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=6.0, lr_power=0.0),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=6.0, lr_power=0.0
+    ),
     "true_multi_digit_deterministic_base24": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=24.0, lr_power=0.0),
-
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=24.0, lr_power=0.0
+    ),
     # lr_power retest under deterministic rounding (JOURNAL.md 2026-08-10
     # "Test 2"): the stochastic-rounding-era true_multi_digit_lr0/lr1/lr2
     # sweep found no real difference between lr_power values, predicted
@@ -312,12 +343,11 @@ ARMS = {
     # the confirmed default) to confirm that prediction still holds now
     # that stochastic noise isn't swamping everything else.
     "true_multi_digit_deterministic_lr1": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=12.0, lr_power=1.0),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=12.0, lr_power=1.0
+    ),
     "true_multi_digit_deterministic_lr2": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=12.0, lr_power=2.0),
-
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=12.0, lr_power=2.0
+    ),
     # _dense variants: fully dense connectivity (every synapse present,
     # loaded straight into block4 via sili__new's load_dense_codes) instead
     # of the random SPARSE "echo network" preseed every arm above uses --
@@ -328,8 +358,8 @@ ARMS = {
     # non-dense counterparts -- dense=True is the only varied axis, so this
     # is a direct paired comparison, not a new axis tangled with others.
     "true_multi_digit_deterministic_dense": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=12.0, lr_power=0.0, dense=True),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=12.0, lr_power=0.0, dense=True
+    ),
     # STOCHASTIC + dense, combined -- the two winning axes found separately
     # this session (stochastic rounding beats deterministic for genuine
     # superposition/rank-floor properties; dense connectivity beats sparse
@@ -340,38 +370,40 @@ ARMS = {
     # what makes dense connectivity stable at all (JOURNAL.md 2026-08-13),
     # replacing spectral_norm_target, which is unavailable in production.
     "true_multi_digit_stochastic_dense": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-        n_stages=3, base=12.0, lr_power=0.0, dense=True),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=3, base=12.0, lr_power=0.0, dense=True
+    ),
     # DENSE counterpart to true_multi_digit_dual above -- same n_stages=2
     # "fp4+fp4" pairing, matching true_multi_digit_stochastic_dense's own
     # dense-connectivity precedent (paired with l1_sparsity_coef at the
     # training-script level, same as that arm).
     "true_multi_digit_dual_dense": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayer,
-        n_stages=2, base=12.0, lr_power=0.0, dense=True),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayer, n_stages=2, base=12.0, lr_power=0.0, dense=True
+    ),
     "true_multi_digit_deterministic_base4_dense": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=4.0, lr_power=0.0, dense=True),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=4.0, lr_power=0.0, dense=True
+    ),
     "true_multi_digit_deterministic_base6_dense": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=6.0, lr_power=0.0, dense=True),
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=6.0, lr_power=0.0, dense=True
+    ),
     "true_multi_digit_deterministic_base24_dense": functools.partial(
-        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic,
-        n_stages=3, base=24.0, lr_power=0.0, dense=True),
-
-    "true_multi_digit_noscale_deterministic": functools.partial(TrueMultiDigitLayer,
-                                                                digit_cls=DISLDOLayerNoScaleDeterministic,
-                                                                n_stages=3, base=12.0, lr_power=0.0),
-
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerDeterministic, n_stages=3, base=24.0, lr_power=0.0, dense=True
+    ),
+    "true_multi_digit_noscale_deterministic": functools.partial(
+        TrueMultiDigitLayer, digit_cls=DISLDOLayerNoScaleDeterministic, n_stages=3, base=12.0, lr_power=0.0
+    ),
     # Direct hypothesis check: each digit's independent preseed/synaptogenesis
     # means digits' connectivity is essentially disjoint (verified: 0/20, 0/20,
     # 1/20 overlap on a fresh preseed) -- the residual-correction mechanism can
     # only fire where digits' connectivity actually coincides. share_connectivity
     # forces every digit onto digit 0's exact (ptrs, indices) at construction.
-    "true_multi_digit_shared_conn": functools.partial(TrueMultiDigitLayer,
-                                                       digit_cls=DISLDOLayerDeterministic,
-                                                       n_stages=3, base=4.0, lr_power=0.0,
-                                                       share_connectivity=True),
+    "true_multi_digit_shared_conn": functools.partial(
+        TrueMultiDigitLayer,
+        digit_cls=DISLDOLayerDeterministic,
+        n_stages=3,
+        base=4.0,
+        lr_power=0.0,
+        share_connectivity=True,
+    ),
 }
 
 
@@ -405,8 +437,9 @@ def _maybe_synaptogenesis(model, k: int = 4, importance_cutoff: float = 0.01):
             sub.synaptogenesis(k, importance_cutoff)
 
 
-def _build_tile_window(embed_table: np.ndarray, tokens: np.ndarray, i: int,
-                       num_tiles: int, column_neurons: int = None) -> np.ndarray:
+def _build_tile_window(
+    embed_table: np.ndarray, tokens: np.ndarray, i: int, num_tiles: int, column_neurons: int | None = None
+) -> np.ndarray:
     """Returns [num_tiles, embed_width] -- a real embed_width vector per
     tile position (zeros for "nothing here yet", before sequence start),
     NOT tiled/repeated into state_width. The model's own input_proj
@@ -453,30 +486,57 @@ def evaluate(model, rng, embed_table: np.ndarray, seq_len: int) -> float:
 # for reporting an approximate memory footprint (index/overhead bits are the
 # same across arms so they wash out of a *relative* comparison; this is an
 # approximation, not a byte-exact accounting).
-ARM_VALUE_BITS = {"rank1": 4, "rank2": 4, "fp8": 8, "fp32": 32, "rank1_8bit": 8,
-                  "row_4bit": 4, "rank1_4bit": 4, "rank4_4bit": 4, "multi_fp4": 8,
-                  "fp8_seeded": 8, "fp8_reseeded": 8, "fp8_resync": 8, "fp8_adamax": 8,
-                  "fixed_digit_2": 8, "fixed_digit_3": 12, "fixed_digit_4": 16,
-                  "true_multi_digit_lr0": 12, "true_multi_digit_lr1": 12, "true_multi_digit_lr2": 12,
-                  "true_multi_digit_fp32_ref": 32, "true_multi_digit_dense": 32,
-                  "row_4bit_resync": 4, "row_4bit_noscale": 4,
-                  "true_multi_digit_resync": 12, "true_multi_digit_noscale": 12,
-                  "row_4bit_deterministic": 4, "row_4bit_resync_deterministic": 4,
-                  "row_4bit_noscale_deterministic": 4,
-                  "true_multi_digit_deterministic": 12, "true_multi_digit_stochastic": 12,
-                  "true_multi_digit_stochastic_dense": 12,
-                  "true_multi_digit_dual": 8, "true_multi_digit_dual_dense": 8,
-                  "true_multi_digit_noscale_deterministic": 12,
-                  "true_multi_digit_deterministic_base4": 12, "true_multi_digit_deterministic_base6": 12,
-                  "true_multi_digit_deterministic_base24": 12,
-                  "true_multi_digit_deterministic_lr1": 12, "true_multi_digit_deterministic_lr2": 12,
-                  "true_multi_digit_deterministic_dense": 12, "true_multi_digit_deterministic_base4_dense": 12,
-                  "true_multi_digit_deterministic_base6_dense": 12, "true_multi_digit_deterministic_base24_dense": 12,
-                  "true_multi_digit_shared_conn": 12}
+ARM_VALUE_BITS = {
+    "rank1": 4,
+    "rank2": 4,
+    "fp8": 8,
+    "fp32": 32,
+    "rank1_8bit": 8,
+    "row_4bit": 4,
+    "rank1_4bit": 4,
+    "rank4_4bit": 4,
+    "multi_fp4": 8,
+    "fp8_seeded": 8,
+    "fp8_reseeded": 8,
+    "fp8_resync": 8,
+    "fp8_adamax": 8,
+    "fixed_digit_2": 8,
+    "fixed_digit_3": 12,
+    "fixed_digit_4": 16,
+    "true_multi_digit_lr0": 12,
+    "true_multi_digit_lr1": 12,
+    "true_multi_digit_lr2": 12,
+    "true_multi_digit_fp32_ref": 32,
+    "true_multi_digit_dense": 32,
+    "row_4bit_resync": 4,
+    "row_4bit_noscale": 4,
+    "true_multi_digit_resync": 12,
+    "true_multi_digit_noscale": 12,
+    "row_4bit_deterministic": 4,
+    "row_4bit_resync_deterministic": 4,
+    "row_4bit_noscale_deterministic": 4,
+    "true_multi_digit_deterministic": 12,
+    "true_multi_digit_stochastic": 12,
+    "true_multi_digit_stochastic_dense": 12,
+    "true_multi_digit_dual": 8,
+    "true_multi_digit_dual_dense": 8,
+    "true_multi_digit_noscale_deterministic": 12,
+    "true_multi_digit_deterministic_base4": 12,
+    "true_multi_digit_deterministic_base6": 12,
+    "true_multi_digit_deterministic_base24": 12,
+    "true_multi_digit_deterministic_lr1": 12,
+    "true_multi_digit_deterministic_lr2": 12,
+    "true_multi_digit_deterministic_dense": 12,
+    "true_multi_digit_deterministic_base4_dense": 12,
+    "true_multi_digit_deterministic_base6_dense": 12,
+    "true_multi_digit_deterministic_base24_dense": 12,
+    "true_multi_digit_shared_conn": 12,
+}
 
 
-def estimate_value_bits(arm: str, state_width: int, embed_width: int, vocab: int,
-                        max_weights: int, use_attention: bool) -> int:
+def estimate_value_bits(
+    arm: str, state_width: int, embed_width: int, vocab: int, max_weights: int, use_attention: bool
+) -> int:
     bits = ARM_VALUE_BITS[arm]
     o_proj = min(max_weights, state_width * state_width)
     lm_head = min(max_weights, embed_width * vocab)
@@ -586,26 +646,39 @@ def main():
     # unseeded regardless of `seed`).
     model_rng = np.random.default_rng(seed)
     model = ToyTileRecurrenceRealFP4(
-        VOCAB, EMBED_WIDTH, COLUMN_NEURONS, mlp_hidden, NUM_TILES, MAX_WEIGHTS_PER_LAYER,
-        num_cpus=NUM_CPUS, disldo_cls=ARMS[arm],
-        use_energy=use_energy, energy_kwargs=ENERGY_KWARGS if use_energy else None,
-        use_attention=use_attention, o_proj_depth=o_proj_depth, rng=model_rng,
-        clip_range=clip_range, magnitude_penalty_coef=magnitude_penalty_coef,
-        spectral_norm_target=spectral_norm_target, l1_sparsity_coef=l1_sparsity_coef)
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        mlp_hidden,
+        NUM_TILES,
+        MAX_WEIGHTS_PER_LAYER,
+        num_cpus=NUM_CPUS,
+        disldo_cls=ARMS[arm],
+        use_energy=use_energy,
+        energy_kwargs=ENERGY_KWARGS if use_energy else None,
+        use_attention=use_attention,
+        o_proj_depth=o_proj_depth,
+        rng=model_rng,
+        clip_range=clip_range,
+        magnitude_penalty_coef=magnitude_penalty_coef,
+        spectral_norm_target=spectral_norm_target,
+        l1_sparsity_coef=l1_sparsity_coef,
+    )
     opt = AdamOptimizer()
     embed_table = rng.randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.3
 
-    value_bits = estimate_value_bits(arm, state_width, EMBED_WIDTH, VOCAB,
-                                     MAX_WEIGHTS_PER_LAYER, use_attention)
-    print(f"# arm={arm} use_energy={use_energy} use_attention={use_attention} "
-          f"train_steps={train_steps} checkpoint_every={checkpoint_every} seed={seed} "
-          f"vocab={VOCAB} num_tiles={NUM_TILES} embed_width={EMBED_WIDTH} "
-          f"column_neurons={COLUMN_NEURONS} state_width={state_width} "
-          f"max_weights={MAX_WEIGHTS_PER_LAYER} o_proj_depth={o_proj_depth} "
-          f"peak_lr={PEAK_LR} est_value_bits={value_bits} "
-          f"(~{value_bits/8:.0f} bytes) use_synaptogenesis={use_synaptogenesis} "
-          f"seq_len={SEQ_LEN_START}->{SEQ_LEN_MAX} (+1/{steps_per_stage} steps)",
-          flush=True)
+    value_bits = estimate_value_bits(arm, state_width, EMBED_WIDTH, VOCAB, MAX_WEIGHTS_PER_LAYER, use_attention)
+    print(
+        f"# arm={arm} use_energy={use_energy} use_attention={use_attention} "
+        f"train_steps={train_steps} checkpoint_every={checkpoint_every} seed={seed} "
+        f"vocab={VOCAB} num_tiles={NUM_TILES} embed_width={EMBED_WIDTH} "
+        f"column_neurons={COLUMN_NEURONS} state_width={state_width} "
+        f"max_weights={MAX_WEIGHTS_PER_LAYER} o_proj_depth={o_proj_depth} "
+        f"peak_lr={PEAK_LR} est_value_bits={value_bits} "
+        f"(~{value_bits / 8:.0f} bytes) use_synaptogenesis={use_synaptogenesis} "
+        f"seq_len={SEQ_LEN_START}->{SEQ_LEN_MAX} (+1/{steps_per_stage} steps)",
+        flush=True,
+    )
 
     t0 = time.time()
     for step in range(1, train_steps + 1):
@@ -631,11 +704,16 @@ def main():
         if step % checkpoint_every == 0:
             acc = evaluate(model, rng, embed_table, seq_len)
             elapsed = time.time() - t0
-            print(f"step={step:>7}  seq_len={seq_len}  acc={acc:.4f}  "
-                  f"({elapsed:.0f}s elapsed, {elapsed/step:.4f}s/step)", flush=True)
+            print(
+                f"step={step:>7}  seq_len={seq_len}  acc={acc:.4f}  "
+                f"({elapsed:.0f}s elapsed, {elapsed / step:.4f}s/step)",
+                flush=True,
+            )
 
-    print(f"# DONE arm={arm} use_energy={use_energy} use_attention={use_attention} "
-          f"({time.time()-t0:.0f}s total)", flush=True)
+    print(
+        f"# DONE arm={arm} use_energy={use_energy} use_attention={use_attention} ({time.time() - t0:.0f}s total)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

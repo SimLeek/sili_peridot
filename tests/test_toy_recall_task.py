@@ -1,12 +1,12 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
 
-from model.toy_recall_task import generate_sequence, induction_correct, generate_mqar_sequence
+from model.toy_recall_task import generate_mqar_sequence, generate_sequence, induction_correct
 
 
 class TestGenerateSequence:
@@ -58,7 +58,7 @@ class TestGenerateSequence:
         lag = 6
         seq_len = lag + 3
         for _ in range(50):
-            tokens, pos = generate_sequence(rng, vocab_size=10, seq_len=seq_len, lag=lag)
+            _tokens, pos = generate_sequence(rng, vocab_size=10, seq_len=seq_len, lag=lag)
             assert pos + 1 < seq_len
             assert pos - lag >= 0
 
@@ -80,7 +80,7 @@ class TestGenerateMqarSequence:
         rng = np.random.RandomState(1)
         num_kv_pairs = 4
         tokens, pairs = generate_mqar_sequence(rng, vocab_size=40, seq_len=32, num_kv_pairs=num_kv_pairs)
-        context = tokens[:num_kv_pairs * 2]
+        context = tokens[: num_kv_pairs * 2]
         kv_map = {int(context[i]): int(context[i + 1]) for i in range(0, len(context), 2)}
         for pos, target in pairs:
             query_key = int(tokens[pos])
@@ -102,7 +102,7 @@ class TestGenerateMqarSequence:
 
     def test_no_duplicate_query_positions(self):
         rng = np.random.RandomState(3)
-        tokens, pairs = generate_mqar_sequence(rng, vocab_size=64, seq_len=32, num_kv_pairs=6)
+        _tokens, pairs = generate_mqar_sequence(rng, vocab_size=64, seq_len=32, num_kv_pairs=6)
         positions = [p for p, _t in pairs]
         assert len(positions) == len(set(positions))
 

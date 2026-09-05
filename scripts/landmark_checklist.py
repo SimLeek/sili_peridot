@@ -22,9 +22,11 @@ Reports TWO metrics per seed:
 
 Usage: PYTHONPATH=<sili_peridot repo root> python scripts/landmark_checklist.py [--seeds N] [--steps N]
 """
+
 import argparse
 import statistics
-from scripts.l1_sparsity_probe import OriginalArchModel, run, evaluate
+
+from scripts.l1_sparsity_probe import OriginalArchModel, evaluate, run
 
 SEEDS = [1000, 1001, 1002, 1003, 1004]
 N_STEPS = 15000
@@ -34,17 +36,17 @@ COEF = 0.05
 # old_style reference (2026-08-12, post -ffast-math NaN fix). No eval_acc
 # reference exists yet -- this run is establishing the first one.
 REFERENCE = {
-    "baseline":          {"mean": 0.8667, "note": "avg of 3 runs: 0.8000, 0.8667, 0.9333"},
-    "baseline_energy":   {"mean": 0.1333, "note": "skip_rate 0.000% post -ffast-math fix (was 46.8%, see JOURNAL.md)"},
+    "baseline": {"mean": 0.8667, "note": "avg of 3 runs: 0.8000, 0.8667, 0.9333"},
+    "baseline_energy": {"mean": 0.1333, "note": "skip_rate 0.000% post -ffast-math fix (was 46.8%, see JOURNAL.md)"},
     "baseline_zeroinit": {"mean": 0.0000, "note": "total failure, all seeds"},
-    "zeroinit_energy":   {"mean": 0.0000, "note": "total failure, all seeds"},
+    "zeroinit_energy": {"mean": 0.0000, "note": "total failure, all seeds"},
 }
 
 CONFIGS = [
-    ("baseline",          dict(use_energy=False, all_zero_init=False)),
-    ("baseline_energy",   dict(use_energy=True,  all_zero_init=False)),
-    ("baseline_zeroinit", dict(use_energy=False, all_zero_init=True)),
-    ("zeroinit_energy",   dict(use_energy=True,  all_zero_init=True)),
+    ("baseline", {"use_energy": False, "all_zero_init": False}),
+    ("baseline_energy", {"use_energy": True, "all_zero_init": False}),
+    ("baseline_zeroinit", {"use_energy": False, "all_zero_init": True}),
+    ("zeroinit_energy", {"use_energy": True, "all_zero_init": True}),
     # rank-N re-test of the zero-init arms (sili__new block4 chain-rule
     # fix + rank-N generalization + headroom-starvation fix, this
     # session) -- baseline_zeroinit/zeroinit_energy above (rank=1
@@ -61,10 +63,10 @@ CONFIGS = [
     # chain-rule/headroom fixes too) -- rank2 is the actual new
     # mechanism being tested, added specifically to avoid the
     # cross-column cancellation the rank1 shared-scale is vulnerable to.
-    ("zeroinit_rank1",         dict(use_energy=False, all_zero_init=True, scale_rank=1)),
-    ("zeroinit_rank2",         dict(use_energy=False, all_zero_init=True, scale_rank=2)),
-    ("zeroinit_energy_rank1",  dict(use_energy=True,  all_zero_init=True, scale_rank=1)),
-    ("zeroinit_energy_rank2",  dict(use_energy=True,  all_zero_init=True, scale_rank=2)),
+    ("zeroinit_rank1", {"use_energy": False, "all_zero_init": True, "scale_rank": 1}),
+    ("zeroinit_rank2", {"use_energy": False, "all_zero_init": True, "scale_rank": 2}),
+    ("zeroinit_energy_rank1", {"use_energy": True, "all_zero_init": True, "scale_rank": 1}),
+    ("zeroinit_energy_rank2", {"use_energy": True, "all_zero_init": True, "scale_rank": 2}),
 ]
 
 # No REFERENCE entry for the rank-N configs -- see their own comment
@@ -79,8 +81,12 @@ def run_config(name, kwargs, seeds, n_steps, n_eval):
     step_times = []
     for seed in seeds:
         model = OriginalArchModel(
-            seed, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-            l1_sparsity_coef=COEF, **kwargs,
+            seed,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=COEF,
+            **kwargs,
         )
         print(f"[{name}] starting seed={seed} ({n_steps} steps)...", flush=True)
         accs, skips, total, avg_step_time = run(model, n_steps, seed, verbose=True)
@@ -93,16 +99,18 @@ def run_config(name, kwargs, seeds, n_steps, n_eval):
         step_times.append(avg_step_time)
         # Printed IMMEDIATELY per seed -- this is what makes partial
         # results pullable mid-run instead of only at the very end.
-        print(f"[{name}] seed={seed} done: old_style={old_style:.4f} "
-              f"eval_acc({n_eval})={eval_acc:.4f}", flush=True)
+        print(f"[{name}] seed={seed} done: old_style={old_style:.4f} eval_acc({n_eval})={eval_acc:.4f}", flush=True)
 
     mean_old = statistics.mean(per_seed_old)
     mean_eval = statistics.mean(per_seed_eval)
     skip_rate = tot_skips / tot_calls if tot_calls else 0.0
     avg_step_time_overall = statistics.mean(step_times)
-    print(f"[{name}] CONFIG DONE: old_style_mean={mean_old:.4f} "
-          f"eval_acc_mean={mean_eval:.4f} eval_per_seed={[round(v,4) for v in per_seed_eval]} "
-          f"skip_rate={skip_rate:.3%} avg_step={avg_step_time_overall*1000:.1f}ms\n", flush=True)
+    print(
+        f"[{name}] CONFIG DONE: old_style_mean={mean_old:.4f} "
+        f"eval_acc_mean={mean_eval:.4f} eval_per_seed={[round(v, 4) for v in per_seed_eval]} "
+        f"skip_rate={skip_rate:.3%} avg_step={avg_step_time_overall * 1000:.1f}ms\n",
+        flush=True,
+    )
     return mean_old, mean_eval, per_seed_old, per_seed_eval, skip_rate, avg_step_time_overall
 
 
@@ -117,8 +125,9 @@ def main():
     print(f"landmark_checklist: {len(seeds)} seeds x {args.steps} steps x {args.eval}-eval, coef={COEF}\n")
     rows = []
     for name, kwargs in CONFIGS:
-        mean_old, mean_eval, per_seed_old, per_seed_eval, skip_rate, avg_step_time = run_config(
-            name, kwargs, seeds, args.steps, args.eval)
+        mean_old, mean_eval, _per_seed_old, per_seed_eval, skip_rate, avg_step_time = run_config(
+            name, kwargs, seeds, args.steps, args.eval
+        )
         if name in _NO_REF:
             ref, delta_old, flag = float("nan"), float("nan"), "NEW (no reference)"
         else:
@@ -127,9 +136,13 @@ def main():
             flag = "OK" if delta_old >= -0.05 else "REGRESSED (old_style, noisy)"
         rows.append((name, mean_old, mean_eval, ref, delta_old, flag, skip_rate, per_seed_eval, avg_step_time))
 
-    print(f"{'config':<18} {'old_style':>10} {'eval_acc':>9} {'old_ref':>8} {'flag':<28} {'skip_rate':>10} {'avg_step':>10}")
-    for name, mean_old, mean_eval, ref, delta_old, flag, skip_rate, per_seed_eval, avg_step_time in rows:
-        print(f"{name:<18} {mean_old:>10.4f} {mean_eval:>9.4f} {ref:>8.4f} {flag:<28} {skip_rate:>9.3%} {avg_step_time*1000:>8.1f}ms")
+    print(
+        f"{'config':<18} {'old_style':>10} {'eval_acc':>9} {'old_ref':>8} {'flag':<28} {'skip_rate':>10} {'avg_step':>10}"
+    )
+    for name, mean_old, mean_eval, ref, _delta_old, flag, skip_rate, per_seed_eval, avg_step_time in rows:
+        print(
+            f"{name:<18} {mean_old:>10.4f} {mean_eval:>9.4f} {ref:>8.4f} {flag:<28} {skip_rate:>9.3%} {avg_step_time * 1000:>8.1f}ms"
+        )
         print(f"    eval_per_seed={[round(v, 4) for v in per_seed_eval]}")
 
     print("\nNote: eval_acc has no prior reference to diff against yet (added")

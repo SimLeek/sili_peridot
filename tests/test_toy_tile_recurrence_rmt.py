@@ -1,15 +1,15 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
-from model.toy_recall_models import cross_entropy_sum, AdamOptimizer
+import pytest
 from sili.sparse_rnn import DISLDOLayer
 from sili.tensor import Tensor
 
+from model.toy_recall_models import AdamOptimizer, cross_entropy_sum
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
@@ -17,9 +17,17 @@ MAX_WEIGHTS = STATE_WIDTH * 16
 
 
 def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0):
-    return ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                MAX_WEIGHTS, num_cpus=num_cpus, disldo_cls=disldo_cls,
-                                l1_sparsity_coef=l1_sparsity_coef)
+    return ToyTileRecurrenceRMT(
+        VOCAB,
+        EMBED_WIDTH,
+        COLUMN_NEURONS,
+        NUM_TILES,
+        NUM_MEM,
+        MAX_WEIGHTS,
+        num_cpus=num_cpus,
+        disldo_cls=disldo_cls,
+        l1_sparsity_coef=l1_sparsity_coef,
+    )
 
 
 class TestToyTileRecurrenceRMT:
@@ -58,7 +66,8 @@ class TestToyTileRecurrenceRMT:
         after = model.step(probe_window, probe_memory, learning_rate=0.0)[1].data
         assert np.all(np.isfinite(after))
         assert not np.allclose(before, after), (
-            "output on a fixed probe never changed -- inline weight update never fired")
+            "output on a fixed probe never changed -- inline weight update never fired"
+        )
 
     def test_resetting_memory_prev_changes_logits(self):
         model = _model()
@@ -69,9 +78,9 @@ class TestToyTileRecurrenceRMT:
         _a, logits_a, _ = model.step(x_window, memory_real, learning_rate=0.0)
         _b, logits_b, _ = model.step(x_window, memory_zero, learning_rate=0.0)
 
-        assert not np.allclose(logits_a.data, logits_b.data), (
-            "different memory_prev produced identical logits")
+        assert not np.allclose(logits_a.data, logits_b.data), "different memory_prev produced identical logits"
 
+    @pytest.mark.integration  # real training-convergence run
     def test_loss_decreases_on_a_single_repeated_example(self):
         model = _model()
         opt = AdamOptimizer()
@@ -92,7 +101,8 @@ class TestToyTileRecurrenceRMT:
             min_loss = float(loss.data) if min_loss is None else min(min_loss, float(loss.data))
 
         assert min_loss < first_loss * 0.5, (
-            f"loss never reached a real minimum: {first_loss:.3f} -> best {min_loss:.3f}")
+            f"loss never reached a real minimum: {first_loss:.3f} -> best {min_loss:.3f}"
+        )
 
 
 class TestToyTileRecurrenceRMTWidening:
@@ -109,11 +119,29 @@ class TestToyTileRecurrenceRMTWidening:
         # them at all -- must produce identical output. Proves the new
         # kwargs' mere presence in the signature doesn't perturb anything.
         rng_seed = 42
-        m_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed))
-        m_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed),
-                                   input_sparsity_p=None, dy_sparsity_p=None, wide_max_weights=None)
+        m_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+        )
+        m_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+            input_sparsity_p=None,
+            dy_sparsity_p=None,
+            wide_max_weights=None,
+        )
         x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
@@ -124,10 +152,19 @@ class TestToyTileRecurrenceRMTWidening:
         wide_embed = EMBED_WIDTH * 2
         wide_state = wide_embed * COLUMN_NEURONS
         model = ToyTileRecurrenceRMT(
-            VOCAB, wide_embed, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(8),
-            input_sparsity_p=0.5, dy_sparsity_p=0.5, wide_max_weights=MAX_WEIGHTS * 4,
-            l1_sparsity_coef=0.05)
+            VOCAB,
+            wide_embed,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(8),
+            input_sparsity_p=0.5,
+            dy_sparsity_p=0.5,
+            wide_max_weights=MAX_WEIGHTS * 4,
+            l1_sparsity_coef=0.05,
+        )
         x_window = np.random.RandomState(9).randn(NUM_TILES, wide_embed).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, wide_state), dtype=np.float32)
         for step in range(5):
@@ -152,23 +189,46 @@ class TestToyTileRecurrenceRMTWidening:
         # which legitimately differ in row capacity at the same
         # max_weights since _max_row_weights depends on n_inputs too).
         base = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(11))
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(11),
+        )
         wide = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(11),
-            wide_max_weights=MAX_WEIGHTS * 4)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(11),
+            wide_max_weights=MAX_WEIGHTS * 4,
+        )
         for name in ("input_proj", "q_proj", "k_proj", "v_proj", "o_proj"):
             assert getattr(wide, name)._max_row_weights > getattr(base, name)._max_row_weights, (
-                f"{name}: wide_max_weights didn't increase its per-row capacity")
+                f"{name}: wide_max_weights didn't increase its per-row capacity"
+            )
         assert wide.lm_head._max_row_weights == base.lm_head._max_row_weights, (
-            "lm_head's capacity must stay unaffected by wide_max_weights")
+            "lm_head's capacity must stay unaffected by wide_max_weights"
+        )
 
     def test_dy_sparsity_p_defaults_from_input_sparsity_p(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(12),
-            input_sparsity_p=0.4)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(12),
+            input_sparsity_p=0.4,
+        )
         assert model.dy_sparsity_p == 0.4
 
 
@@ -182,11 +242,27 @@ class TestOutputDySparsityP:
 
     def test_none_default_bit_identical(self):
         rng_seed = 21
-        m_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed))
-        m_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed),
-                                   output_dy_sparsity_p=None)
+        m_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+        )
+        m_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+            output_dy_sparsity_p=None,
+        )
         x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
@@ -195,9 +271,16 @@ class TestOutputDySparsityP:
 
     def test_set_value_stays_finite_through_real_backward(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(22),
-            output_dy_sparsity_p=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(22),
+            output_dy_sparsity_p=0.5,
+        )
         x_window = np.random.RandomState(23).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         for step in range(5):
@@ -222,9 +305,16 @@ class TestOutputDySparsityP:
         # model._wide_extra_kwargs(name) (what actually gets splatted
         # into their forward() calls) stay at their untouched defaults.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(24),
-            output_dy_sparsity_p=0.3)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(24),
+            output_dy_sparsity_p=0.3,
+        )
         assert model.dy_sparsity_p is None
         for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
             assert model._wide_extra_kwargs(name) == {}
@@ -241,11 +331,27 @@ class TestDyRTarget:
 
     def test_none_default_bit_identical(self):
         rng_seed = 31
-        m_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed))
-        m_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed),
-                                   dy_r_target=None)
+        m_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+        )
+        m_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+            dy_r_target=None,
+        )
         x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
@@ -256,17 +362,34 @@ class TestDyRTarget:
 
     def test_takes_priority_over_dy_sparsity_p_in_wide_extra_kwargs(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(32),
-            dy_sparsity_p=0.5, dy_r_target=0.7, dy_k_min=2)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(32),
+            dy_sparsity_p=0.5,
+            dy_r_target=0.7,
+            dy_k_min=2,
+        )
         for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
             assert model._wide_extra_kwargs(name) == {"dy_r_target": 0.7, "dy_k_min": 2}
 
     def test_set_value_stays_finite_through_real_backward(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(33),
-            dy_r_target=0.6, dy_k_min=1)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(33),
+            dy_r_target=0.6,
+            dy_k_min=1,
+        )
         x_window = np.random.RandomState(34).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         for step in range(5):
@@ -286,9 +409,16 @@ class TestDyRTarget:
 
     def test_controller_shrinks_r_target_when_too_slow(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(35),
-            dy_r_target=0.7)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(35),
+            dy_r_target=0.7,
+        )
         # layer_name=None (default) applies the same correction to every
         # wide layer uniformly (task #372) -- all 5 entries start and end
         # identical, so any one of them is representative.
@@ -301,9 +431,16 @@ class TestDyRTarget:
 
     def test_controller_grows_r_target_when_faster_than_target(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(36),
-            dy_r_target=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(36),
+            dy_r_target=0.5,
+        )
         updated = model.apply_amortized_dy_r_target_control(measured_sps=20.0, target_sps=10.0)
         assert updated["q_proj"] > 0.5
 
@@ -311,11 +448,17 @@ class TestDyRTarget:
         # task #372: layer_name lets a caller (task #374's future inner
         # loop) adjust one layer independently -- the rest stay untouched.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(39),
-            dy_r_target=0.7)
-        updated = model.apply_amortized_dy_r_target_control(
-            measured_sps=1.0, target_sps=10.0, layer_name="q_proj")
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(39),
+            dy_r_target=0.7,
+        )
+        updated = model.apply_amortized_dy_r_target_control(measured_sps=1.0, target_sps=10.0, layer_name="q_proj")
         assert set(updated) == {"q_proj"}
         assert model.dy_r_target["q_proj"] < 0.7
         for name in ("input_proj", "k_proj", "v_proj", "o_proj"):
@@ -323,17 +466,31 @@ class TestDyRTarget:
 
     def test_controller_respects_r_min_r_max_clip(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(37),
-            dy_r_target=0.06)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(37),
+            dy_r_target=0.06,
+        )
         for _ in range(50):
             model.apply_amortized_dy_r_target_control(measured_sps=1.0, target_sps=100.0, r_min=0.05)
         assert all(v >= 0.05 for v in model.dy_r_target.values())
 
         model2 = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(38),
-            dy_r_target=0.95)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(38),
+            dy_r_target=0.95,
+        )
         for _ in range(50):
             model2.apply_amortized_dy_r_target_control(measured_sps=100.0, target_sps=1.0, r_max=0.99)
         assert all(v <= 0.99 for v in model2.dy_r_target.values())
@@ -353,9 +510,16 @@ class TestDySurprise:
         # to task #372's own behavior, matching every other opt-in
         # kwarg's None-means-off convention in this file.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(40),
-            dy_r_target=0.7)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(40),
+            dy_r_target=0.7,
+        )
         model._layer_surprise["q_proj"] = {"E_t": 100.0, "Lbar": 1.0}  # would be a huge ratio if used
         assert model._effective_dy_r_target("q_proj") == 0.7
         assert model._wide_extra_kwargs("q_proj")["dy_r_target"] == 0.7
@@ -365,35 +529,67 @@ class TestDySurprise:
         # empty (no real backward has run yet) -- must fall back to
         # r_bar unmodified, not divide-by-zero or KeyError.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(41),
-            dy_r_target=0.7, dy_surprise_alpha=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(41),
+            dy_r_target=0.7,
+            dy_surprise_alpha=0.5,
+        )
         assert model._layer_surprise == {}
         assert model._effective_dy_r_target("q_proj") == 0.7
 
     def test_formula_modulates_up_when_e_t_above_lbar(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(42),
-            dy_r_target=0.3, dy_surprise_alpha=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(42),
+            dy_r_target=0.3,
+            dy_surprise_alpha=0.5,
+        )
         model._layer_surprise["q_proj"] = {"E_t": 4.0, "Lbar": 1.0}  # ratio=4, sqrt=2
         r_t = model._effective_dy_r_target("q_proj")  # 0.3*2=0.6, within [0.05, 0.99]
         assert abs(r_t - 0.3 * 2.0) < 1e-9
 
     def test_formula_modulates_down_when_e_t_below_lbar(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(43),
-            dy_r_target=0.5, dy_surprise_alpha=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(43),
+            dy_r_target=0.5,
+            dy_surprise_alpha=0.5,
+        )
         model._layer_surprise["q_proj"] = {"E_t": 0.25, "Lbar": 1.0}  # ratio=0.25, sqrt=0.5
         r_t = model._effective_dy_r_target("q_proj")
         assert abs(r_t - 0.5 * 0.5) < 1e-9
 
     def test_formula_clips_to_0_05_0_99(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(44),
-            dy_r_target=0.5, dy_surprise_alpha=1.0)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(44),
+            dy_r_target=0.5,
+            dy_surprise_alpha=1.0,
+        )
         model._layer_surprise["q_proj"] = {"E_t": 1000.0, "Lbar": 1.0}
         assert model._effective_dy_r_target("q_proj") == 0.99
         model._layer_surprise["q_proj"] = {"E_t": 0.0001, "Lbar": 1.0}
@@ -403,9 +599,17 @@ class TestDySurprise:
         # Only q_proj has surprise data seeded -- every other wide layer
         # (real cold start) must stay at r_bar unmodified.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(45),
-            dy_r_target=0.5, dy_surprise_alpha=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(45),
+            dy_r_target=0.5,
+            dy_surprise_alpha=0.5,
+        )
         model._layer_surprise["q_proj"] = {"E_t": 4.0, "Lbar": 1.0}
         assert model._effective_dy_r_target("q_proj") != 0.5
         for name in ("input_proj", "k_proj", "v_proj", "o_proj"):
@@ -437,9 +641,17 @@ class TestDySurprise:
         # -> _update_layer_surprise) actually wires up end to end, not
         # just the formula in isolation.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(46),
-            dy_r_target=0.7, dy_surprise_alpha=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(46),
+            dy_r_target=0.7,
+            dy_surprise_alpha=0.5,
+        )
         x_window = np.random.RandomState(47).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         memory_prev, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.05)
@@ -457,9 +669,17 @@ class TestDySurprise:
         # for step N must reflect step N-1's surprise data, never step
         # N's own (which doesn't exist yet at forward()-call time).
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(48),
-            dy_r_target=0.7, dy_surprise_alpha=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(48),
+            dy_r_target=0.7,
+            dy_surprise_alpha=0.5,
+        )
         x_window = np.random.RandomState(49).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
 
@@ -479,7 +699,7 @@ class TestDySurprise:
         # Step 2: forward()-time kwargs must reflect step 1's surprise
         # snapshot, unchanged by anything from step 2 itself (which
         # hasn't run backward yet).
-        memory_prev, logits2, _aux2 = model.step(x_window, memory_prev, learning_rate=0.05)
+        memory_prev, _logits2, _aux2 = model.step(x_window, memory_prev, learning_rate=0.05)
         assert model._layer_surprise["q_proj"] == snapshot
 
 
@@ -494,11 +714,27 @@ class TestXRTarget:
 
     def test_none_default_bit_identical(self):
         rng_seed = 50
-        m_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed))
-        m_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                   MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(rng_seed),
-                                   x_r_target=None)
+        m_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+        )
+        m_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(rng_seed),
+            x_r_target=None,
+        )
         x_window = np.random.RandomState(1).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         _mem_a, logits_a, _ = m_a.step(x_window, memory_prev, learning_rate=0.05)
@@ -516,9 +752,18 @@ class TestXRTarget:
         # not by comparing against the fixed-fraction output (which
         # would be a different, unrelated set of kept indices).
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(51),
-            input_sparsity_p=0.5, x_r_target=0.7, x_k_min=1)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(51),
+            input_sparsity_p=0.5,
+            x_r_target=0.7,
+            x_k_min=1,
+        )
         x = Tensor(np.random.RandomState(52).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32))
         out = model._to_sparse(x, "input_proj")
         assert out.data.__class__.__name__ == "CSR"
@@ -535,9 +780,17 @@ class TestXRTarget:
 
     def test_set_value_stays_finite_through_real_backward(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(53),
-            x_r_target=0.6, x_k_min=1)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(53),
+            x_r_target=0.6,
+            x_k_min=1,
+        )
         x_window = np.random.RandomState(54).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         for step in range(5):
@@ -550,9 +803,16 @@ class TestXRTarget:
 
     def test_controller_shrinks_r_target_when_too_slow(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(55),
-            x_r_target=0.7)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(55),
+            x_r_target=0.7,
+        )
         updated = model.apply_amortized_x_r_target_control(measured_sps=1.0, target_sps=10.0)
         assert set(updated) == set(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
         assert updated["q_proj"] < 0.7
@@ -560,11 +820,17 @@ class TestXRTarget:
 
     def test_controller_can_target_a_single_layer(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(56),
-            x_r_target=0.7)
-        updated = model.apply_amortized_x_r_target_control(
-            measured_sps=1.0, target_sps=10.0, layer_name="q_proj")
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(56),
+            x_r_target=0.7,
+        )
+        updated = model.apply_amortized_x_r_target_control(measured_sps=1.0, target_sps=10.0, layer_name="q_proj")
         assert set(updated) == {"q_proj"}
         assert model.x_r_target["q_proj"] < 0.7
         for name in ("input_proj", "k_proj", "v_proj", "o_proj"):
@@ -574,9 +840,17 @@ class TestXRTarget:
         # x_r_target and dy_r_target are genuinely separate axes (input
         # vs grad) -- setting one must not touch the other's state.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(57),
-            x_r_target=0.7, dy_r_target=0.3)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(57),
+            x_r_target=0.7,
+            dy_r_target=0.3,
+        )
         assert model.x_r_target["q_proj"] == 0.7
         assert model.dy_r_target["q_proj"] == 0.3
         model.apply_amortized_x_r_target_control(measured_sps=1.0, target_sps=100.0)
@@ -602,14 +876,22 @@ class TestInputSelectionTrajectory:
 
     def test_real_r_satisfies_invariant_under_x_r_target(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(71),
-            x_r_target=0.7, x_k_min=1)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(71),
+            x_r_target=0.7,
+            x_k_min=1,
+        )
         x_window = np.random.RandomState(72).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         model.step(x_window, memory_prev, learning_rate=0.05)
         assert set(model.last_input_selection) == set(ToyTileRecurrenceRMT._WIDE_LAYER_NAMES)
-        for name, stats in model.last_input_selection.items():
+        for stats in model.last_input_selection.values():
             # Real invariant this kernel guarantees (task #364's own
             # C++ test covers this at the kernel level; here we confirm
             # it survives all the way through to the Python-side stats
@@ -623,9 +905,16 @@ class TestInputSelectionTrajectory:
         # Real R/k diagnostic is meaningful for the LEGACY fixed-
         # fraction path too, not just nucleus selection.
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(73),
-            input_sparsity_p=0.5)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(73),
+            input_sparsity_p=0.5,
+        )
         x_window = np.random.RandomState(74).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         model.step(x_window, memory_prev, learning_rate=0.05)
@@ -636,9 +925,17 @@ class TestInputSelectionTrajectory:
 
     def test_overwritten_not_accumulated_across_steps(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(75),
-            x_r_target=0.7, x_k_min=1)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(75),
+            x_r_target=0.7,
+            x_k_min=1,
+        )
         x_window = np.random.RandomState(76).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         model.step(x_window, memory_prev, learning_rate=0.05)
@@ -659,9 +956,17 @@ class TestCrossLayerBudgetAllocator:
 
     def _model_with_x_r_target(self, seed=60, **kwargs):
         return ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(seed),
-            x_r_target=0.7, **kwargs)
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(seed),
+            x_r_target=0.7,
+            **kwargs,
+        )
 
     def test_never_touches_dy_r_target(self):
         model = self._model_with_x_r_target(dy_r_target=0.3)
@@ -676,8 +981,7 @@ class TestCrossLayerBudgetAllocator:
         # down_factor (weight=1.0 for every layer).
         model = self._model_with_x_r_target(seed=61)
         assert model._layer_timing == {}
-        updated = model.apply_cross_layer_budget_allocator(
-            measured_sps=1.0, target_sps=10.0, down_factor=0.8)
+        updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=10.0, down_factor=0.8)
         for name in ToyTileRecurrenceRMT._WIDE_LAYER_NAMES:
             assert abs(updated[name] - 0.7 * 0.8) < 1e-9
 
@@ -708,8 +1012,7 @@ class TestCrossLayerBudgetAllocator:
         model._layer_timing = {
             "q_proj": {"fwd_s": 1.0, "bwd_s": 0.0},
         }
-        updated = model.apply_cross_layer_budget_allocator(
-            measured_sps=1.0, target_sps=10.0, down_factor=0.85)
+        updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=10.0, down_factor=0.85)
         eff_down_clipped = 1.0 - (1.0 - 0.85) * 3.0  # weight clipped to 3.0
         assert eff_down_clipped > 0.0  # sanity: still a valid multiplicative factor
         assert abs(updated["q_proj"] - 0.7 * eff_down_clipped) < 1e-9
@@ -732,8 +1035,15 @@ class TestCrossLayerBudgetAllocator:
 
     def test_only_adjusts_layers_with_x_r_target_already_set(self):
         model = ToyTileRecurrenceRMT(
-            VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-            MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(65))
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(65),
+        )
         model.x_r_target["q_proj"] = 0.7  # only one layer opted in
         updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=10.0)
         assert set(updated) == {"q_proj"}
@@ -753,7 +1063,7 @@ class TestCrossLayerBudgetAllocator:
             loss.backward()
         assert model._layer_timing  # real data accumulated
         updated = model.apply_cross_layer_budget_allocator(measured_sps=1.0, target_sps=100.0)
-        for name, v in updated.items():
+        for v in updated.values():
             assert np.isfinite(v)
             assert 0.05 <= v <= 0.99
 
@@ -780,10 +1090,26 @@ class TestStepCached:
         # depends only on its own token and the CURRENT weights -- with
         # requires_grad=False (no backward, weights genuinely static),
         # caching introduces zero approximation, not a small one.
-        model_a = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                       MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(42))
-        model_b = ToyTileRecurrenceRMT(VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM,
-                                       MAX_WEIGHTS, num_cpus=2, rng=np.random.default_rng(42))
+        model_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(42),
+        )
+        model_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            rng=np.random.default_rng(42),
+        )
         embed_table = np.random.RandomState(1).randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.1
         tokens = np.random.RandomState(2).randint(0, VOCAB, size=12)
 
@@ -794,7 +1120,8 @@ class TestStepCached:
             window = _build_window(embed_table, tokens, i, NUM_TILES)
             memory_a, logits_a, _aux_a = model_a.step(window, memory_a, 0.0, requires_grad=False)
             memory_b, logits_b, _aux_b, tile_cache = model_b.step_cached(
-                embed_table[tokens[i]], memory_b, 0.0, tile_cache, requires_grad=False)
+                embed_table[tokens[i]], memory_b, 0.0, tile_cache, requires_grad=False
+            )
             row_a = np.asarray(logits_a.data)[NUM_TILES - 1]
             row_b = np.asarray(logits_b.data)[0]
             assert np.array_equal(row_a, row_b), f"step {i}: logits diverged with static weights"
@@ -805,7 +1132,8 @@ class TestStepCached:
         new_embed = np.random.RandomState(1).randn(EMBED_WIDTH).astype(np.float32) * 0.1
         memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         memory_new, logits, aux_loss, tile_cache = model.step_cached(
-            new_embed, memory_prev, learning_rate=0.01, tile_cache=None)
+            new_embed, memory_prev, learning_rate=0.01, tile_cache=None
+        )
         assert memory_new.shape == (NUM_MEM, STATE_WIDTH)
         assert logits.data.shape == (1, VOCAB)
         assert np.all(np.isfinite(memory_new))
@@ -824,7 +1152,8 @@ class TestStepCached:
         for _ in range(NUM_TILES + 5):
             new_embed = (rng.randn(EMBED_WIDTH) * 0.1).astype(np.float32)
             memory, _logits, _aux, tile_cache = model.step_cached(
-                new_embed, memory, learning_rate=0.0, tile_cache=tile_cache)
+                new_embed, memory, learning_rate=0.0, tile_cache=tile_cache
+            )
             assert len(tile_cache) <= NUM_TILES - 1
 
     def test_weights_actually_update_via_backward(self):
@@ -833,8 +1162,9 @@ class TestStepCached:
         memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         new_embed = np.random.RandomState(6).randn(EMBED_WIDTH).astype(np.float32) * 0.1
         before = np.asarray(model.input_ln.data).copy()
-        memory, logits, aux, tile_cache = model.step_cached(
-            new_embed, memory, learning_rate=0.05, tile_cache=None, requires_grad=True)
+        memory, logits, aux, _tile_cache = model.step_cached(
+            new_embed, memory, learning_rate=0.05, tile_cache=None, requires_grad=True
+        )
         loss = cross_entropy_sum(logits, [(0, 1)])
         if aux is not None:
             loss = loss + aux
@@ -852,27 +1182,30 @@ class TestStepContentDySparsitySchedule:
 
     def test_none_default_matches_pre_change_behavior(self):
         model_a = _model()
-        model_b = _model()
+        _model()
         # separately-constructed models won't share weights, so instead
         # confirm the SAME model gives identical output whether or not
         # the new kwarg is explicitly passed as None.
         window = np.random.RandomState(40).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         _mem_a, logits_a, _aux_a = model_a.step(window, memory, 0.0, requires_grad=False)
-        _mem_b, logits_b, _aux_b = model_a.step(window, memory, 0.0, requires_grad=False,
-                                                 content_dy_sparsity_schedule=None)
+        _mem_b, logits_b, _aux_b = model_a.step(
+            window, memory, 0.0, requires_grad=False, content_dy_sparsity_schedule=None
+        )
         assert np.array_equal(np.asarray(logits_a.data), np.asarray(logits_b.data))
 
     def test_graded_schedule_runs_finite_through_real_backward(self):
         from scripts.train_mqar_curriculum import _default_graded_dy_schedule
+
         model = _model()
         opt = AdamOptimizer()
         window = np.random.RandomState(41).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         schedule = _default_graded_dy_schedule(NUM_TILES)
         assert len(schedule) == NUM_TILES
-        memory_new, logits, aux = model.step(window, memory, 0.05, requires_grad=True,
-                                             content_dy_sparsity_schedule=schedule)
+        memory_new, logits, aux = model.step(
+            window, memory, 0.05, requires_grad=True, content_dy_sparsity_schedule=schedule
+        )
         loss = cross_entropy_sum(logits, [(NUM_TILES - 1, 1)])
         if aux is not None:
             loss = loss + aux
@@ -887,8 +1220,9 @@ class TestStepContentDySparsitySchedule:
         window = np.random.RandomState(42).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
         memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
         try:
-            model.step(window, memory, 0.0, requires_grad=False,
-                      content_dy_sparsity_schedule=[1.0, 0.5])  # wrong length
-            assert False, "expected ValueError for mismatched schedule length"
+            model.step(
+                window, memory, 0.0, requires_grad=False, content_dy_sparsity_schedule=[1.0, 0.5]
+            )  # wrong length
+            raise AssertionError("expected ValueError for mismatched schedule length")
         except ValueError:
             pass

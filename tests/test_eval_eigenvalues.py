@@ -17,6 +17,7 @@ One opt-in test wires track_spectral_health to the actual `baseline`
 OriginalArchModel to confirm it runs end-to-end against a real training
 loop and produces a sane, non-exploding trajectory.
 """
+
 import os
 import sys
 
@@ -24,12 +25,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-
 from sili.tensor import Tensor
+
 from model.eval_eigenvalues import (
-    SpectralProbe, probe_layers, measure_snapshot, track_spectral_health,
-    dense_weight_matrix, exact_spectral_norm, exact_spectral_radius,
+    SpectralProbe,
+    dense_weight_matrix,
+    exact_spectral_norm,
+    exact_spectral_radius,
     exact_spectral_snapshot,
+    measure_snapshot,
+    probe_layers,
+    track_spectral_health,
 )
 
 RUN_ENV_VAR = "SILI_RUN_LR_SEARCH"
@@ -39,6 +45,7 @@ class _LinearStub:
     """Minimal .forward(x, learning_rate)-compatible stub -- exactly the
     interface this module needs, nothing else, so these tests don't
     depend on any real DISLDOLayer machinery."""
+
     def __init__(self, W: np.ndarray):
         self.W = W.astype(np.float32)
         self.in_features = W.shape[0]
@@ -56,7 +63,7 @@ def _triangular_matrix_with_real_dominant_eigenvalue(n, dominant, seed=0):
     generic random matrix, whose dominant eigenvalue is usually complex
     -- see this module's own docstring)."""
     rng = np.random.default_rng(seed)
-    diag = np.array([dominant] + [dominant * f for f in (0.5, 0.3, 0.2, 0.1)][:n - 1])
+    diag = np.array([dominant, *[dominant * f for f in (0.5, 0.3, 0.2, 0.1)][: n - 1]])
     W = np.triu(rng.standard_normal((n, n)).astype(np.float64) * 0.3, k=1)
     np.fill_diagonal(W, diag[:n])
     return W.astype(np.float32), float(dominant)
@@ -105,6 +112,7 @@ class TestSpectralProbeSynthetic:
         class _NoShape:
             def forward(self, x, learning_rate=0.0):
                 return x
+
         with pytest.raises(ValueError):
             probe_layers({"bad": _NoShape()})
 
@@ -131,7 +139,10 @@ class TestSpectralProbeSynthetic:
         traj = track_spectral_health(
             model_step_fn=lambda: None,  # stub "training" does nothing
             layers_fn=lambda: {"only": layer},
-            n_steps=1000, probe_every=100, seed=0, ema_decay=0.0,
+            n_steps=1000,
+            probe_every=100,
+            seed=0,
+            ema_decay=0.0,
         )
         assert len(traj.snapshots) == 10
         assert traj.final("only") == pytest.approx(true_radius, rel=0.05)
@@ -192,16 +203,21 @@ class TestExactSpectralMeasurements:
         assert snap["rect"]["norm"] is not None
 
 
-@pytest.mark.skipif(not os.environ.get(RUN_ENV_VAR),
-                    reason=f"real short training run, opt in via {RUN_ENV_VAR}=1")
+@pytest.mark.skipif(not os.environ.get(RUN_ENV_VAR), reason=f"real short training run, opt in via {RUN_ENV_VAR}=1")
 class TestSpectralHealthRealModel:
     def test_baseline_config_produces_sane_trajectory(self):
-        from scripts.l1_sparsity_probe import OriginalArchModel, generate_copy_sequence, VOCAB
         import numpy as np
 
+        from scripts.l1_sparsity_probe import VOCAB, OriginalArchModel, generate_copy_sequence
+
         model = OriginalArchModel(
-            1000, dense=True, o_proj_coef=0.0, all_layer_coef=0.0,
-            l1_sparsity_coef=0.05, use_energy=False, all_zero_init=False,
+            1000,
+            dense=True,
+            o_proj_coef=0.0,
+            all_layer_coef=0.0,
+            l1_sparsity_coef=0.05,
+            use_energy=False,
+            all_zero_init=False,
         )
         task_rng = np.random.RandomState(1000)
         embed_table = task_rng.randn(VOCAB, 8).astype(np.float32) * 0.3
@@ -218,8 +234,9 @@ class TestSpectralHealthRealModel:
         # across the tile sequence, backward() + opt.step() once per
         # outer step, same as the actual training loop this repo uses
         # everywhere else.
-        from model.toy_recall_models import cross_entropy_sum, AdamOptimizer, clip_grad_norm_
-        from scripts.l1_sparsity_probe import _build_tile_window, NUM_TILES
+        from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum
+        from scripts.l1_sparsity_probe import NUM_TILES, _build_tile_window
+
         opt = AdamOptimizer()
 
         def step():
@@ -229,7 +246,7 @@ class TestSpectralHealthRealModel:
             total_loss = None
             for i in range(NUM_TILES):
                 window = _build_tile_window(embed_table, tokens, i, NUM_TILES, 4)
-                M, logits, aux = model.step(window, M, 0.0483)
+                M, logits, _aux = model.step(window, M, 0.0483)
                 if i in targets:
                     tgt_loss = cross_entropy_sum(logits, [(NUM_TILES - 1, targets[i])])
                     total_loss = tgt_loss if total_loss is None else total_loss + tgt_loss
@@ -240,12 +257,18 @@ class TestSpectralHealthRealModel:
 
         traj = track_spectral_health(
             model_step_fn=step,
-            layers_fn=lambda: {"q_proj": model.q_proj, "k_proj": model.k_proj,
-                                "v_proj": model.v_proj, "o_proj": model.o_proj},
-            n_steps=500, probe_every=100,
+            layers_fn=lambda: {
+                "q_proj": model.q_proj,
+                "k_proj": model.k_proj,
+                "v_proj": model.v_proj,
+                "o_proj": model.o_proj,
+            },
+            n_steps=500,
+            probe_every=100,
         )
-        print(f"\nspectral (radius-like) trajectory over 500 steps: "
-              f"{[(n, traj.series(n)) for n in traj.layer_names()]}")
+        print(
+            f"\nspectral (radius-like) trajectory over 500 steps: {[(n, traj.series(n)) for n in traj.layer_names()]}"
+        )
         for name in traj.layer_names():
             series = traj.series(name)
             assert all(np.isfinite(s) for s in series)
@@ -255,10 +278,10 @@ class TestSpectralHealthRealModel:
             assert max(series) < 1000.0
 
         exact = exact_spectral_snapshot(
-            {"q_proj": model.q_proj, "k_proj": model.k_proj,
-             "v_proj": model.v_proj, "o_proj": model.o_proj})
+            {"q_proj": model.q_proj, "k_proj": model.k_proj, "v_proj": model.v_proj, "o_proj": model.o_proj}
+        )
         print(f"exact final snapshot: {exact}")
-        for name, vals in exact.items():
+        for vals in exact.values():
             assert np.isfinite(vals["norm"])
             assert vals["radius"] is not None and np.isfinite(vals["radius"])
             # norm >= radius always (spectral norm upper-bounds radius).

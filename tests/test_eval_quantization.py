@@ -1,25 +1,26 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
+from conftest import trim_memory
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from model.config import MiniCPM5Config
 from model.checkpoint import load_minicpm5_checkpoint
+from model.config import MiniCPM5Config
+from model.eval_pruning import EVAL_TEXTS, EVAL_TEXTS_HELDOUT
+from model.eval_quantization import compare_pruned_vs_quantized
 from model.prune import (
-    prune_state_dict_by_role, DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    DEFAULT_TARGET_SPARSITY_BY_ROLE,
+    prune_state_dict_by_role,
     sparse_state_to_dense_state_dict,
 )
 from model.quantize import build_quantized_dense_state_dict_streaming
-from model.eval_quantization import compare_pruned_vs_quantized
-from model.eval_pruning import EVAL_TEXTS, EVAL_TEXTS_HELDOUT
-from conftest import trim_memory
 
-REAL_CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(__file__), '..', '..', 'MiniCPM5-1B-Base')
+REAL_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "MiniCPM5-1B-Base")
 
 # This file's two real-checkpoint classes, and the whole test suite
 # (`pytest tests/test_fold.py tests/test_quantize.py
@@ -41,8 +42,9 @@ REAL_CHECKPOINT_DIR = os.path.join(
 # own to OOM-kill this machine even after the two fixes above.
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestRealCheckpointQuantizationQuality:
     """
     Does B5's real FP4 quantization scheme (one scale per input feature,
@@ -91,43 +93,54 @@ class TestRealCheckpointQuantizationQuality:
         sd = load_minicpm5_checkpoint(REAL_CHECKPOINT_DIR)
         sparse_state, _ = prune_state_dict_by_role(sd, DEFAULT_TARGET_SPARSITY_BY_ROLE)
         del sd
-        trim_memory()   # prune's own transients peak ~12GB on this machine -- see conftest.py
+        trim_memory()  # prune's own transients peak ~12GB on this machine -- see conftest.py
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
         quantized_dense = build_quantized_dense_state_dict_streaming(
-            sparse_state, cfg, value_scale_mode="per_row", prefix="model.layers.")
+            sparse_state, cfg, value_scale_mode="per_row", prefix="model.layers."
+        )
         return pruned_dense, quantized_dense
 
     def test_shared_scale_quantization_currently_destroys_quality(
-        self, model, tokenizer, pruned_and_quantized,
+        self,
+        model,
+        tokenizer,
+        pruned_and_quantized,
     ):
         pruned_dense, quantized_dense = pruned_and_quantized
         result = compare_pruned_vs_quantized(model, tokenizer, pruned_dense, quantized_dense, EVAL_TEXTS)
-        assert result["pruned_accuracy"] > 0.4   # the already-validated B3b baseline
+        assert result["pruned_accuracy"] > 0.4  # the already-validated B3b baseline
         # Documents the real, current finding -- not a target to defend,
         # a floor this must eventually rise above once quantization
         # granularity/calibration is fixed (see JOURNAL.md).
         assert result["quantized_accuracy"] < 0.2
 
     def test_shared_scale_quantization_holds_on_independent_text(
-        self, model, tokenizer, pruned_and_quantized,
+        self,
+        model,
+        tokenizer,
+        pruned_and_quantized,
     ):
         pruned_dense, quantized_dense = pruned_and_quantized
         result = compare_pruned_vs_quantized(model, tokenizer, pruned_dense, quantized_dense, EVAL_TEXTS_HELDOUT)
-        assert result["quantized_accuracy"] < 0.2   # same collapse, not overfit to EVAL_TEXTS
+        assert result["quantized_accuracy"] < 0.2  # same collapse, not overfit to EVAL_TEXTS
 
     def test_compare_pruned_vs_quantized_restores_original_weights(
-        self, model, tokenizer, pruned_and_quantized,
+        self,
+        model,
+        tokenizer,
+        pruned_and_quantized,
     ):
         pruned_dense, quantized_dense = pruned_and_quantized
         original = {k: v.clone() for k, v in model.state_dict().items()}
         compare_pruned_vs_quantized(model, tokenizer, pruned_dense, quantized_dense, EVAL_TEXTS)
         after = model.state_dict()
-        for k in original:
-            assert torch.equal(original[k], after[k]), f"{k} not restored after comparison"
+        for k, v in original.items():
+            assert torch.equal(v, after[k]), f"{k} not restored after comparison"
 
 
-@pytest.mark.skipif(not os.path.isdir(REAL_CHECKPOINT_DIR),
-                    reason="MiniCPM5-1B-Base checkpoint not present on this machine")
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
+)
 class TestRealCheckpointRank1QuantizationQuality:
     """
     The fix for TestRealCheckpointQuantizationQuality's catastrophe (see
@@ -159,14 +172,18 @@ class TestRealCheckpointRank1QuantizationQuality:
         sd = load_minicpm5_checkpoint(REAL_CHECKPOINT_DIR)
         sparse_state, _ = prune_state_dict_by_role(sd, DEFAULT_TARGET_SPARSITY_BY_ROLE)
         del sd
-        trim_memory()   # prune's own transients peak ~12GB on this machine -- see conftest.py
+        trim_memory()  # prune's own transients peak ~12GB on this machine -- see conftest.py
         pruned_dense = sparse_state_to_dense_state_dict(sparse_state)
         quantized_dense = build_quantized_dense_state_dict_streaming(
-            sparse_state, cfg, value_scale_mode="rank1", prefix="model.layers.")
+            sparse_state, cfg, value_scale_mode="rank1", prefix="model.layers."
+        )
         return pruned_dense, quantized_dense
 
     def test_rank1_quantization_recovers_most_of_the_loss(
-        self, model, tokenizer, pruned_and_quantized_rank1,
+        self,
+        model,
+        tokenizer,
+        pruned_and_quantized_rank1,
     ):
         pruned_dense, quantized_dense = pruned_and_quantized_rank1
         result = compare_pruned_vs_quantized(model, tokenizer, pruned_dense, quantized_dense, EVAL_TEXTS)
@@ -176,7 +193,10 @@ class TestRealCheckpointRank1QuantizationQuality:
         assert result["quantized_accuracy"] > 0.2
 
     def test_rank1_quantization_holds_on_independent_text(
-        self, model, tokenizer, pruned_and_quantized_rank1,
+        self,
+        model,
+        tokenizer,
+        pruned_and_quantized_rank1,
     ):
         pruned_dense, quantized_dense = pruned_and_quantized_rank1
         result = compare_pruned_vs_quantized(model, tokenizer, pruned_dense, quantized_dense, EVAL_TEXTS_HELDOUT)

@@ -16,15 +16,16 @@ predict_fn(seed) -> (predictions, targets, logits) callback that runs
 some held-out eval batch and returns the raw per-sample data, instead of
 collapsing straight to a scalar the way evaluate() does.
 """
+
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, List, Tuple
 
 import numpy as np
 
-PredictFn = Callable[[int], Tuple[List[int], List[int], List[np.ndarray]]]
+PredictFn = Callable[[int], tuple[list[int], list[int], list[np.ndarray]]]
 
 
 @dataclass
@@ -35,7 +36,7 @@ class OutputCollapseReport:
     most_common_prediction_fraction: float
     prediction_entropy_bits: float
     max_entropy_bits: float  # log2(vocab_size), for normalizing
-    mean_logit_std: float          # average WITHIN-sample logit spread
+    mean_logit_std: float  # average WITHIN-sample logit spread
     cross_sample_logit_std: float  # average ACROSS-sample logit spread per class
 
     @property
@@ -45,12 +46,12 @@ class OutputCollapseReport:
         threshold -- below ~0.3 is a reasonable starting point to treat
         as a real collapse signal worth investigating, not a pass/fail
         line."""
-        return (self.prediction_entropy_bits / self.max_entropy_bits
-                if self.max_entropy_bits > 0 else 0.0)
+        return self.prediction_entropy_bits / self.max_entropy_bits if self.max_entropy_bits > 0 else 0.0
 
 
-def check_output_collapse(predict_fn: PredictFn, *, vocab_size: int,
-                           n_batches: int = 1, seed: int = 0) -> OutputCollapseReport:
+def check_output_collapse(
+    predict_fn: PredictFn, *, vocab_size: int, n_batches: int = 1, seed: int = 0
+) -> OutputCollapseReport:
     """predict_fn(seed) -> (predictions, targets, logits) over some
     held-out eval set -- same shape/semantics as l1_sparsity_probe.py's
     own evaluate(), just returning the raw per-sample data instead of
@@ -67,9 +68,9 @@ def check_output_collapse(predict_fn: PredictFn, *, vocab_size: int,
     very different bug than a model whose raw OUTPUT REPRESENTATION
     barely moves at all regardless of input (near-zero
     cross_sample_logit_std), which is collapse in a much deeper sense."""
-    all_preds: List[int] = []
-    all_targets: List[int] = []
-    all_logits: List[np.ndarray] = []
+    all_preds: list[int] = []
+    all_targets: list[int] = []
+    all_logits: list[np.ndarray] = []
     for b in range(n_batches):
         preds, targets, logits = predict_fn(seed + b)
         all_preds.extend(preds)
@@ -80,7 +81,7 @@ def check_output_collapse(predict_fn: PredictFn, *, vocab_size: int,
     if n == 0:
         raise ValueError("predict_fn returned zero samples")
 
-    correct = sum(p == t for p, t in zip(all_preds, all_targets))
+    correct = sum(p == t for p, t in zip(all_preds, all_targets, strict=False))
     accuracy = correct / n
 
     counts: dict = {}
@@ -100,9 +101,12 @@ def check_output_collapse(predict_fn: PredictFn, *, vocab_size: int,
     cross_sample_logit_std = float(np.mean(np.std(logit_stack, axis=0)))
 
     return OutputCollapseReport(
-        n_samples=n, accuracy=accuracy,
+        n_samples=n,
+        accuracy=accuracy,
         unique_prediction_fraction=unique_fraction,
         most_common_prediction_fraction=most_common_fraction,
-        prediction_entropy_bits=entropy, max_entropy_bits=max_entropy,
-        mean_logit_std=mean_logit_std, cross_sample_logit_std=cross_sample_logit_std,
+        prediction_entropy_bits=entropy,
+        max_entropy_bits=max_entropy,
+        mean_logit_std=mean_logit_std,
+        cross_sample_logit_std=cross_sample_logit_std,
     )

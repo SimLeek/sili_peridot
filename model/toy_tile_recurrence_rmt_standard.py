@@ -46,18 +46,15 @@ than changing everything at once:
     to isolate the OPTIMIZER/ATTENTION/NORM/CLIP question specifically,
     not the readout question too.
 """
+
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
-import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class ToyTileRecurrenceRMTStandard(nn.Module):
-    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int,
-                 num_tiles: int, num_memory_slots: int):
+    def __init__(self, vocab_size: int, embed_width: int, column_neurons: int, num_tiles: int, num_memory_slots: int):
         super().__init__()
         self.embed_width = embed_width
         self.column_neurons = column_neurons
@@ -84,8 +81,7 @@ class ToyTileRecurrenceRMTStandard(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(self.total_slots, sw))
         nn.init.normal_(self.pos_embed, std=0.02)
 
-    def forward(self, x_window: torch.Tensor, memory_prev: torch.Tensor
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x_window: torch.Tensor, memory_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         n_mem, n_content = self.num_memory_slots, self.num_tiles
 
         x_wide = self.input_proj(x_window)
@@ -98,7 +94,7 @@ class ToyTileRecurrenceRMTStandard(nn.Module):
         k = self.k_proj(combined_normed)
         v = self.v_proj(combined_normed)
         d = q.shape[-1]
-        scores = (q @ k.transpose(-1, -2)) / (d ** 0.5)
+        scores = (q @ k.transpose(-1, -2)) / (d**0.5)
         attn_w = torch.softmax(scores, dim=-1)
         attn = attn_w @ v
         attn = self.o_proj(attn)

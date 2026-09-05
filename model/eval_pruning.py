@@ -20,10 +20,10 @@ get zeroed."
 torch/transformers-only; not part of the sili runtime path, only a
 validation step for the conversion pipeline.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
 
 import torch
 
@@ -32,19 +32,15 @@ import torch
 # (no instruction tuning) should already predict well; this isn't meant
 # to be a rigorous benchmark, just a sanity-scale check that pruning
 # hasn't broken the model in an obvious way.
-EVAL_TEXTS: List[str] = [
+EVAL_TEXTS: list[str] = [
     "The capital of France is Paris, a city known for its museums and "
     "architecture. Many tourists visit every year to see the Eiffel Tower.",
-
     "Water boils at one hundred degrees Celsius at sea level. As "
     "altitude increases, the boiling point of water decreases.",
-
     "She opened the old wooden door and stepped into the quiet library. "
     "Dust floated in the afternoon light as she searched the shelves.",
-
     "The mitochondria is often called the powerhouse of the cell because "
     "it produces most of the cell's supply of adenosine triphosphate.",
-
     "In the morning, the fishermen pushed their small boats into the "
     "gray water and rowed out past the harbor wall toward open sea.",
 ]
@@ -56,19 +52,15 @@ EVAL_TEXTS: List[str] = [
 # steady across both sets (0.482 vs. 0.478) even though the dense
 # baseline itself varies more between them (0.503 vs. 0.584) -- see
 # JOURNAL.md.
-EVAL_TEXTS_HELDOUT: List[str] = [
+EVAL_TEXTS_HELDOUT: list[str] = [
     "Mount Everest is the tallest mountain above sea level on Earth, "
     "located in the Himalayas on the border between Nepal and Tibet.",
-
     "He measured the flour carefully, then folded it into the batter "
     "along with two eggs and a pinch of salt before heating the pan.",
-
     "Photosynthesis is the process by which plants convert sunlight, "
     "water, and carbon dioxide into glucose and release oxygen.",
-
     "The train pulled slowly out of the station as passengers waved "
     "goodbye through the rain-streaked windows of the carriage.",
-
     "A honeybee colony typically has one queen, thousands of worker "
     "bees, and a much smaller number of drones during the summer months.",
 ]
@@ -76,8 +68,8 @@ EVAL_TEXTS_HELDOUT: List[str] = [
 
 @dataclass
 class EvalResult:
-    per_text_loss: List[float]
-    per_text_accuracy: List[float]
+    per_text_loss: list[float]
+    per_text_accuracy: list[float]
 
     @property
     def perplexity(self) -> float:
@@ -89,7 +81,7 @@ class EvalResult:
         return sum(self.per_text_accuracy) / len(self.per_text_accuracy)
 
 
-def evaluate_next_token_prediction(model, tokenizer, texts: List[str] = EVAL_TEXTS) -> EvalResult:
+def evaluate_next_token_prediction(model, tokenizer, texts: list[str] = EVAL_TEXTS) -> EvalResult:
     """Teacher-forced next-token loss (HF's own shifted cross-entropy via
     labels=input_ids) and top-1 accuracy, per text."""
     model.eval()
@@ -100,7 +92,7 @@ def evaluate_next_token_prediction(model, tokenizer, texts: List[str] = EVAL_TEX
             out = model(**ids, labels=ids["input_ids"])
             losses.append(float(out.loss))
 
-            logits = out.logits[0, :-1]          # predict token t+1 from position t
+            logits = out.logits[0, :-1]  # predict token t+1 from position t
             targets = ids["input_ids"][0, 1:]
             preds = logits.argmax(dim=-1)
             accs.append(float((preds == targets).float().mean()))
@@ -110,8 +102,8 @@ def evaluate_next_token_prediction(model, tokenizer, texts: List[str] = EVAL_TEX
 def compare_dense_vs_pruned(
     model,
     tokenizer,
-    pruned_dense_state_dict: Dict[str, torch.Tensor],
-    texts: List[str] = EVAL_TEXTS,
+    pruned_dense_state_dict: dict[str, torch.Tensor],
+    texts: list[str] = EVAL_TEXTS,
 ) -> dict:
     """
     Evaluate `model` dense, then with `pruned_dense_state_dict` loaded
@@ -123,7 +115,7 @@ def compare_dense_vs_pruned(
     """
     original_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
     try:
-        model.load_state_dict(original_state_dict)   # ensure a known-clean start
+        model.load_state_dict(original_state_dict)  # ensure a known-clean start
         dense_result = evaluate_next_token_prediction(model, tokenizer, texts)
 
         model.load_state_dict(pruned_dense_state_dict)
@@ -132,10 +124,10 @@ def compare_dense_vs_pruned(
         model.load_state_dict(original_state_dict)
 
     return {
-        "dense_perplexity":  dense_result.perplexity,
+        "dense_perplexity": dense_result.perplexity,
         "pruned_perplexity": pruned_result.perplexity,
-        "dense_accuracy":    dense_result.accuracy,
-        "pruned_accuracy":   pruned_result.accuracy,
-        "dense_per_text_loss":  dense_result.per_text_loss,
+        "dense_accuracy": dense_result.accuracy,
+        "pruned_accuracy": pruned_result.accuracy,
+        "dense_per_text_loss": dense_result.per_text_loss,
         "pruned_per_text_loss": pruned_result.per_text_loss,
     }

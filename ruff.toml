@@ -1,0 +1,75 @@
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+  "E", "F", "W",   # pycodestyle / pyflakes
+  "I",             # isort
+  "UP",            # pyupgrade
+  "B",             # flake8-bugbear
+  "SIM",           # flake8-simplify
+  "C90",           # mccabe complexity
+  "PL",            # pylint port
+  "RUF",           # ruff-specific
+  "NPY",           # numpy
+  "ARG",           # unused arguments
+  "ERA",           # commented-out code  <- the AI-slop killer
+  "S",             # bandit-equivalent security
+  "C4",            # comprehension style
+  "PIE",           # misc bugs
+  "RET",           # return style
+  "PERF",          # perf anti-patterns
+]
+ignore = [
+  "E501",          # line length handled by formatter
+  "PLR0913",       # too many args   (research code: many probe/sweep scripts)
+  "PLR0915",       # too many statements
+  "PLR2004",       # magic values    (research code)
+  "S101",          # assert          (asserts are load-bearing in this codebase)
+  "RET504",        # assignment before return (readability preference)
+]
+mccabe.max-complexity = 12
+
+[lint.pylint]
+max-args = 20
+max-locals = 40
+
+[lint.per-file-ignores]
+# model/, scripts/, tests/ had never been linted before this setup.
+# 201 findings survive after --fix/--unsafe-fixes + the mechanical fixes
+# applied directly this pass (import sort/pyupgrade, ambiguous var names,
+# unused unpacked vars, dict.fromkeys, PLC0206/PERF102 dict iteration,
+# subprocess check=, E702 split, PLW2901 rename) and 2 real bugs fixed
+# directly (typo tracepack->traceback in a legacy overnight script;
+# missing kwargs on a test's log_fn stub). Left as an explicit, reviewed
+# bypass rather than further mass-editing research/model code (task #386):
+#  - E402 (58): sys.path.insert(0, ...)-before-import pattern used
+#    throughout scripts/ and tests/ for the flat (non-package) layout
+#  - NPY002 (32): legacy np.random.* calls -- switching to Generator-based
+#    RNG changes the actual random stream, which would silently invalidate
+#    every seeded reproducibility/statistical-comparison result in this
+#    codebase; not a safe mechanical rewrite (see memory: seed stochastic
+#    RNG for comparisons)
+#  - ARG001/ARG002 (50): unused args kept for interface/callback parity
+#    (e.g. log_fn stub signatures, ABC-style overrides)
+#  - C901/PLR0912 (23): pre-existing complexity in already-tested, working
+#    research code (train_curriculum: 654 lines/CCN=74; step(): 453
+#    lines/CCN=14) -- real debt, but a dedicated refactor, not a lint-pass
+#    side effect; see the separate lizard baseline-scan finding
+#  - PLC0415 (14): deliberate lazy imports
+#  - SIM115 (6): open() without a context manager in one-off sweep
+#    scripts that log across the whole script lifetime, no early-return
+#    path to leak the handle on
+#  - PLW0603 (5): deliberate module-global state in probe scripts
+#  - S603/PLR0917 (8): subprocess calls with a fixed arg list; positional-
+#    arg-heavy signatures (research code, matches the already-ignored
+#    PLR0913 rationale above)
+#  - S301 (2): pickle load/save is the checkpoint format by design here
+#  - B017 (2): pytest.raises(Exception) is deliberately broad where two
+#    different code paths can raise two different exception types
+#  - PERF401 (1): rewriting a try/append loop as list.extend would lose
+#    the partial-results-on-exception behavior the surrounding
+#    try/finally relies on
+"model/**/*.py" = ["E402", "NPY002", "ARG001", "ARG002", "C901", "PLR0912", "PLC0415", "SIM115", "PLW0603", "S603", "PLR0917", "S301", "B017", "PERF401"]
+"scripts/**/*.py" = ["E402", "NPY002", "ARG001", "ARG002", "C901", "PLR0912", "PLC0415", "SIM115", "PLW0603", "S603", "PLR0917", "S301", "B017", "PERF401"]
+"tests/**/*.py" = ["E402", "NPY002", "ARG001", "ARG002", "C901", "PLR0912", "PLC0415", "SIM115", "PLW0603", "S603", "PLR0917", "S301", "B017", "PERF401"]

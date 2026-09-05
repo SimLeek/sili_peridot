@@ -69,6 +69,7 @@ isolating the actual cause.
 
 Run: python -m scripts.torch_rnn_control
 """
+
 from __future__ import annotations
 
 import sys
@@ -76,12 +77,12 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 sys.path.insert(0, ".")
 
-from model.toy_beyond_context_task import generate_deviation_sequence, VOCAB_SIZE
+from model.toy_beyond_context_task import VOCAB_SIZE, generate_deviation_sequence
 
 HIDDEN = 128
 TRAIN_STEPS = 2000
@@ -100,9 +101,9 @@ class RecurrentControl(nn.Module):
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         # tokens: [T] (single sequence, body + query token, no batch dim)
-        x = self.embed(tokens).unsqueeze(0)   # [1, T, hidden]
-        out, _ = self.rnn(x)                  # full real BPTT through the whole sequence
-        return self.head(out.squeeze(0))       # [T, vocab] -- logits at every position
+        x = self.embed(tokens).unsqueeze(0)  # [1, T, hidden]
+        out, _ = self.rnn(x)  # full real BPTT through the whole sequence
+        return self.head(out.squeeze(0))  # [T, vocab] -- logits at every position
 
 
 def evaluate(model, rng):
@@ -118,7 +119,7 @@ def evaluate(model, rng):
             for _ in range(EVAL_SEQUENCES):
                 tokens, pairs = generate_deviation_sequence(rng, n_bits)
                 query_pos, answer = pairs[0]
-                tokens_t = torch.from_numpy(tokens[:query_pos + 1]).long()
+                tokens_t = torch.from_numpy(tokens[: query_pos + 1]).long()
                 logits = model(tokens_t)
                 pred = int(logits[-1].argmax())
                 correct += int(pred == answer)
@@ -135,11 +136,11 @@ def train_and_eval(rnn_cls, label, seed):
     opt = torch.optim.Adam(model.parameters(), lr=LR)
 
     losses = []
-    for step in range(TRAIN_STEPS):
+    for _step in range(TRAIN_STEPS):
         n_bits = int(rng.randint(2, OUT_OF_CONTEXT_MAX + 1))  # uniform, no curriculum needed
         tokens, pairs = generate_deviation_sequence(rng, n_bits)
         query_pos, answer = pairs[0]
-        tokens_t = torch.from_numpy(tokens[:query_pos + 1]).long()
+        tokens_t = torch.from_numpy(tokens[: query_pos + 1]).long()
         logits = model(tokens_t)
         loss = F.cross_entropy(logits[-1:], torch.tensor([answer]))
         opt.zero_grad()
@@ -164,7 +165,7 @@ def train_and_eval_no_bptt(rnn_cls, label, seed):
     opt = torch.optim.Adam(model.parameters(), lr=LR)
 
     losses = []
-    for step in range(TRAIN_STEPS):
+    for _step in range(TRAIN_STEPS):
         n_bits = int(rng.randint(2, OUT_OF_CONTEXT_MAX + 1))
         tokens, pairs = generate_deviation_sequence(rng, n_bits)
         query_pos, answer = pairs[0]
@@ -187,21 +188,20 @@ def train_and_eval_no_bptt(rnn_cls, label, seed):
 
 
 def main():
-    print(f"hidden={HIDDEN} train_steps={TRAIN_STEPS} lr={LR} optimizer=Adam "
-          f"eval_sequences={EVAL_SEQUENCES}\n")
+    print(f"hidden={HIDDEN} train_steps={TRAIN_STEPS} lr={LR} optimizer=Adam eval_sequences={EVAL_SEQUENCES}\n")
 
     print("=== full BPTT ===")
     for rnn_cls, label in [(nn.RNN, "nn.RNN (vanilla Elman)"), (nn.LSTM, "nn.LSTM")]:
         t0 = time.time()
         results, final_loss = train_and_eval(rnn_cls, label, seed=1000)
-        print(f"{label}: final_loss(last100)={final_loss:.4f}  ({time.time()-t0:.1f}s)")
+        print(f"{label}: final_loss(last100)={final_loss:.4f}  ({time.time() - t0:.1f}s)")
         print(f"  {' '.join(f'n={n}:{results[n]:.2f}' for n in EVAL_N_VALUES)}")
 
     print("\n=== NO BPTT (hidden state detached every tick, matching the from-scratch system) ===")
     for rnn_cls, label in [(nn.RNN, "nn.RNN (vanilla Elman)"), (nn.LSTM, "nn.LSTM")]:
         t0 = time.time()
         results, final_loss = train_and_eval_no_bptt(rnn_cls, label, seed=1000)
-        print(f"{label}: final_loss(last100)={final_loss:.4f}  ({time.time()-t0:.1f}s)")
+        print(f"{label}: final_loss(last100)={final_loss:.4f}  ({time.time() - t0:.1f}s)")
         print(f"  {' '.join(f'n={n}:{results[n]:.2f}' for n in EVAL_N_VALUES)}")
 
     print("\n(chance = 0.5 for a single binary answer bit)")

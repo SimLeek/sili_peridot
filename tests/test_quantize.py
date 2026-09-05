@@ -1,11 +1,11 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import numpy as np
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
 
 from model.config import MiniCPM5Config
 from model.fold import SUFFIXES
@@ -14,9 +14,15 @@ from model.quantize import build_quantized_dense_state_dict_streaming
 
 def _tiny_config(n_layers=2) -> MiniCPM5Config:
     return MiniCPM5Config(
-        hidden_size=8, intermediate_size=12, num_hidden_layers=n_layers,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=4,
-        vocab_size=10, rms_norm_eps=1e-6, rope_theta=5000000.0,
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=n_layers,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=10,
+        rms_norm_eps=1e-6,
+        rope_theta=5000000.0,
         tie_word_embeddings=False,
     )
 
@@ -26,13 +32,34 @@ def _fake_sparse_state(cfg: MiniCPM5Config, seed=3) -> dict:
     sd = {}
     for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
-        sd[p + ".self_attn.q_proj.weight"] = {"raw": torch.randn(cfg.q_proj_out, cfg.attn_in), "shape": (cfg.q_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.k_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.v_proj.weight"] = {"raw": torch.randn(cfg.kv_proj_out, cfg.attn_in), "shape": (cfg.kv_proj_out, cfg.attn_in)}
-        sd[p + ".self_attn.o_proj.weight"] = {"raw": torch.randn(cfg.attn_out, cfg.o_proj_in), "shape": (cfg.attn_out, cfg.o_proj_in)}
-        sd[p + ".mlp.gate_proj.weight"]    = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.up_proj.weight"]      = {"raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in), "shape": (cfg.mlp_hidden, cfg.mlp_in)}
-        sd[p + ".mlp.down_proj.weight"]    = {"raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden), "shape": (cfg.mlp_out, cfg.mlp_hidden)}
+        sd[p + ".self_attn.q_proj.weight"] = {
+            "raw": torch.randn(cfg.q_proj_out, cfg.attn_in),
+            "shape": (cfg.q_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.k_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.v_proj.weight"] = {
+            "raw": torch.randn(cfg.kv_proj_out, cfg.attn_in),
+            "shape": (cfg.kv_proj_out, cfg.attn_in),
+        }
+        sd[p + ".self_attn.o_proj.weight"] = {
+            "raw": torch.randn(cfg.attn_out, cfg.o_proj_in),
+            "shape": (cfg.attn_out, cfg.o_proj_in),
+        }
+        sd[p + ".mlp.gate_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.up_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_hidden, cfg.mlp_in),
+            "shape": (cfg.mlp_hidden, cfg.mlp_in),
+        }
+        sd[p + ".mlp.down_proj.weight"] = {
+            "raw": torch.randn(cfg.mlp_out, cfg.mlp_hidden),
+            "shape": (cfg.mlp_out, cfg.mlp_hidden),
+        }
     return sd
 
 
@@ -111,18 +138,14 @@ class TestBuildQuantizedDenseStateDictStreaming:
 
         out = build_quantized_dense_state_dict_streaming(sparse_state, cfg)
 
-        changed = any(
-            not torch.equal(out[name], original[name])
-            for name in original
-        )
+        changed = any(not torch.equal(out[name], original[name]) for name in original)
         assert changed
 
     def test_invalid_value_scale_mode_raises(self):
         cfg = _tiny_config(n_layers=1)
         sparse_state = _fake_sparse_state(cfg)
         with pytest.raises(ValueError, match="value_scale_mode"):
-            build_quantized_dense_state_dict_streaming(
-                sparse_state, cfg, value_scale_mode="bogus")
+            build_quantized_dense_state_dict_streaming(sparse_state, cfg, value_scale_mode="bogus")
 
 
 class TestRank1QuantizationRecoversMoreThanPerRow:
@@ -130,18 +153,15 @@ class TestRank1QuantizationRecoversMoreThanPerRow:
         cfg = _tiny_config(n_layers=3)
         sparse_state = _fake_sparse_state_with_output_structure(cfg)
         original = {name: entry["raw"].clone() for name, entry in sparse_state.items()}
-        sparse_state_per_row = {name: {"raw": entry["raw"].clone(), "shape": entry["shape"]}
-                                for name, entry in sparse_state.items()}
+        sparse_state_per_row = {
+            name: {"raw": entry["raw"].clone(), "shape": entry["shape"]} for name, entry in sparse_state.items()
+        }
 
-        quantized_rank1 = build_quantized_dense_state_dict_streaming(
-            sparse_state, cfg, value_scale_mode="rank1")
+        quantized_rank1 = build_quantized_dense_state_dict_streaming(sparse_state, cfg, value_scale_mode="rank1")
         quantized_per_row = build_quantized_dense_state_dict_streaming(
-            sparse_state_per_row, cfg, value_scale_mode="per_row")
+            sparse_state_per_row, cfg, value_scale_mode="per_row"
+        )
 
-        err_rank1 = sum(
-            (quantized_rank1[name] - original[name]).abs().sum().item() for name in original
-        )
-        err_per_row = sum(
-            (quantized_per_row[name] - original[name]).abs().sum().item() for name in original
-        )
+        err_rank1 = sum((quantized_rank1[name] - original[name]).abs().sum().item() for name in original)
+        err_per_row = sum((quantized_per_row[name] - original[name]).abs().sum().item() for name in original)
         assert err_rank1 < err_per_row

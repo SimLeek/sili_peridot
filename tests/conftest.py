@@ -3,6 +3,8 @@ sili_peridot/tests/conftest.py
 ─────────────────────────────
 Shared pytest fixtures/hooks.
 """
+
+import contextlib
 import ctypes
 import gc
 
@@ -19,10 +21,8 @@ def trim_memory():
     real-checkpoint tests run close to this machine's 15GB ceiling.
     """
     gc.collect()
-    try:
+    with contextlib.suppress(OSError):
         ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except OSError:
-        pass
 
 
 def pytest_runtest_teardown(item, nextitem):

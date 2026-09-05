@@ -1,18 +1,18 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
 
-from model.toy_beyond_context_task import generate_parity_sequence, QUERY_TOKEN, VOCAB_SIZE
+from model.toy_beyond_context_task import QUERY_TOKEN, VOCAB_SIZE, generate_parity_sequence
 
 
 class TestGenerateParitySequence:
     def test_shape_and_dtype(self):
         rng = np.random.RandomState(0)
-        tokens, pairs = generate_parity_sequence(rng, n_bits=5)
+        tokens, _pairs = generate_parity_sequence(rng, n_bits=5)
         assert tokens.shape == (7,)
         assert tokens.dtype == np.int64
 
@@ -40,7 +40,7 @@ class TestGenerateParitySequence:
     def test_answer_is_binary_and_within_vocab(self):
         rng = np.random.RandomState(4)
         for _ in range(20):
-            tokens, pairs = generate_parity_sequence(rng, n_bits=3)
+            _tokens, pairs = generate_parity_sequence(rng, n_bits=3)
             _pos, answer = pairs[0]
             assert answer in (0, 1)
             assert answer < VOCAB_SIZE

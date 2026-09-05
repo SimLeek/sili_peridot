@@ -30,16 +30,14 @@ co-activate, so the resulting interference is rare too) -- dense input
 makes it increasingly worthwhile, which is why the real comparison sweeps
 density rather than testing at one fixed sparsity level.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, List, Optional
 
 import numpy as np
-
 from sili.tensor import Tensor, reduce_sum
-
-from model.eval_rank_floor import FullRankDenseLayer  # reused as-is for the plain-float encoder/decoder sanity arm
 
 
 def sample_sparse_features(rng: np.random.Generator, n_features: int, density: float) -> np.ndarray:
@@ -57,7 +55,7 @@ def feature_importance(n_features: int, decay: float = 0.9) -> np.ndarray:
     convention (without some importance gradient, every feature is
     interchangeable and there's nothing to prioritize when interference
     under a tight bottleneck is unavoidable)."""
-    return np.array([decay ** i for i in range(n_features)], dtype=np.float32)
+    return np.array([decay**i for i in range(n_features)], dtype=np.float32)
 
 
 def weighted_mse(x: np.ndarray, x_hat: np.ndarray, importance: np.ndarray) -> float:
@@ -90,13 +88,24 @@ class SuperpositionReport:
     best_weighted_loss: float  # lowest weighted loss seen at any evaluation checkpoint
 
 
-def measure_superposition(encoder, decoder, n_features: int, hidden_width: int, density: float,
-                           n_steps: int, lr: float, seed: int, importance_decay: float = 0.9,
-                           opt=None, opt_step: Optional[Callable] = None,
-                           clip_grad_norm: Optional[Callable] = None,
-                           lr_decay: float = 1.0, eval_every: int = 20,
-                           eval_batch: int = 200,
-                           log_fn: Optional[Callable[[int, int, float, float], None]] = None) -> SuperpositionReport:
+def measure_superposition(
+    encoder,
+    decoder,
+    n_features: int,
+    hidden_width: int,
+    density: float,
+    n_steps: int,
+    lr: float,
+    seed: int,
+    importance_decay: float = 0.9,
+    opt=None,
+    opt_step: Callable | None = None,
+    clip_grad_norm: Callable | None = None,
+    lr_decay: float = 1.0,
+    eval_every: int = 20,
+    eval_batch: int = 200,
+    log_fn: Callable[[int, int, float, float], None] | None = None,
+) -> SuperpositionReport:
     """Trains `encoder` (n_features -> hidden_width) and `decoder`
     (hidden_width -> n_features) -- each any object with `.forward(x:
     Tensor, learning_rate) -> Tensor` and (for a plain, non-quantized
@@ -140,7 +149,7 @@ def measure_superposition(encoder, decoder, n_features: int, hidden_width: int, 
     importance_t = Tensor(importance.reshape(1, -1))
     best = float("inf")
     for step in range(n_steps):
-        effective_lr = lr * (lr_decay ** step)
+        effective_lr = lr * (lr_decay**step)
         x_np = sample_sparse_features(rng, n_features, density)
         x = Tensor(x_np.reshape(1, -1))
         hidden = encoder.forward(x, effective_lr)
@@ -166,6 +175,9 @@ def measure_superposition(encoder, decoder, n_features: int, hidden_width: int, 
     if log_fn is not None:
         log_fn(n_steps, n_steps, final, best)
     return SuperpositionReport(
-        n_features=n_features, hidden_width=hidden_width, density=density,
-        final_weighted_loss=final, best_weighted_loss=best,
+        n_features=n_features,
+        hidden_width=hidden_width,
+        density=density,
+        final_weighted_loss=final,
+        best_weighted_loss=best,
     )
