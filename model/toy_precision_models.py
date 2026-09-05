@@ -1,47 +1,9 @@
 """
 sili_peridot/model/toy_precision_models.py
 ────────────────────────────────────────────
-Adam (fp32-matched-to-FP4) vs importance+energy (real FP4), matched
-precision -- see the approved plan (fuzzy-plotting-starlight.md) for
-the full design rationale. Answers a question deliberately deferred
-earlier this session: does this project's own importance/row-scale
-training (`sili.sparse_rnn.DISLDOLayer`) beat a standard, well-tuned
-optimizer (Adam), when BOTH sides represent weights at the SAME
-FP4-level precision -- not fp32 vs FP4, which would just repeat the
-precision/optimizer confound this session already spent real effort
-disentangling (JOURNAL.md's two isolation controls).
-
-`use_energy` is a SEPARATE, orthogonal toggle on BOTH model classes
-(not baked into one arm only) -- per [[feedback_do_science_correctly]]:
-an earlier version of this module gave `EnergyDynamics` to the
-real-FP4 arm only, confounding "optimizer" with "energy's own added
-noise/aux-loss." `EnergyDynamics` wraps ACTIVATIONS (the attention
-output), not weight training, so it attaches identically regardless of
-which linear-layer type is used -- each layer builds its OWN fresh
-`EnergyDynamics` instance (`_toy_scale_energy()`) when `use_energy=True`,
-since its `energy` running state is per-instance and must not be
-shared across layers/models.
-
-`fake_quantize_fp4`/`ArtificialFP4Linear` reproduce the REAL FP4
-representation (`sili/lib/headers/fp4quant.hpp`'s 16-level table,
-`sili/sparse_rnn.py`'s `per_row` calibration formula
-`scale=max(|row|)/6.0`) as a straight-through fake-quantization op on
-top of an ordinary Adam-trainable fp32 leaf -- NOT a reimplementation
-of DISLDOLayer's own (also gradient-trained) row-scale, which stays
-real/untouched on the other arm. `ToySmallTransformerRealFP4` uses
-DISLDOLayer directly (per [[feedback_importance_is_already_the_optimizer]]:
-its inline C++ update during backward() already IS an optimizer -- no
-external AdamOptimizer.step() call on its own big weight matrices).
-
-`AdamRowScaleDISLDOLayer`/`ToySmallTransformerRealFP4RowScaleAdam`:
-per direct correction, individual FP4 weight VALUES should keep
-importance as their training signal (believed to be the right
-mechanism for synaptogenesis/pruning), but the coarser per-row
-`value_scale` -- one float per row, not per weight -- is cheap to give
-its own Adam-style adaptive normalization on top of importance's own
-raw update, without replacing importance's role anywhere. See
-AdamRowScaleDISLDOLayer's own docstring for the exact mechanism and
-its one real approximation.
+Precision-matched Adam-vs-importance comparison harness (Adam+fake-FP4
+vs real DISLDOLayer FP4/energy).
+See docs/research/toy_precision_models.rst:toy_precision_models.module_overview.
 """
 
 from __future__ import annotations
@@ -57,53 +19,27 @@ from .toy_recall_models import AdamOptimizer, DenseTensorLinear, rmsnorm_tensor
 
 
 def _toy_scale_energy() -> EnergyDynamics:
-    """`sili_block.default_window_energy` is explicitly a placeholder
-    calibrated for full-model-scale windows ("real tuning is Phase 5's
-    job") -- checked directly against this toy scale (HIDDEN=12,
-    T*HIDDEN~60) rather than assumed to transfer: its own aux_loss grew
-    unbounded during training (5.5 -> 17.9 over 300 steps) and total
-    loss diverged. This config instead matches sili__new's own small
-    -scale EnergyDynamics test convention
-    (tests/unit/python/test_sparse_rnn_cell.py's
-    TestEnergyDynamicsKeptIndices, h sizes 20-64 -- comparable to this
-    toy model's own T*hidden), verified directly to behave far better
-    here (aux_loss stays 0.005 -> ~0.3, loss reaches a real minimum
-    instead of diverging)."""
+    """See docs/research/toy_precision_models.rst:toy_scale_energy.calibration."""
     return EnergyDynamics(drive=0.1, activation_cost=0.05, precision=0.01, density=0.05, p=0.3)
 
 
 def _apply_energy(energy: EnergyDynamics | None, attn: Tensor, T: int, hidden: int) -> tuple[Tensor, Tensor | None]:
-    """Shared by both model classes below -- wraps attn [T, hidden]
-    through EnergyDynamics (flatten/unflatten, matching
-    model/tile_recurrence.py's own apply_tile_step convention) if
-    `energy` is given, else passes attn through unchanged with no
-    aux_loss. Keeps the with/without-energy code paths identical
-    everywhere except this one call, so the two arms differ ONLY in
-    whether this is a no-op."""
+    """Shared use_energy toggle helper (flatten/unflatten around EnergyDynamics), no-op when energy is None.
+    See docs/research/toy_precision_models.rst:real_fp4_layer.inline_training."""
     if energy is None:
         return attn, None
     gated, aux_loss, _actual_p = energy(attn.reshape((T * hidden,)))
     return gated.reshape((T, hidden)), aux_loss
 
 
-# 15 real, finite FP4 (OCP MXFP4 E2M1) levels -- verbatim copy of
-# sili/lib/headers/fp4quant.hpp's FP4_TABLE (one of the 16 four-bit
-# codes is repurposed as NaN there, leaving 15 usable values here):
-# {0, .5, 1, 1.5, 2, 3, 4, 6} and their negatives (0 not duplicated).
+# See docs/research/toy_precision_models.rst:fake_quantize_fp4.straight_through_qat.
 _FP4_POSITIVE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
 FP4_TABLE = np.concatenate([-_FP4_POSITIVE[:0:-1], _FP4_POSITIVE]).astype(np.float32)
 FP4_MAX = 6.0
 
 
 def fake_quantize_fp4(w: Tensor) -> Tensor:
-    """Straight-through fake FP4 quantization -- forward rounds each
-    row of `w` to the real 15-level FP4 table using the same per-row
-    `scale=max(|row|)/6.0` calibration `sili/sparse_rnn.py`'s
-    `per_row` mode uses; backward is identity (standard QAT practice --
-    `w` itself, not the quantized output, is the thing Adam actually
-    trains). Same custom-`_bwd`-closure pattern as
-    `toy_recall_models.cross_entropy_sum`/`rmsnorm_tensor` -- no
-    sili__new change needed."""
+    """See docs/research/toy_precision_models.rst:fake_quantize_fp4.straight_through_qat."""
     row_scale = np.max(np.abs(w.data), axis=-1, keepdims=True) / FP4_MAX
     row_scale = np.maximum(row_scale, 1e-8)
     scaled = w.data / row_scale
@@ -120,9 +56,8 @@ def fake_quantize_fp4(w: Tensor) -> Tensor:
 
 
 class ArtificialFP4Linear:
-    """fp32 master weight (ordinary Adam-trainable leaf), matmul
-    against its own fake-FP4-quantized value every forward -- see
-    fake_quantize_fp4."""
+    """fp32 master weight, matmuls against its own fake_quantize_fp4-quantized value every forward.
+    See docs/research/toy_precision_models.rst:fake_quantize_fp4.straight_through_qat."""
 
     def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
         self.weight = Tensor((np.random.randn(in_features, out_features) * scale).astype(np.float32))
@@ -155,17 +90,9 @@ class _ArtificialFP4Layer:
 
 
 class ToySmallTransformerArtificialFP4:
-    """Same shape as toy_recall_models.ToySmallTransformer, built from
-    ArtificialFP4Linear instead of DenseTensorLinear -- the Adam arm
-    of the precision-matched comparison. Trained via an ordinary
-    AdamOptimizer over .parameters(), exactly like the dense toy
-    baseline. `use_energy` toggles EnergyDynamics on the attention
-    output (see module docstring) -- independent of the optimizer/
-    precision question this class otherwise tests.
-
-    forward() returns (logits, aux_loss) -- aux_loss is None when
-    use_energy=False, else must be added to the task loss before
-    .backward() (same convention as ToySmallTransformerRealFP4)."""
+    """Adam arm of the precision-matched comparison (ArtificialFP4Linear + ordinary AdamOptimizer).
+    See docs/research/toy_precision_models.rst:toy_precision_models.module_overview
+    and real_fp4_layer.inline_training."""
 
     def __init__(
         self,
@@ -217,14 +144,7 @@ class ToySmallTransformerArtificialFP4:
 
 
 class _RealFP4Layer:
-    """DISLDOLayer's own big weight matrices train inline during
-    backward() (learning_rate-driven, no external optimizer -- see
-    module docstring); input_ln/post_ln are plain Tensor leaves,
-    trained by a small separate AdamOptimizer step (see
-    ToySmallTransformerRealFP4.parameters_for_optimizer -- these are
-    the ONLY params that optimizer ever sees). `disldo_cls` lets
-    ToySmallTransformerRealFP4RowScaleAdam reuse this exact layer
-    shape with AdamRowScaleDISLDOLayer in place of plain DISLDOLayer."""
+    """See docs/research/toy_precision_models.rst:real_fp4_layer.inline_training."""
 
     def __init__(
         self, hidden: int, mlp_hidden: int, max_weights: int, use_energy: bool, num_cpus: int, disldo_cls=DISLDOLayer
@@ -245,21 +165,8 @@ class _RealFP4Layer:
 
 
 class ToySmallTransformerRealFP4:
-    """Same shape as toy_recall_models.ToySmallTransformer, built from
-    DISLDOLayer (real inline-trained FP4, importance/row-scale as the
-    optimizer) -- the importance arm of the precision-matched
-    comparison. `use_energy` toggles EnergyDynamics on the attention
-    output (matching model/tile_recurrence.py's own apply_tile_step
-    pattern) -- independent of the optimizer/precision question this
-    class otherwise tests (see module docstring -- an earlier version
-    of this class always used energy, confounding the two).
-
-    forward() returns (logits, aux_loss) -- aux_loss is None when
-    use_energy=False, else must be added to the task loss before the
-    single shared .backward() call: that one call both trains
-    DISLDOLayer's weights (inline, via the gradient reaching each
-    layer's own output) AND accumulates gradient for the plain leaf
-    parameters (parameters_for_optimizer, below)."""
+    """Importance arm of the precision-matched comparison (DISLDOLayer, inline-trained real FP4).
+    See docs/research/toy_precision_models.rst:real_fp4_layer.inline_training."""
 
     def __init__(
         self,
@@ -282,9 +189,8 @@ class ToySmallTransformerRealFP4:
         self.lm_head = disldo_cls(hidden, vocab_size, max_weights, num_cpus)
 
     def parameters_for_optimizer(self) -> list[Tensor]:
-        """ONLY the plain leaf params (RMSNorm weights) -- DISLDOLayer's
-        own big weight matrices train inline during backward(), never
-        via an external optimizer step (see module/class docstrings)."""
+        """ONLY the plain leaf params (RMSNorm weights).
+        See docs/research/toy_precision_models.rst:real_fp4_layer.inline_training."""
         params = []
         for layer in self.layers:
             params += layer.trainable_leaf_parameters()
@@ -318,33 +224,7 @@ class ToySmallTransformerRealFP4:
 
 
 class AdamRowScaleDISLDOLayer:
-    """A real DISLDOLayer, with its per-row `value_scale` re-normalized
-    via Adam AFTER each backward() -- individual FP4 weight VALUES are
-    completely untouched (importance keeps its existing role there
-    entirely); only the coarser row-scale (one float per row) gets an
-    adaptive step on top.
-
-    Mechanism: `SparseLinearLayer.get_value_scale(row)`/
-    `set_value_scale_raw(row, scale)` are real pybind accessors
-    (`cpu_backend.cpp:1082-1097`) -- checked directly, not assumed.
-    `forward()` snapshots `value_scale` for every row BEFORE the
-    caller's `loss.backward()` runs (which is when DISLDOLayer's own
-    `backward_dense` applies its raw importance-damped update to
-    `value_scale`, inside the `_bwd` closure below); once that raw
-    update has been applied, this treats the OBSERVED delta
-    (`after - before`) as a proxy gradient signal
-    (`grad ~= -raw_delta / learning_rate`) and runs one standard Adam
-    moment-update step over that per-row vector, overwriting
-    `value_scale` with the Adam-normalized step instead of the raw
-    one.
-
-    This is an approximation, documented as such rather than silently
-    assumed correct: it re-normalizes an ALREADY-APPLIED delta rather
-    than intercepting the true pre-damping gradient before
-    DISLDOLayer's own importance-damping is applied to it -- a
-    reasonable experimental probe for whether adaptive normalization
-    on just the row-scale helps, not a claim that this is identical to
-    running real Adam on the underlying gradient."""
+    """See docs/research/toy_precision_models.rst:adam_row_scale_disldo_layer.proxy_gradient_approximation."""
 
     def __init__(
         self,
@@ -400,24 +280,7 @@ class AdamRowScaleDISLDOLayer:
 
 
 class AdamRank1DISLDOLayer:
-    """AdamRowScaleDISLDOLayer's mechanism, extended from row-only to
-    rank-1 (row `value_scale` AND column `output_scale`, both Adam
-    -normalized independently) -- individual FP4 weight VALUES stay
-    completely untouched, same as AdamRowScaleDISLDOLayer.
-
-    `output_scale` is real (`get_output_scale(col)`/
-    `set_output_scale_raw(col, scale)`, `cpu_backend.cpp:1105-1125`)
-    but -- checked directly, not assumed -- the pybind docstring states
-    it only becomes gradient-trainable in `backward_dense()` "after
-    calling `set_output_scale_raw` at least once." `__init__` calls
-    `set_output_scale_raw(c, 1.0)` for every column once (the
-    documented default value) specifically to activate that -- without
-    it, `output_scale` would never move at all and there'd be nothing
-    for the Adam step to re-normalize.
-
-    Same approximation as AdamRowScaleDISLDOLayer, documented there:
-    re-normalizes an ALREADY-APPLIED delta, not the true pre-damping
-    gradient."""
+    """See docs/research/toy_precision_models.rst:adam_rank1_disldo_layer.output_scale_activation."""
 
     def __init__(
         self,
@@ -491,10 +354,7 @@ class AdamRank1DISLDOLayer:
 
 
 class ToySmallTransformerRealFP4RowScaleAdam(ToySmallTransformerRealFP4):
-    """ToySmallTransformerRealFP4 with AdamRowScaleDISLDOLayer in place
-    of plain DISLDOLayer -- same architecture shape, same importance
-    -driven per-weight training, only the row-scale gets Adam
-    normalization on top. See AdamRowScaleDISLDOLayer's own docstring."""
+    """See docs/research/toy_precision_models.rst:adam_row_scale_disldo_layer.proxy_gradient_approximation."""
 
     def __init__(
         self,
@@ -521,9 +381,7 @@ class ToySmallTransformerRealFP4RowScaleAdam(ToySmallTransformerRealFP4):
 
 
 class ToySmallTransformerRealFP4Rank1Adam(ToySmallTransformerRealFP4):
-    """ToySmallTransformerRealFP4 with AdamRank1DISLDOLayer in place of
-    plain DISLDOLayer -- row AND column scale both get Adam
-    normalization. See AdamRank1DISLDOLayer's own docstring."""
+    """See docs/research/toy_precision_models.rst:adam_rank1_disldo_layer.output_scale_activation."""
 
     def __init__(
         self,
@@ -550,11 +408,7 @@ class ToySmallTransformerRealFP4Rank1Adam(ToySmallTransformerRealFP4):
 
 
 def row_scale_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, bits: int) -> np.ndarray:
-    """Per-row max-abs scale, symmetric signed N-bit levels -- matches
-    sili's own existing value_scale convention. Deterministic
-    round-to-nearest (NOT stochastic -- keeps this isolated from FP4's
-    own stochastic-rounding noise, a separate, already-characterized
-    variable)."""
+    """See docs/research/toy_precision_models.rst:rank1_fake_quantize.shared_scale_catastrophe_fix."""
     levels = 2 ** (bits - 1) - 1  # e.g. 7 for 4-bit, 127 for 8-bit
     out = vals.copy()
     for r in range(len(ptrs) - 1):
@@ -571,11 +425,7 @@ def row_scale_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, bits: int) -> np
 
 
 def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray, n_out: int, bits: int) -> np.ndarray:
-    """Row scale * col scale (rank-1 envelope, matching sili_peridot's
-    own B5a fix for the shared-scale FP4 catastrophe): alternating
-    max-fit, 3 passes. Fully vectorized (np.maximum.at scatter-max, no
-    per-synapse Python loop) -- must stay cheap enough to run every
-    training step at full density."""
+    """See docs/research/toy_precision_models.rst:rank1_fake_quantize.shared_scale_catastrophe_fix."""
     levels = 2 ** (bits - 1) - 1
     n_in = len(ptrs) - 1
     abs_vals = np.abs(vals.astype(np.float64))
@@ -602,42 +452,7 @@ def rank1_fake_quantize(vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray,
 def rankn_fake_quantize(
     vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray, n_out: int, bits: int, rank: int = 2
 ) -> np.ndarray:
-    """Generalizes rank1_fake_quantize's single shared row_scale/col_scale
-    pair to `rank` independently-fit column-scale profiles, one per
-    row-magnitude bucket (rows bucketed by their own max |w| into `rank`
-    equal-count quantile groups -- deterministic sort+split, no
-    iterative clustering).
-
-    An additive residual decomposition (fit rank-1, subtract, re-fit the
-    leftover, matching e.g. matching-pursuit/greedy-SVD) was the first
-    thing tried and does NOT work here, verified by hand before writing
-    this: rank1_fake_quantize's envelope is a strict MAX-COVER (its
-    alternating-max-fit guarantees row_scale[r]*col_scale[c] >= |v| for
-    every synapse in the row/col, by construction of row_scale itself
-    being a row max) -- the residual after subtracting it is <= 0
-    everywhere, so a second additive term has nothing left to refine.
-    This matters beyond being a dead end: an envelope is exactly what a
-    real N-bit fixed-point scale must be (never let a stored value
-    exceed what `levels` codes can represent) -- an approach that
-    doesn't preserve the cover property would be simulating something
-    real hardware couldn't actually do.
-
-    Bucketing rows by magnitude is the degree of freedom rank-1 alone
-    can't express: a single shared col_scale must cover the worst row
-    sharing that column even when most rows sharing it are far smaller
-    -- every small-magnitude row wastes precision matching a big
-    outlier row it happens to share a column with. Splitting rows into
-    magnitude buckets lets each bucket fit its own column envelope
-    against only its own peers. Measured effect is real but modest
-    (checked on a synthetic bimodal-magnitude case: rank-2 tightened
-    the small-magnitude bucket's mean envelope/|value| ratio by ~22%,
-    the large-magnitude bucket unchanged, as expected) -- it is bounded
-    by how much true row/col scale correlation the data has, not a
-    free lunch, and higher rank than the number of genuinely distinct
-    magnitude regimes in the data won't keep helping.
-
-    Reduces EXACTLY to rank1_fake_quantize when rank=1 (single bucket
-    containing every row = the identical 3-pass alternating fit)."""
+    """See docs/research/toy_precision_models.rst:rankn_fake_quantize.magnitude_bucketed_columns."""
     if rank < 1:
         raise ValueError(f"rank must be >= 1, got {rank}")
     levels = 2 ** (bits - 1) - 1
@@ -682,27 +497,7 @@ def rankn_fake_quantize(
 def residual_fake_quantize(
     vals: np.ndarray, ptrs: np.ndarray, indices: np.ndarray, n_out: int, bits_per_stage: int, n_stages: int
 ) -> np.ndarray:
-    """True residual/cascaded quantization -- matching neural-audio-codec
-    RVQ (e.g. EnCodec/SoundStream): quantize vals via rank1_fake_quantize
-    at bits_per_stage, then quantize the ROUNDING RESIDUAL (vals - q1)
-    with a FRESH rank1 envelope fit to the residual's own (much smaller)
-    dynamic range, repeat n_stages times, sum every stage to reconstruct.
-
-    NOT the same as the rank-n entry's documented dead end (JOURNAL.md):
-    that attempt tried to refine the rank1 SCALE ENVELOPE itself
-    (row_scale*col_scale, a max-cover bound -- provably nothing left to
-    subtract a second time, since the envelope already upper-bounds
-    every |v| in its row/col by construction). This instead refines the
-    quantized VALUE's rounding error, an unrelated, always-nonzero
-    quantity bounded by half a quantization step -- the actual mechanism
-    real residual vector quantization exploits, and genuinely untested
-    here before now.
-
-    Total cost: n_stages * bits_per_stage bits/weight (plus n_stages
-    independent row/col scale pairs -- small, O(rows+cols) overhead per
-    stage) -- e.g. n_stages=2, bits_per_stage=4 is 8 bits/weight total,
-    a fair, apples-to-apples comparison against
-    rank1_fake_quantize(bits=8)'s single 8-bit code."""
+    """See docs/research/toy_precision_models.rst:residual_fake_quantize.true_rvq_vs_rankn."""
     residual = vals.astype(np.float64).copy()
     reconstructed = np.zeros_like(residual)
     for _ in range(n_stages):
@@ -717,44 +512,7 @@ def residual_fake_quantize(
 def fixed_digit_residual_quantize(
     vals: np.ndarray, bits_per_stage: int, n_stages: int, base: float = 12.0, e_shared: float = 1.0
 ) -> np.ndarray:
-    """Zero-scaling-VECTOR residual quantization, literal closed-form
-    digit-place-value construction per direct design discussion:
-    `fp(4n) ~= e_shared * sum_i digit_i * base**-i`. NO row/col fit
-    anywhere (contrast `residual_fake_quantize`'s own per-stage
-    `rank1_fake_quantize` calls, and `rank1_8bit`'s trained
-    value_scale/output_scale) and NO per-call data-dependent
-    computation either (contrast even a fresh-every-step global max
-    like BitNet/XNOR-Net use) -- every stage's step size is a FIXED
-    constant chosen before any data is seen, matching the literal
-    "maybe choose/learn B or e_shared, but even then I'm not sure
-    that's needed" framing directly.
-
-    `base`: ratio between consecutive residual stages' resolution.
-    The mantissa-derived value (real sili FP4/E2M1's own worst-case
-    relative rounding error ~= 1/2**(mantissa_bits+1) = 1/4, i.e.
-    base=4) substantially OVERLAPS each stage's representable range
-    with the one before it. Default 12.0 instead: the value where
-    digit i+1's ceiling lands exactly on digit i's floor (exact
-    tiling, zero overlap, zero gap), confirmed the real winner on
-    `TrueMultiDigitLayer`'s out-of-context curriculum -- mean_acc
-    0.9375 (plateaued, lowest variance) vs base=4's 0.8771, base=24's
-    0.70 (still not converged at 15000 steps, inconclusive). See
-    sili_peridot/JOURNAL.md 2026-08-10 and
-    project_hybrid_precision_plan memory for the full sweep.
-
-    `e_shared`: a single FIXED scalar (not a per-row/per-col vector,
-    not gradient-trained, never updated after being chosen) applied
-    once to bring the whole layer's values into the digit format's
-    representable floor -- has nothing to go stale relative to, since
-    it never changes after construction. Real FP4 alone only covers
-    ~[0.5, 6] before hitting its floor, and typical weight init
-    (~1/sqrt(fan_in)) sits well below that -- this is the ONE thing a
-    pure residual stack genuinely cannot fix on its own (each stage
-    only refines PRECISION within the range the previous stage already
-    covers, it can never extend the floor downward), so this parameter
-    stays even in the otherwise fully zero-scale design. Default 1.0
-    (no rescaling) -- real usage should derive this once from initial
-    weight statistics at construction, never touch it again."""
+    """See docs/research/toy_precision_models.rst:fixed_digit_residual_quantize.base_and_e_shared_derivation."""
     levels = 2 ** (bits_per_stage - 1) - 1
     residual = vals.astype(np.float64).copy()
     reconstructed = np.zeros_like(residual)
@@ -768,15 +526,7 @@ def fixed_digit_residual_quantize(
 
 
 def _quantize_raw_digit_inplace(inner: DISLDOLayer32, bits: int, step: float) -> None:
-    """Quantize a single digit's OWN stored weight (and importance) to a
-    plain, fixed, symmetric grid at `step` -- no row/col fit, no base/
-    e_shared multiplication (that scaling is applied OUTSIDE the digit,
-    as a multiplicative factor at combination time in
-    TrueMultiDigitDISLDOLayer, matching fixed_digit_residual_quantize's
-    own factoring of `step = e_shared/levels` as digit 1's shared raw
-    grid). Same grid for every digit -- the geometric base**-i shrink
-    happens entirely via the external factor, not via a finer grid
-    here."""
+    """See docs/research/toy_precision_models.rst:true_multi_digit_layer.independent_digit_architecture."""
     c = inner._c
     ptrs = np.array(c.ptrs, copy=True)
     indices = np.array(c.indices, copy=True)
@@ -788,52 +538,7 @@ def _quantize_raw_digit_inplace(inner: DISLDOLayer32, bits: int, step: float) ->
 
 
 class TrueMultiDigitLayer:
-    """Genuinely SEPARATE, independently-trained residual digit layers
-    -- NO hidden fp32 shadow across digits (contrast
-    QuantizedDISLDOLayer32(scheme="fixed_digit_residual"), which trains
-    ONE fp32 accumulator and only discretizes it for STORAGE after the
-    fact -- a real hardware implementation has no room for a hidden
-    full-precision shadow of every weight). Each digit is its OWN real
-    `digit_cls` instance, contributing `base**-i` of the final combined
-    output (i=0 is the coarsest/first digit) -- the Tensor class's own
-    `*`/`+` autograd ops chain the gradient back into each digit's own
-    real backward() automatically, no manual backward-wiring needed.
-
-    `digit_cls` -- per direct correction, DISLDO's real FP4 codec
-    should be the PRIMARY test here (quantization is the whole point),
-    not a fp32-backed simulation: default `DISLDOLayer` (real 4-bit
-    E2M1, matching sili's actual production codec) needs NO extra
-    Python-side quantization step at all -- real disldo_backward
-    already stores FP4 natively every update, so `simulate_quantize`
-    stays False for it. `DISLDOLayer32` (fp32 backend) is kept as an
-    optional REFERENCE/ceiling arm -- same digit-residual architecture
-    and training dynamics, but exact storage, isolating "does the
-    residual-DIGIT architecture itself work" from "does it survive
-    real FP4 storage" (this project's own long-standing
-    precision-isolation-control convention) -- for that arm only, pass
-    `simulate_quantize=True` to fake-quantize to a fixed grid after
-    each step (matching `fixed_digit_residual_quantize`'s own grid);
-    passing it True for an already-real-FP4 `digit_cls` would just
-    double-round for no reason.
-
-    Direct test of whether LATER (finer) digits need their OWN,
-    separately-scaled-down effective learning rate to stay stable, per
-    direct discussion (found first empirically: `fixed_digit_residual`
-    at 3+ stages needed roughly HALF the overall PEAK_LR to stop
-    degrading -- more digits remove the implicit noise-filtering coarse
-    rounding was providing, letting per-step gradient noise accumulate
-    unchecked). IMPORTANT, corrects an earlier mislabeling: the
-    combination `out_i * factors[i]` ALREADY multiplies the gradient
-    reaching digit i by `base**-i` via the ordinary chain rule (Tensor
-    `mul`'s own backward, verified directly) -- BEFORE `eff_lr` is even
-    applied. So `lr_power=0` (uniform nominal `learning_rate` passed to
-    every digit) is already naturally chain-rule-scaled, not an
-    unscaled "naive" baseline. `lr_power` sets an EXTRA multiplicative
-    reduction on top of that natural scaling:
-    `eff_lr = learning_rate / base**(lr_power*i)` -- lr_power=1/2 test
-    damping LATER digits MORE than the chain rule alone already gives,
-    not "chain-rule-matched" as an earlier draft of this docstring
-    incorrectly claimed."""
+    """See docs/research/toy_precision_models.rst:true_multi_digit_layer.independent_digit_architecture."""
 
     def __init__(
         self,
@@ -854,13 +559,7 @@ class TrueMultiDigitLayer:
         empty_init: bool = False,
         rng: np.random.Generator | None = None,
     ):
-        # dense=True / scale_rank>1 / empty_init=True only forwarded when
-        # set (not unconditionally) -- only DISLDOLayer/
-        # DISLDOLayerDeterministic (sili__new) accept these kwargs at
-        # all; older/other digit_cls options (DISLDOLayer32,
-        # DISLDOLayerResync, etc.) would TypeError on an unexpected
-        # kwarg otherwise, breaking every existing caller that doesn't
-        # ask for it.
+        # See docs/research/toy_precision_models.rst:true_multi_digit_layer.kwarg_forwarding_and_connectivity_sharing.
         digit_kwargs = {"rng": rng}
         if dense:
             digit_kwargs["dense"] = True
@@ -871,24 +570,7 @@ class TrueMultiDigitLayer:
         self.digits = [
             digit_cls(in_features, out_features, max_weights, num_cpus, **digit_kwargs) for _ in range(n_stages)
         ]
-        # share_connectivity: per direct hypothesis check -- each digit's
-        # OWN independent preseed/synaptogenesis (real DISLDOLayer, no
-        # coordination between digits) means digit i's active (row,col)
-        # synapses generally do NOT coincide with digit 0's. Verified
-        # directly: fresh preseed of 3 digits at max_weights=40/n=20
-        # showed 0/20, 0/20, 1/20 overlap -- essentially disjoint. The
-        # residual-correction mechanism this whole scheme depends on
-        # (digit i correcting digit i-1's rounding error AT THE SAME
-        # synapse) can only fire where digits' connectivity actually
-        # coincides -- with near-zero overlap it almost never does,
-        # unlike the SIMULATED fixed_digit_residual_quantize, which
-        # decomposes one shared value at one shared (row,col) by
-        # construction. When True, force every digit after the first
-        # onto digit 0's EXACT (ptrs, indices) -- same synapses, each
-        # digit's own independently-drawn/trained weight values -- a
-        # direct test of whether connectivity alignment, not more bits
-        # or a different LR, is what the residual composition actually
-        # needed. See sili_peridot/JOURNAL.md for the investigation.
+        # See docs/research/toy_precision_models.rst:true_multi_digit_layer.kwarg_forwarding_and_connectivity_sharing.
         if share_connectivity and n_stages > 1:
             base_c = self.digits[0]._c
             ptrs0 = np.asarray(base_c.ptrs)
@@ -926,11 +608,8 @@ class TrueMultiDigitLayer:
         damp_by_importance: bool = True,
         **synapse_kwargs,
     ) -> Tensor:
-        # synapse_kwargs: passed straight through to each digit's own
-        # forward() -- min_decay_frac/max_abs_delta/max_ci (see
-        # sili.sparse_rnn.DISLDOLayer.forward's own docstring), or
-        # nothing at all if the caller doesn't override them (each
-        # digit falls back to its own C++-side production defaults).
+        # synapse_kwargs forwarded as-is to each digit.forward() (min_decay_frac/max_abs_delta/max_ci; see
+        # sili.sparse_rnn.DISLDOLayer.forward).
         outs = []
         for i, digit in enumerate(self.digits):
             eff_lr = learning_rate / (self.base ** (self.lr_power * i))
@@ -956,23 +635,15 @@ class TrueMultiDigitLayer:
         return total
 
     def synaptogenesis(self, k: int, importance_cutoff: float):
-        """Delegate to each digit's own real synaptogenesis
-        (sili.sparse_rnn._SparseLayerBase.synaptogenesis: build_probes+
-        synap_step+equalizer_step), each capped at its OWN already
-        -stored `_max_row_weights` (set at construction from the SAME
-        `max_weights` every digit received -- see __init__). No shared
-        -connectivity coordination here (that was tested directly and
-        made things WORSE, not better -- see JOURNAL.md); each digit
-        grows/prunes independently, same as at construction time."""
+        """Delegate to each digit's own real synaptogenesis, independently (no shared-connectivity coordination).
+        See docs/research/toy_precision_models.rst:true_multi_digit_layer.kwarg_forwarding_and_connectivity_sharing."""
         for digit in self.digits:
             if hasattr(digit, "synaptogenesis"):
                 digit.synaptogenesis(k, importance_cutoff, digit._max_row_weights)
 
     def magnitude_rescale_output(self, target: float, correction_rate: float, scale_invariant: bool = False) -> None:
-        """Delegate to each digit's own real magnitude_rescale_output
-        (sili.sparse_rnn._SparseLayerBase.magnitude_rescale_output) --
-        same independent-per-digit pattern as synaptogenesis above (no
-        shared-scale coordination across digits)."""
+        """Delegate to each digit's own real magnitude_rescale_output, same independent-per-digit pattern as
+        synaptogenesis above."""
         for digit in self.digits:
             if hasattr(digit, "_c") and hasattr(digit._c, "magnitude_rescale_output"):
                 digit.magnitude_rescale_output(target, correction_rate, scale_invariant)
@@ -982,28 +653,7 @@ class TrueMultiDigitLayer:
 
 
 class TrueMultiDigitDenseLayer:
-    """DENSE, ordinary-Adam-trained control for TrueMultiDigitLayer --
-    per direct request: same digit-residual architecture (n separate
-    plain `DenseTensorLinear` layers, each contributing `base**-i`,
-    combined via the same Tensor `*`/`+` autograd chain), but trained
-    via a STANDARD external AdamOptimizer instead of DISLDO's own
-    inline importance-based update. If this dense+Adam version behaves
-    very differently from the real-FP4 `TrueMultiDigitLayer` at the
-    same n_stages/base/lr_power, that's evidence something about
-    DISLDO's OWN update mechanism specifically (not the residual-digit
-    ARCHITECTURE itself) explains the difference -- matching this
-    project's own long-standing precision/optimizer-isolation
-    convention (`ToySmallTransformerFP32Ref`,
-    `dense_tanh_no_bptt_control.py`). No quantization anywhere (fp32
-    dense weights throughout) -- this isolates the ARCHITECTURE +
-    UPDATE-RULE question specifically, separate from "does it survive
-    low-bit storage" (already covered by `TrueMultiDigitLayer`'s own
-    `digit_cls=DISLDOLayer` vs `DISLDOLayer32` comparison).
-
-    `max_weights`/`num_cpus` accepted but unused -- kept only so this
-    drops into the SAME `disldo_cls(in_features, out_features,
-    max_weights, num_cpus)` call convention `ToyTileRecurrenceRealFP4`
-    already uses for every other arm, no changes needed there."""
+    """See docs/research/toy_precision_models.rst:true_multi_digit_dense_layer.architecture_isolation_control."""
 
     def __init__(
         self,
@@ -1087,40 +737,7 @@ def _quantize_disldo32_inplace(
 
 
 class QuantizedDISLDOLayer32:
-    """A real DISLDOLayer32 (fp32 DeltaCSRBiValues backend, same
-    RMSprop-style importance formula as production DISLDOLayer) whose
-    weight AND importance arrays get fake-quantized to `bits` right
-    after every backward() call that actually trains (learning_rate !=
-    0.0). Simulates "this layer's real storage is N-bit" while keeping
-    the forward/backward ARITHMETIC itself exact fp32 -- isolates
-    "does training survive N-bit storage" from "is the update-rule
-    math itself precise", matching real quantization-aware-training
-    simulators.
-
-    Found empirically (see sili_peridot JOURNAL.md, the original
-    single-RNN-task sweep in the quantization-exploration script):
-    8-bit + rank-1 scale (row*col envelope), quantizing BOTH weight
-    and importance, reaches near-FP32 convergence quality; plain
-    per-row scale needs to leave importance in FP32 to do nearly as
-    well; 4-bit (either scale scheme) converges but at a real quality
-    cost even with rank-1 -- importance's dynamic range is shaped by
-    BOTH forward and backward signal, unlike a weight, which is why it
-    needs the extra rank-1 degree of freedom more. Defaults here
-    (bits=8, scheme=rank1, quantize_importance=True) are that
-    empirically-validated winner, not an arbitrary default -- this
-    class is the vehicle for testing whether it generalizes across
-    OTHER toy models/tasks before being worth a real sili__new C++
-    variant.
-
-    `scheme="rankn"` (with `rank` >= 2) is a follow-up being tested to
-    see whether it helps 4-bit specifically -- see rankn_fake_quantize's
-    own docstring for the mechanism and its honest, modest measured
-    effect. `rank` is only consulted when scheme=="rankn".
-
-    Same disldo_cls-pluggable call convention as DISLDOLayer/
-    DISLDOLayer32/AdamRowScaleDISLDOLayer -- drops directly into
-    ToySmallTransformerRealFP4/ToyTileRecurrenceRealFP4 with no
-    changes needed there."""
+    """See docs/research/toy_precision_models.rst:quantized_disldo_layer32.rank1_scale_envelope."""
 
     def __init__(
         self,
@@ -1144,12 +761,7 @@ class QuantizedDISLDOLayer32:
         self.rank = rank  # only consulted when scheme == "rankn"
         self.n_stages = n_stages  # only consulted when scheme in {"residual", "fixed_digit_residual"}
         self.base = base  # only consulted when scheme == "fixed_digit_residual"
-        # Computed ONCE here from the initial preseeded weights, then frozen
-        # for the rest of training (matching fixed_digit_residual_quantize's
-        # own "chosen once, never touched again" design -- has nothing to go
-        # stale relative to). e_shared=None (default) derives it from the
-        # real initial weight magnitude; a caller can still pass a fixed
-        # constant directly to skip that entirely.
+        # See docs/research/toy_precision_models.rst:fixed_digit_residual_quantize.base_and_e_shared_derivation.
         self.e_shared = 1.0  # only consulted when scheme == "fixed_digit_residual"
         if scheme == "fixed_digit_residual":
             if e_shared is None:
@@ -1188,19 +800,7 @@ class QuantizedDISLDOLayer32:
 
 
 def _seed_rank1_scale(inner_c, in_features: int, out_features: int) -> None:
-    """Seed value_scale/output_scale ONCE, from a real closed-form
-    3-pass alternating max-cover fit of the layer's CURRENT (freshly
-    -preseeded) weights -- same math as rank1_fake_quantize's own
-    envelope fit, applied here only to set the starting point, not to
-    quantize/round anything. Real ongoing training still uses
-    DISLDOLayer8's own gradient-based value_scale/output_scale update
-    (linear_disldo.hpp) after this -- isolates whether that slow,
-    noisy, query-tick-only-gradient learning process was simply
-    undertrained within a fixed step budget (found directly: real
-    DISLDOLayer8 collapsed out-of-context, mean_acc=0.19, despite
-    nominally using the identical 8-bit+rank1 scheme the toy
-    fake-quantize simulation solved at mean_acc=0.97), vs the
-    8-bit+rank1 REPRESENTATION itself being insufficient."""
+    """See docs/research/toy_precision_models.rst:seed_rank1_scale.cold_start_diagnostic."""
     ptrs = np.array(inner_c.ptrs, copy=True)
     indices = np.array(inner_c.indices, copy=True)
     abs_vals = np.abs(np.array(inner_c.weights_vals, copy=True).astype(np.float64))
@@ -1225,16 +825,7 @@ def _seed_rank1_scale(inner_c, in_features: int, out_features: int) -> None:
 
 
 class SeededRank1DISLDOLayer8(DISLDOLayer8):
-    """Real DISLDOLayer8 (true C++ E4M3 storage, true disldo_forward/
-    backward kernels -- NOT a fake-quantize simulation) whose
-    value_scale/output_scale are seeded once at construction from a
-    real closed-form rank-1 fit (see _seed_rank1_scale), instead of
-    left at the default 1.0 for the slow gradient-based update to
-    discover from scratch. Direct diagnostic for whether real
-    DISLDOLayer8's out-of-context collapse is a cold-start/undertrained
-    -scale problem rather than the 8-bit+rank-1 representation itself
-    being insufficient (the toy simulation already showed the
-    representation works when the envelope is well-fit)."""
+    """See docs/research/toy_precision_models.rst:seed_rank1_scale.cold_start_diagnostic."""
 
     def __init__(
         self,
@@ -1249,17 +840,7 @@ class SeededRank1DISLDOLayer8(DISLDOLayer8):
 
 
 class SeededDISLDOLayer8Resync(DISLDOLayer8Resync):
-    """Real DISLDOLayer8Resync (the DeferredScaleWrite fix -- see
-    sili__new's ScalePolicy/disldo_backward docstrings) with
-    value_scale/output_scale seeded once at construction, same as
-    SeededRank1DISLDOLayer8. Seeding here isn't about cold-start (the
-    fix under test is orthogonal to that) -- it's for a FAIR comparison
-    against `fp8_seeded`: plain DISLDOLayer8's output_scale never
-    trains at all unless something calls set_output_scale_raw at least
-    once (confirmed directly: no code in DISLDOLayer8's own
-    construction path does), so without seeding here too, any
-    difference measured could just be "output_scale was active" rather
-    than "the deferred-write fix helped"."""
+    """See docs/research/toy_precision_models.rst:seeded_disldo_layer8_resync.fair_comparison_rationale."""
 
     def __init__(
         self,
@@ -1274,9 +855,7 @@ class SeededDISLDOLayer8Resync(DISLDOLayer8Resync):
 
 
 class SeededDISLDOLayer8AdaMax(DISLDOLayer8AdaMax):
-    """Same as SeededDISLDOLayer8Resync, but the AdaMax-style scale
-    update (see AdaMaxScalePolicy's docstring, sili__new's
-    delta_csr_types.hpp) instead of RMSprop."""
+    """See docs/research/toy_precision_models.rst:seeded_disldo_layer8_resync.fair_comparison_rationale."""
 
     def __init__(
         self,
@@ -1291,16 +870,7 @@ class SeededDISLDOLayer8AdaMax(DISLDOLayer8AdaMax):
 
 
 class PeriodicSeedRank1DISLDOLayer8(DISLDOLayer8):
-    """Like SeededRank1DISLDOLayer8, but re-seeds value_scale/output_scale
-    from a fresh closed-form rank-1 fit every `reseed_every` training
-    backward() calls, not just once at construction -- direct test of
-    whether REPEATEDLY correcting the envelope (touching NOTHING about
-    the real RMSprop weight-update math) can substitute for the
-    simulation's every-step refit, or whether real DISLDOLayer8's own
-    separate, nested value_scale/output_scale optimizer (see
-    linear_disldo.hpp's `scale_eff_lr = learning_rate / nnz_row`,
-    itself RMSprop-style via value_scale_importance) genuinely can't
-    hold a good fit between corrections even when repeatedly given one."""
+    """See docs/research/toy_precision_models.rst:periodic_seed_rank1_disldo_layer8.repeated_correction_test."""
 
     def __init__(
         self,
@@ -1336,12 +906,8 @@ class PeriodicSeedRank1DISLDOLayer8(DISLDOLayer8):
 
 
 class ToySmallTransformerFP32Ref(ToySmallTransformerRealFP4):
-    """ToySmallTransformerRealFP4 built from plain DISLDOLayer32 (fp32
-    DeltaCSRBiValues, RMSprop importance, NO quantization) -- the
-    reference ceiling this class's own quantized siblings below are
-    measured against, on the SAME architecture/task (not the separate
-    single-RNN-task reference the quantization scheme was originally
-    validated on)."""
+    """Plain DISLDOLayer32 (fp32, no quantization), the reference ceiling for the quantized siblings below.
+    See docs/research/toy_precision_models.rst:quantized_disldo_layer32.rank1_scale_envelope."""
 
     def __init__(
         self,
@@ -1368,10 +934,8 @@ class ToySmallTransformerFP32Ref(ToySmallTransformerRealFP4):
 
 
 class ToySmallTransformerQuant8Rank1(ToySmallTransformerRealFP4):
-    """ToySmallTransformerRealFP4 with QuantizedDISLDOLayer32 (8-bit,
-    rank-1 scale, weight+importance both quantized -- the validated
-    winner config) in place of plain DISLDOLayer. See
-    QuantizedDISLDOLayer32's own docstring."""
+    """QuantizedDISLDOLayer32(bits=8, scheme=rank1) -- the validated winner config.
+    See docs/research/toy_precision_models.rst:quantized_disldo_layer32.rank1_scale_envelope."""
 
     def __init__(
         self,
@@ -1391,9 +955,8 @@ class ToySmallTransformerQuant8Rank1(ToySmallTransformerRealFP4):
 
 
 class ToySmallTransformerQuant4Rank1(ToySmallTransformerRealFP4):
-    """Same as ToySmallTransformerQuant8Rank1 but 4-bit -- the
-    known-worse (but not broken) config, kept as a comparison point,
-    not the recommended default."""
+    """Same as ToySmallTransformerQuant8Rank1 but 4-bit -- known-worse (not broken) comparison point.
+    See docs/research/toy_precision_models.rst:quantized_disldo_layer32.rank1_scale_envelope."""
 
     def __init__(
         self,
@@ -1413,10 +976,8 @@ class ToySmallTransformerQuant4Rank1(ToySmallTransformerRealFP4):
 
 
 class ToySmallTransformerQuant4Rank2(ToySmallTransformerRealFP4):
-    """Same as ToySmallTransformerQuant4Rank1 but with rankn_fake_quantize
-    (rank=2, magnitude-bucketed column scale) in place of plain rank1
-    scaling -- tests whether the extra scale degree of freedom recovers
-    some of 4-bit's real quality cost vs rank-1."""
+    """Same as ToySmallTransformerQuant4Rank1 but scheme=rankn(rank=2).
+    See docs/research/toy_precision_models.rst:rankn_fake_quantize.magnitude_bucketed_columns."""
 
     def __init__(
         self,
@@ -1436,8 +997,8 @@ class ToySmallTransformerQuant4Rank2(ToySmallTransformerRealFP4):
 
 
 class ToySmallTransformerQuant4Rank4(ToySmallTransformerRealFP4):
-    """Same as ToySmallTransformerQuant4Rank2 but rank=4 -- checks
-    whether the trend (if any) continues past rank=2 or plateaus."""
+    """Same as ToySmallTransformerQuant4Rank2 but rank=4.
+    See docs/research/toy_precision_models.rst:rankn_fake_quantize.magnitude_bucketed_columns."""
 
     def __init__(
         self,
@@ -1457,24 +1018,7 @@ class ToySmallTransformerQuant4Rank4(ToySmallTransformerRealFP4):
 
 
 class _PeakEligibilityTrace:
-    """Leaky peak-hold tracker over the layer's FULL [batch, features]
-    input shape (matching `SparseLinearLayer.last_input` exactly, not
-    reduced) -- remembers, per (tile, feature) cell, the SIGNED value
-    from whichever recent tick had the largest magnitude, decaying only
-    until a new input exceeds the decayed peak (then replaced), rather
-    than blurring all history into one running sum. Direct replacement
-    for an earlier smooth-decaying-SUM design (`e = decay*e +
-    activity`, no longer in this file) that was found, via the actual
-    C++ update formula (`linear_disldo.hpp`'s disldo_backward:
-    `dL/d(value_scale[r])` already bakes in the query tick's OWN input
-    magnitude via `g = dy*iv`), to double-count activity magnitude when
-    multiplied against DISLDOLayer's own already-input-weighted row
-    gradient -- see JOURNAL.md's e-prop postmortem for the full
-    diagnosis. SIGNED (not magnitude-only): the substitution this
-    feeds (see PeakEligibilityDISLDOLayer) needs a real signed input
-    value, since DISLDO's gradient math depends on input sign for
-    direction, not just magnitude -- this formulation was worked out
-    directly with the user."""
+    """See docs/research/toy_precision_models.rst:peak_eligibility_trace.signed_peak_hold_design."""
 
     def __init__(self, shape: tuple[int, ...], decay: float = 0.9):
         self.decay = decay
@@ -1482,8 +1026,7 @@ class _PeakEligibilityTrace:
         self.peak_mag = np.zeros(shape, dtype=np.float32)  # |peak|, tracked for comparison
 
     def update(self, x: np.ndarray) -> np.ndarray:
-        """Call every forward(), returns a SNAPSHOT (copy) of the
-        signed peak as it stood right after this tick's update."""
+        """Call every forward(); returns a copy of the signed peak after this tick's update."""
         x_np = np.asarray(x, dtype=np.float32)
         decayed_mag = self.decay * self.peak_mag
         decayed_val = self.decay * self.peak
@@ -1494,48 +1037,7 @@ class _PeakEligibilityTrace:
 
 
 class PeakEligibilityDISLDOLayer:
-    """A real DISLDOLayer whose per-row `value_scale` credit-assignment
-    uses REAL C++ gradient math, applied to a peak-substituted input --
-    the replacement for the earlier, found-broken EPropDISLDOLayer/
-    EPropAdamDISLDOLayer (removed; see JOURNAL.md's postmortem) AND for
-    an even-earlier broadcast-`out.grad` version tried in between.
-
-    Mechanism, worked out directly with the user: `SparseLinearLayer`
-    caches its most recent forward input as `_last_input` and exposes
-    it via the `last_input` property -- checked directly, not assumed
-    (`cpu_backend.cpp:1199-1214`): this is a ZERO-COPY, WRITABLE numpy
-    view straight onto the C++ buffer (verified: mutating the returned
-    array from Python propagates into the object the C++ backward
-    reads from). `backward_dense` doesn't take `x` as an argument at
-    all -- it reads `_last_input` directly. So instead of trying to
-    hand-derive a Python-side approximation of the gradient (two prior
-    attempts, both found flawed -- see JOURNAL.md), this OVERWRITES
-    `last_input` with the peak-held (signed) value right after
-    forward, BEFORE backward ever fires, so DISLDO's OWN real
-    `backward_dense` computes the row's (and, internally, each
-    synapse's) gradient AS IF the input had been whichever recent tick
-    was most salient for that cell -- zero Python-side gradient
-    approximation, reusing the actual C++ math end to end.
-
-    Known, accepted side effect: `dx` (accumulated into this layer's
-    input Tensor's `.grad`, e.g. into `qkv_source.grad` in
-    ToyTileRecurrenceRealFP4.step()) is ALSO computed from the
-    substituted input, not the true one -- this contaminates gradient
-    reaching upstream plain-Tensor leaves (input_ln/post_ln) a little,
-    since backward_dense computes dx and the value_scale gradient from
-    the same `_last_input` in one pass with no way to split them apart
-    without a C++ change. Accepted as a small, documented tradeoff
-    (input_ln/post_ln are secondary parameters, not the credit
-    -assignment mechanism itself) rather than deferred silently.
-
-    True per-SYNAPSE substitution (not just per-row) would need direct
-    CSR access -- the "expensive, large core change" the user already
-    flagged as a separate, later effort, not attempted here. If this
-    layer's typical input activation ends up genuinely ~1-sparse (few
-    nonzero rows), `SISLDOLayer`'s CSR forward/backward path would let
-    this same substitution touch only the active indices instead of a
-    full dense array -- a real future efficiency angle at true
-    MiniCPM5 scale, not needed at this toy width."""
+    """See docs/research/toy_precision_models.rst:peak_eligibility_disldo_layer.last_input_substitution_mechanism."""
 
     def __init__(
         self, in_features: int, out_features: int, max_weights: int, num_cpus: int = 4, trace_decay: float = 0.9

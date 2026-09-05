@@ -180,6 +180,33 @@ default value) specifically to activate that -- without it, ``output_scale``
 would never move at all and there'd be nothing for the Adam step to
 re-normalize.
 
+.. _rank1_fake_quantize.shared_scale_catastrophe_fix:
+
+``row_scale_fake_quantize``/``rank1_fake_quantize``: deterministic rounding, and the B5a shared-scale lineage
+-------------------------------------------------------------------------------------------------------------------
+
+*ID:* ``rank1_fake_quantize.shared_scale_catastrophe_fix``
+
+``row_scale_fake_quantize`` (plain per-row max-abs scale, symmetric signed
+N-bit levels, matching sili's own existing ``value_scale`` convention)
+rounds DETERMINISTICALLY (round-to-nearest, not stochastic) on purpose --
+this keeps it isolated from FP4's own stochastic-rounding noise, a
+separate, already-characterized variable this toy harness deliberately
+doesn't want to reintroduce here.
+
+``rank1_fake_quantize``'s row-scale * col-scale alternating max-fit (3
+passes) directly matches sili_peridot's own earlier B5a fix (see
+``JOURNAL.md``, "B5a -- rank-1 quantization scale fixes most of the
+catastrophe"): a single scale SHARED across many folded/concatenated
+layers forced every layer sharing it to tolerate the widest outlier among
+them, even though each was trained independently -- the real fix was
+giving each row AND each column their own scale (a rank-1/outer-product
+pair, not one shared scalar per layer). This function's alternating-max
+fit is that same rank-1-envelope idea, applied per-row/per-column within
+one layer instead of per-folded-layer. Implemented fully vectorized
+(``np.maximum.at`` scatter-max, no per-synapse Python loop) since it must
+stay cheap enough to run every training step at full density.
+
 .. _rankn_fake_quantize.magnitude_bucketed_columns:
 
 ``rankn_fake_quantize``: magnitude-bucketed columns, and why additive residual scale-fitting is a dead end
