@@ -378,3 +378,28 @@ the fold-depth recurrence's accumulated state, so a layer near the start is
 not necessarily equivalent to the same layer near the end).
 ``window_activation_density`` is the window's own (single, not
 per-position) density, passed to ``apply_window_step``.
+
+.. _sili_block.default_window_helpers.placeholder_and_init_conventions:
+
+``default_window_energy`` / ``default_window_gaussian_params``: placeholder defaults and matching init conventions
+--------------------------------------------------------------------------------------------------------------------
+
+*ID:* ``sili_block.default_window_helpers.placeholder_and_init_conventions``
+
+``default_window_energy`` gives placeholder defaults for the window's
+``EnergyDynamics`` gate, loosely matching ``SparseRNNCell``'s own
+``percent_active``-derived formula (see ``sili__new/sili/sparse_rnn.py``'s
+constructor) -- real tuning is Phase 5's job (the eventual actor-critic
+controls energy drive); this just needs to be a safe, finite starting
+point.
+
+``default_window_gaussian_params`` gives fresh, from-scratch
+``centers``/``log_sigmas`` for a ``window_size``-wide window:
+``center[p] = 2p + 0.5`` (own fresh-token/carried-state pair's midpoint in
+``apply_window_step``'s interleaved ``2*window_size`` key space, see
+``sili_block.apply_window_step.major_pivot_design``), ``log_sigma[p] = 0.0``
+(``sigma=1.0``) -- concentrates ~68% of attention mass on position p's own
+pair at init, while still reachable by neighbors. Matches
+``advance_window``'s own incremental per-position init exactly -- this is
+for callers that want a whole window's worth at once (tests, or a
+from-scratch ``WindowState``) rather than growing one position at a time.
