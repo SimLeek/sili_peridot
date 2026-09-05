@@ -145,6 +145,20 @@ was never meant to solve, not an intentional design. The wide state's
 actual content for a fresh token must come from a real learned mapping,
 same as q/k/v/o_proj/lm_head.
 
+.. _toy_tile_precision_models.use_attention_bypass_ablation:
+
+``use_attention=False``: bypassing attention entirely, an ablation to isolate gaussian_attention
+--------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_precision_models.use_attention_bypass_ablation``
+
+Bypasses ``q``/``k``/``v``/``gaussian_attention`` (and ``energy``, which only
+ever gated the attention output) entirely -- collapses the recurrence into a
+plain RNN cell, ``state = clip(rmsnorm(state + o_proj(rmsnorm(x)+
+rmsnorm(state))))``. Ablation to isolate whether ``gaussian_attention``
+itself is what's hard to learn, before assuming the whole architecture is
+broken.
+
 .. _toy_tile_precision_models.o_proj_depth_cascaded_quantization:
 
 ``o_proj_depth>1``: cascaded coarse layers as a substitute for width
