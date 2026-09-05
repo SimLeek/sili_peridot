@@ -51,6 +51,12 @@
 # docs/research/toy_tile_recurrence_rmt.rst, 48.2% -> under 30%.
 # model/toy_beyond_context_task.py did the same to
 # docs/research/toy_beyond_context_task.rst, 48.4% -> under 30%.
+# model/eval_rank_floor.py did the same to
+# docs/research/eval_rank_floor.rst, 46.2% -> under 30%.
+# model/curriculum.py did the same to docs/research/curriculum.rst,
+# 45.5% -> under 30%. model/toy_tile_recurrence_rmt_standard.py did
+# the same to docs/research/toy_tile_recurrence_rmt_standard.rst,
+# 44.5% -> under 30%.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -83,7 +89,7 @@ repos:
         entry: python3 tools/comment_limit.py
         language: system
         types_or: [python]
-        exclude: ^(tests/|scripts/prototype_peak_synapse_learning_comparison\.py|scripts/l1_sparsity_probe\.py|model/eval_rank_floor\.py|model/curriculum\.py|model/toy_tile_recurrence_rmt_standard\.py|scripts/train_tile_curriculum\.py|model/eval_eigenvalues\.py|scripts/mqar_k1_precision_control\.py|model/toy_tile_recurrence_rmt_torch\.py|model/toy_recall_models\.py|model/eval_stuck_weights\.py|scripts/debug_energy_log_sigmas_runaway\.py|model/eval_superposition\.py|scripts/stochastic_stability_vs_scale_sparsity\.py|model/eval_quantization\.py|model/eval_lr\.py|scripts/torch_rnn_control\.py|scripts/lr_calibration_probe\.py|model/toy_recall_task\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|model/fold\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
+        exclude: ^(tests/|scripts/prototype_peak_synapse_learning_comparison\.py|scripts/l1_sparsity_probe\.py|scripts/train_tile_curriculum\.py|model/eval_eigenvalues\.py|scripts/mqar_k1_precision_control\.py|model/toy_tile_recurrence_rmt_torch\.py|model/toy_recall_models\.py|model/eval_stuck_weights\.py|scripts/debug_energy_log_sigmas_runaway\.py|model/eval_superposition\.py|scripts/stochastic_stability_vs_scale_sparsity\.py|model/eval_quantization\.py|model/eval_lr\.py|scripts/torch_rnn_control\.py|scripts/lr_calibration_probe\.py|model/toy_recall_task\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|model/fold\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration)
