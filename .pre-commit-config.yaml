@@ -31,16 +31,19 @@
 # scripts/stochastic_stability_vs_scale_sparsity.py 38.2%,
 # model/eval_quantization.py 37.7%, model/eval_lr.py 37.6%,
 # scripts/torch_rnn_control.py 37.4%, scripts/lr_calibration_probe.py
-# 37.0%, model/toy_recall_task.py 36.8%, model/sili_block.py 36.6%,
+# 37.0%, model/toy_recall_task.py 36.8%,
 # scripts/train_toy_beyond_context_peak_eligibility_only.py 35.6%,
 # scripts/stochastic_scale_dense_confirmation.py 35.5%, model/fold.py
-# 35.4%, model/toy_precision_models.py 34.2%,
-# scripts/train_toy_recall_comparison.py 33.1%,
+# 35.4%, scripts/train_toy_recall_comparison.py 33.1%,
 # model/eval_output_collapse.py 33.0%, model/quantize.py 32.5%,
 # scripts/disldo_no_bptt_ablation.py 32.2%, model/prune.py 31.5%,
 # scripts/disldo_tanh_no_bptt_ablation.py 30.9%,
 # scripts/mqar_k1_calibration.py 30.8%, model/sili_model.py 30.8%,
 # model/eval_pruning.py 30.8%.
+# model/toy_tile_precision_models.py did the same to
+# docs/research/toy_tile_precision_models.rst, 52.5% -> under 30%.
+# model/sili_block.py did the same to docs/research/sili_block.rst,
+# 36.6% -> under 30%.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -73,7 +76,7 @@ repos:
         entry: python3 tools/comment_limit.py
         language: system
         types_or: [python]
-        exclude: ^(tests/|model/toy_tile_precision_models\.py|model/toy_beyond_context_task\.py|model/toy_tile_recurrence_rmt\.py|scripts/prototype_peak_synapse_learning_comparison\.py|scripts/l1_sparsity_probe\.py|model/eval_rank_floor\.py|model/curriculum\.py|scripts/train_mqar_curriculum\.py|model/toy_tile_recurrence_rmt_standard\.py|scripts/train_tile_curriculum\.py|model/eval_eigenvalues\.py|scripts/mqar_k1_precision_control\.py|model/toy_tile_recurrence_rmt_torch\.py|model/toy_recall_models\.py|model/eval_stuck_weights\.py|scripts/debug_energy_log_sigmas_runaway\.py|model/eval_superposition\.py|scripts/stochastic_stability_vs_scale_sparsity\.py|model/eval_quantization\.py|model/eval_lr\.py|scripts/torch_rnn_control\.py|scripts/lr_calibration_probe\.py|model/toy_recall_task\.py|model/sili_block\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|model/fold\.py|model/toy_precision_models\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
+        exclude: ^(tests/|model/toy_beyond_context_task\.py|model/toy_tile_recurrence_rmt\.py|scripts/prototype_peak_synapse_learning_comparison\.py|scripts/l1_sparsity_probe\.py|model/eval_rank_floor\.py|model/curriculum\.py|scripts/train_mqar_curriculum\.py|model/toy_tile_recurrence_rmt_standard\.py|scripts/train_tile_curriculum\.py|model/eval_eigenvalues\.py|scripts/mqar_k1_precision_control\.py|model/toy_tile_recurrence_rmt_torch\.py|model/toy_recall_models\.py|model/eval_stuck_weights\.py|scripts/debug_energy_log_sigmas_runaway\.py|model/eval_superposition\.py|scripts/stochastic_stability_vs_scale_sparsity\.py|model/eval_quantization\.py|model/eval_lr\.py|scripts/torch_rnn_control\.py|scripts/lr_calibration_probe\.py|model/toy_recall_task\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|model/fold\.py|model/toy_precision_models\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration)
