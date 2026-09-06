@@ -1,31 +1,4 @@
-"""
-scripts/train_toy_beyond_context_peak_eligibility_only.py
-────────────────────────────────────────────────────────────
-Runs ONLY the new peak-eligibility arm (PeakEligibilityDISLDOLayer) of
-the Tier 1 beyond-context comparison, at a REDUCED step budget.
-
-Replaces the earlier e-prop-only script -- e-prop (both the plain and
-Adam variants) was found structurally flawed (see JOURNAL.md's
-postmortem: its delta-trick gradient proxy is provably zero for a row
-silent at the query tick, which is exactly the row this mechanism most
-needs to credit). PeakEligibilityDISLDOLayer replaces it: instead of
-any Python-side gradient approximation, it substitutes a peak-held
-(signed) value directly into SparseLinearLayer's own `last_input`
-buffer before backward fires, so DISLDO's REAL C++ gradient math
-computes the correction -- worked out directly with the user.
-
-Same reduced-budget rationale as before: the 120k-step (~1hr) scale-up
-was compensating for the no-BPTT/no-gradient-pathway problem;
-peak-eligibility exists to provide exactly that missing pathway, so it
-should not need the same 40x scale-up to show a signal.
-
-The dense/tile/tile+energy numbers below are from the PRIOR
-120,000-step run (JOURNAL.md, "Tier 1, ~1hr budget (40x steps)") and
-are shown for CONTEXT ONLY -- different step budget, not a strict
-equal-budget comparison.
-
-Run: python -m scripts.train_toy_beyond_context_peak_eligibility_only
-"""
+"""See docs/research/train_toy_beyond_context_peak_eligibility_only.rst:module_overview."""
 
 from __future__ import annotations
 
@@ -35,10 +8,7 @@ import scripts.train_toy_beyond_context_comparison as base
 from model.toy_precision_models import PeakEligibilityDISLDOLayer
 from scripts.train_toy_beyond_context_comparison import EVAL_N_VALUES, W
 
-# Reduced budget: 30% of the 120k run, same curriculum ratios/shape as
-# the earlier e-prop probe (WARMUP_STEPS/TRAIN_STEPS = 1/30,
-# STEPS_PER_LEVEL/TRAIN_STEPS = 1/20). Monkeypatched onto the imported
-# module since _train_tile/_sample_n_bits read these as module globals.
+# See docs/research/train_toy_beyond_context_peak_eligibility_only.rst:reduced_budget_monkeypatch.
 base.TRAIN_STEPS = 36_000
 base.WARMUP_STEPS = 1_200
 base.STEPS_PER_LEVEL = 1_800
@@ -46,9 +16,6 @@ base.STEPS_PER_LEVEL = 1_800
 _train_tile = base._train_tile
 evaluate_tile = base.evaluate_tile
 
-# From JOURNAL.md, "Tier 1, ~1hr budget (40x steps)" -- TRAIN_STEPS=120_000
-# (3.3x this run's budget), same curriculum shape, seeds 1/2/3 for
-# dense/tile-no-energy/tile+energy. Shown for CONTEXT ONLY (see docstring).
 RECORDED_DENSE = {2: 0.53, 4: 0.38, 8: 0.45, 16: 0.63, 24: 0.53}
 RECORDED_TILE_NO_ENERGY = {2: 0.72, 4: 0.45, 8: 0.43, 16: 0.47, 24: 0.15}
 RECORDED_TILE_ENERGY = {2: 0.45, 4: 0.30, 8: 0.43, 16: 0.35, 24: 0.50}
