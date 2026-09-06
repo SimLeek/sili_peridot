@@ -1,46 +1,13 @@
 """
 sili_peridot/model/eval_stuck_weights.py
 ───────────────────────────────────────────
-Are synapses the model's own importance signal (ci -- the combined
-gradient+forward-contribution second moment DISLDO's RMSprop-style
-update tracks, see sili__new's linear_disldo.hpp) has flagged as
-important actually MOVING, or are they stuck? A synapse can end up
-stuck for reasons genuinely worth distinguishing: its update rounds
-away below FP4/FP8's quantization step (this project's own history has
-multiple real bugs of exactly this shape -- the zero-escape/ULP-
-rounding work earlier this session), `ci` itself has grown large enough
-to over-damp the step (importance-as-optimizer doing its job TOO well),
-or the lr is genuinely too small for that synapse's local gradient
-scale (the same calibration issue eval_lr.py's find_optimal_lr exists
-to catch at the whole-model level, here at single-synapse resolution).
-
-Confirmed directly this session (conversation): under deterministic
-rounding at toy scale (and at every width tested up to 1024, an 8x-
-plus sweep), essentially every already-live synapse is stuck at
-mean|delta_w|=0.0. Under stochastic rounding, dead (weight=0,
-importance=0) synapses DO wake up over time (nnz grows) -- but whether
-stochastic rounding ALSO helps already-LIVE synapses move more (not
-just wakes dead ones) needs a clean before/after diff that survives
-connectivity CHANGING between snapshots, since stochastic rounding's
-whole point is that connectivity isn't stable.
-
-Snapshot-diff based, not a live per-step hook: call
-snapshot_multi_digit_state() before and after some real training
-interval, then check_stuck_weights() on the two snapshots. Snapshots
-are keyed by (row, col) -- NOT raw array position -- specifically so a
-snapshot pair survives nnz changing between them (new synapses waking
-up, in sili__new terms, insert into the middle of a row's CSR data,
-shifting every later array position; diffing by array index instead of
-by stable key silently compared the WRONG pairs of synapses whenever
-that happened, confirmed directly as the reason an earlier attempt at
-this comparison failed with a shape-mismatch guard instead of a wrong
-answer -- only checking BOTH shapes AND (implicitly) index-for-index
-correspondence, via a hard reject, is what caught it). The comparison
-here only uses the INTERSECTION of keys present at both snapshots (see
-n_new/n_died on the report for how much churn that intersection is
-throwing away) -- a genuinely fair "did an already-alive-at-both-points
-synapse move" comparison, independent of how many synapses appeared or
-disappeared in between.
+Is the model's own importance signal (`ci`) an accurate predictor of
+which synapses are stuck vs actually moving under training? See
+docs/research/eval_stuck_weights.rst:eval_stuck_weights.module_overview
+for the research question and findings, and
+docs/research/eval_stuck_weights.rst:eval_stuck_weights.snapshot_row_col_keying
+for why the snapshot-diff format below is keyed by (row, col) instead of
+raw array position.
 """
 
 from __future__ import annotations
@@ -54,12 +21,9 @@ Snapshot = dict[tuple[int, int], tuple[float, float]]
 
 
 def snapshot_layer_state(layer) -> Snapshot:
-    """layer must be a raw DISLDOLayer-style wrapper exposing ._c with
-    .ptrs/.indices/.weights_vals/.importance (the sili__new C++
-    binding's own CSR-format per-synapse storage) -- NOT a
-    TrueMultiDigitLayer directly, see snapshot_multi_digit_state for
-    that. Keyed by (row, col), not raw array position -- see this
-    module's own docstring for why that distinction is the whole point."""
+    """layer must be a raw DISLDOLayer-style wrapper exposing ._c (NOT a
+    TrueMultiDigitLayer directly, see snapshot_multi_digit_state). See
+    docs/research/eval_stuck_weights.rst:eval_stuck_weights.snapshot_row_col_keying."""
     c = getattr(layer, "_c", None)
     if c is None:
         raise ValueError(
@@ -82,12 +46,9 @@ def snapshot_layer_state(layer) -> Snapshot:
 
 
 def snapshot_multi_digit_state(layer) -> list[Snapshot]:
-    """TrueMultiDigitLayer holds n_stages separate DISLDOLayer digits,
-    each with its own weights/importance -- snapshots ALL of them (not
-    just stage 0), since a stuck synapse in any digit stage is a real
-    stuck synapse. Falls back to a single snapshot for a layer that
-    isn't a TrueMultiDigitLayer (has no .digits) but does have ._c
-    directly."""
+    """Snapshots ALL of a TrueMultiDigitLayer's digit stages, or falls
+    back to a single snapshot for a plain ._c-bearing layer. See
+    docs/research/eval_stuck_weights.rst:eval_stuck_weights.multi_digit_fallback."""
     digits = getattr(layer, "digits", None)
     if digits is not None:
         return [snapshot_layer_state(d) for d in digits]
@@ -110,22 +71,14 @@ class StuckWeightsReport:
 
     @property
     def excess_stuck_ratio(self) -> float:
-        """stuck_fraction relative to what pure chance would predict --
-        1.0 means "no more stuck synapses than random overlap would
-        produce", meaningfully above 1.0 (say 2x+) is the real signal
-        that high-importance synapses are specifically failing to move,
-        not just unlucky sampling."""
+        """See docs/research/eval_stuck_weights.rst:eval_stuck_weights.excess_stuck_ratio_signal."""
         if self.expected_stuck_fraction_if_independent <= 0:
             return float("nan")
         return self.stuck_fraction / self.expected_stuck_fraction_if_independent
 
     @property
     def churn_fraction(self) -> float:
-        """(n_new + n_died) relative to the stable intersection size --
-        a direct measure of how much connectivity moved around between
-        snapshots (near 0 for deterministic rounding at dense init,
-        meaningfully positive for stochastic rounding's dead-synapse
-        wakeup churn -- see this module's own docstring)."""
+        """See docs/research/eval_stuck_weights.rst:eval_stuck_weights.churn_fraction_signal."""
         if self.n_synapses <= 0:
             return float("nan")
         return (self.n_new + self.n_died) / self.n_synapses
@@ -139,21 +92,11 @@ def check_stuck_weights(
     movement_percentile: float = 25.0,
 ) -> StuckWeightsReport:
     """before/after: lists of {(row,col): (weight,importance)} snapshots
-    (one per digit/layer, from snapshot_multi_digit_state -- pass
-    snapshots from MULTIPLE layers concatenated together for a whole-
-    model check, or one layer's own list for a per-layer check), taken
-    at two points separated by some real training interval.
-
-    Flags a synapse STUCK if its importance at the BEFORE snapshot (the
-    model's own belief about how much this synapse matters going INTO
-    the interval) is in the top importance_percentile, but its realized
-    |weight change| over the interval is in the bottom
-    movement_percentile among ALL synapses (not just the high-
-    importance ones). Only synapses present at BOTH snapshots (same
-    (row,col) key, in the SAME digit) are compared -- synapses that
-    appeared or disappeared in between (n_new/n_died on the report)
-    have no well-defined "delta" and are excluded, not treated as
-    either stuck or moving."""
+    (one per digit/layer, from snapshot_multi_digit_state), taken at two
+    points separated by some real training interval. See
+    docs/research/eval_stuck_weights.rst:eval_stuck_weights.check_stuck_weights_semantics
+    for the STUCK definition and why appeared/disappeared synapses are
+    excluded rather than counted."""
     w_before_list, imp_before_list, delta_list = [], [], []
     n_new = n_died = 0
     for b, a in zip(before, after, strict=False):
