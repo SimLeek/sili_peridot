@@ -70,6 +70,17 @@
 # model/toy_recall_models.py did the same to
 # docs/research/toy_recall_models.rst, 40.0% -> under 30%. model/fold.py
 # did the same to docs/research/fold.rst, 35.4% -> under 30%.
+# scripts/mqar_k1_precision_control.py did the same to
+# docs/research/mqar_k1_precision_control.rst, 42.4% -> under 30%.
+# model/eval_stuck_weights.py did the same to
+# docs/research/eval_stuck_weights.rst, 39.4% -> under 30%.
+# scripts/debug_energy_log_sigmas_runaway.py did the same to
+# docs/research/debug_energy_log_sigmas_runaway.rst, 39.0% -> under 30%.
+# model/eval_superposition.py did the same to
+# docs/research/eval_superposition.rst, 38.8% -> under 30%.
+# scripts/stochastic_stability_vs_scale_sparsity.py did the same to
+# docs/research/stochastic_stability_vs_scale_sparsity.rst, 38.2% ->
+# under 30%.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -102,7 +113,7 @@ repos:
         entry: python3 tools/comment_limit.py
         language: system
         types_or: [python]
-        exclude: ^(tests/|scripts/mqar_k1_precision_control\.py|model/eval_stuck_weights\.py|scripts/debug_energy_log_sigmas_runaway\.py|model/eval_superposition\.py|scripts/stochastic_stability_vs_scale_sparsity\.py|model/eval_quantization\.py|model/eval_lr\.py|scripts/torch_rnn_control\.py|scripts/lr_calibration_probe\.py|model/toy_recall_task\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
+        exclude: ^(tests/|model/eval_quantization\.py|model/eval_lr\.py|scripts/torch_rnn_control\.py|scripts/lr_calibration_probe\.py|model/toy_recall_task\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration)
