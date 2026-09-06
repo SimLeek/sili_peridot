@@ -84,6 +84,11 @@
 # docs/research/eval_quantization.rst, 37.7% -> under 30%.
 # scripts/lr_calibration_probe.py did the same to
 # docs/research/lr_calibration_probe.rst, 37.0% -> under 30%.
+# model/eval_lr.py did the same to docs/research/eval_lr.rst, 37.6% ->
+# under 30%. scripts/torch_rnn_control.py did the same to
+# docs/research/torch_rnn_control.rst, 37.4% -> under 30%.
+# model/toy_recall_task.py did the same to
+# docs/research/toy_recall_task.rst, 36.8% -> under 30%.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -116,7 +121,7 @@ repos:
         entry: python3 tools/comment_limit.py
         language: system
         types_or: [python]
-        exclude: ^(tests/|model/eval_lr\.py|scripts/torch_rnn_control\.py|model/toy_recall_task\.py|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
+        exclude: ^(tests/|scripts/train_toy_beyond_context_peak_eligibility_only\.py|scripts/stochastic_scale_dense_confirmation\.py|scripts/train_toy_recall_comparison\.py|model/eval_output_collapse\.py|model/quantize\.py|scripts/disldo_no_bptt_ablation\.py|model/prune\.py|scripts/disldo_tanh_no_bptt_ablation\.py|scripts/mqar_k1_calibration\.py|model/sili_model\.py|model/eval_pruning\.py)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration)
