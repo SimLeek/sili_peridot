@@ -3,39 +3,8 @@ sili_peridot/model/prune.py
 ─────────────────────────────
 Prune MiniCPM5's checkpoint to a mixed sparse(CSR)/dense payload.
 
-A SINGLE global threshold (prune_state_dict, DEFAULT_TARGET_SPARSITY)
-turned out to be the wrong tool for this model, discovered the hard way
-by actually measuring next-token prediction quality (model/eval_pruning.py)
-before this landed, not by CSR-shape/sparsity-percentage reasoning alone:
-
-1. Doesn't reuse sili__new's toy-Mistral pruning defaults uncritically
-   (see todolist.md Phase B3): target_sparsity=0.5 (sparse_prune's own
-   default) leaves almost the entire model dense here -- CSR only wins
-   over dense once a tensor's OWN sparsity clears ~70%, given
-   _keep_dense_reason's 12-bytes-per-nonzero estimate vs. 4 bytes/element
-   dense. DEFAULT_TARGET_SPARSITY=0.8 gets real compression (~1.65x,
-   127/170 tensors sparse) at this global level.
-
-2. But at target_sparsity=0.8, next-token accuracy collapses to 0.0 (vs.
-   0.503 dense) with NO retraining involved -- a single global threshold
-   destroys the model long before it reaches CSR-viable sparsity.
-   Per-tensor-ROLE sensitivity varies enormously (embed_tokens tolerated
-   90% fine; v_proj -- architecturally near-identical to k_proj, which
-   tolerated 70% -- collapsed already past ~25%), and isolated per-role
-   thresholds compound MUCH worse once combined (see
-   sili.conversion.prune_sensitivity.stepwise_cumulative_eval). See
-   sili_peridot/JOURNAL.md for the full search.
-
-DEFAULT_TARGET_SPARSITY_BY_ROLE / prune_state_dict_by_role is the actual
-result of that search (iterative_threshold_search, sili__new PR #8):
-combined next-token accuracy 0.482 (search set) / 0.478 (independent
-held-out set) vs. a 0.503 dense baseline -- real quality preserved, at
-the cost of most groups being well below CSR-viable sparsity for now.
-That's intentional at this stage (see JOURNAL.md): the actual memory win
-this whole pipeline is chasing is Phase B4's folding (24 layers -> 1),
-which doesn't need genuine sparsity, just CSR-shaped tensors -- deeper
-sparsification is left to training-time synaptogenesis, not this
-conversion-time step.
+See docs/research/prune.rst:prune.module_overview and
+docs/research/prune.rst:prune.default_target_sparsity_by_role.iterative_search_result.
 """
 
 from __future__ import annotations
@@ -52,11 +21,7 @@ from sili.conversion.sparse_prune import (
 
 DEFAULT_TARGET_SPARSITY = 0.8
 
-# The validated result of the group-sensitivity + iterative-search
-# calibration (see module docstring and JOURNAL.md). Keys are ROLE names
-# (as returned by _role_of below), not raw group keys from
-# group_tensor_names_by_role -- those embed a regex-derived prefix/suffix
-# that isn't a stable, human-writable identifier.
+# See docs/research/prune.rst:prune.default_target_sparsity_by_role.iterative_search_result.
 DEFAULT_TARGET_SPARSITY_BY_ROLE: dict[str, float] = {
     "embed_tokens": 0.8,
     "q_proj": 0.4,
@@ -112,12 +77,7 @@ def _record_pruned_tensor(
     sparse_state: dict[str, dict],
     report: PruneReport,
 ) -> None:
-    """Shared per-tensor logic: zero below `threshold`, decide sparse vs.
-    dense storage, and record both into `sparse_state`/`report` in place.
-    Used by both prune_state_dict (one global threshold for every
-    tensor) and prune_state_dict_by_role (a different threshold per
-    tensor, looked up by role) so the format-decision/reporting logic
-    isn't duplicated between them."""
+    """See docs/research/prune.rst:prune.record_pruned_tensor.shared_format_decision."""
     n_elem = param.numel()
     dense_bytes = max(n_elem, 1) * 4
 
@@ -162,24 +122,10 @@ def prune_state_dict(
     max_sparse_ratio: float = 0.9,
     max_sample: int = 5_000_000,
 ) -> tuple[dict[str, dict], PruneReport]:
-    """
-    Prune `state_dict` with ONE global threshold for every eligible
-    tensor, to a {name: {"csr": tensor, "shape": ...}} or {name: {"raw":
-    tensor, "shape": ...}} payload (same entry shapes sili__new's
-    rnn_fold.py / sparse_runtime.py already expect via the "raw"/"csr"
-    keys), plus a PruneReport for B3a-style verification (actual
-    density, not just "it ran").
+    """See docs/research/prune.rst:prune.prune_state_dict.reference_only.
 
-    Kept for reference/comparison -- see module docstring for why
-    prune_state_dict_by_role is the actual recommended path; a single
-    global threshold cannot get real CSR compression without destroying
-    next-token prediction quality on this model.
-
-    min_abs_param: explicit threshold, bypassing calibration entirely if
-    given (same priority convention as sili__new's sparsify_model --
-    explicit always wins). Mainly for tests that need a deterministic,
-    hand-picked threshold rather than whatever the calibrated percentile
-    happens to be.
+    Returns (sparse_state, PruneReport); min_abs_param overrides calibration
+    when given.
     """
     threshold = (
         min_abs_param
@@ -198,11 +144,7 @@ _ROLE_NAMES = ["embed_tokens", "lm_head", "q_proj", "k_proj", "v_proj", "o_proj"
 
 
 def _role_of(group_key: str) -> str:
-    """Map a group_tensor_names_by_role() key (an internal, regex-derived
-    identifier) to one of MiniCPM5's own known tensor roles. Raises if a
-    group doesn't match any known role -- silently skipping an unknown
-    tensor role would mean it never gets pruned at all without anyone
-    noticing."""
+    """See docs/research/prune.rst:prune.role_of.fail_loud_on_unknown_role."""
     for role in _ROLE_NAMES:
         if role in group_key:
             return role
@@ -220,23 +162,10 @@ def prune_state_dict_by_role(
     max_sparse_ratio: float = 0.9,
     max_sample: int = 5_000_000,
 ) -> tuple[dict[str, dict], PruneReport]:
-    """
-    Prune `state_dict` with a SEPARATE calibrated threshold per tensor
-    role (see module docstring for why: a single global threshold
-    destroys this model's next-token prediction quality long before it
-    reaches CSR-viable sparsity). This is the recommended path, not
-    prune_state_dict.
+    """See docs/research/prune.rst:prune.prune_state_dict_by_role.grouping_and_per_role_calibration.
 
-    Groups tensors via sili__new's group_tensor_names_by_role (repeated
-    per-layer tensors grouped by shared suffix, e.g. every layer's own
-    self_attn.q_proj.weight; embed_tokens/lm_head/norm each their own
-    singleton group), calibrates ONE threshold per group on that group's
-    own tensors, then reuses the same per-tensor sparse/dense
-    format-decision logic as prune_state_dict.
-
-    Returns the same (sparse_state, PruneReport) shape as
-    prune_state_dict -- report.min_abs_param is a {role: threshold} dict
-    here instead of a single float.
+    The recommended path. Returns (sparse_state, PruneReport) with
+    report.min_abs_param as a {role: threshold} dict.
     """
     groups = group_tensor_names_by_role(state_dict)
     thresholds_by_group: dict[str, float] = {}
@@ -282,14 +211,7 @@ def print_report(report: PruneReport) -> None:
 
 
 def sparse_state_to_dense_state_dict(sparse_state: dict[str, dict]) -> dict[str, torch.Tensor]:
-    """
-    Convert a prune_state_dict / prune_state_dict_by_role payload (each
-    entry {"csr": tensor, "shape": ...} or {"raw": tensor, "shape": ...})
-    back into a plain {name: tensor} state dict with each tensor's
-    ORIGINAL shape restored -- directly loadable via
-    model.load_state_dict, e.g. for eval_pruning.compare_dense_vs_pruned
-    to check a pruning decision's actual effect on model quality.
-    """
+    """See docs/research/prune.rst:prune.sparse_state_to_dense_state_dict.round_trip_for_eval."""
     out = {}
     for name, entry in sparse_state.items():
         shape = entry["shape"]

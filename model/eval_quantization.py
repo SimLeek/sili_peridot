@@ -1,16 +1,4 @@
-"""
-sili_peridot/model/eval_quantization.py
-─────────────────────────────────────────
-Does B5's real FP4 quantization (model/quantize.py's real
-FoldedLayer.from_descriptor, sili__new PR #10) degrade
-MiniCPM5-1B-Base's next-token prediction quality by an unacceptable
-amount, ON TOP OF B3's already-validated pruning? Same methodology as
-model/eval_pruning.py's compare_dense_vs_pruned (B3b) -- load the real
-HF model, evaluate with B3's pruned weights (the accepted baseline),
-then with those SAME weights additionally FP4-quantized, and compare
-next-token loss/perplexity/accuracy -- isolating quantization's own
-effect from pruning's (already measured separately).
-"""
+"""See docs/research/eval_quantization.rst:module_overview."""
 
 from __future__ import annotations
 
@@ -26,13 +14,7 @@ def compare_pruned_vs_quantized(
     quantized_dense_state_dict: dict[str, torch.Tensor],
     texts: list[str] = EVAL_TEXTS,
 ) -> dict:
-    """
-    Evaluate `model` with pruned_dense_state_dict loaded (B3's already
-    -validated baseline), then with quantized_dense_state_dict applied
-    on top (partial -- only the suffixes model.quantize actually
-    touches, loaded with strict=False), then restore the model's
-    original weights so the caller isn't left with a mutated model.
-    """
+    """See docs/research/eval_quantization.rst:compare_pruned_vs_quantized_partial_load."""
     original_state_dict = {k: model.state_dict()[k].clone() for k in pruned_dense_state_dict}
     try:
         model.load_state_dict(pruned_dense_state_dict)

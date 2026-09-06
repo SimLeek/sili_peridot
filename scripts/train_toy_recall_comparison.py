@@ -4,55 +4,11 @@ scripts/train_toy_recall_comparison.py
 Real training experiment (not a pytest sanity check): does
 `ToyTileRecurrence`'s column-averaged wide recurrent state actually
 learn, at rough parity of context visibility with a dense causal
-baseline?
-
-Standard Multi-Query Associative Recall (MQAR) benchmark (Arora,
-Eyuboglu et al., "Zoology", 2023 -- model/toy_recall_task.py's own
-generate_mqar_sequence, a direct port of zoology's reference
-implementation), AdamOptimizer + clip_grad_norm_ (real global-norm
-clipping -- see clip_grad_norm_'s own docstring for why that's correct
-now: both models are built from DenseTensorLinear, nothing self
--updates during backward() anymore), warmup+cosine LR schedule.
-
-This is the SECOND real run of this comparison. The first (see
-JOURNAL.md's "Real MQAR comparison run: tile-recurrence fails, root
-cause found") found ToyTileRecurrence stuck at or below chance, and an
-ablation traced it to two real design mistakes, both fixed here per
-direct correction:
-
-1. `num_tiles` was a fixed, tiny constant (4) -- widened here to
-   `num_tiles = seq_len` per config, removing the window-narrowness
-   confound. This run tests whether the mechanism can learn at all
-   when it CAN see the whole sequence (same visibility as the dense
-   baseline's own full causal attention) -- testing genuine cross-tick
-   recall BEYOND a narrow window stays explicitly deferred to a
-   follow-up once this passes.
-2. The old per-tile "column" loss (next-tile classification, no state
-   -width expansion at all) is gone. `ToyTileRecurrence` now has a
-   genuinely WIDER internal recurrent state (`state_width =
-   embed_width * column_neurons`) than its input/output, read out via
-   a parameter-free column-MEAN pool (not sum, not a learned
-   down-projection -- see model/toy_recall_models.py's own docstring
-   for why: `lm_head` stands in for the real system's fixed-width
-   pretrained output head). The unified per-position target below
-   (used for BOTH models now, not just the tile one) replaces the old
-   MQAR-only / column-classification split entirely.
-
-**Unified per-position training target for ToyTileRecurrence only**
-(NOT the dense control -- see train_and_eval_dense's own docstring for
-why: this fix exists for the column-mean readout's specific
-width-mismatch problem, which a standard dense transformer doesn't
-have; changing the control's own training procedure at the same time
-would confound the comparison). At a query position, the target is
-the recalled value (unchanged, the real task). Within the key/value
-CONTEXT-laydown region (positions `0` to `context_size-2`), the target
-is the literal real next token -- true structure (each key is
-genuinely followed by its value in the data), reinforcing exactly the
-key->value adjacency the later query needs. Everywhere else is pure
-random filler (checked directly against model/toy_recall_task.py:
-`random_non_queries=True` fills non-query slots with noise, so
-`tokens[i+1]` is NOT a meaningful target at a query position) --
-skipped, not trained on.
+baseline? Second real run, after the first found two design mistakes
+(fixed here) -- see
+docs/research/train_toy_recall_comparison.rst:train_toy_recall_comparison.module_overview,
+:train_toy_recall_comparison.second_run_fixes,
+:train_toy_recall_comparison.unified_target_design.
 
 Run: python -m scripts.train_toy_recall_comparison
 """
@@ -84,8 +40,8 @@ PEAK_LR = 0.02
 MAX_GRAD_NORM = 1.0
 EVAL_SEQUENCES = 60
 
-# (seq_len, num_kv_pairs, vocab_size) -- MQAR requires vocab_size > seq_len
-# and seq_len >= 4*num_kv_pairs.
+# Each entry below is a seq_len/num_kv_pairs/vocab_size triple -- see
+# docs/research/train_toy_recall_comparison.rst:train_toy_recall_comparison.config_and_dims_provenance.
 CONFIGS = [
     (16, 2, 20),
     (32, 4, 40),
@@ -93,9 +49,12 @@ CONFIGS = [
 
 
 def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> dict:
-    """Unified per-position target dict -- see module docstring.
-    query positions -> recalled value; context-laydown region -> real
-    next token; everywhere else -> no entry (pure random filler)."""
+    """Unified per-position target dict: query positions -> recalled
+    value; context-laydown region -> real next token; everywhere else
+    -> no entry (pure random filler).
+
+    See docs/research/train_toy_recall_comparison.rst:train_toy_recall_comparison.build_targets_semantics.
+    """
     context_size = num_kv_pairs * 2
     targets = dict(mqar_pairs)
     for i in range(context_size - 1):
@@ -104,18 +63,11 @@ def _build_targets(tokens: np.ndarray, mqar_pairs: list, num_kv_pairs: int) -> d
 
 
 def train_and_eval_dense(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed):
-    """The CONTROL -- unmodified from the first real comparison run
-    (JOURNAL.md's "Real MQAR comparison run"). Trains on the true MQAR
-    pairs only, nothing else. Deliberately NOT given the unified
-    context-region next-token target: that fix exists specifically for
-    ToyTileRecurrence's column-mean readout (a mechanism for backprop
-    -ing an output error into a state much WIDER than the output --
-    see model/toy_recall_models.py's own docstring). A standard dense
-    causal transformer has no such width mismatch (its hidden state
-    already matches lm_head's own input width directly), so there's no
-    equivalent problem for this loss to fix here -- changing the
-    control's own training procedure at the same time as fixing tile
-    would confound whatever the comparison is trying to isolate."""
+    """The CONTROL -- unmodified from the first real comparison run,
+    trains on the true MQAR pairs only, nothing else.
+
+    See docs/research/train_toy_recall_comparison.rst:train_toy_recall_comparison.unified_target_design.
+    """
     rng = np.random.RandomState(seed)
     np.random.seed(seed)  # DenseTensorLinear's own init uses the global RNG
     tf = ToySmallTransformer(vocab, hidden, mlp_hidden, n_layers=2, num_cpus=2)
@@ -147,12 +99,9 @@ def train_and_eval_dense(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed)
 def _build_tile_window(
     embed_table: np.ndarray, tokens: np.ndarray, i: int, num_tiles: int, M_prev: np.ndarray, column_neurons: int
 ) -> np.ndarray:
-    """[num_tiles, state_width] -- real-token slots get their
-    embed_width embedding broadcast up to state_width
-    (np.repeat, parameter-free, matches the readout's own
-    parameter-free column-mean pool); fallback slots (no real token
-    yet) use M_prev[j] directly, already state_width since M itself
-    lives at state_width now."""
+    """[num_tiles, state_width]. See
+    docs/research/train_toy_recall_comparison.rst:train_toy_recall_comparison.tile_window_construction.
+    """
     state_width = embed_table.shape[1] * column_neurons
     window = np.empty((num_tiles, state_width), dtype=np.float32)
     for j in range(num_tiles):
@@ -201,11 +150,10 @@ def train_and_eval_tile(seq_len, num_kv_pairs, vocab, hidden, mlp_hidden, seed):
 
 
 def main():
-    hidden, mlp_hidden = 32, 48  # zoology's own smallest real attention-baseline
-    # d_model for MQAR is 32 (models_repo.py's
-    # add_attention sweeps d_model in [32, 64, 128],
-    # n_layers=2) -- looked up, not guessed.
-    tile_mlp_hidden = hidden * COLUMN_NEURONS * 2  # scaled with state_width, same ratio as dense
+    # hidden/mlp_hidden/tile_mlp_hidden provenance: see
+    # docs/research/train_toy_recall_comparison.rst:train_toy_recall_comparison.config_and_dims_provenance.
+    hidden, mlp_hidden = 32, 48
+    tile_mlp_hidden = hidden * COLUMN_NEURONS * 2
     print(
         f"column_neurons={COLUMN_NEURONS} hidden={hidden} mlp_hidden={mlp_hidden} "
         f"tile_mlp_hidden={tile_mlp_hidden} train_steps={TRAIN_STEPS} warmup={WARMUP_STEPS} "

@@ -1,30 +1,8 @@
-"""
-sili_peridot/model/toy_recall_models.py
-─────────────────────────────────────────
-Small, TRAINING-oriented (not frozen-inference) models for validating
-the tile-recurrence architecture on the synthetic induction-recall task
-(model/toy_recall_task.py) -- see the approved plan
-(fuzzy-plotting-starlight.md) for the full design rationale and the
-toy-track-only simplifications (fixed embeddings, no positional
-encoding, single head) this module deliberately makes.
-
-Built from DenseTensorLinear (plain fp32 sili.tensor matmul) trained
-via a real AdamOptimizer, NOT sili.sparse_rnn.DISLDOLayer -- per direct
-decision, after two isolation controls (scripts/torch_mqar_control.py,
-scripts/fp32_handrolled_control.py) confirmed the earlier stuck-at
--chance training result was caused by this session's own hand-rolled
-optimizer (plain per-node-clipped SGD, no momentum) diverging, NOT by
-FP4 quantization -- fp32 with that SAME hand-rolled optimizer diverged
-identically. Fixing this for DISLDOLayer's own inline C++ weight
-update would need real new work in sili__new (disldo_backward); fixing
-it for plain Tensor leaves is pure Python (this file's own
-AdamOptimizer) and directly answers this track's actual question (does
-tile-recurrence learn genuine recall), so per direct decision that's
-the path taken here. DISLDOLayer/FP4's own training dynamics remain a
-distinct, not-revisited-here concern (already partially validated
-elsewhere per direct feedback -- importance-driven training behaves
-similarly to other optimizers).
-"""
+"""sili_peridot/model/toy_recall_models.py
+Training-oriented toy models for the tile-recurrence architecture on the
+synthetic induction-recall task (model/toy_recall_task.py).
+See docs/research/toy_recall_models.rst:module_overview,
+:optimizer_choice_isolation_controls."""
 
 from __future__ import annotations
 
@@ -45,10 +23,9 @@ from sili.tensor import (
 
 
 class DenseTensorLinear:
-    """Plain fp32 Tensor-graph linear layer (matmul-based, no
-    quantization) -- trains via AdamOptimizer.step(), an ordinary
-    Tensor leaf like RMSNorm weights/centers/log_sigmas, not an
-    inline-self-updating primitive."""
+    """Plain fp32 Tensor-graph linear layer (matmul-based, no quantization),
+    trains via AdamOptimizer.step().
+    See docs/research/toy_recall_models.rst:optimizer_choice_isolation_controls."""
 
     def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
         self.weight = Tensor((np.random.randn(in_features, out_features) * scale).astype(np.float32))
@@ -61,9 +38,9 @@ class DenseTensorLinear:
 
 
 def rmsnorm_tensor(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    """x: [T, hidden] Tensor. Same formula as sili_block.rmsnorm, but
-    built from Tensor ops so gradient flows through it (needed here,
-    unlike sili_block's frozen-inference plain-numpy version)."""
+    """x: [T, hidden] Tensor. Same formula as sili_block.rmsnorm, built from
+    Tensor ops so gradient can flow through it.
+    See docs/research/toy_recall_models.rst:rmsnorm_tensor_gradient_flow."""
     hidden = x.data.shape[-1]
     mean_sq = reduce_sum(x * x, axis=-1) * (1.0 / hidden)  # [T]
     mean_sq = mean_sq.reshape((x.data.shape[0], 1))  # [T, 1]
@@ -72,11 +49,8 @@ def rmsnorm_tensor(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 
 def sigmoid_tensor(x: Tensor) -> Tensor:
-    """1/(1+e^-x), built from existing Tensor primitives (no new op
-    needed) -- NOT `bounded_gate` (defined elsewhere in sili.tensor),
-    which is a different shape (f(0)=0, domain [0,inf)) meant for
-    energy-gated non-negative activations, not a symmetric LSTM-style
-    gate (f(0)=0.5, all reals) for mixing two signals."""
+    """1/(1+e^-x), built from existing Tensor primitives -- NOT `bounded_gate`.
+    See docs/research/toy_recall_models.rst:sigmoid_tensor_vs_bounded_gate."""
     return power(exp(neg(x)) + 1.0, -1.0)
 
 
@@ -84,28 +58,7 @@ def cross_entropy_sum(logits: Tensor, row_target_pairs: list[tuple[int, int]]) -
     """logits: [N, vocab_size] Tensor. row_target_pairs: [(row, target_
     token_id), ...] -- returns the SUM of softmax cross-entropy loss
     over each pair (caller divides by len(...) for a mean).
-
-    `Tensor` has no `__getitem__`/slicing, so per-row loss can't be
-    computed by indexing a row out directly -- built instead from
-    reduce_sum(axis=-1)/exp/log (whole-tensor ops) plus `gather`'s
-    FLAT indexing (`out[i] = a.flat[indices[i]]`) for both the
-    per-row log-sum-exp lookup and the (row, target) logit lookup --
-    handles either a single (row, target) pair or many at once (e.g.
-    every tile's own "column" prediction target in one call) with no
-    row-slicing needed anywhere.
-
-    Standard max-subtraction numerical stability trick IS needed here
-    (an earlier version of this function skipped it, assuming toy-scale
-    logits would stay small -- wrong, confirmed directly: raw exp()
-    overflowed after a few dozen real training steps, since logits
-    grow as the model gets more confident, toy scale or not). The
-    per-row max is computed from `logits.data` directly (plain numpy,
-    detached) rather than a Tensor op -- subtracting a constant shift
-    from logits before the exp/sum/log chain doesn't change the loss's
-    gradient w.r.t. the ORIGINAL logits at all, so nothing needs to
-    backprop through the max itself; using a `reduce_max` Tensor op
-    (which doesn't exist in sili.tensor) would only be necessary if
-    gradient had to flow through the max, which it doesn't."""
+    See docs/research/toy_recall_models.rst:cross_entropy_sum_and_predicted_token."""
     vocab_size = logits.data.shape[-1]
     row_max = logits.data.max(axis=-1, keepdims=True).astype(np.float32)  # [N,1], detached
     shifted = logits + Tensor(-row_max)  # [N,vocab], stable
@@ -118,21 +71,16 @@ def cross_entropy_sum(logits: Tensor, row_target_pairs: list[tuple[int, int]]) -
 
 
 def predicted_token(logits: Tensor, row: int) -> int:
-    """Inference-time-only readout (no gradient needed/possible through
-    argmax) -- reads .data directly, doesn't need Tensor slicing."""
+    """Inference-time-only readout -- reads .data directly (no gradient
+    possible through argmax).
+    See docs/research/toy_recall_models.rst:cross_entropy_sum_and_predicted_token."""
     return int(np.argmax(logits.data[row]))
 
 
 def apply_gradient_step(params: list[Tensor], lr: float) -> None:
     """Plain SGD step + zero_grad for ordinary Tensor leaves. Kept for
-    tests/comparison -- superseded by AdamOptimizer for real training
-    (see module docstring: plain per-node-clipped SGD, no momentum, was
-    confirmed via two isolation controls to diverge on this task,
-    independent of precision).
-
-    Leaves whose .grad is still None (e.g. a tile whose column target
-    didn't apply this specific tick) are skipped, not zeroed against a
-    nonexistent gradient."""
+    tests/comparison, superseded by AdamOptimizer for real training.
+    See docs/research/toy_recall_models.rst:optimizer_choice_isolation_controls."""
     for p in params:
         if p.grad is not None:
             p.data = p.data - lr * np.asarray(p.grad, dtype=np.float32)
@@ -140,22 +88,10 @@ def apply_gradient_step(params: list[Tensor], lr: float) -> None:
 
 
 class AdamOptimizer:
-    """Standard Adam (Kingma & Ba, 2014) for plain Tensor leaves --
-    per-parameter first/second moment estimates with bias correction.
-    Added per direct decision after two isolation controls
-    (scripts/torch_mqar_control.py, scripts/fp32_handrolled_control.py)
-    confirmed this session's earlier hand-rolled plain-SGD-with-clipping
-    optimizer (apply_gradient_step) was the actual cause of every
-    stuck-at-chance/diverging toy training result -- NOT FP4
-    quantization, NOT the architecture. A full-precision + Adam control
-    converged easily and fast on the identical task; full precision
-    with the OLD plain-SGD optimizer diverged identically to the FP4
-    version. Momentum/adaptive per-parameter scaling was the missing
-    piece, not precision.
-
-    Keyed by `id(param)` (Tensor doesn't define __hash__/__eq__, so
-    default object-identity hashing is exactly what's wanted here --
-    each distinct Tensor leaf gets its own independent moment state)."""
+    """Standard Adam (Kingma & Ba, 2014) for plain Tensor leaves, keyed by
+    `id(param)` (each distinct Tensor leaf gets its own independent moment
+    state).
+    See docs/research/toy_recall_models.rst:optimizer_choice_isolation_controls."""
 
     def __init__(self, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8):
         self.beta1 = beta1
@@ -186,21 +122,11 @@ class AdamOptimizer:
 
 
 def backward_with_grad_clip(loss: Tensor, max_grad_norm: float) -> None:
-    """Gradient-clipped replacement for `loss.backward()` -- clips the
-    L2 norm of EVERY node's incoming gradient (not just the final
-    parameter gradients) to `max_grad_norm`, right before that node's
-    own `_backward()` fires. Still used alongside AdamOptimizer
-    (clip+Adam together is standard practice, e.g. nanoGPT's own
-    convention) -- clipping alone was never sufficient (see
-    AdamOptimizer's own docstring), but it's still good practice
-    combined with real momentum.
-
-    `Tensor.backward()` (`sili/tensor.py`) is just `for node in
-    reversed(_topo_sort(self)): node._backward()` -- replicated here
-    with a clip inserted in the loop, so every node's `.grad` (already
-    fully accumulated from all its consumers by the time its own turn
-    comes, per topological order) is bounded before it propagates
-    further."""
+    """Gradient-clipped replacement for `loss.backward()` -- clips the L2
+    norm of EVERY node's incoming gradient (not just the final parameter
+    gradients) to `max_grad_norm`, right before that node's own
+    `_backward()` fires.
+    See docs/research/toy_recall_models.rst:backward_with_grad_clip_per_node."""
     if loss.grad is None:
         loss.grad = np.ones_like(loss.data)
     for node in reversed(_topo_sort(loss)):
@@ -213,9 +139,8 @@ def backward_with_grad_clip(loss: Tensor, max_grad_norm: float) -> None:
 
 
 def lr_schedule(step: int, total_steps: int, peak_lr: float, warmup_steps: int, min_lr_ratio: float = 0.1) -> float:
-    """Linear warmup + cosine decay, matching nanoGPT's own convention
-    (widely-used, well-tested defaults for small transformer training --
-    looked up rather than guessed, per direct decision)."""
+    """Linear warmup + cosine decay, matching nanoGPT's own convention.
+    See docs/research/toy_recall_models.rst:lr_schedule_nanogpt_convention."""
     if step < warmup_steps:
         return peak_lr * (step + 1) / max(1, warmup_steps)
     progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
@@ -224,43 +149,20 @@ def lr_schedule(step: int, total_steps: int, peak_lr: float, warmup_steps: int, 
 
 
 def clip_grad_norm_(params: list[Tensor], max_norm: float) -> float:
-    """Textbook GLOBAL gradient-norm clipping -- the total L2 norm
-    ACROSS ALL of `params`' gradients combined is capped to `max_norm`
-    (matching torch.nn.utils.clip_grad_norm_ exactly, including the
-    control script that used it: scripts/torch_mqar_control.py).
-
-    `backward_with_grad_clip`'s per-NODE clipping exists specifically
-    because `DISLDOLayer`'s own weights self-update INLINE during
-    `backward()`, so a true global-norm measurement isn't available
-    before an update already happened (see its own docstring). That
-    constraint doesn't apply to this module's models anymore (per
-    direct decision -- they're built from `DenseTensorLinear` now, see
-    module docstring): NOTHING updates until `optimizer.step()` is
-    called explicitly, so the real global norm can be measured first,
-    same as any standard training loop. Confirmed this distinction
-    actually matters, not just theoretically: per-node clipping still
-    let AdamOptimizer diverge on the real MQAR task (every one of many
-    parameter tensors independently allowed up to norm `max_norm` is a
-    much LARGER aggregate step than one norm-`max_norm` budget shared
-    across all of them) -- this is the correct, stronger clip to use
-    for models built from DenseTensorLinear; call after `loss.backward()`
-    (plain, ordinary -- not `backward_with_grad_clip`) and before
-    `optimizer.step()`."""
+    """Textbook GLOBAL gradient-norm clipping -- the total L2 norm ACROSS
+    ALL of `params`' gradients combined is capped to `max_norm` (matching
+    torch.nn.utils.clip_grad_norm_). Call after plain `loss.backward()`
+    (not `backward_with_grad_clip`) and before `optimizer.step()`.
+    See docs/research/toy_recall_models.rst:clip_grad_norm_global_vs_per_node."""
     total_sq = 0.0
     for p in params:
         if p.grad is not None:
             total_sq += float(np.sum(np.asarray(p.grad, dtype=np.float64) ** 2))
     total_norm = total_sq**0.5
     if not np.isfinite(total_norm):
-        # `total_norm > max_norm` and `total_norm > 0` are BOTH False when
-        # total_norm is NaN (IEEE 754) -- a NaN/Inf gradient would silently
-        # skip the clip below and sail straight into opt.step(), permanently
-        # poisoning Adam's m/v moving averages (every future step also NaN
-        # after that). Confirmed as the real, direct cause of dense
-        # connectivity's permanent NaN divergence via the C++-side analog
-        # of this exact bug (sili__new's ScalePolicy::update, see its own
-        # docstring; JOURNAL.md 2026-08-10). Zero the gradient instead --
-        # skips this step's update rather than corrupting all future ones.
+        # Real bug, fixed: zero the gradient instead of clipping it when the
+        # norm isn't finite -- see the RST anchor above for why an unguarded
+        # NaN/Inf norm would otherwise silently skip the clip below.
         for p in params:
             if p.grad is not None:
                 p.grad = np.zeros_like(np.asarray(p.grad, dtype=np.float32))
@@ -298,20 +200,12 @@ class _ToyTransformerLayer:
 
 
 class ToySmallTransformer:
-    """Stacked causal dense transformer -- each layer has its OWN
-    distinct weights (real depth-stacking, unlike tile-recurrence's
-    single shared tile network). Single-head attention (see module
-    docstring's simplifications), no positional encoding.
-
-    `half_bandwidth`: defaults to unlimited (full causal visibility --
-    the default matches every existing call site's behavior). Set to
-    an int `W` to give this model a GENUINELY bounded context window
-    -- structurally unable to see more than `W` positions back,
-    regardless of training. Used as the real "standard LLM" stand-in
-    for the out-of-context benchmark suite (see
-    scripts/train_toy_beyond_context_comparison.py) -- tile-recurrence's
-    own `num_tiles` already plays this same role, no equivalent knob
-    needed there."""
+    """Stacked causal dense transformer -- each layer has its OWN distinct
+    weights. Single-head attention, no positional encoding.
+    `half_bandwidth` defaults to unlimited; set to an int `W` for a
+    genuinely bounded context window, structurally unable to see more than
+    `W` positions back.
+    See docs/research/toy_recall_models.rst:tosmalltransformer_half_bandwidth."""
 
     def __init__(
         self,
@@ -365,24 +259,12 @@ class ToySmallTransformer:
 
 class ToyTileRecurrence:
     """One shared tile network (DenseTensorLinear q/k/v/o/gate/up/down),
-    gaussian_attention across tiles, additive energy-free gated residual
-    (toy scale -- see module docstring; no EnergyDynamics here, plain
-    residual add is enough to test the core retrieval mechanism without
-    pulling in another moving part). Single head, no positional
-    encoding (see module docstring's simplifications).
-
-    `embed_width` (E) matches the real token-embedding width. The
-    internal recurrent `state_width` = E * `column_neurons` (C) is
-    deliberately WIDER -- solves "how do you backprop a prediction
-    error into a state much wider than the output" (see the approved
-    plan, fuzzy-plotting-starlight.md, for the full worked example:
-    selecting a fixed subset starves the rest of gradient, summing a
-    column forces the state's own values small to avoid blowup,
-    AVERAGING a column works and stays in the same natural magnitude
-    range). `lm_head` stays fixed at `embed_width` -- standing in for
-    the real system's pretrained, fixed-width output head, which is
-    exactly why the width-reduction has to be the parameter-free
-    column-mean, not a new learned down-projection."""
+    gaussian_attention across tiles, additive energy-free gated residual.
+    Single head, no positional encoding.
+    `embed_width` (E) matches the real token-embedding width; the internal
+    recurrent `state_width` = E * `column_neurons` (C) is deliberately
+    WIDER, read out via column-mean pooling back to `embed_width`.
+    See docs/research/toy_recall_models.rst:tile_recurrence_state_width_column_mean."""
 
     def __init__(
         self,
@@ -430,23 +312,14 @@ class ToyTileRecurrence:
         return params
 
     def step(self, x_window: np.ndarray, M_prev: np.ndarray) -> tuple[np.ndarray, Tensor]:
-        """One recurrence tick. x_window, M_prev: [num_tiles,
-        state_width] numpy, DETACHED (no BPTT, matching
-        tile_recurrence.py's own design) -- both already widened to
-        state_width by the caller (see _build_tile_window in
-        scripts/train_toy_recall_comparison.py), so nothing here needs
-        to handle mixed widths. Returns (M_new numpy [num_tiles,
-        state_width], logits Tensor [num_tiles, vocab_size] -- one row
-        per tile's own column-mean-pooled next-token prediction; only
-        the LAST row, the real current tick position, is ever actually
-        trained by the caller).
-
-        Q/K/V draw from x_window BLENDED with M_prev (per direct
-        correction -- see [[feedback_attention_needs_combined_input_state]]:
-        input-only attention forces anything relating fresh input to
-        carried state through an artificial "write to state, wait a
-        tick, then attend" detour; attention must be able to relate
-        input and state directly, in one step)."""
+        """One recurrence tick. x_window, M_prev: [num_tiles, state_width]
+        numpy, DETACHED (no BPTT) -- both already widened to state_width by
+        the caller. Returns (M_new numpy [num_tiles, state_width], logits
+        Tensor [num_tiles, vocab_size] -- one row per tile's own
+        column-mean-pooled next-token prediction; only the LAST row is
+        ever actually trained by the caller).
+        Q/K/V draw from x_window BLENDED with M_prev.
+        See docs/research/toy_recall_models.rst:tile_recurrence_step_qkv_blend."""
         x_normed = rmsnorm_tensor(Tensor(x_window.astype(np.float32)), self.input_ln, self.rms_eps)
         m_normed = rmsnorm_tensor(Tensor(M_prev.astype(np.float32)), self.input_ln, self.rms_eps)
         qkv_source = x_normed + m_normed

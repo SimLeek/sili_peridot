@@ -1,17 +1,8 @@
 """
 sili_peridot/model/sili_model.py
-──────────────────────────────────
-B7: assemble the full model (embedding lookup -> B6's fold-depth
-recurrence -> final RMSNorm -> lm_head) and evaluate next-token
-prediction quality entirely through sili -- no torch forward pass
-anywhere in this module, mirroring eval_pruning.evaluate_next_token_
-prediction's exact loss/accuracy methodology so the two are directly
-comparable.
-
-embed_tokens/lm_head are never part of the 7 folded suffixes (B3 never
-prunes them, B5 never quantizes them) -- read as plain float32 arrays
-and applied via a numpy gather / matmul, same scope boundary as
-sili_block.py's layernorm weights.
+Assembles the full model (embedding -> fold-depth recurrence -> RMSNorm
+-> lm_head) and evaluates next-token prediction entirely through sili.
+See docs/research/sili_model.rst:sili_model.module_overview.
 """
 
 from __future__ import annotations
@@ -33,16 +24,10 @@ def _to_dense_numpy(entry: dict) -> np.ndarray:
 
 
 def _to_sparse_or_dense(entry: dict) -> _EmbedOrHead:
-    """
-    B3's role-based thresholds DO prune embed_tokens/lm_head (both 2-D,
-    ~20%/~70% density respectively on the real checkpoint) -- storing
-    them fully dense regardless (the previous behavior) cost ~1.5GB for
-    two tensors that compress to ~360MB combined at their real density.
-    Keeps a real {"csr": ...} entry as a scipy CSR matrix (cheap row
-    gather for embed_tokens, cheap sparse-dense matmul for lm_head) --
-    scipy is already a transitive dependency (via sili__new), not a new
-    one. {"raw": ...} entries (never pruned to CSR) fall back to dense,
-    matching the 1-D layernorm vectors' own always-raw convention.
+    """entry is a prune.py sparse_state value. Kept as scipy CSR when B3
+    pruned it (cheaper than dense at real density); {"raw": ...} entries
+    fall back to dense, matching layernorm's raw convention.
+    See docs/research/sili_model.rst:sili_model.embed_head_sparse_storage.
     """
     if "csr" not in entry:
         return entry["raw"].float().numpy().copy()
@@ -61,15 +46,10 @@ def build_sili_model(
     value_scale_mode: str = "per_row",
     rank1_iters: int = 6,
 ) -> dict:
-    """
-    Pops embed_tokens/lm_head/final-norm and every fold step's real sili
-    layers out of `sparse_state` (MUTATES it -- same streaming discipline
-    as build_step_layers). Returns a dict bundling everything
-    compute_logits_sili/evaluate_next_token_prediction_sili need.
-
-    embed_tokens/lm_head are kept as scipy CSR matrices when B3 pruned
-    them (the real checkpoint case), not densified -- see
-    _to_sparse_or_dense.
+    """Pops embed_tokens/lm_head/final-norm and every fold step's layers
+    out of sparse_state (mutates it, streaming discipline). Returns a
+    dict bundling everything compute_logits_sili needs.
+    See docs/research/sili_model.rst:sili_model.embed_head_sparse_storage.
     """
     embed_tokens = _to_sparse_or_dense(sparse_state.pop("model.embed_tokens.weight"))
     lm_head = _to_sparse_or_dense(sparse_state.pop("lm_head.weight"))
@@ -102,14 +82,9 @@ def compute_logits_sili(
     num_cpus: int = 4,
     activation_density: _ActivationDensity | list[_ActivationDensity] = None,
 ) -> np.ndarray:
-    """Returns [T, vocab_size] float32 logits. activation_density: None
-    (default) = dense forward throughout (current behavior); a float in
-    (0, 1] sparsifies every projection's input activation to that
-    per-token top-k density and routes through SISLDO's forward_sparse
-    instead; a dict isolates specific suffixes; a list of length
-    cfg.num_hidden_layers isolates specific fold steps -- see
-    sili_block.apply_fold_step's _forward helper and
-    run_folded_recurrence's per_step handling."""
+    """Returns [T, vocab_size] float32 logits.
+    See docs/research/sili_model.rst:sili_model.activation_density_interface
+    for activation_density semantics."""
     embed_tokens = sili_model["embed_tokens"]
     x = embed_tokens[token_ids]  # [T, hidden] -- cheap row gather either way
     if scipy.sparse.issparse(x):
@@ -128,16 +103,14 @@ def compute_logits_sili(
 
     lm_head = sili_model["lm_head"]
     if scipy.sparse.issparse(lm_head):
-        # sparse [vocab, hidden] @ dense [hidden, T] -> dense [vocab, T],
-        # never materializes lm_head densely -- .T to hidden @ lm_head.T's shape.
+        # See docs/research/sili_model.rst:sili_model.lm_head_sparse_matmul.
         return (lm_head @ hidden.T).T.astype(np.float32)
     return hidden @ lm_head.T
 
 
 def _cross_entropy_and_accuracy(logits: np.ndarray, targets: np.ndarray) -> tuple[float, float]:
-    """logits: [N, vocab], targets: [N] int. Standard numerically-stable
-    softmax cross-entropy (mean over N) + top-1 accuracy -- same
-    definition as HF's shifted labels=input_ids loss."""
+    """logits: [N, vocab], targets: [N] int.
+    See docs/research/sili_model.rst:sili_model.eval_parity."""
     shifted = logits - logits.max(axis=-1, keepdims=True)
     log_probs = shifted - np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
     loss = -log_probs[np.arange(len(targets)), targets].mean()
@@ -155,10 +128,8 @@ def evaluate_next_token_prediction_sili(
     num_cpus: int = 4,
     activation_density: _ActivationDensity | list[_ActivationDensity] = None,
 ) -> EvalResult:
-    """sili-only counterpart to eval_pruning.evaluate_next_token_prediction
-    -- same teacher-forced next-token loss/top-1-accuracy definition,
-    same EvalResult, so perplexity/accuracy are directly comparable.
-    See compute_logits_sili for activation_density."""
+    """sili-only counterpart to eval_pruning.evaluate_next_token_prediction.
+    See docs/research/sili_model.rst:sili_model.eval_parity."""
     losses, accs = [], []
     for text in texts:
         ids = tokenizer(text, return_tensors="pt")["input_ids"][0].numpy()
