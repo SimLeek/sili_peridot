@@ -1,25 +1,4 @@
-"""
-sili_peridot/model/eval_pruning.py
-────────────────────────────────────
-Does a given pruning decision actually degrade MiniCPM5-1B-Base's
-next-token prediction quality by an unacceptable amount? Loads the real
-HuggingFace model, evaluates it dense, then loads an already-pruned
-dense state dict (built by model/prune.py -- no CSR conversion, no
-folding, no column-averaging, no sili runtime involved at all here --
-purely "does zeroing these specific weights hurt", isolated from every
-later conversion step) and compares next-token loss/perplexity and
-top-1 accuracy on a small held-out text sample.
-
-This module has NO pruning-construction logic of its own -- see
-model/prune.py for that (prune_state_dict / prune_state_dict_by_role,
-plus prune.sparse_state_to_dense_state_dict to turn either's output back
-into plain tensors loadable via model.load_state_dict). Keeping the two
-concerns separate avoids two parallel implementations of "which weights
-get zeroed."
-
-torch/transformers-only; not part of the sili runtime path, only a
-validation step for the conversion pipeline.
-"""
+"""See docs/research/eval_pruning.rst:module_overview."""
 
 from __future__ import annotations
 
@@ -27,11 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-# Short, diverse, hand-written passages -- no external dataset
-# dependency. Plain declarative English is exactly what a BASE model
-# (no instruction tuning) should already predict well; this isn't meant
-# to be a rigorous benchmark, just a sanity-scale check that pruning
-# hasn't broken the model in an obvious way.
+# See docs/research/eval_pruning.rst:eval_texts_design.
 EVAL_TEXTS: list[str] = [
     "The capital of France is Paris, a city known for its museums and "
     "architecture. Many tourists visit every year to see the Eiffel Tower.",
@@ -45,13 +20,7 @@ EVAL_TEXTS: list[str] = [
     "gray water and rowed out past the harbor wall toward open sea.",
 ]
 
-# A second, disjoint set (different topics/style) -- never used during
-# threshold search, only to check a chosen set of thresholds isn't
-# overfit to the specific EVAL_TEXTS snippets above. Confirmed on the
-# final DEFAULT_TARGET_SPARSITY_BY_ROLE thresholds: pruned accuracy held
-# steady across both sets (0.482 vs. 0.478) even though the dense
-# baseline itself varies more between them (0.503 vs. 0.584) -- see
-# JOURNAL.md.
+# See docs/research/eval_pruning.rst:eval_texts_heldout_design.
 EVAL_TEXTS_HELDOUT: list[str] = [
     "Mount Everest is the tallest mountain above sea level on Earth, "
     "located in the Himalayas on the border between Nepal and Tibet.",
@@ -105,14 +74,7 @@ def compare_dense_vs_pruned(
     pruned_dense_state_dict: dict[str, torch.Tensor],
     texts: list[str] = EVAL_TEXTS,
 ) -> dict:
-    """
-    Evaluate `model` dense, then with `pruned_dense_state_dict` loaded
-    in, then restore its original weights -- so the caller's model isn't
-    left mutated. `pruned_dense_state_dict` is typically
-    prune.sparse_state_to_dense_state_dict(prune.prune_state_dict_by_role(...)[0]).
-
-    Returns a plain dict so callers/tests don't need EvalResult imported.
-    """
+    """See docs/research/eval_pruning.rst:compare_dense_vs_pruned_restore."""
     original_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
     try:
         model.load_state_dict(original_state_dict)  # ensure a known-clean start
