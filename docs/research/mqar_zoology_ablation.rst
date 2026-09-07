@@ -316,14 +316,42 @@ Tier 1 (continued) -- direct mechanistic literature support
    ceiling from an unusually long LEVEL_DOWN-disabled convergence basin;
    only continued non-convergence all the way to ``max_steps`` would.
 
-   Currently past the transition, in the expected post-transition dip at
-   the new tier (``vocab=126, k=2``): accuracy low/flat (0.001-0.06),
-   loss elevated (4.6-4.9) as of step 57,000, ~13,700 steps into this
-   phase so far. Next milestone is "full k" -- once this tier's own
-   ``LEVEL_UP``s exhaust (k cycles 2->3, then since vocab is already at
-   ``TASK_VOCAB_MAX`` further ``LEVEL_UP``s increment k indefinitely
-   toward ``k_max=8``). Watching for that, and for the run reaching
-   ``max_steps=100,000`` (``DONE``) regardless.
+   **Final result: run completed at max_steps=100,000 without reaching
+   "full k".** ``DONE wall_s=12999.8 total_steps=100000
+   steps_per_sec(engine)=7.69 final_k=2 final_vocab=126
+   vocab_tiers_seen=[16, 32, 64, 126] peak={'vocab': 126, 'k': 2}``. From
+   the step-43,286 transition to the end of the run (56,714 steps -- more
+   than double the previous longest phase, and the majority of the run's
+   entire step budget), the model stayed at ``vocab=126, k=2`` and never
+   held a 10-in-a-row streak long enough to ``LEVEL_UP`` to k=3. Unlike
+   the earlier vocab=64/k=3 phase (which also ran unusually long, then
+   broke through), this phase showed no recovery trend for its entire
+   remaining duration -- accuracy stayed noisy and low the whole way
+   (roughly 0.001-0.08, no upward drift) and loss, if anything, drifted
+   slightly worse over time (4.4-4.8 in the back half vs. the 4.5-4.9
+   range seen earlier in the same phase). So the "false alarm" caveat
+   above does NOT apply here: this phase genuinely never converged within
+   the tested budget, as opposed to the earlier phase which looked stuck
+   but wasn't.
+
+   **Honest summary of the goal from this session** (k=3 AND vocab=128,
+   simultaneously): NOT reached. What WAS reached: full vocab (126) at
+   k=2, and k=3 at a lower vocab (64). The LEVEL_DOWN-disabled fix
+   clearly unblocked real progress that the LEVEL_DOWN-enabled run never
+   achieved at all -- but "k=3 held at vocab=126" is evidently harder
+   than either "k=3 at vocab=64" or "k=2 at vocab=126" individually, and
+   56,714 steps (about 3 hours of wall time at this model's ~7.7 steps/
+   sec) wasn't enough to cross that harder combination. Plausible next
+   levers, not yet tested: (a) simply more steps -- this run was capped
+   at 100,000 by an arbitrary probe budget, not evidence of a true
+   ceiling; (b) more raw compute/throughput to make longer runs
+   affordable (the user's "8x from a better CPU" plan, or eventually
+   GPU); (c) the sparsity machinery (``input_sparsity_p``/
+   ``dy_sparsity_p``, already built per Phase 0-8 above) combined with a
+   wider ``embed_width``, which increases capacity per wall-clock step
+   rather than just running longer at the same width. (b) and (c) are
+   complementary, not alternatives -- discussed as the next planning
+   topic with the user (2026-09-07).
 
 Tier 2 -- plausible, well-established in general ML, less specific to this failure
 ----------------------------------------------------------------------------------

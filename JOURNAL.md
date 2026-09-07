@@ -8307,3 +8307,47 @@ since vocab is already maxed, further LEVEL_UPs increment k indefinitely
 toward ``k_max=8``). Updated ``docs/research/mqar_zoology_ablation.rst``
 Tier 1 item 2 accordingly. Continuing to watch for k progress and/or
 ``DONE`` at ``max_steps=100,000``.
+
+## 2026-09-07 (cont'd) -- run complete: full vocab held, k=3 at vocab=126
+## not reached within budget
+
+``arm_nolevel_down`` finished: ``DONE wall_s=12999.8 total_steps=100000
+steps_per_sec(engine)=7.69 final_k=2 final_vocab=126
+vocab_tiers_seen=[16, 32, 64, 126]``. From the step-43,286 vocab=126
+transition to the end of the run, 56,714 steps (more than half the
+run's entire budget, more than double the previous longest phase)
+elapsed at ``vocab=126, k=2`` without a single further ``LEVEL_UP`` --
+accuracy stayed noisy and low the whole way (~0.001-0.08, no upward
+trend) and loss didn't recover the way it did after every earlier
+transition. Unlike the vocab=64/k=3 phase earlier in this same run
+(which also looked stuck for a long stretch, then broke through), this
+phase genuinely never converged within the tested budget -- the
+"long-flat-stretch isn't proof of a ceiling" caveat noted earlier
+doesn't rescue this one.
+
+Honest bottom line against this session's original goal (k=3 AND
+vocab=128 simultaneously): NOT reached. What the LEVEL_DOWN-disabled fix
+DID prove, decisively: real progress that never happened at all under
+the old curriculum (full vocab reached, k=3 reached at a lower vocab).
+"k=3 held at vocab=126" is evidently a harder combination than either
+piece alone, and ~3 hours of wall time wasn't enough to cross it at this
+model's small (state_width=128) scale.
+
+Discussed the next step with the user: this reframes the priority from
+"debug the curriculum" (done, confirmed working) to "get more effective
+compute" -- either more raw throughput (user has an ~8x CPU upgrade
+path in mind; GPU is an open question for this specific workload, since
+it's serial small-recurrent-step compute, not batched matmul-friendly)
+or making existing compute go further per step (the sparsity machinery
+from the ``fuzzy-plotting-starlight.md`` plan, Phase 0-8, already built
+and CLI-wired but unused by this run -- combined with a wider
+``embed_width`` for more capacity). Both levers are complementary. Real
+compute-roadmap planning is the explicit next topic, to be worked out
+with the user rather than decided unilaterally.
+
+Committed the full investigation (root-cause + confirmation run +
+milestone updates) as PR #24 (``research/mqar-leveldown-vocab126``,
+cherry-picked onto real ``main`` after confirming
+``docs/research-comments-to-rst`` was already merged via PR #23).
+Updated ``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 2 with
+the final result and honest summary.
