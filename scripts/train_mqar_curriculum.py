@@ -323,6 +323,17 @@ def train_curriculum(
         k_first_vocab = seq_len_for_k(k_first_target) + 4
 
     disldo_cls = PRECISION_CLS[precision]
+    # AQRS (additive_rank/dynamic_rank_control) exists to give LOW-BIT
+    # storage (FP4/FP8) extra precision where it's sparse -- fp32 is
+    # already full precision everywhere, so AQRS has nothing to correct
+    # for. Force it off here rather than support it on DISLDOLayer32: the
+    # caller's own additive_rank=1/dynamic_rank_control=True defaults
+    # would otherwise reach ToyTileRecurrenceRMT's non-zero-value guard
+    # (rank_kwargs/additive_kwargs, model/toy_tile_recurrence_rmt.py) and
+    # get forwarded into a constructor that was never meant to have it.
+    if precision == "fp32":
+        additive_rank = 0
+        dynamic_rank_control = False
     state_width = embed_width * COLUMN_NEURONS
 
     rng = np.random.RandomState(seed)
