@@ -8351,3 +8351,271 @@ cherry-picked onto real ``main`` after confirming
 ``docs/research-comments-to-rst`` was already merged via PR #23).
 Updated ``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 2 with
 the final result and honest summary.
+
+## 2026-09-07 (cont'd) -- adaptive-sparsity speedup experiment blocked: real
+## engine bug, activation sparsity never worked for dense fp32 layers
+
+Started the requested experiment (adaptive nucleus sparsity via
+``x_r_target``/``dy_r_target`` + ``target_steps_per_sec`` closed loop,
+targeting a measured 5x-10x speedup over each model's freshly-calibrated
+dense baseline: 70k @ 12.759 sps -> target 95.69; 350k @ 3.441 sps ->
+target 25.81, embed_width=36 chosen to land near 350,000 real params via
+``264*w^2 + 128*w``). ``arm_nolevel_down``-style run launched
+(``adaptive_70k``), watched it hit a real speedup ceiling of only ~24.7
+sps (not 95.69) once ``x_r``/``dy_r`` bottomed out at their 0.05 floor --
+but far more importantly, ``loss``/``acc`` were frozen BIT-FOR-BIT
+(``loss=4.852030277252197``, ``acc=0.0``) from step 500 all the way to
+step 45,500 when stopped. That's not "stuck," that's ``ln(128)`` --
+exact cross-entropy of a uniform 128-way distribution -- meaning the
+model's output had collapsed to a constant regardless of input.
+
+Root-caused via isolation (stripped to ``x_r_target=0.9`` alone, no
+closed loop; then instrumented ``_to_sparse``/``DISLDOLayer32.forward``
+directly): the CSR-typed sparse input reaching the layer was completely
+real and nonzero (``csr.nnz=9``, ``values.sum=-0.465``), but
+``DISLDOLayer32.forward``'s ``forward_sparse`` branch returned EXACTLY
+zero output for it, every single call. Traced to
+``sili__new/sili/lib/headers/sisldo_ops.hpp``: both ``sisldo_forward``
+and ``disldo_backward_sparse_grad``'s block4 branches are gated behind
+``if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>)`` -- a real,
+deliberate, ALREADY-documented scoping decision from when block4 was
+FP4-only, never widened when FP8 (tasks #90-96) or float32
+(tasks #391-398) block4 storage were added later. Since ``dense=True``
+layers are 100% block4-resident (0 scattered synapses, confirmed
+earlier this session: 69,632/69,632 = 100% density), this means the
+sparse-activation forward/backward path reads/writes NOTHING for a
+dense=True fp32 or FP8 layer -- silent, exact zero, no error.
+
+Consequence: activation-level sparsity (both the newer
+``x_r_target``/``dy_r_target`` nucleus mechanism, tasks #362-375, AND
+the older fixed-fraction ``input_sparsity_p``/``dy_sparsity_p``,
+tasks #328-341 -- both route through the same C++ function) has never
+actually worked on a dense=True fp32 layer, i.e. never on the precision
+this whole session's landmark MQAR result used. Only FP4 layers ever
+exercised this path correctly. This also means my earlier claim to the
+user that "sparse IO is already validated/working" was only true for
+FP4 -- corrected now.
+
+Wrote up the full finding in ``sili__new/docs/research/sisldo_ops.rst``
+(new anchor
+``sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8``).
+Filed sili_peridot task #413 (the bug, fix direction: replace the
+hardcoded ``FP4_TABLE[byte & 0xFu]`` decode with the type-generic
+``ValueAccessor<VALUES_TYPE>`` pattern already used elsewhere in the
+same file, mirroring how ``linear_disldo.hpp``'s dense-path block4
+kernel was already made type-generic). Stopped ``adaptive_70k`` (task
+#411) and did not launch ``adaptive_350k`` (task #412) -- both are
+blocked on this fix or a decision to run the experiment on FP4 instead.
+Filed tasks #405-410 for the broader compute-roadmap tracks discussed
+with the user (CPU-first, then GPU, FPGA later for FP4; sparse-IO
+GPU-portability corrected per user's block4-warp-gather insight).
+
+## 2026-09-07 (cont'd) -- task #413 fixed: sisldo/disldo backward parity
+## restored for fp32 and fp8, two pre-existing bugs found along the way
+
+Per explicit directive ("sisldo with csr should match disldo with 0
+value inputs so we can have bit exact tests... keep pushing until it
+gets the same backwards values"), wrote real TDD parity tests first
+(``sili__new/tests/unit/test_sisldo_disldo_parity_fp32.cpp``'s new
+``run_config_block4``, and a new ``test_sisldo_disldo_parity_fp8.cpp``
+mirroring the existing FP4 template) before doing any further fixing.
+Made ``sisldo_forward``/``disldo_backward_sparse_grad`` type-generic
+(the FP4-only gate from the previous entry), then used the new tests as
+the correctness gate to find and fix two more, genuinely separate bugs:
+
+1. **New bug, introduced by this same generalization**:
+   ``disldo_backward_sparse_grad``'s row-workspace byte cursor advanced
+   using the bare FP4-only ``block4_stored_tile_len`` for every
+   ``VALUES_TYPE`` instead of the type-correct ``..._len8``/``..._len32``
+   variant (three separate, non-interchangeable functions in
+   ``block4.hpp``). Misaligned every FP8/float32 tile after the first in
+   a multi-tile row. Fixed fp32 parity outright; fp8 still failed after
+   this fix, with a divergence pattern that superficially looked like
+   column-index swaps (e.g. ``dense[0][2]``~=``sparse[0][5]`` and vice
+   versa) but turned out to be bug #2 below.
+
+2. **Independently pre-existing, in ``linear_disldo.hpp``, unrelated to
+   sisldo entirely**: the FP8 block4 backward's write-back (both SIMD
+   and scalar-fallback paths) called ``fp8_quantize_stochastic``/
+   ``fp8_quantize_stochastic_live`` unconditionally, never checking the
+   ``StochasticRounding`` template flag -- unlike the FP4/float32
+   branches in the same function, which already gate it correctly. The
+   parity test's dense reference arm (``StochasticRounding=false``,
+   expecting deterministic rounding) was silently dithering every FP8
+   weight write regardless, while the sparse arm rounded deterministically
+   as requested -- producing near-quantization-step-sized divergences
+   that looked like transposed values but were really RNG-vs-deterministic
+   outcomes on the same underlying float. This bug predates the whole
+   sisldo generalization effort and would affect ANY caller requesting
+   deterministic FP8 block4 rounding, not just this test.
+
+Both fixed; full suite green at 153/153 (previously 151/153, with the
+two new parity tests as the only failures). Confirmed deterministic
+across 5 repeat runs of each fixed test (no residual nondeterminism).
+Full writeup in ``sili__new/docs/research/sisldo_ops.rst`` (update to
+the existing ``sisldo_forward.block4_fp4_only_silent_zero_for_dense_
+fp32_fp8`` anchor). Task #413 now marked complete; #411/#412 (the
+originally-blocked adaptive-sparsity speedup experiments) are unblocked.
+
+## 2026-09-07 (cont'd) -- adaptive_70k (task #411) result: real speedup, but
+## far below target AND a genuine quality collapse -- not a clean win
+
+Rebuilt the Python extension (``pip install -e . --no-build-isolation``,
+now safe now that the C++ fix from the previous entry is verified)
+and relaunched ``adaptive_70k`` (embed_width=16, ``dy_r_target=
+x_r_target=0.9`` seed, closed-loop control targeting 95.69 sps = 7.5x
+over the 12.759 sps dense baseline, 100,000 steps, same base config as
+``arm_nolevel_down``). Confirmed via a 200-step smoke test first that
+loss now genuinely decreases (4.91->4.50) instead of being frozen at
+``ln(128)`` -- the block4 fix works end-to-end through the real Python
+path, not just the C++ parity tests.
+
+**Result is NOT the hoped-for "similar speedup without taking too much
+quality" outcome.** Two separate problems, both real:
+
+1. **Speedup capped far short of target.** ``x_r_target``/``dy_r_target``
+   both hit their hardcoded floor (``r_min=0.05``,
+   ``toy_tile_recurrence_rmt.py``'s ``apply_amortized_dy_r_target_control``
+   family) by step ~19,500 and stayed pinned there for the remaining
+   80,500 steps. Measured throughput plateaued at 19.46 sps -- only
+   1.53x over the dense baseline, nowhere near the 7.5x target. The
+   closed loop is working exactly as designed (it ratchets sparsity down
+   as fast as it can toward the target), it just ran out of floor to give
+   before reaching the requested speedup. The 5x-10x target was never
+   achievable at this floor value, full stop -- not a tuning near-miss.
+
+2. **Quality collapsed at that floor, and never recovered.** Loss
+   dropped to a real low of ~2.63-2.67 around step 19,500-20,000 (right
+   as ``r_target`` bottomed out) -- then got WORSE for the rest of the
+   run, ending in visible instability: loss spiking to 6.6-7.8 and
+   accuracy crashing to as low as ``1e-10`` in the final 5,000 steps.
+   ``final_vocab=16`` the entire run -- the curriculum's level-up gate
+   was never crossed even once in 100,000 steps. Compare directly to
+   ``arm_nolevel_down`` (same base config, no adaptive sparsity, task
+   #403): that run reached ``vocab=126`` before finishing at
+   ``max_steps=100,000``. At this floor value, r_target=0.05 nucleus
+   sparsity is not "similar speedup without taking too much quality" --
+   it is catastrophic for a 70k-param (embed_width=16) model, consistent
+   with [[feedback_toy_scale_invalidates_fp4_bit_budget_claims]]'s
+   already-established finding that this width lacks the fan-in for
+   aggressive sparsity/precision reduction to hold up.
+
+**Not launching ``adaptive_350k`` (task #412) yet without a decision.**
+Running the 350k arm next was the original plan (test whether more
+fan-in tolerates the same floor better), and that comparison is still
+the right next experiment -- but given the 70k result shows the
+CONFIGURED target (95.69 sps / 7.5x) is structurally unreachable at
+``r_min=0.05`` regardless of scale, re-running the exact same
+target_steps_per_sec setup on 350k would very likely just reproduce
+"floor hit early, quality degrades" again without adding new
+information, unless the floor itself is raised (i.e. don't push nucleus
+sparsity as aggressively) or the target speedup is lowered to something
+the floor can actually reach. Flagged for the user rather than silently
+re-running the same failed configuration at a second scale.
+
+Task #417: width=288 (``embed_width=36``) overnight run, sparse
+(``r_target_min=0.5``) vs dense control -- clean quality-cost
+confirmation, estimator ratio validated
+-----------------------------------------------------------------------
+
+Following the r_min sweep above (W=128, r=0.5/0.3 stable-but-plateaued
+at k=2) and the estimator built in ``scripts/estimate_wide_scaling.py``
+(task #416, targeting the 2.03x speedup point at width=288), ran the
+actual overnight training at that width, then built the missing dense
+control to interpret the result cleanly.
+
+**Sparse arm** (``embed_width=36``, ``r_target_min=0.5``,
+``target_steps_per_sec=95.69`` driving the closed loop to the 0.5 floor
+and holding it, 100,000 steps, fp32, ``K_START=2``/query-only-targets
+base config): ``final_k=2 final_vocab=16``, held that stage the ENTIRE
+run -- no collapse (loss/acc stable throughout, unlike the r_min=0.05
+failure above), but also zero curriculum progress. Steady-state
+measured throughput ~5.05-5.3 steps/sec once ``x_r``/``dy_r`` settled at
+their 0.5 floor (~step 15k onward).
+
+**Dense control** (same width, same base config, no sparsity args at
+all, 20,000 steps -- built specifically because none existed for a
+direct comparison): ``final_k=3 final_vocab=32``, reached ``vocab=32``
+by ~step 11,500 and HELD it (no destabilization) through step 20,000.
+Measured ``steps_per_sec=2.42``.
+
+**Conclusion -- this is a real, sparsity-attributable quality cost, not
+a width-specific training issue.** The dense arm crossed the exact
+plateau point (k=2/vocab=16) the sparse arm never crossed, and did it
+in under 2,000 steps -- 50x fewer steps than the sparse arm's full
+budget. This closes the open question from the sparse run alone: width
+=288 is NOT too wide to progress past k=2 with this LR/init/schedule;
+the r_target_min=0.5 floor specifically is what's costing capability at
+this scale, consistent with (and now confirmed at a second, larger
+scale beyond) the W=128 r_min sweep's identical k=2 plateau.
+[[project_natural_sparsity_curve]] / [[project_io_sparsity_energy_rl_pairing]]
+both remain the live hypothesis for how to recover past this floor
+(pair with energy_rl's dead-neuron-prevention mechanism before pushing
+r_target below ~0.3-0.5), not yet tested at width=288.
+
+**Estimator validated on the ratio, not the absolute numbers.** Measured
+speedup = 5.07/2.42 = 2.10x, matching the targeted/projected 2.03x
+almost exactly. The absolute sps values the estimator projected (3.61
+sparse / 1.77 dense) were both off by roughly the same multiplicative
+factor from what was actually measured (5.07 / 2.42) -- consistent with
+uniform noise or systematic underestimate in the single W=128
+calibration point rather than a broken scaling model. The speedup RATIO
+is what the estimator was built to predict for pre-compute-commitment
+decisions, and it held.
+
+Debug note: the first dense-control launch attempt crashed on a
+Python-side bug in the ad-hoc ``log_fn`` (assumed ``steps_per_sec``/
+``window_wall_s`` are always non-``None``, but event-triggered log calls
+like ``LEVEL_UP`` only pass ``ranks``) -- not a model/engine bug. Useful
+anyway: the crash landed exactly on a ``LEVEL_UP`` event between step
+1500 and 2000, an early hint (confirmed by the clean rerun) that the
+dense arm was already leveling up fast.
+
+Task #414 continuation: r_target_min floor sweep at 0.99/0.95/0.90 --
+started, suspended partway (partial result recorded, not a completed
+finding)
+--------------------------------------------------------------------
+
+User correction after the r=0.5 result above: r_target is an ENERGY
+threshold, not a literal fraction-removed knob. Per
+[[project_natural_sparsity_curve]]'s own measured table, r_target=0.5
+corresponds to only ~11% of dims kept (~89% removed), not "50% removed"
+-- so the r=0.5 quality-cost finding was actually testing a far more
+aggressive cut than the framing implied. Raising the floor to 0.90/0.95/
+0.99 (which the natural-sparsity-curve table puts at 28%/~35-45%/50% of
+dims kept respectively -- i.e. 50-72% removed, "still above 50%
+sparsity" per the user) is a meaningfully different, much gentler
+regime worth testing separately before writing off IO sparsity at this
+width.
+
+Launched a sequential 3-arm sweep at width=288 (embed_width=36), same
+base config as the dense/r=0.5 comparison above, each arm 20,000 steps,
+``dy_r_target``/``x_r_target`` initialized to 0.9 and closed-loop-forced
+down to (and pinned at) each floor via the same unreachable
+``target_steps_per_sec=95.69`` trick used for r=0.5.
+
+**Partial result, r_target_min=0.99 (SUSPENDED at step 14,500/20,000,
+not completed)**: one real level-up early (k=2->k=3 at step 2830,
+loss=1.36, acc=0.619 at the crossing -- a clean signal). But quality
+degraded substantially afterward -- loss climbed from ~1.7-2.3 right
+after the level-up to 3.1-4.5 by step 13,000-14,500, accuracy dropped
+to 0.03-0.2 in the same window. Looked like real post-level-up
+instability, not steady-state noise, though the run was stopped before
+we could see whether it would recover or fully collapse.
+
+**Speed note, also partial but real**: r_target_min=0.99 measured
+SLOWER than pure dense throughout the observed window (1.59-2.72 sps,
+trending down, vs dense's steady 2.42 sps) -- at this floor (~50% dims
+kept per the natural-sparsity-curve table), the CSR-construction
+overhead this session's own estimator flagged as a real, nonzero cost
+appears to outweigh the compute saved on the wide layers. Whether this
+holds at r=0.95/0.90 (less dims kept, less overhead-to-savings ratio)
+is unknown -- those arms never ran.
+
+**Why suspended, not finished**: mid-run, given how slow/noisy this
+class of experiment is (each arm ~2-3+ hours, results only interpretable
+after the fact), the decision was made to stop spending hours-per-data-
+point on quality sweeps and instead prioritize the deterministic
+engine/hardware-level optimizations first (making each future test run
+in seconds rather than hours), then return to this floor sweep once
+iteration is cheap. See [[feedback_prioritize_deterministic_speedups_before_sweeps]].
