@@ -52,6 +52,7 @@ class ToyTileRecurrenceRMT:
         x_r_target: float | None = None,
         x_k_min: int = 0,
         x_k_max: int | None = None,
+        r_target_min: float = 0.05,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -72,7 +73,18 @@ class ToyTileRecurrenceRMT:
         dy_surprise_alpha, dy_surprise_beta:
             See docs/research/toy_tile_recurrence_rmt.rst:dy_surprise_design.
         x_r_target, x_k_min, x_k_max:
-            See docs/research/toy_tile_recurrence_rmt.rst:x_r_target_design."""
+            See docs/research/toy_tile_recurrence_rmt.rst:x_r_target_design.
+        r_target_min: floor the amortized closed-loop controllers
+            (apply_amortized_dy_r_target_control/apply_amortized_
+            x_r_target_control/apply_cross_layer_budget_allocator) ratchet
+            dy_r_target/x_r_target down to when measured throughput is
+            below target. Was hardcoded 0.05 in all three call sites --
+            see JOURNAL.md's 2026-09-07 adaptive_70k entry: at that floor,
+            a 70k-param (embed_width=16) model's quality collapsed
+            (curriculum never leveled past its starting vocab tier in
+            100k steps) well before reaching the requested speedup
+            target. Exposed here so the floor itself can be swept to find
+            the largest speedup a given model size actually tolerates."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -102,6 +114,8 @@ class ToyTileRecurrenceRMT:
         self.dy_r_target: dict = dict.fromkeys(self._WIDE_LAYER_NAMES, dy_r_target)
         self.dy_k_min = dy_k_min
         self.dy_k_max = dy_k_max
+        # See __init__'s own r_target_min docstring above.
+        self.r_target_min = r_target_min
         # See docs/research/toy_tile_recurrence_rmt.rst:dy_surprise_design.
         self.dy_surprise_alpha = dy_surprise_alpha
         self.dy_surprise_beta = dy_surprise_beta
@@ -265,19 +279,27 @@ class ToyTileRecurrenceRMT:
     def _real_layers(self):
         return [layer for _name, layer in self._named_real_layers()]
 
-    def _timed_layer_forward(self, layer, layer_name: str, *args, **kwargs) -> Tensor:
-        """Real per-layer forward+backward timing, and the task #374
-        surprise-signal capture point. See
-        docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
+    def _timed_call(self, name: str, fn, *args, **kwargs) -> Tensor:
+        """Generic per-component forward+backward timing, and the task #374
+        surprise-signal capture point -- same accounting as
+        _timed_layer_forward but for any Tensor-returning callable (e.g.
+        gaussian_attention, lm_head.forward), not just a disldo_cls layer's
+        own .forward. See
+        docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design and
+        :component_timing_breakdown_design (lm_head/critic_head/attention
+        added as their own named buckets, task #415 -- previously only the
+        5 wide layers were timed, so everything else silently fell into an
+        unmeasured "the rest" bucket that neither speedup estimates nor
+        Amdahl's-law reasoning could actually check against real numbers)."""
         t0 = time.perf_counter()
-        out = layer.forward(*args, **kwargs)
-        rec = self._layer_timing.setdefault(layer_name, {"fwd_s": 0.0, "bwd_s": 0.0, "fwd_calls": 0, "bwd_calls": 0})
+        out = fn(*args, **kwargs)
+        rec = self._layer_timing.setdefault(name, {"fwd_s": 0.0, "bwd_s": 0.0, "fwd_calls": 0, "bwd_calls": 0})
         rec["fwd_s"] += time.perf_counter() - t0
         rec["fwd_calls"] += 1
         orig_backward = out._backward
         if orig_backward is not None:
 
-            def _timed_backward(_orig=orig_backward, _rec=rec, _out=out, _name=layer_name):
+            def _timed_backward(_orig=orig_backward, _rec=rec, _out=out, _name=name):
                 tb0 = time.perf_counter()
                 _orig()
                 _rec["bwd_s"] += time.perf_counter() - tb0
@@ -288,10 +310,24 @@ class ToyTileRecurrenceRMT:
             out._backward = _timed_backward
         return out
 
+    def _timed_layer_forward(self, layer, layer_name: str, *args, **kwargs) -> Tensor:
+        """Real per-layer forward+backward timing, and the task #374
+        surprise-signal capture point. See
+        docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
+        return self._timed_call(layer_name, layer.forward, *args, **kwargs)
+
     def reset_layer_timing(self) -> None:
         """Zero self._layer_timing -- call at the start of a measurement
         window. See docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
         self._layer_timing = {}
+
+    def layer_timing_snapshot(self) -> dict:
+        """Deep-enough copy of self._layer_timing (per-component fwd_s/
+        bwd_s/fwd_calls/bwd_calls) for callers that need the CURRENT
+        window's breakdown before it gets consumed/reset -- e.g. task #415's
+        standard per-component timing report. See
+        docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
+        return {name: dict(rec) for name, rec in self._layer_timing.items()}
 
     def _update_layer_surprise(self, layer_name: str, dy) -> None:
         """E_t/Lbar per-layer surprise EMA update.
@@ -305,8 +341,9 @@ class ToyTileRecurrenceRMT:
         rec["Lbar"] = self.dy_surprise_beta * rec["Lbar"] + (1.0 - self.dy_surprise_beta) * E_t
 
     def _effective_dy_r_target(self, layer_name: str) -> float | None:
-        """r_t = clip(r_bar * (E_t/Lbar)^alpha, 0.05, 0.99), lagged one step.
-        See docs/research/toy_tile_recurrence_rmt.rst:dy_surprise_design."""
+        """r_t = clip(r_bar * (E_t/Lbar)^alpha, self.r_target_min, 0.99),
+        lagged one step. See docs/research/toy_tile_recurrence_rmt.rst:
+        dy_surprise_design."""
         r_bar = self.dy_r_target.get(layer_name)
         if r_bar is None or self.dy_surprise_alpha is None:
             return r_bar
@@ -315,7 +352,7 @@ class ToyTileRecurrenceRMT:
             return r_bar
         ratio = surprise["E_t"] / surprise["Lbar"]
         r_t = r_bar * (ratio**self.dy_surprise_alpha)
-        return min(max(r_t, 0.05), 0.99)
+        return min(max(r_t, self.r_target_min), 0.99)
 
     def _wide_extra_kwargs(self, layer_name: str) -> dict:
         """Extra kwargs for ONE of the 5 affected layers' forward() calls;
@@ -341,12 +378,14 @@ class ToyTileRecurrenceRMT:
         layer_name: str | None = None,
         down_factor: float = 0.85,
         up_factor: float = 1.05,
-        r_min: float = 0.05,
+        r_min: float | None = None,
         r_max: float = 0.99,
     ) -> dict:
         """Closed-loop controller adjusting self.dy_r_target against
         MEASURED steps/sec. See
         docs/research/toy_tile_recurrence_rmt.rst:amortized_r_target_control_design."""
+        if r_min is None:
+            r_min = self.r_target_min
         names = [layer_name] if layer_name is not None else list(self._WIDE_LAYER_NAMES)
         updated = {}
         for name in names:
@@ -368,12 +407,14 @@ class ToyTileRecurrenceRMT:
         layer_name: str | None = None,
         down_factor: float = 0.85,
         up_factor: float = 1.05,
-        r_min: float = 0.05,
+        r_min: float | None = None,
         r_max: float = 0.99,
     ) -> dict:
         """Same as apply_amortized_dy_r_target_control, operating on
         x_r_target (INPUT axis) instead. See
         docs/research/toy_tile_recurrence_rmt.rst:amortized_r_target_control_design."""
+        if r_min is None:
+            r_min = self.r_target_min
         names = [layer_name] if layer_name is not None else list(self._WIDE_LAYER_NAMES)
         updated = {}
         for name in names:
@@ -394,12 +435,14 @@ class ToyTileRecurrenceRMT:
         target_sps: float,
         down_factor: float = 0.85,
         up_factor: float = 1.05,
-        r_min: float = 0.05,
+        r_min: float | None = None,
         r_max: float = 0.99,
     ) -> dict:
         """Coordinates x_r_target (INPUT axis) against the remaining compute
         budget using per-layer timing; dy_r_target (GRAD axis) untouched.
         See docs/research/toy_tile_recurrence_rmt.rst:cross_layer_budget_allocator_design."""
+        if r_min is None:
+            r_min = self.r_target_min
         names = [n for n in self._WIDE_LAYER_NAMES if self.x_r_target.get(n) is not None]
         if not names:
             return {}
@@ -733,8 +776,16 @@ class ToyTileRecurrenceRMT:
         q_mem = gather(q, mem_idx).reshape((n_mem, sw))
         centers_mem = gather(self.centers, list(range(n_mem)))
         sigmas_mem = gather(sigmas, list(range(n_mem)))
-        attn_pre_o_mem = gaussian_attention(
-            q_mem, k_phys, v_phys, centers_mem, sigmas_mem, num_cpus=self.num_cpus, causal=False
+        attn_pre_o_mem = self._timed_call(
+            "attention",
+            gaussian_attention,
+            q_mem,
+            k_phys,
+            v_phys,
+            centers_mem,
+            sigmas_mem,
+            num_cpus=self.num_cpus,
+            causal=False,
         )
         attn_mem = self._timed_layer_forward(
             self.o_proj,
@@ -794,7 +845,9 @@ class ToyTileRecurrenceRMT:
         if self.recurrent_only_output:
             # See docs/research/toy_tile_recurrence_rmt.rst:recurrent_only_output_ablation.
             v2_phys_mem_only = v2_phys * self._mem_only_value_mask
-            attn_pre_o_content = gaussian_attention(
+            attn_pre_o_content = self._timed_call(
+                "attention",
+                gaussian_attention,
                 q_content,
                 k2_phys,
                 v2_phys_mem_only,
@@ -804,8 +857,16 @@ class ToyTileRecurrenceRMT:
                 causal=False,
             )
         else:
-            attn_pre_o_content = gaussian_attention(
-                q_content, k2_phys, v2_phys, centers_content, sigmas_content, num_cpus=self.num_cpus, causal=False
+            attn_pre_o_content = self._timed_call(
+                "attention",
+                gaussian_attention,
+                q_content,
+                k2_phys,
+                v2_phys,
+                centers_content,
+                sigmas_content,
+                num_cpus=self.num_cpus,
+                causal=False,
             )
         attn_content = self._timed_layer_forward(
             self.o_proj,
@@ -878,8 +939,16 @@ class ToyTileRecurrenceRMT:
                 self._l1_sparsity_split(
                     self.o_proj,
                     self._to_sparse(
-                        gaussian_attention(
-                            q, k_phys, v_phys, self.centers, sigmas, num_cpus=self.num_cpus, causal=False
+                        self._timed_call(
+                            "attention",
+                            gaussian_attention,
+                            q,
+                            k_phys,
+                            v_phys,
+                            self.centers,
+                            sigmas,
+                            num_cpus=self.num_cpus,
+                            causal=False,
                         ),
                         "o_proj",
                     ),
@@ -915,15 +984,27 @@ class ToyTileRecurrenceRMT:
                 self.lm_head, pooled, learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad
             )
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
-        logits = self.lm_head.forward(
-            pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs, **self._output_extra_kwargs
+        logits = self._timed_call(
+            "lm_head",
+            self.lm_head.forward,
+            pooled,
+            learning_rate,
+            requires_grad=requires_grad,
+            **self.synapse_kwargs,
+            **self._output_extra_kwargs,
         )
 
         # Advantage-actor-critic value head, exposed via attribute not
         # return value. See docs/research/toy_tile_recurrence_rmt.rst:critic_head_design.
         self.last_critic_pred = (
-            self.critic_head.forward(
-                pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs, **self._output_extra_kwargs
+            self._timed_call(
+                "critic_head",
+                self.critic_head.forward,
+                pooled,
+                learning_rate,
+                requires_grad=requires_grad,
+                **self.synapse_kwargs,
+                **self._output_extra_kwargs,
             )
             if self.use_critic
             else None
@@ -1037,8 +1118,16 @@ class ToyTileRecurrenceRMT:
         # --- PASS 1: WRITE (identical structure to step()'s own PASS 1) ---
         centers_mem = gather(self.centers, self._mem_center_idx)
         sigmas_mem = gather(sigmas, self._mem_center_idx)
-        attn_pre_o_mem = gaussian_attention(
-            q_mem, k_phys, v_phys, centers_mem, sigmas_mem, num_cpus=self.num_cpus, causal=False
+        attn_pre_o_mem = self._timed_call(
+            "attention",
+            gaussian_attention,
+            q_mem,
+            k_phys,
+            v_phys,
+            centers_mem,
+            sigmas_mem,
+            num_cpus=self.num_cpus,
+            causal=False,
         )
         attn_mem = self._timed_layer_forward(
             self.o_proj,
@@ -1088,12 +1177,28 @@ class ToyTileRecurrenceRMT:
         sigmas_content = gather(sigmas, self._newest_content_idx)
         if self.recurrent_only_output:
             v2_phys_mem_only = v2_phys * self._mem_only_value_mask
-            attn_pre_o_content = gaussian_attention(
-                q_new, k2_phys, v2_phys_mem_only, centers_content, sigmas_content, num_cpus=self.num_cpus, causal=False
+            attn_pre_o_content = self._timed_call(
+                "attention",
+                gaussian_attention,
+                q_new,
+                k2_phys,
+                v2_phys_mem_only,
+                centers_content,
+                sigmas_content,
+                num_cpus=self.num_cpus,
+                causal=False,
             )
         else:
-            attn_pre_o_content = gaussian_attention(
-                q_new, k2_phys, v2_phys, centers_content, sigmas_content, num_cpus=self.num_cpus, causal=False
+            attn_pre_o_content = self._timed_call(
+                "attention",
+                gaussian_attention,
+                q_new,
+                k2_phys,
+                v2_phys,
+                centers_content,
+                sigmas_content,
+                num_cpus=self.num_cpus,
+                causal=False,
             )
         attn_content = self._timed_layer_forward(
             self.o_proj,
@@ -1187,13 +1292,25 @@ class ToyTileRecurrenceRMT:
                 self.lm_head, pooled, learning_rate, self.l1_sparsity_coef, requires_grad=requires_grad
             )
             aux_loss = lm_l1 if aux_loss is None else aux_loss + lm_l1
-        logits = self.lm_head.forward(
-            pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs, **self._output_extra_kwargs
+        logits = self._timed_call(
+            "lm_head",
+            self.lm_head.forward,
+            pooled,
+            learning_rate,
+            requires_grad=requires_grad,
+            **self.synapse_kwargs,
+            **self._output_extra_kwargs,
         )
 
         self.last_critic_pred = (
-            self.critic_head.forward(
-                pooled, learning_rate, requires_grad=requires_grad, **self.synapse_kwargs, **self._output_extra_kwargs
+            self._timed_call(
+                "critic_head",
+                self.critic_head.forward,
+                pooled,
+                learning_rate,
+                requires_grad=requires_grad,
+                **self.synapse_kwargs,
+                **self._output_extra_kwargs,
             )
             if self.use_critic
             else None

@@ -9,6 +9,7 @@ Run: python3 scripts/train_mqar_curriculum.py <precision> [max_steps] [seed] [pe
   [recurrent_only_output] [embed_width] [input_sparsity_p] [wide_max_weights] [dy_sparsity_p]
   [use_tile_cache] [output_dy_sparsity_p] [wrong_streak_threshold] [dy_r_target] [dy_k_min]
   [dy_k_max] [target_steps_per_sec] [dy_surprise_alpha] [x_r_target] [x_k_min] [trajectory_log_every]
+  [r_target_min]
   precision: fp4 | fp8 | fp32
 See docs/research/train_mqar_curriculum.rst:train_curriculum.cli_gradient_sparsity_args for
 dy_r_target/dy_k_min/dy_k_max/target_steps_per_sec/dy_surprise_alpha/x_r_target/x_k_min/
@@ -307,6 +308,7 @@ def train_curriculum(
     trajectory_log_every: int | None = None,
     trajectory_log_steps: tuple[int, int] | None = None,
     trajectory_log_fn=None,
+    r_target_min: float = 0.05,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -374,6 +376,7 @@ def train_curriculum(
         x_r_target=x_r_target,
         x_k_min=x_k_min,
         x_k_max=x_k_max,
+        r_target_min=r_target_min,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -483,6 +486,8 @@ def train_curriculum(
             log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
     t0 = time.time()
+    window_t0 = t0
+    model.reset_layer_timing()
     step = 0
     while step < max_steps:
         step += 1
@@ -657,12 +662,22 @@ def train_curriculum(
         if step % log_every == 0:
             ranks = _log_ranks(step)
             steps_per_sec = step / (time.time() - t0)
+            window_wall_s = time.time() - window_t0
+            # Component timing breakdown (task #415): the STANDARD metric
+            # going forward, steps_per_sec kept as secondary info -- a
+            # single aggregate rate hides which parts a change (e.g.
+            # sparsity) actually sped up vs the Amdahl's-law fixed
+            # remainder (lm_head/critic_head/attention/orchestration) that
+            # doesn't shrink with it. Snapshot BEFORE the closed-loop calls
+            # below consume + reset it, so it reflects exactly this window.
+            layer_timing_snapshot = model.layer_timing_snapshot()
             # See docs/research/train_mqar_curriculum.rst:
             # train_curriculum.dy_r_target_closed_loop_reset_ordering.
             if target_steps_per_sec is not None:
                 model.apply_amortized_dy_r_target_control(steps_per_sec, target_steps_per_sec)
                 model.apply_cross_layer_budget_allocator(steps_per_sec, target_steps_per_sec)
-                model.reset_layer_timing()
+            model.reset_layer_timing()
+            window_t0 = time.time()
             if log_fn is not None:
                 log_fn(
                     step,
@@ -677,6 +692,8 @@ def train_curriculum(
                     max_streak=max_streak_seen,
                     dy_r_target=model.dy_r_target,
                     x_r_target=model.x_r_target,
+                    layer_timing=layer_timing_snapshot,
+                    window_wall_s=window_wall_s,
                 )
             max_streak_seen = 0
 
@@ -760,6 +777,13 @@ def main():
     x_k_min = int(sys.argv[25]) if len(sys.argv) > 25 else 0
     _trajectory_log_every_arg = int(sys.argv[26]) if len(sys.argv) > 26 else -1
     trajectory_log_every = _trajectory_log_every_arg if _trajectory_log_every_arg > 0 else None
+    # r_target_min: floor the dy_r_target/x_r_target closed loop ratchets down
+    # to -- see JOURNAL.md's 2026-09-07 adaptive_70k entry (quality collapsed
+    # at the previously-hardcoded 0.05 floor well before reaching the
+    # requested speedup). -1 sentinel keeps the 0.05 default, matching this
+    # file's other sparsity-arg conventions.
+    _r_target_min_arg = float(sys.argv[27]) if len(sys.argv) > 27 else -1.0
+    r_target_min = _r_target_min_arg if _r_target_min_arg >= 0 else 0.05
 
     print(
         f"# MQAR curriculum precision={precision} max_steps={max_steps} seed={seed} "
@@ -772,7 +796,8 @@ def main():
         f"streak_threshold={STREAK_THRESHOLD} wrong_streak_threshold={wrong_streak_threshold} "
         f"dy_r_target={dy_r_target} dy_k_min={dy_k_min} dy_k_max={dy_k_max} "
         f"target_steps_per_sec={target_steps_per_sec} dy_surprise_alpha={dy_surprise_alpha} "
-        f"x_r_target={x_r_target} x_k_min={x_k_min} trajectory_log_every={trajectory_log_every}",
+        f"x_r_target={x_r_target} x_k_min={x_k_min} trajectory_log_every={trajectory_log_every} "
+        f"r_target_min={r_target_min}",
         flush=True,
     )
 
@@ -783,6 +808,37 @@ def main():
             return ""
         parts = [f"{_SHORT_NAME.get(n, n)}={s}/{a}" for n, (s, a) in ranks.items()]
         return "  ranks[" + " ".join(parts) + "]"
+
+    # Component timing breakdown (task #415) -- STANDARD per-window report
+    # going forward. steps_per_sec (aggregate, whole-run-average) is kept
+    # as secondary info alongside it, not replaced: a single rate can't
+    # show which components a change actually sped up vs the Amdahl's-law
+    # fixed remainder (lm_head/critic_head/attention/orchestration) that
+    # doesn't shrink with sparsity. "other" is the residual --
+    # window_wall_s minus every named component's fwd_s+bwd_s -- i.e.
+    # token embedding, target-building, CSR construction, and all
+    # Python-level loop orchestration this window, none of which is
+    # sparsified by x_r_target/dy_r_target. See
+    # docs/research/train_mqar_curriculum.rst:component_timing_breakdown_design.
+    _TIMING_ORDER = ["input_proj", "q_proj", "k_proj", "v_proj", "o_proj", "attention", "lm_head", "critic_head"]
+
+    def _layer_timing_str(layer_timing, window_wall_s):
+        if not layer_timing or window_wall_s is None:
+            return ""
+        parts = []
+        accounted_s = 0.0
+        for name in _TIMING_ORDER:
+            rec = layer_timing.get(name)
+            if rec is None:
+                continue
+            comp_s = rec["fwd_s"] + rec["bwd_s"]
+            accounted_s += comp_s
+            pct = 100.0 * comp_s / window_wall_s if window_wall_s > 0 else 0.0
+            parts.append(f"{_SHORT_NAME.get(name, name)}={comp_s:.2f}s({pct:.0f}%)")
+        other_s = max(0.0, window_wall_s - accounted_s)
+        other_pct = 100.0 * other_s / window_wall_s if window_wall_s > 0 else 0.0
+        parts.append(f"other={other_s:.2f}s({other_pct:.0f}%)")
+        return "  t[" + " ".join(parts) + f" / {window_wall_s:.2f}s]"
 
     def log_fn(
         step,
@@ -797,12 +853,17 @@ def main():
         max_streak=None,
         dy_r_target=None,
         x_r_target=None,
+        layer_timing=None,
+        window_wall_s=None,
     ):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
         tag = f"  [{event}]" if event else ""
+        # steps_per_sec: secondary info now, see _layer_timing_str's own
+        # comment -- kept in the line, just no longer the primary signal.
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
+        timing_s = _layer_timing_str(layer_timing, window_wall_s)
 
         def _r_target_str(label, d):
             # Shared dy_r_target/x_r_target formatter; see cli_gradient_sparsity_args anchor.
@@ -817,7 +878,7 @@ def main():
         x_r_s = _r_target_str("x_r_target", x_r_target)
         print(
             f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}",
+            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{timing_s}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}",
             flush=True,
         )
 
@@ -880,6 +941,7 @@ def main():
         x_r_target=x_r_target,
         x_k_min=x_k_min,
         target_steps_per_sec=target_steps_per_sec,
+        r_target_min=r_target_min,
     )
     print(
         f"\nFINAL precision={precision} final_vocab={r['final_vocab']} final_k={r['final_k']} "
