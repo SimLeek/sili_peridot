@@ -7964,3 +7964,390 @@ per-layer surprise together. Scoped first slice under discussion:
 per-layer grad r_target with the lagged energy signal alone, model
 stays on a single shared speed target for now, input-side and the
 cross-layer allocator deferred until that's validated.
+
+## 2026-09-06 -- BPTT-question code trace + full Zoology ablation catalog
+
+Traced whether our own `step()`'s cross-step `memory` detach (real,
+documented, `docs/research/toy_tile_recurrence_rmt.rst:step_design`) is
+what's capping the k=3/vocab=128 MQAR ceiling. Finding: at every k tested
+so far, `seq_len_for_k(k) <= num_tiles(16)`, so the whole key/value context
+is still live (un-detached) in `x_window` at query time within the SAME
+`step()` call -- meaning we already get local full-context gradient reach
+equivalent in effect to a single-shot whole-sequence backward, without
+needing cross-step BPTT at all. So the detach is real but likely NOT the
+active cause of the current ceiling; launched a background probe (fp32,
+new block4 path) sweeping k past the window boundary at two window sizes
+(num_tiles=16 vs 8) to test this directly rather than assume it -- both
+arms currently oscillating k=1/2 at vocab=36 (the known reward-hacking
+level-up/level-down cycle), not yet conclusive.
+
+Per direct instruction, cloned the real HazyResearch/zoology repo instead
+of trusting the paper's stated design, and built a full code-grounded
+difference catalog against their actual MQAR sweep --
+`docs/research/mqar_zoology_ablation.rst`. Highlights: their real attention
+baseline is 2 stacked layers of (short causal conv -> MHA), not 1 bare
+attention op like ours -- directly matches Olsson et al.'s induction-head
+finding that copy/recall needs a 2-layer minimum circuit (previous-token
+head then induction head), which a single-layer model structurally cannot
+form. Also found a real, previously-unnoticed difference: our
+`_build_targets` gives every KV-write position its own "predict next
+token" auxiliary loss, while Zoology's labels are -100 everywhere except
+actual queries -- an easy one-line ablation. Full ranked list (batch size,
+optimizer/schedule, dataset-repetition budget, vocab size, dropout, init)
+in the doc; vocab-size and quantization-precision differences were both
+directly ruled OUT as the cause (fp32-vs-fp4/fp8 already hits the same
+ceiling; small vocab should if anything be easier per the Zoology paper's
+own reasoning).
+
+## 2026-09-06 (cont'd) -- window-size (BPTT) finding reopened; k=1-start and
+## no-aux-loss ablations both show early positive signal
+
+Correction to the same day's earlier entry: the "cross-step BPTT absence is
+likely not the active cause" read was premature. A full 40,000-step
+completed run at ``num_tiles=8, vocab=36`` (fp32/block4, kcycle curriculum)
+never reached k=3 across 447 total LEVEL_UP attempts
+(``final_k=1 peak={vocab:36,k:2}``). The matched ``num_tiles=16, vocab=36``
+arm reached k=3 at least once well before finishing. Same task, same
+vocab, only the window size differs -- this is real, not noise from a
+small sample, and reopens the cross-step-memory-detach question
+(``ToyTileRecurrenceRMT.step()``'s documented "no BPTT across calls"
+design) as a genuine candidate, not a ruled-out one. Updated
+``docs/research/mqar_zoology_ablation.rst`` accordingly (moved out of
+"ruled out," new Tier 1 item 0).
+
+Two more probes launched same day, both still in-progress but showing
+early positive signal, same vocab=16/num_tiles=16 base config:
+- **K_START=2** (skip k=1 entirely, curriculum starts fresh at k=2 every
+  vocab tier instead of leveling up from k=1): reached k=3 by step 2675,
+  the earliest of any arm tested. Single occurrence so far, not yet
+  confirmed as a stable effect, but directly consistent with the project's
+  own existing k-first-curriculum rationale (k=1-only training entrenches
+  synapses against the k>1 feature) -- just one level deeper than
+  currently implemented.
+- **No write-time auxiliary loss** (Tier 1 item 3 in the ablation doc --
+  matching Zoology's real target construction, only real queries get
+  supervised): reached k=3 four times in ~4000 steps, notably more often
+  than any other arm tested so far.
+
+Not yet conclusive for either -- all of this is from runs still in
+progress (small numbers of LEVEL_UP attempts at k=3 so far, except the
+one genuinely completed ``num_tiles=8`` run). Letting the ``num_tiles=8``
+counterparts (vocab=16 and K_START=2) run to completion is the next real
+checkpoint before treating any of this as settled.
+
+## 2026-09-06 (cont'd 2) -- both interim findings substantially strengthened
+
+Both still-running probes crossed from "small sample, directional lean"
+into genuinely strong signals:
+
+- **Window size**: ``arm_narrow8_v16`` (``num_tiles=8, vocab=16``) reached
+  10,000 steps with ZERO k=3 events, while ``arm_wide16_v16``
+  (``num_tiles=16``) had already reached k=3 four times by step 7939 --
+  fewer steps, more successes. Combined with the completed ``vocab=36``
+  pair (``arm_narrow8``: 447 LEVEL_UP attempts, 0 k=3; ``arm_wide16``: 1
+  k=3 event before finishing), this is now two independent vocab settings
+  showing the same window-size asymmetry -- no longer plausibly noise.
+- **No write-time aux loss**: ``arm_wide16_noaux`` reached k=3 24 times
+  by step 7883, vs. the matched aux-loss-on arm's 4 times by step 7939 --
+  a 6x frequency difference at matched step counts, not just a lean.
+- ``arm_wide16_kstart2`` (skip k=1 entirely) more modest by comparison:
+  2 k=3 events by step 5000, running slowly (~1.3 sps) under heavy CPU
+  contention from the other 4 concurrent probes.
+
+Updated ``docs/research/mqar_zoology_ablation.rst`` (Tier 1 items 0 and 3)
+to reflect both strengthened findings. Still waiting on ``arm_wide16``
+(the original ``vocab=36`` run) to finish and free CPU capacity before
+launching the queued ``arm_narrow8_kstart2`` to complete the K_START
+comparison at the harder window size.
+
+## 2026-09-06 (cont'd 3) -- K_START=2 structurally permanent (code-confirmed,
+## not just observed), noaux checked clean for blow-up, combined confirmation
+## run launched
+
+Direct instruction prompted a precise code check rather than assuming:
+does ``K_START=2`` only affect the run's start, or does it keep k=1 excluded
+from every future level-down too? Traced ``_advance_stage``/``_regress_stage``
+(``scripts/train_mqar_curriculum.py:420-483``) -- the curriculum is a real
+stack, not a counter. ``LEVEL_UP`` pushes a new stage; ``LEVEL_DOWN`` pops
+back to whatever's underneath. Every vocab-tier advance (even from the
+"kcycle" odometer) also resets k to ``K_START`` and PUSHES that onto the
+existing stack, not a fresh one. Since k=1 is never pushed anywhere once
+``K_START=2`` is set, there is no k=1 entry anywhere in the stack for any
+future level-down to reveal -- confirmed empirically too, zero k=1
+occurrences across ``arm_wide16_kstart2``'s entire log. This was a genuine
+"does it already do the thing" question, not a request for a code change --
+answer: yes, already permanent for the whole run, by construction.
+
+Also checked whether the no-aux-loss ablation's much stronger k=3 frequency
+(now 8.5x, up from 6x, at matched ~11,650-step counts) is coming at the
+cost of stability -- direct concern raised that some aux-loss-style terms
+exist specifically to prevent blow-up and might be "too aggressive" to
+remove. No evidence of that here: no NaN/Inf in the no-aux-loss log, and
+its loss_ema stays bounded and if anything lower on average than the
+aux-loss-on arm's. Worth being precise about what got removed, though --
+the disabled signal is a task-shaping label (write-time "predict next
+token"), not a regularizer. The project's actual stability mechanisms
+(L1 sparsity penalty, magnitude-clip penalty, ``max_abs_delta``/``max_ci``
+hard bounds, amortized L2 decay) are all untouched and still active in
+every arm.
+
+Launched ``arm_combo_kstart2_noaux`` (100,000-step budget, curriculum-only,
+no model changes) combining both ablations. Early read (step 2455): 20
+k=3 events already -- faster accumulation than either ablation alone,
+suggesting a possibly synergistic (not just additive) effect. Real target
+for this run isn't touching k=3 more often, though -- it's whether it
+eventually completes a full correct-streak AT k=3 and genuinely advances
+past the ``vocab=16`` tier (sustained occupancy, not transient spikes).
+Zero real vocab-tier advances so far (the one ``[NEW_VOCAB_TIER]`` tag
+in its log is a logging artifact from the first log call, not an actual
+advance).
+
+## 2026-09-06 (cont'd 4) -- vocab=36 window-size comparison now fully
+## completed on both sides; arm_narrow8_kstart2 launched
+
+``arm_wide16`` (``num_tiles=16, vocab=36``) finished its full 40,000-step
+run: ``final_k=1 peak={vocab:36,k:3}``. Its counterpart ``arm_narrow8``
+(``num_tiles=8``) had already completed with ``peak={vocab:36,k:2}`` --
+never reached k=3. Both arms now COMPLETE, not interim: two full
+40,000-step runs, same task/vocab/everything else, only window size
+differs, and only the wide window ever touched k=3. Updated
+``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 0 to reflect this
+is now a hard result rather than an in-progress one.
+
+``arm_wide16`` finishing freed CPU capacity -- launched the queued
+``arm_narrow8_kstart2`` (K_START=2, num_tiles=8) to complete the K_START
+comparison at the harder window size, matching ``arm_wide16_kstart2``
+already in progress at ``num_tiles=16``.
+
+## 2026-09-06 (cont'd 5) -- earlier recurrence-validation recollection
+## corrected; framing the plateau-vs-acceleration pattern
+
+Direct question raised whether the existing ``recurrent_only_output``
+distance-sweep validation ([[project_rnn_recurrence_validation]]) already
+proved cross-step memory works fine even without live gradient into the
+write step (recalled as "detached input_proj + random projections still
+worked"), which would argue the window/BPTT hypothesis (Tier 1 item 0)
+isn't necessary. Re-checked the actual memory record: that's not what it
+showed. The near-zero-gradient ``input_proj`` was a diagnosed BUG (bug #2
+in that validation), fixed by giving it a real, LIVE, intra-step gradient
+path (the sequential write-then-read redesign, 0.037->1209 gradient
+magnitude) -- not by validating that detached/random weights work fine.
+The distance-sweep itself was run WITH that fix applied, and its own
+result was above-chance accuracy only within the TRAINED distance range
+(1-4), decaying toward chance beyond it (untrained, ~distance 6+) --
+i.e. the one time longer-range reach was actually measured, it did NOT
+generalize for free. If anything this supports keeping the window/BPTT
+question open rather than closing it.
+
+Separately, clarified scope: the current in-context k=3 struggle (wide16/
+combo arms) isn't a memory-slot-capacity problem at all -- ``num_tiles=16``
+already holds the whole k=3 sequence within the raw window, no reliance
+on the 2-slot ``memory`` state is being exercised. Real 2-slot capacity
+concerns (can't know in advance which key will be queried, so genuine
+superposition across possibly-several facts would be needed, which 2
+slots probably can't support -- likely need >=4) are a separate, deferred
+concern for a FUTURE true out-of-context goal, not the present blocker.
+
+On the actual open question -- is the single-ablation plateau (zero new
+k=3 events for 8000+ steps in every arm except the combo) a sign of a
+hard structural ceiling, or just "hasn't reached its phase transition
+yet": the single most relevant literature isn't generic grokking (which
+is normally tied to weight decay + a fixed, overfit-then-generalized
+dataset -- doesn't map onto this project's fresh-random-example-every-step
+setup) but Olsson et al. 2022's documented SUDDEN phase transition
+specifically for induction-head formation in Transformers -- the exact
+circuit MQAR-style recall needs. Their transitions happen at training
+scales far beyond our current ~25k raw steps (matches the earlier
+~100x+ effective-step gap estimate), so "hasn't happened yet" is
+plausible on scale grounds alone. The stronger empirical signal from our
+own data: unlike the single-ablation arms (flat plateau), the combo run
+(``K_START=2`` + no-aux-loss together) keeps ACCELERATING (20/2455,
+82/5722, 111/8000) rather than flatlining -- a real structural ceiling
+would more likely show up as every arm plateauing similarly. Decided
+NOT to build a new test for this -- the decisive signal is already the
+combo run's own trajectory: does it eventually plateau too (structural),
+or produce a genuine held streak/vocab-tier advance (needed more steps).
+Watching for that specifically going forward, not just raw touch counts.
+
+## 2026-09-06 (cont'd 6) -- decisive signal resolved: combo run also plateaued
+
+The question posed at the end of the previous entry is now answered.
+``arm_combo_kstart2_noaux`` stopped growing: 124 k=3 events at step
+10,382, still 124 at step 12,500 (2,100+ steps flat). Every arm tested --
+all four single ablations plus the combo -- is now hard-plateaued:
+``wide16_v16`` at 4 (since step 11,664), ``wide16_kstart2`` at 2 (since
+~2686), ``wide16_noaux`` at 35 (since 17,119), ``combo_kstart2_noaux`` at
+124 (since 10,382). Zero real vocab-tier advances anywhere.
+
+This weakens the "just hasn't reached its phase transition yet" reading
+(Olsson et al. 2022 induction-head framing from the prior entry) -- the
+combo run had by far the strongest touch-frequency of anything tested and
+still hit a ceiling rather than continuing to climb toward a held streak.
+Doesn't rule out "needs even more steps," but shifts weight toward there
+being a real blocker that no curriculum-only lever (window size, K_START,
+aux-loss) is sufficient to overcome alone. Updated
+``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 0 with this
+resolution and a recommendation: the next real test is architectural
+(Tier 1 item 1 -- adding a second attention "layer"/hop within one
+``step()`` call, matching Olsson et al.'s 2-layer induction-head circuit
+requirement), not another curriculum-only sweep of axes that have now all
+plateaued. Not started -- this is a bigger change than a monkeypatch and
+warrants explicit go-ahead before touching the model architecture.
+
+## 2026-09-06 (cont'd 7) -- stopped the 5 plateaued probes, combo plateau
+## reconfirmed at full speed over 20k+ steps
+
+Direct instruction: wait for ``arm_combo_kstart2_noaux`` to finish its full
+100,000-step budget before starting the architectural test (second
+attention layer/hop), and skip multi-seed validation for now given time
+cost. Stopped the 5 already-plateaued single-ablation probes
+(``wide16_v16``, ``narrow8_v16``, ``wide16_kstart2``, ``narrow8_kstart2``,
+``wide16_noaux``) to free CPU capacity for the combo run -- measured
+speedup 1.26sps -> 5.56sps (4.4x), cutting the remaining-time estimate
+from ~19 hours to ~4.3 hours.
+
+At full uncontended speed the k=3 plateau (124 events) held all the way
+from step 10,382 through 30,500 -- a 20,000+-step flat plateau, not an
+artifact of the earlier slow/contended sampling. Updated
+``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 0 accordingly.
+Still waiting for either completion (~100k steps) or a real vocab-tier
+advance before revisiting the architectural test.
+
+## 2026-09-06 (cont'd 8) -- refined finding: the plateau is a regression,
+## not a stable ceiling
+
+Direct question prompted a closer look than "k=3 count stopped growing":
+since the step-10,382 LEVEL_DOWN, k has literally never left 2 for
+36,600+ steps (verified: 76/76 logged lines at k=2, zero further
+LEVEL_UP attempts, zero k=1 anywhere in the whole run -- confirms
+K_START=2's stack-floor held for the entire run, not just after some
+point). Sampled ``acc_ema`` across that stretch: 0.407 right at the
+drop, then 0.137/0.259/0.249/0.160/0.143/0.154/0.152/0.100/0.189
+through step 47,500 -- hovering around chance (~0.125, 1/8 for the
+disjoint 8-token value half), not the 0.4-0.7 range k=2 showed earlier
+in this same run and in every other arm. This is a real regression, not
+a stable "close but not quite enough" plateau -- directly explains why
+it never re-attempted LEVEL_UP (accuracy this low never strings
+together the correct-streak needed to trigger one). Updated
+``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 0 with this
+refined characterization. Flagged as an open question for later: is
+this regression specific to this run/seed, or a general failure mode
+worth a dedicated min-accuracy-floor diagnostic in future runs, not
+just k/vocab-tier tracking.
+
+## 2026-09-07 -- LANDMARK: LEVEL_DOWN-disabled run confirms the actual
+## blocker, unblocking real k=3 mastery and vocab advancement
+
+Direct hypothesis, prompted by observing the combo run's stuck-at-k=2
+near-chance-accuracy state: repeated k=3-attempt-then-LEVEL_DOWN cycles
+(124 of them) may be causing real training disruption to k=2 competence
+-- catastrophic-interference style, not "learned avoidance" (no
+credit-assignment pathway exists for intertemporal risk-avoidance given
+this project's no-BPTT design, established earlier this session).
+Directly corroborated by an already-documented finding in this project
+for the vocab axis (``wrong_streak_threshold_reward_hacking`` in
+``docs/research/train_mqar_curriculum.rst``: the ``WRONG_STREAK_
+THRESHOLD=5`` vs ``STREAK_THRESHOLD=10`` asymmetry previously caused a
+max_streak plateau at 7/10). Confirmed via direct code read that
+Zoology's real curriculum cannot produce this pattern at all --
+``_SyntheticDataset`` processes each difficulty tier's examples in one
+fixed monotonic block, ``shuffle=False``, no regression, no adaptive
+gating on measured accuracy.
+
+Test: ``wrong_streak_threshold=float("inf")`` (existing, already-
+supported kwarg -- no monkeypatch needed) disables LEVEL_DOWN entirely.
+Launched ``arm_nolevel_down`` (same K_START=2 + no-aux-loss base as the
+combo run, plus this) as a direct A/B against ``arm_combo_kstart2_noaux``.
+
+**RESULT: CONFIRMED, decisively.** By step 14,000, ``arm_nolevel_down``
+had reached vocab=32 (step 3,134, real LEVEL_UP) then vocab=64 (step
+8,672, real LEVEL_UP) -- 4 total LEVEL_UP events, each a genuine held
+10-in-a-row correct-streak (structurally the only way LEVEL_UP fires).
+At the identical step count, ``arm_combo_kstart2_noaux`` (same config,
+LEVEL_DOWN still enabled) remained stuck at vocab=16/k=2 near chance,
+as it had been since step 10,382 across 70,000+ steps. Single
+best-evidenced result of the whole investigation: the actual blocker on
+this session's original goal (k=3 AND vocab=128) was the curriculum's
+own asymmetric-threshold LEVEL_DOWN mechanism causing repeated real
+training disruption -- NOT missing architectural depth (the previously-
+planned second-attention-layer test), NOT the cross-step BPTT/window
+question (real but apparently not the active blocker at this scale), NOT
+model capacity. Updated ``docs/research/mqar_zoology_ablation.rst`` Tier
+1 item 2 with the full result. Recommend continuing ``arm_nolevel_down``
+toward the original target rather than starting the architectural
+change -- the curriculum fix alone appears sufficient.
+
+## 2026-09-07 (cont'd) -- "full vocab" milestone reached: vocab=126 at
+## step 43,286
+
+``arm_nolevel_down`` continued past the step-18,937 LEVEL_UP (vocab=64,
+k=3). That phase ran a long time -- 24,349 steps, more than double the
+previous longest phase -- and for a stretch (steps ~27,500-41,500) loss
+was actually drifting up (3.8->4.8) with flat-low accuracy (0.03-0.13),
+which briefly looked like a genuine model-capacity ceiling (state_
+width=128/embed_width=16 too narrow for vocab=64 at k=3) rather than an
+ordinary slow convergence. It broke through anyway: a 6th LEVEL_UP fired
+at step 43,286, advancing straight to ``vocab=126`` (``TASK_VOCAB_MAX``,
+the k-first odometer's ceiling -- the "full vocab" milestone from this
+session's original goal), acc=0.51 at the transition, k reset to 2.
+
+Worth remembering as a methodological note: a long flat-or-worsening
+stretch under this curriculum does NOT reliably distinguish a real
+capacity ceiling from an unusually long (but still LEVEL_DOWN-disabled)
+convergence basin -- only continued non-convergence all the way to
+``max_steps`` would actually support the capacity-ceiling read. Don't
+over-read a slow phase as a structural limit before the run has actually
+stopped improving for good.
+
+Currently in the expected post-transition dip at the new tier (vocab=
+126, k=2): accuracy low/flat (0.001-0.06), loss elevated (4.6-4.9) as of
+step 57,000, ~13,700 steps into this phase. Next milestone is "full k" --
+once this tier's LEVEL_UPs exhaust the k-first odometer (k: 2->3, then
+since vocab is already maxed, further LEVEL_UPs increment k indefinitely
+toward ``k_max=8``). Updated ``docs/research/mqar_zoology_ablation.rst``
+Tier 1 item 2 accordingly. Continuing to watch for k progress and/or
+``DONE`` at ``max_steps=100,000``.
+
+## 2026-09-07 (cont'd) -- run complete: full vocab held, k=3 at vocab=126
+## not reached within budget
+
+``arm_nolevel_down`` finished: ``DONE wall_s=12999.8 total_steps=100000
+steps_per_sec(engine)=7.69 final_k=2 final_vocab=126
+vocab_tiers_seen=[16, 32, 64, 126]``. From the step-43,286 vocab=126
+transition to the end of the run, 56,714 steps (more than half the
+run's entire budget, more than double the previous longest phase)
+elapsed at ``vocab=126, k=2`` without a single further ``LEVEL_UP`` --
+accuracy stayed noisy and low the whole way (~0.001-0.08, no upward
+trend) and loss didn't recover the way it did after every earlier
+transition. Unlike the vocab=64/k=3 phase earlier in this same run
+(which also looked stuck for a long stretch, then broke through), this
+phase genuinely never converged within the tested budget -- the
+"long-flat-stretch isn't proof of a ceiling" caveat noted earlier
+doesn't rescue this one.
+
+Honest bottom line against this session's original goal (k=3 AND
+vocab=128 simultaneously): NOT reached. What the LEVEL_DOWN-disabled fix
+DID prove, decisively: real progress that never happened at all under
+the old curriculum (full vocab reached, k=3 reached at a lower vocab).
+"k=3 held at vocab=126" is evidently a harder combination than either
+piece alone, and ~3 hours of wall time wasn't enough to cross it at this
+model's small (state_width=128) scale.
+
+Discussed the next step with the user: this reframes the priority from
+"debug the curriculum" (done, confirmed working) to "get more effective
+compute" -- either more raw throughput (user has an ~8x CPU upgrade
+path in mind; GPU is an open question for this specific workload, since
+it's serial small-recurrent-step compute, not batched matmul-friendly)
+or making existing compute go further per step (the sparsity machinery
+from the ``fuzzy-plotting-starlight.md`` plan, Phase 0-8, already built
+and CLI-wired but unused by this run -- combined with a wider
+``embed_width`` for more capacity). Both levers are complementary. Real
+compute-roadmap planning is the explicit next topic, to be worked out
+with the user rather than decided unilaterally.
+
+Committed the full investigation (root-cause + confirmation run +
+milestone updates) as PR #24 (``research/mqar-leveldown-vocab126``,
+cherry-picked onto real ``main`` after confirming
+``docs/research-comments-to-rst`` was already merged via PR #23).
+Updated ``docs/research/mqar_zoology_ablation.rst`` Tier 1 item 2 with
+the final result and honest summary.
