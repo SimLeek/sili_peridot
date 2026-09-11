@@ -4,6 +4,7 @@ import math
 import time
 
 import numpy as np
+from sili.energy import EnergyDynamics
 from sili.sparse_rnn import CSR, DISLDOLayer, _nucleus_top_k_csr
 from sili.tensor import Tensor, concat, exp, gather, gaussian_attention, power, reduce_sum, relu, tensor_abs
 
@@ -52,7 +53,12 @@ class ToyTileRecurrenceRMT:
         x_r_target: float | None = None,
         x_k_min: int = 0,
         x_k_max: int | None = None,
+        x_balance_bias_step: float | None = None,
+        x_balance_loss_coef: float = 0.0,
+        x_balance_freq_beta: float = 0.99,
         r_target_min: float = 0.05,
+        use_energy: bool = False,
+        energy_kwargs: dict | None = None,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -74,6 +80,21 @@ class ToyTileRecurrenceRMT:
             See docs/research/toy_tile_recurrence_rmt.rst:dy_surprise_design.
         x_r_target, x_k_min, x_k_max:
             See docs/research/toy_tile_recurrence_rmt.rst:x_r_target_design.
+        x_balance_bias_step, x_balance_loss_coef, x_balance_freq_beta:
+            two independent, mutually-exclusive-in-practice load-balancing
+            probes for the x_r_target nucleus selection, prototype-only.
+            x_balance_bias_step != None: auxiliary-loss-free balancing
+            (DeepSeek-V3-style, arXiv:2408.15664) -- a per-dim bias added
+            to the ranking score BEFORE top-k, nudged +/-step each call
+            by whether that dim was selected; never touches loss/gradient.
+            x_balance_loss_coef > 0: classic MoE-style auxiliary
+            load-balancing loss (f_j * mean(x_j^2) summed, f_j = EMA'd
+            empirical selection frequency, detached) added to the total
+            training loss; selection itself stays plain magnitude top-k.
+            Both no-op by default. See project memory
+            project_sparsity_floor_generalization_scoping.md's 2026-09-11
+            entries for the full design rationale and MoE/biology
+            precedent research.
         r_target_min: floor the amortized closed-loop controllers
             (apply_amortized_dy_r_target_control/apply_amortized_
             x_r_target_control/apply_cross_layer_budget_allocator) ratchet
@@ -84,7 +105,19 @@ class ToyTileRecurrenceRMT:
             (curriculum never leveled past its starting vocab tier in
             100k steps) well before reaching the requested speedup
             target. Exposed here so the floor itself can be swept to find
-            the largest speedup a given model size actually tolerates."""
+            the largest speedup a given model size actually tolerates.
+        use_energy, energy_kwargs: task #269 -- homeostatic energy gating
+            (sili.energy.EnergyDynamics) applied to the two most nucleus-
+            sparsity-starved activation regions -- "state" (combined_normed,
+            feeding q/k/v_proj) and "embed_input" (x_window_t, feeding
+            input_proj) -- one EnergyDynamics instance per region, not
+            per-layer, not global. energy_kwargs is keyed BY REGION NAME,
+            e.g. {"state": {...}, "embed_input": {...}} (mirrors x_r_target/
+            dy_r_target's own per-layer-name dict convention) -- required
+            per-region since the two regions' E[|h|] measure ~4x apart
+            (state~=0.23, embed_input~=0.06 at width=288) and
+            EnergyDynamics.drive must be calibrated against the region it
+            actually gates, not shared. No-op unless use_energy=True."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -108,6 +141,13 @@ class ToyTileRecurrenceRMT:
         self.x_r_target: dict = dict.fromkeys(self._WIDE_LAYER_NAMES, x_r_target)
         self.x_k_min = x_k_min
         self.x_k_max = x_k_max
+        # See __init__'s own x_balance_bias_step/x_balance_loss_coef docstring.
+        self.x_balance_bias_step = x_balance_bias_step
+        self.x_balance_loss_coef = x_balance_loss_coef
+        self.x_balance_freq_beta = x_balance_freq_beta
+        self._x_balance_bias: dict = {}  # layer_name -> np.float32[n_in], Arm B
+        self._x_balance_freq: dict = {}  # layer_name -> np.float32[n_in], Arm A
+        self._balance_aux_loss: Tensor | None = None
         # See docs/research/toy_tile_recurrence_rmt.rst:input_selection_stats_design.
         self.last_input_selection: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
@@ -123,6 +163,11 @@ class ToyTileRecurrenceRMT:
         # See docs/research/toy_tile_recurrence_rmt.rst:sparsity_phase6_design.
         self.output_dy_sparsity_p = output_dy_sparsity_p
         self._output_extra_kwargs = {"dy_sparsity_p": output_dy_sparsity_p} if output_dy_sparsity_p is not None else {}
+        # See __init__'s own use_energy/energy_kwargs docstring above.
+        self.use_energy = use_energy
+        self.energy_kwargs = energy_kwargs or {}
+        self._energy: dict = {}  # region name -> EnergyDynamics, lazily built
+        self._energy_aux_loss: Tensor | None = None
 
         state_width = self.state_width
         if rng is None:
@@ -278,6 +323,24 @@ class ToyTileRecurrenceRMT:
 
     def _real_layers(self):
         return [layer for _name, layer in self._named_real_layers()]
+
+    @property
+    def last_grad_selection(self) -> dict:
+        """Real per-layer GRADIENT-axis (dy_r_target) R/k stats, pulled
+        from each disldo_cls layer's own last_grad_selection (set inside
+        sili's dy_r_target nucleus branch, sili/sparse_rnn.py) -- mirrors
+        last_input_selection's x-axis equivalent, which previously had no
+        counterpart: the dy axis only ever exposed its setpoint (r_bar),
+        never a measured achieved density. A layer with no entry yet
+        (never had a dy_r_target backward call, or its disldo_cls doesn't
+        support dy_r_target at all, e.g. DISLDOLayer8/fp8) is simply
+        omitted."""
+        out = {}
+        for name, layer in self._named_real_layers():
+            sel = getattr(layer, "last_grad_selection", None)
+            if sel is not None:
+                out[name] = sel
+        return out
 
     def _timed_call(self, name: str, fn, *args, **kwargs) -> Tensor:
         """Generic per-component forward+backward timing, and the task #374
@@ -561,6 +624,35 @@ class ToyTileRecurrenceRMT:
                 results[name] = (c.get_scale_rank(), c.get_additive_rank())
         return results
 
+    def _apply_energy(self, x: Tensor, region: str) -> Tensor:
+        """Homeostatic energy gating (task #269), applied to a region's
+        FULL continuous tensor BEFORE its x_r_target nucleus selection --
+        see __init__'s own use_energy/energy_kwargs docstring for why
+        (breaking nucleus-selection's dead-neuron lock-in is the whole
+        point, and that only works if energy sees the pre-selection
+        values). No-op unless use_energy=True. Lazily builds one
+        EnergyDynamics per region name on first call (region, not layer
+        name -- q_proj/k_proj/v_proj all call this with region="state" on
+        the SAME combined_normed tensor, so they share one instance, not
+        three). energy_kwargs is keyed BY REGION NAME (mirrors x_r_target/
+        dy_r_target's own per-layer-name dict convention) -- required,
+        since "state" and "embed_input" measure ~4x apart in E[|h|]
+        (state~=0.23, embed_input~=0.06 at width=288, measured directly,
+        see JOURNAL.md) and EnergyDynamics.drive must be calibrated per
+        the region it actually gates, not shared. aux_loss accumulates
+        into self._energy_aux_loss for the caller to fold into step()'s
+        own aux_loss before returning -- step() resets
+        self._energy_aux_loss to None at its own start."""
+        if not self.use_energy:
+            return x
+        ed = self._energy.get(region)
+        if ed is None:
+            ed = EnergyDynamics(**self.energy_kwargs[region])
+            self._energy[region] = ed
+        h_out, aux, _actual_p = ed(x)
+        self._energy_aux_loss = aux if self._energy_aux_loss is None else self._energy_aux_loss + aux
+        return h_out
+
     def _to_sparse(self, x: Tensor, layer_name: str) -> Tensor:
         """Sparsity plan Phase 6 helper; no-op unless x_r_target[layer_name]
         or input_sparsity_p is set. Real bug fix: wires _children/_backward
@@ -574,13 +666,18 @@ class ToyTileRecurrenceRMT:
         x_np = np.asarray(x.data, dtype=np.float32)
         x2d = x_np[np.newaxis, :] if x_np.ndim == 1 else x_np
         if x_r_target is not None:
-            ptrs, indices, values = _nucleus_top_k_csr(
-                x2d, x_r_target, self.num_cpus, k_min=self.x_k_min, k_max=self.x_k_max
-            )
+            if self.x_balance_bias_step is not None:
+                ptrs, indices, values = self._nucleus_top_k_balanced(x2d, layer_name, x_r_target)
+            else:
+                ptrs, indices, values = _nucleus_top_k_csr(
+                    x2d, x_r_target, self.num_cpus, k_min=self.x_k_min, k_max=self.x_k_max
+                )
             csr = CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
         else:
             csr = CSR.from_dense(x2d, self.input_sparsity_p, self.num_cpus)
         self._update_input_selection_stats(layer_name, x2d, csr)
+        if self.x_balance_loss_coef > 0.0 and x_r_target is not None:
+            self._accumulate_balance_loss(x, layer_name, csr)
         out = Tensor(csr, _children=(x,), _op="to_sparse", backend=x.backend)
 
         def _bwd():
@@ -593,6 +690,78 @@ class ToyTileRecurrenceRMT:
 
         out._backward = _bwd
         return out
+
+    def _nucleus_top_k_balanced(
+        self, x2d: np.ndarray, layer_name: str, r_target
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Arm B -- auxiliary-loss-free load balancing (DeepSeek-V3-style,
+        arXiv:2408.15664). Same nucleus/energy-threshold contract as
+        _nucleus_top_k_csr, but ranking uses vⱼ²+biasⱼ instead of raw vⱼ²
+        -- biasⱼ is a persistent per-dim state nudged +/-x_balance_bias_step
+        each call by whether that dim was selected THIS call, never touched
+        by gradient. R(v,k) energy accounting stays in TRUE vⱼ² units
+        (bias only changes ranking, never what gets stored). See __init__'s
+        x_balance_bias_step docstring."""
+        rows, cols = x2d.shape
+        bias = self._x_balance_bias.get(layer_name)
+        if bias is None:
+            bias = np.zeros(cols, dtype=np.float64)
+        ptrs = np.zeros(rows + 1, dtype=np.int64)
+        all_indices: list[np.ndarray] = []
+        all_values: list[np.ndarray] = []
+        selected_mask = np.zeros(cols, dtype=bool)
+        for row in range(rows):
+            v_row = x2d[row]
+            v_sq = v_row.astype(np.float64) ** 2
+            total = float(np.sum(v_sq))
+            score = v_sq + bias
+            order = np.argsort(-score, kind="stable")
+            if total <= 0:
+                k = 0
+            else:
+                cum = np.cumsum(v_sq[order])
+                k = int(np.searchsorted(cum, r_target * total) + 1)
+                k = min(k, cols)
+            if self.x_k_min:
+                k = max(k, self.x_k_min)
+            if self.x_k_max is not None:
+                k = min(k, self.x_k_max)
+            sel = np.sort(order[:k])
+            all_indices.append(sel.astype(np.int32))
+            all_values.append(v_row[sel])
+            ptrs[row + 1] = ptrs[row] + k
+            selected_mask[sel] = True
+        step = self.x_balance_bias_step
+        bias = bias + step * (~selected_mask).astype(np.float64) - step * selected_mask.astype(np.float64)
+        self._x_balance_bias[layer_name] = bias
+        indices = np.concatenate(all_indices) if all_indices else np.zeros(0, dtype=np.int32)
+        values = np.concatenate(all_values) if all_values else np.zeros(0, dtype=np.float32)
+        return ptrs, indices, values
+
+    def _accumulate_balance_loss(self, x: Tensor, layer_name: str, csr: CSR) -> None:
+        """Arm A -- classic MoE-style auxiliary load-balancing loss
+        (differentiable, added to the total training loss; selection
+        itself stays plain magnitude top-k, unaffected). fⱼ (EMA'd
+        empirical selection frequency, detached bookkeeping) times
+        differentiable per-dim energy xⱼ², summed across dims -- pushes
+        the model to shrink activation energy on frequently-selected
+        dims relative to others, the same f_i*P_i shape as standard MoE
+        router balancing losses. Accumulates into self._balance_aux_loss,
+        reset each step() call and folded into the final aux_loss there
+        (mirrors self._energy_aux_loss's own accumulate-then-combine
+        pattern). See __init__'s x_balance_loss_coef docstring."""
+        cols = csr.cols
+        selected_mask = np.zeros(cols, dtype=np.float32)
+        for row in range(csr.rows):
+            start, end = int(csr.ptrs[row]), int(csr.ptrs[row + 1])
+            selected_mask[csr.indices[start:end]] = 1.0
+        freq = self._x_balance_freq.get(layer_name)
+        beta = self.x_balance_freq_beta
+        freq = selected_mask if freq is None else beta * freq + (1.0 - beta) * selected_mask
+        self._x_balance_freq[layer_name] = freq
+        freq_t = Tensor(freq.astype(np.float32))
+        term = reduce_sum(power(x, 2) * freq_t, axis=None) * self.x_balance_loss_coef
+        self._balance_aux_loss = term if self._balance_aux_loss is None else self._balance_aux_loss + term
 
     def _update_input_selection_stats(self, layer_name: str, x2d: np.ndarray, csr: CSR) -> None:
         """Real per-layer INPUT-axis R/k trajectory stats, overwritten
@@ -669,6 +838,8 @@ class ToyTileRecurrenceRMT:
         See docs/research/toy_tile_recurrence_rmt.rst:step_design."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
+        self._energy_aux_loss = None  # see _apply_energy's own docstring
+        self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
 
         if content_dy_sparsity_schedule is not None:
             if len(content_dy_sparsity_schedule) != n_content:
@@ -690,7 +861,14 @@ class ToyTileRecurrenceRMT:
                 return self._wide_extra_kwargs(layer_name)
 
         x_window_t = Tensor(x_window.astype(np.float32))
-        x_window_sparse = self._to_sparse(x_window_t, "input_proj")
+        # Energy gates a SEPARATE variable, not x_window_t itself --
+        # last_debug["x_window_t"] below is the embedding-learning hook's
+        # dL/d(raw embedding) Tensor; gradient still flows through the
+        # energy gate back to this same object (h*gate_np keeps h's
+        # identity), so keeping x_window_t un-reassigned preserves that
+        # hook's contract exactly, energy on or off.
+        x_window_energized = self._apply_energy(x_window_t, "embed_input")
+        x_window_sparse = self._to_sparse(x_window_energized, "input_proj")
         x_wide = self._timed_layer_forward(
             self.input_proj,
             "input_proj",
@@ -706,6 +884,7 @@ class ToyTileRecurrenceRMT:
         memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
 
         combined_normed = concat([memory_normed, x_normed], axis=0)  # [total_slots, sw]
+        combined_normed = self._apply_energy(combined_normed, "state")
 
         # Each of q/k/v_proj gets its OWN _to_sparse call on combined_normed.
         # See docs/research/toy_tile_recurrence_rmt.rst:to_sparse_gradient_detach_bug.
@@ -1009,6 +1188,11 @@ class ToyTileRecurrenceRMT:
             if self.use_critic
             else None
         )
+
+        if self._energy_aux_loss is not None:
+            aux_loss = self._energy_aux_loss if aux_loss is None else aux_loss + self._energy_aux_loss
+        if self._balance_aux_loss is not None:
+            aux_loss = self._balance_aux_loss if aux_loss is None else aux_loss + self._balance_aux_loss
 
         return memory_new, logits, aux_loss
 

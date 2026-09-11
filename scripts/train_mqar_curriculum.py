@@ -304,11 +304,15 @@ def train_curriculum(
     x_r_target: float | None = None,
     x_k_min: int = 0,
     x_k_max: int | None = None,
+    x_balance_bias_step: float | None = None,
+    x_balance_loss_coef: float = 0.0,
     target_steps_per_sec: float | None = None,
     trajectory_log_every: int | None = None,
     trajectory_log_steps: tuple[int, int] | None = None,
     trajectory_log_fn=None,
     r_target_min: float = 0.05,
+    use_energy: bool = False,
+    energy_kwargs: dict | None = None,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -321,6 +325,22 @@ def train_curriculum(
     # train_curriculum.use_tile_cache_query_step_fallback.
     # k_first_target/k_first_vocab: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.k_first_target_odometer_reordering.
+    #
+    # WARNING (2026-09-11): leaving k_first_target unset (the default) runs
+    # the vocab-first curriculum -- k=1 for the ENTIRE vocab ramp, tens of
+    # thousands of steps, before k ever grows. This risks training the model
+    # to solve MQAR via a positional/relative shortcut (there's only ever
+    # ONE query-key pair per sequence at k=1) rather than genuine key-value
+    # binding, and per this file's own k_first_target_odometer_reordering
+    # design note, entrenches synapse importance against the k>1 feature
+    # before the model is ever asked to use it. Callers should set
+    # k_first_target (the "kcycle" odometer -- v16k1,v16k2,v16k3,v18k1,...)
+    # by default; only leave it unset when the test SPECIFICALLY calls for
+    # isolating vocab growth from k growth (e.g. reproducing an older
+    # vocab-first result, or a deliberate ablation of curriculum order
+    # itself). Kept opt-in rather than flipping the default, per this
+    # param's own backward-compatibility policy above -- existing callers
+    # that already pass k_first_target explicitly are unaffected either way.
     if k_first_target is not None and k_first_vocab is None:
         k_first_vocab = seq_len_for_k(k_first_target) + 4
 
@@ -376,7 +396,11 @@ def train_curriculum(
         x_r_target=x_r_target,
         x_k_min=x_k_min,
         x_k_max=x_k_max,
+        x_balance_bias_step=x_balance_bias_step,
+        x_balance_loss_coef=x_balance_loss_coef,
         r_target_min=r_target_min,
+        use_energy=use_energy,
+        energy_kwargs=energy_kwargs,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -890,12 +914,15 @@ def main():
             if r_bar is None:
                 continue
             surprise = model._layer_surprise.get(name)
+            sel = model.last_grad_selection.get(name)
+            bits = [f"r{r_bar:.3f}"]
+            if sel is not None:
+                bits.append(f"R{sel['R_mean']:.3f}")
+                bits.append(f"k{sel['k_mean']:.1f}")
             if surprise is not None:
-                dy_parts.append(
-                    f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f},E{surprise['E_t']:.2g},L{surprise['Lbar']:.2g}"
-                )
-            else:
-                dy_parts.append(f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f}")
+                bits.append(f"E{surprise['E_t']:.2g}")
+                bits.append(f"L{surprise['Lbar']:.2g}")
+            dy_parts.append(f"{_SHORT_NAME.get(name, name)}=" + ",".join(bits))
         x_parts = []
         for name, x_target in model.x_r_target.items():
             if x_target is None:

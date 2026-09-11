@@ -442,6 +442,15 @@ default (vocab-first) run already has once ITS vocab phase is exhausted.
 Graduation for this mode mirrors the default run's own terminal condition
 ("vocab already maxed out AND k has grown past its own cap").
 
+**Use this mode by default (2026-09-11).** Leaving ``k_first_target``
+unset runs k=1 for the entire vocab ramp -- tens of thousands of steps
+with only ONE query-key pair per sequence, which risks training a
+positional/relative-position shortcut instead of genuine key-value
+binding, and entrenches synapse importance against the k>1 feature
+before the model ever needs it (see this section's own rationale above).
+Only leave ``k_first_target`` unset when the test specifically calls for
+isolating vocab growth from k growth -- not as a default choice.
+
 .. _train_curriculum.embed_table_builder_sdr_hook:
 
 ``embed_table_builder``: caller-controlled SDR embedding structure

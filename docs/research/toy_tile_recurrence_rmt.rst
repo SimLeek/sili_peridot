@@ -668,6 +668,39 @@ tracks its own step counter -- the model itself stays stateless about step
 numbers, same existing design choice as every other per-step model
 attribute here (``last_debug``, ``last_critic_pred``, etc.).
 
+.. _toy_tile_recurrence_rmt.last_grad_selection_design:
+
+``last_grad_selection``: the grad-axis counterpart, now instrumented (2026-09)
+------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.last_grad_selection_design``
+
+The "unlike the grad axis" caveat above is no longer true -- sili's own
+``_nucleus_top_k_csr`` call sites for ``dy_r_target`` (``DISLDOLayer.forward``
+and ``DISLDOLayer32.forward``, see sili__new's
+``record_grad_selection_stats.design``) now capture the same R/k stats onto
+each layer's own ``last_grad_selection``, right where the CSR is actually
+produced (this model's own Python has no visibility into that call, so it
+couldn't be computed here the way the x-axis stat is). This model's
+``last_grad_selection`` PROPERTY (not a plain dict -- computed on read, not
+maintained incrementally) pulls it back together across
+``_named_real_layers()``, mirroring ``last_input_selection``'s shape so
+``train_mqar_curriculum.py``'s trajectory printer can treat both axes the
+same way. A layer with no entry (no ``dy_r_target`` backward call yet, or a
+disldo_cls with no ``dy_r_target`` support at all, e.g. ``DISLDOLayer8``) is
+simply omitted, not a missing-key error.
+
+Real measurement (wide288 scale, ``r_target=0.9``, before the closed loop
+ratchets down): the grad axis kept roughly 2x MORE of its tensor than the
+x axis did at the same nominal setpoint (q/k/v: dy ``k~=128-133/288``
+vs. x ``k~=58/288``) -- gradients are measurably less concentrated than
+forward activations at this stage of training, so the two axes' densities
+do not simply multiply together the way a naive combined-density estimate
+would assume. Whether this gap narrows (or the grad axis becomes sparser
+than x, as hypothesized) later in training is an open question this
+instrumentation now lets a real run answer directly, rather than by
+extrapolating from a single early-training snapshot.
+
 .. _toy_tile_recurrence_rmt.l1_sparsity_split_design:
 
 ``_l1_sparsity_split``: a parallel probe branch, no longer order-sensitive
