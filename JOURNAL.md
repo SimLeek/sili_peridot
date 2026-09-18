@@ -8737,3 +8737,68 @@ k=3 arrival step against dense's step 2294 (both currently just "within
 Arm C (or a variant) can be pushed toward the superposition regime
 (k>3) as a genuinely harder follow-on question, separate from this
 comparison's current scope.
+
+## Real methodological gap found: the current dense reference never replicated the 2026-09-07 success config
+--------------------------------------------------------------------
+
+Direct instruction, prompted by remembering a smaller (~70k-param,
+embed_width=16) model reaching vocab=128 at k=3 previously. Checked
+JOURNAL.md directly rather than trusting memory alone: confirmed real --
+`arm_nolevel_down` (2026-09-07) reached vocab=126 at step 43,286,
+embed_width=16/state_width=128. That success combined THREE factors,
+not the one or two initially accounted for here:
+
+1. `K_START=2` (skip the k=1 shortcut stage) -- already suspected and
+   being tested (launch_arm_c_plus_knee_skip_k1.py, corrected from an
+   initial K_START=3 overreach -- k=2 is the more complex, genuine
+   associative-binding case worth testing, not just "skip everything
+   easy").
+2. `wrong_streak_threshold` effectively infinite (LEVEL_DOWN disabled)
+   -- already matched in every launcher this pass (100000000 throughout),
+   not a regression.
+3. **"no-aux-loss"** -- NOT previously accounted for. `_build_targets`'s
+   fallback (`targets.setdefault(i, tokens[i+1])` for every non-query
+   write position) mixes a "predict next token" signal into every
+   training step alongside the real MQAR objective. The 2026-09-07
+   investigation found removing it helped (bounded, if anything lower
+   loss), but only ever did so via an ad-hoc module-level monkeypatch
+   (`scripts/sandbox_arm_launchers/run_sandbox_dense_probe.py`'s `_q`,
+   itself recovered from arch-sandbox earlier this session without
+   realizing what it was) -- never promoted to a real, reusable
+   parameter. Every run in THIS investigation (dense reference,
+   confusion matrix, Arm C variants) had this signal ALWAYS ON,
+   unconditionally, with no way to turn it off.
+
+**Fixed**: `write_time_aux_targets: bool = False` is now a real
+`train_curriculum` parameter (`scripts/train_mqar_curriculum.py`) --
+per direct instruction, OFF by default, not opt-in: predict-next-token
+only makes sense as a training signal if the next token is actually
+predictable, and in MQAR's random key/value layout it structurally
+isn't. `True` restores the old always-on behavior for anyone who needs
+it. Full pytest suite stayed green (no existing test relied on the old
+default).
+
+**Launched** `launch_width288_nolevel_down_control.py` (local, not
+arch-sandbox -- both remote runs were already at load 8/16) -- the
+first width-288 run matching ALL THREE of the historical success
+factors exactly, isolating width as the only real remaining variable.
+Direct test of whether the current ~300k-param scaling is genuinely
+degenerate (per direct concern: "something's off if the larger model
+isn't reaching top performance in fewer steps than the smaller model")
+or whether it just needed these same curriculum fixes the smaller model
+needed. Result pending.
+
+**Margin sweep (knee_margin_sweep.py) also landed while this was being
+investigated** -- 6 margins x 4000 steps, same Arm C + k_first_target=3
+(k=1 included) curriculum: margins {0.03, 0.05, 0.2} reached k=3 within
+budget, {0.0, 0.08, 0.12} stayed at k=2 -- noisy, non-monotonic, no
+clean "higher margin = better" trend at this short budget. Real
+correction from the earlier premature read: the standard-curriculum
+full run's slow progress at margin=0.05 specifically was NOT evidence
+the knee-adaptive mechanism doesn't work -- 0.05 was a single untested
+guess. This sweep is the actual calibration; margin's effect (if any)
+may only show up at a longer horizon than 4000 steps, same "don't
+over-read a slow phase" lesson as the 2026-09-07 investigation's own
+explicit methodological note (a long flat-or-worsening stretch does not
+reliably distinguish a real ceiling from an unusually long convergence
+basin).
