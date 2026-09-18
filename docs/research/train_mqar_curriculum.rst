@@ -672,16 +672,24 @@ for a fresh failure).
 
 1. A third ``(N, peak_lr)`` point (e.g. ``state_width=192`` or a second
    width=288 LR value) to actually pin ``alpha`` instead of bracketing it.
-2. Same "does an absolute, non-width-proportional budget decouple LR
-   from width" question, but via a mechanism this project has already
-   validated as safe at toy scale -- DYNAMIC per-step selection (e.g. a
-   fixed absolute *count* of active dy/x connections per step, not a
-   fraction of width, and not a static structural weight-existence cap).
-   Not yet designed.
-3. Sweep Arm C's ``dy_time_gate_cutoff`` (gate density) against required
-   ``peak_lr`` at fixed width -- does a denser gate (closer to ungated)
-   need dense's lower LR, and does a sparser gate tolerate the current,
-   un-scaled ``DEFAULT_PEAK_LR``. This is itself dynamic (not structural)
+2. **Designed and queued (2026-09-18)**: same "does an absolute,
+   non-width-proportional budget decouple LR from width" question, via a
+   mechanism this project has already validated as safe at toy scale --
+   DYNAMIC per-step selection, forced to a fixed absolute count via
+   ``dy_k_min=dy_k_max=64`` (clamps the nucleus top-k's result regardless
+   of ``dy_r_target``), ``dense=True`` kept at its default (structural
+   connectivity untouched). ``launch_dy_fixed_count_width128.py`` /
+   ``launch_dy_fixed_count_width288.py``, both at the unscaled
+   ``peak_lr=0.015``.
+3. **Designed and queued (2026-09-18)**: sweep Arm C's
+   ``dy_time_gate_cutoff`` (gate density) against required ``peak_lr`` at
+   fixed width=288 -- does a denser gate (closer to ungated) need dense's
+   lower LR, and does a sparser gate tolerate the current, un-scaled
+   ``DEFAULT_PEAK_LR``. 2x2 grid: cutoff in {0.0 (~50% density), 0.6
+   (~29.5% density)} x peak_lr in {0.015 unscaled, 0.01 scaled} --
+   ``launch_armc_gatemid_lr_unscaled.py`` / ``launch_armc_gatemid_lr_scaled.py``
+   / ``launch_armc_gatesparse_lr_unscaled.py`` /
+   ``launch_armc_gatesparse_lr_scaled.py``. This is itself dynamic (not structural)
    sparsity, so no conflict with the correction above.
 
 .. _train_curriculum.dense_was_hardcoded_true:
