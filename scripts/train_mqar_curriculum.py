@@ -28,7 +28,7 @@ import numpy as np
 sys.path.insert(0, ".")
 
 from sili import _cpu
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
+from sili.sparse_rnn import DIDLDOLayer32, DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili.tensor import combine_losses
 
 from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, predicted_token
@@ -50,7 +50,17 @@ from scripts.train_mqar_rmt_reference import (
 )
 from scripts.train_tile_curriculum import _build_tile_window
 
-PRECISION_CLS = {"fp4": DISLDOLayer, "fp8": DISLDOLayer8, "fp32": DISLDOLayer32}
+PRECISION_CLS = {
+    "fp4": DISLDOLayer,
+    "fp8": DISLDOLayer8,
+    "fp32": DISLDOLayer32,
+    # Group B (DIDLDO/SIDLDO, dense weight storage) -- the real dense
+    # control arm for the dense-vs-sparse MQAR comparison, not
+    # DISLDOLayer32(dense=True) (still Group A/sparse-capable storage,
+    # just densely initialized). See sparse_rnn.rst:
+    # sparse_rnn.engine_select_two_groups for the group distinction.
+    "fp32_dense": DIDLDOLayer32,
+}
 
 
 def _default_graded_dy_schedule(num_tiles: int, floor: float = 0.02) -> list:
@@ -73,7 +83,12 @@ NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 NOCAPS_KWARGS_FP8 = {"max_abs_delta": 2.0, "max_ci": 1e30}
 # See docs/research/train_mqar_curriculum.rst:train_curriculum.fp32_unbounded_weight_blowup.
 NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0}
-PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS_FP32}
+PRECISION_SYNAPSE_KWARGS = {
+    "fp4": NOCAPS_KWARGS,
+    "fp8": NOCAPS_KWARGS_FP8,
+    "fp32": NOCAPS_KWARGS_FP32,
+    "fp32_dense": NOCAPS_KWARGS_FP32,
+}
 
 DEFAULT_PEAK_LR = 0.015
 DEFAULT_NUM_TILES = 16  # fixed local-attention window (model param, not a task param)
@@ -348,12 +363,13 @@ def train_curriculum(
     # AQRS (additive_rank/dynamic_rank_control) exists to give LOW-BIT
     # storage (FP4/FP8) extra precision where it's sparse -- fp32 is
     # already full precision everywhere, so AQRS has nothing to correct
-    # for. Force it off here rather than support it on DISLDOLayer32: the
-    # caller's own additive_rank=1/dynamic_rank_control=True defaults
-    # would otherwise reach ToyTileRecurrenceRMT's non-zero-value guard
-    # (rank_kwargs/additive_kwargs, model/toy_tile_recurrence_rmt.py) and
-    # get forwarded into a constructor that was never meant to have it.
-    if precision == "fp32":
+    # for. Force it off here rather than support it on DISLDOLayer32/
+    # DIDLDOLayer32: the caller's own additive_rank=1/dynamic_rank_
+    # control=True defaults would otherwise reach ToyTileRecurrenceRMT's
+    # non-zero-value guard (rank_kwargs/additive_kwargs, model/
+    # toy_tile_recurrence_rmt.py) and get forwarded into a constructor
+    # that was never meant to have it.
+    if precision in ("fp32", "fp32_dense"):
         additive_rank = 0
         dynamic_rank_control = False
     state_width = embed_width * COLUMN_NEURONS
