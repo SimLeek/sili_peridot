@@ -629,6 +629,18 @@ O(1)); ``alpha=0.5`` is naive per-element/NTK scaling and is the value that
 happened to match the one tested point (``0.01`` vs. predicted ``0.0067``
 at alpha=1.0). Do not treat either exponent as settled from a single run.
 
+**Correction, 2026-09-18 (same day): NOT a monotonic "lower is always
+better" relationship.** A third data point, ``peak_lr=0.0067`` (the
+alpha=1.0 value), came back WORSE than the unscaled ``peak_lr=0.015``
+baseline -- ``vocab=32/k=3`` (stuck) vs. unscaled's ``vocab=64/k=3``
+(stuck), where ``peak_lr=0.01`` reached ``vocab=126/k=3`` and held it.
+``0.01`` is a real sweet spot with both neighbors doing worse, not an
+endpoint on a one-directional curve -- the
+``lr(N) ~= lr_base*(N_base/N)^alpha`` power-law framing may not even be
+the right functional form (a single exponent can't produce a U-shape).
+Needs more points near ``0.01`` (e.g. ``0.008``, ``0.012``) before
+trusting any specific value as "the" width-288 LR.
+
 **Correction to an earlier draft of this hypothesis**: sparsity does NOT
 automatically cap this. ``x_r_target``/``dy_r_target`` (this file's own
 selection knobs) are *proportional* -- a fraction of the layer's width --

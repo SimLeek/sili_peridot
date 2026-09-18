@@ -9043,3 +9043,37 @@ arch-sandbox slot (queue item 2). 3 arch-sandbox Arm C+knee variants
 and 2 local runs (alpha1-LR test, dy_fixed_count width=128) still in
 flight; 4 items remain queued (test 2's already-launched width=288 run
 was item 2, so items 3-6 -- the Arm C gate-density grid -- are next).
+
+## 2026-09-18 (cont'd) -- alpha=1.0 LR test finished: WORSE than unscaled,
+## revealing a real sweet spot rather than "lower is always better"
+
+`launch_dense_lr_alpha1_scaled.py` (peak_lr=0.0067, the muP-predicted
+alpha=1.0 value) completed its full 100k steps (14,068s, steps/sec=
+7.11). Result: reached `vocab=32, k=3` at step 10,283, then flat for
+the remaining 89,717 steps -- WORSE than the unscaled `peak_lr=0.015`
+baseline, which at least reached `vocab=64, k=3` before stalling. Three
+real data points now:
+
+| peak_lr | alpha | outcome |
+|---|---|---|
+| 0.015 (unscaled) | 0 | stuck at vocab=64/k=3 |
+| 0.01 | ~0.5 | **reached vocab=126/k=3, held to completion** |
+| 0.0067 | 1.0 (muP) | stuck at vocab=32/k=3 -- worse than unscaled |
+
+This is NOT a monotonic "lower LR is always better, just find the
+right exponent" relationship -- 0.01 is a real sweet spot with both
+neighbors doing worse, not an endpoint on a one-directional curve. Too
+high (0.015) plausibly still hits the coherent-rank-1-update
+instability the muP argument describes; too low (0.0067) is a
+different failure entirely -- plausibly just too little signal per
+step to escape a harder curriculum tier in a comparable number of
+steps, unrelated to the fan-in/width argument. The
+`lr(N) ~= lr_base*(N_base/N)^alpha` power-law framing may not be the
+right functional form at all -- pinning a single alpha won't capture a
+U-shaped response. Needs a 4th+ data point near 0.01 (e.g. 0.008,
+0.012) to characterize the actual shape before trusting any single
+number as "the" width-288 LR.
+
+Freed a local slot -- launched queue item 3,
+`launch_armc_gatemid_lr_unscaled.py` (Arm C gate cutoff=0.0 ~50%
+density, peak_lr=0.015 unscaled).
