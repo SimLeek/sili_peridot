@@ -8802,3 +8802,99 @@ over-read a slow phase" lesson as the 2026-09-07 investigation's own
 explicit methodological note (a long flat-or-worsening stretch does not
 reliably distinguish a real ceiling from an unusually long convergence
 basin).
+
+## 2026-09-18: width-scaling degeneracy resolved (peak_lr, not grad clip) + fan-in/fan-out LR scaling law
+
+Direct question: why does state_width=288 (dense, all 3 historical-
+success factors matched -- K_START=2, LEVEL_DOWN disabled,
+write_time_aux_targets=False) take MORE steps to reach vocab=126 than
+the historical state_width=128 run, when it should take FEWER (more
+capacity, same task)? Completed 100k-step dense reference
+(`launch_width288_nolevel_down_control.py`) got stuck at vocab=64/k=3
+for its last 86,257 steps -- never reached vocab=126 at all.
+
+Read the actual code for 4 candidate mechanisms. Ruled out
+`l1_sparsity_coef`/`magnitude_clip_penalty_coef` (both properly
+normalized `sum(...)/n` by element count, width-invariant already).
+Two remained as real, unnormalized-by-width code patterns: (1) global
+gradient-norm clipping (`clip_grad_norm_` in
+`model/toy_recall_models.py`) computes ONE L2 norm across ALL
+parameters combined, clipped to a fixed `MAX_GRAD_NORM=1.0` never
+scaled by parameter count; (2) fixed `peak_lr=0.015` regardless of
+`state_width`, a standard muP-style concern for hidden-to-hidden
+matmuls (q/k/v/o_proj, each `state_width x state_width`).
+
+Promoted both to real `train_curriculum` parameters (not monkeypatches):
+`max_grad_norm: float | None = None` and the already-exposed `peak_lr`.
+Ran both as direct, isolated tests against the width=288 dense
+reference, same budget (100k steps):
+
+- `max_grad_norm=1.5` (sqrt(288/128)-scaled from 1.0): tracked baseline's
+  pace, no breakthrough (vocab=64/k=2 at step ~21,750, comparable to or
+  slower than baseline's own trajectory at that stage).
+- `peak_lr=0.01` (scaled down from 0.015): reached vocab=126/k=2 at
+  step 11,261 and vocab=126/k=3 at step 13,601 -- i.e. it blew straight
+  past the exact wall (vocab=64/k=3) the baseline got stuck behind for
+  86,257 steps, and did so FASTER than baseline even reached its own
+  stall point. Clean, unambiguous result: **the fixed peak_lr, not
+  gradient-norm clipping, is the dominant driver of the width-scaling
+  degeneracy.**
+
+### Rough scaling law (recorded per direct instruction, not yet independently re-derived from more data points)
+
+For DENSE hidden-to-hidden matrices (q/k/v/o_proj, each
+`N x N` where `N = state_width`, realized fan-in/fan-out both equal
+to the full layer width `N`), peak_lr should shrink as width grows:
+
+    lr(N) ~= lr_base * (N_base / N) ^ alpha,   0.5 <= alpha <= 1.0
+
+Two anchor points:
+- alpha=1.0 (**muP's known hidden-layer prescription** -- Yang & Hu,
+  "Feature Learning in Infinite-Width Neural Networks", 2021: because
+  a linear layer's per-step weight update is rank-1
+  (`dW_ij = delta_i * x_j`), its induced effect on the layer's output
+  is COHERENT across all `N` inputs, so keeping that induced change
+  O(1) instead of O(N) requires `lr ~ 1/N`) predicts
+  `lr(288) = 0.015 * (128/288) ~= 0.0067` -- not yet tested.
+- alpha=0.5 (naive per-element/NTK-style scaling) predicts
+  `lr(288) = 0.015 * sqrt(128/288) ~= 0.0100` -- this is almost
+  exactly the `peak_lr=0.01` value tested above, which DID resolve the
+  degeneracy. Rough match, one data point -- not proof of the exact
+  exponent, just consistent with alpha somewhere in [0.5, 1.0] and
+  closer to 0.5 than 1.0 so far.
+
+**Your framing, recorded verbatim as the key open hypothesis**: this
+scaling requirement should be a property of DENSE connectivity
+specifically, not width per se -- because it's driven by realized
+fan-in/fan-out (how many synapses actually feed into/out of a given
+neuron), and dense connectivity is the special case where realized
+fan-in/fan-out EQUALS total layer width `N` and therefore grows
+without bound as the model scales. If instead a layer's sparsity is
+capped at an ABSOLUTE synapse budget per neuron (your figure:
+1000-10000 synapses/neuron) rather than a budget proportional to
+width, then past the point where layer width `N` exceeds that cap,
+adding more width just adds more low-fan-in neurons -- it does NOT
+raise any given neuron's realized fan-in further. Under this framing,
+`lr` should stop needing to shrink once sparsity has capped realized
+fan-in, even as nominal width `N` keeps growing -- decoupling LR
+scaling from width entirely in the sparse regime.
+
+**Why this matters for the broader dense-vs-sparse-amortization
+question** ([[project_dense_vs_sparse_mqar_confusion_matrix]]): this
+would be a SECOND, independent way sparsity could beat dense at scale,
+distinct from the original "sparse eventually catches up given enough
+steps" question -- dense strictly requires ever-shrinking LR (and
+therefore, all else equal, ever-slower convergence) as it's scaled up
+with no ceiling, while absolute-budget sparse connectivity would not.
+Not yet tested -- the natural next experiment is the same width=128
+vs width=288 comparison, but on the SPARSE arm with an absolute (not
+width-proportional) `dy_r_target`/`max_weights`-style fan-in cap, at
+a single fixed `peak_lr`, checking whether width=288 needs the same
+LR cut dense needed or not.
+
+Six overnight/local runs from the write_time_aux_targets fix are still
+either completed (dense baseline, dense-fwd+ArmC-bwd, both plateaued
+below vocab=126) or in flight (4x Arm C + knee variants on
+arch-sandbox) -- unaffected by this LR finding since none scaled
+`peak_lr`; worth rerunning the more promising sparse arms at a
+width-288-appropriate LR once this scaling law has more data points.
