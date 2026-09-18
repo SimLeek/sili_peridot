@@ -11,6 +11,34 @@ from sili.tensor import Tensor, concat, exp, gather, gaussian_attention, power, 
 from .toy_recall_models import rmsnorm_tensor
 
 
+def _knee_elbow_r(x2d: np.ndarray) -> float:
+    """Kneedle-style elbow detection on the batch-averaged, per-row-
+    sorted cumulative squared-magnitude ("energy") curve: the point
+    maximizing vertical distance from the diagonal y=x on the curve
+    normalized to [0,1]x[0,1] -- where additional active neurons stop
+    paying for themselves in captured signal energy. Answers "how much
+    of the signal is actually needed" from the data itself instead of
+    assuming a fixed threshold (e.g. 99.95%) by hand. Returns R (energy
+    fraction retained at the elbow), not k directly, so it's a drop-in
+    replacement value for x_r_target/dy_r_target.
+
+    Each row is sorted independently (descending) before averaging --
+    summing raw values across rows first would mix each row's OWN
+    largest-magnitude dims with others' smallest, destroying the
+    per-row energy-concentration shape this is meant to measure."""
+    rows, cols = x2d.shape
+    v2 = x2d.astype(np.float64) ** 2
+    sorted_v2 = -np.sort(-v2, axis=1)
+    mean_sorted = sorted_v2.mean(axis=0)
+    total = float(mean_sorted.sum())
+    if total <= 0:
+        return 1.0
+    cum = np.cumsum(mean_sorted) / total
+    k_norm = np.arange(1, cols + 1) / cols
+    elbow_idx = int(np.argmax(cum - k_norm))
+    return float(cum[elbow_idx])
+
+
 class ToyTileRecurrenceRMT:
     """Faithful RMT reference control for the MQAR investigation.
     See docs/research/toy_tile_recurrence_rmt.rst:module_overview."""
@@ -56,6 +84,9 @@ class ToyTileRecurrenceRMT:
         x_balance_bias_step: float | None = None,
         x_balance_loss_coef: float = 0.0,
         x_balance_freq_beta: float = 0.99,
+        x_r_target_auto: bool = False,
+        x_r_target_auto_beta: float = 0.98,
+        x_r_target_auto_margin: float = 0.0,
         dy_time_gate_cutoff: float | None = None,
         dy_time_gate_phase_step: float = 0.02,
         dy_time_gate_period_range: tuple[float, float] = (50.0, 200.0),
@@ -99,6 +130,21 @@ class ToyTileRecurrenceRMT:
             project_sparsity_floor_generalization_scoping.md's 2026-09-11
             entries for the full design rationale and MoE/biology
             precedent research.
+        x_r_target_auto, x_r_target_auto_beta, x_r_target_auto_margin:
+            whenever forward-axis nucleus selection runs (x_r_target set
+            OR x_r_target_auto True), the batch's elbow R (_knee_elbow_r
+            -- see its own docstring) is ALWAYS measured and EMA'd per
+            layer into self._x_knee_r_target, purely as a diagnostic --
+            "how much signal does this layer's own data actually need,"
+            not a fixed hand-picked threshold. x_r_target_auto=True goes
+            further: uses that live, self-discovered value (+ the fixed
+            margin) AS x_r_target for the real selection, replacing the
+            constructor's fixed x_r_target for this layer entirely.
+            beta controls how fast the tracked elbow adapts; margin adds
+            a fixed safety buffer on top of the raw measured elbow.
+            Untested in combination with x_balance_bias_step/
+            x_balance_loss_coef -- should compose (auto sets the target
+            the balancing mechanisms then rank against) but not verified.
         dy_time_gate_cutoff, dy_time_gate_phase_step, dy_time_gate_period_range,
         dy_time_gate_seed: Arm C -- pure time-division fairness on the
             BACKWARD/dy axis, independent of any measured signal.
@@ -168,6 +214,11 @@ class ToyTileRecurrenceRMT:
         self._x_balance_bias: dict = {}  # layer_name -> np.float32[n_in], Arm B
         self._x_balance_freq: dict = {}  # layer_name -> np.float32[n_in], Arm A
         self._balance_aux_loss: Tensor | None = None
+        # See __init__'s own x_r_target_auto docstring.
+        self.x_r_target_auto = x_r_target_auto
+        self.x_r_target_auto_beta = x_r_target_auto_beta
+        self.x_r_target_auto_margin = x_r_target_auto_margin
+        self._x_knee_r_target: dict = {}  # layer_name -> float, EMA'd elbow R
         # See __init__'s own dy_time_gate_* docstring (Arm C).
         self.dy_time_gate_cutoff = dy_time_gate_cutoff
         self.dy_time_gate_phase_step = dy_time_gate_phase_step
@@ -718,11 +769,14 @@ class ToyTileRecurrenceRMT:
         docs/research/toy_tile_recurrence_rmt.rst:to_sparse_gradient_detach_bug
         and :x_r_target_design."""
         x_r_target = self.x_r_target.get(layer_name)
-        if x_r_target is None and self.input_sparsity_p is None:
+        if x_r_target is None and self.input_sparsity_p is None and not self.x_r_target_auto:
             return x
         x_np = np.asarray(x.data, dtype=np.float32)
         x2d = x_np[np.newaxis, :] if x_np.ndim == 1 else x_np
-        if x_r_target is not None:
+        if x_r_target is not None or self.x_r_target_auto:
+            knee_r = self._update_knee_r_target(layer_name, x2d)
+            if self.x_r_target_auto:
+                x_r_target = knee_r
             if self.x_balance_bias_step is not None:
                 ptrs, indices, values = self._nucleus_top_k_balanced(x2d, layer_name, x_r_target)
             else:
@@ -814,6 +868,20 @@ class ToyTileRecurrenceRMT:
         freq = selected_mask if freq is None else beta * freq + (1.0 - beta) * selected_mask
         self._x_balance_freq[layer_name] = freq
         return freq
+
+    def _update_knee_r_target(self, layer_name: str, x2d: np.ndarray) -> float:
+        """EMA's _knee_elbow_r's raw per-call measurement into
+        self._x_knee_r_target (always tracked as a diagnostic whenever
+        this is called) and returns the smoothed value + the configured
+        safety margin, clipped to 0.999 -- the value x_r_target_auto
+        uses AS x_r_target when enabled. See __init__'s own
+        x_r_target_auto docstring."""
+        raw = _knee_elbow_r(x2d)
+        prev = self._x_knee_r_target.get(layer_name)
+        beta = self.x_r_target_auto_beta
+        smoothed = raw if prev is None else beta * prev + (1.0 - beta) * raw
+        self._x_knee_r_target[layer_name] = smoothed
+        return min(0.999, smoothed + self.x_r_target_auto_margin)
 
     def _accumulate_balance_loss(self, x: Tensor, layer_name: str, freq: np.ndarray) -> None:
         """Arm A -- classic MoE-style auxiliary load-balancing loss
