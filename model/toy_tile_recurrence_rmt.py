@@ -733,8 +733,10 @@ class ToyTileRecurrenceRMT:
         else:
             csr = CSR.from_dense(x2d, self.input_sparsity_p, self.num_cpus)
         self._update_input_selection_stats(layer_name, x2d, csr)
-        if self.x_balance_loss_coef > 0.0 and x_r_target is not None:
-            self._accumulate_balance_loss(x, layer_name, csr)
+        if x_r_target is not None:
+            freq = self._update_x_balance_freq(layer_name, csr)
+            if self.x_balance_loss_coef > 0.0:
+                self._accumulate_balance_loss(x, layer_name, freq)
         out = Tensor(csr, _children=(x,), _op="to_sparse", backend=x.backend)
 
         def _bwd():
@@ -795,18 +797,13 @@ class ToyTileRecurrenceRMT:
         values = np.concatenate(all_values) if all_values else np.zeros(0, dtype=np.float32)
         return ptrs, indices, values
 
-    def _accumulate_balance_loss(self, x: Tensor, layer_name: str, csr: CSR) -> None:
-        """Arm A -- classic MoE-style auxiliary load-balancing loss
-        (differentiable, added to the total training loss; selection
-        itself stays plain magnitude top-k, unaffected). fⱼ (EMA'd
-        empirical selection frequency, detached bookkeeping) times
-        differentiable per-dim energy xⱼ², summed across dims -- pushes
-        the model to shrink activation energy on frequently-selected
-        dims relative to others, the same f_i*P_i shape as standard MoE
-        router balancing losses. Accumulates into self._balance_aux_loss,
-        reset each step() call and folded into the final aux_loss there
-        (mirrors self._energy_aux_loss's own accumulate-then-combine
-        pattern). See __init__'s x_balance_loss_coef docstring."""
+    def _update_x_balance_freq(self, layer_name: str, csr: CSR) -> np.ndarray:
+        """EMA'd per-dim forward-axis selection frequency -- the mode-1
+        (input starvation) diagnostic proxy, per the dense-vs-sparse
+        confusion matrix plan. Split out from _accumulate_balance_loss so
+        it can run as a pure measurement regardless of which mechanism
+        (if any) is active, not just under Arm A. Returns the updated
+        frequency array (also stored in self._x_balance_freq)."""
         cols = csr.cols
         selected_mask = np.zeros(cols, dtype=np.float32)
         for row in range(csr.rows):
@@ -816,6 +813,21 @@ class ToyTileRecurrenceRMT:
         beta = self.x_balance_freq_beta
         freq = selected_mask if freq is None else beta * freq + (1.0 - beta) * selected_mask
         self._x_balance_freq[layer_name] = freq
+        return freq
+
+    def _accumulate_balance_loss(self, x: Tensor, layer_name: str, freq: np.ndarray) -> None:
+        """Arm A -- classic MoE-style auxiliary load-balancing loss
+        (differentiable, added to the total training loss; selection
+        itself stays plain magnitude top-k, unaffected). fⱼ (EMA'd
+        empirical selection frequency, detached bookkeeping, from
+        _update_x_balance_freq) times differentiable per-dim energy xⱼ²,
+        summed across dims -- pushes the model to shrink activation
+        energy on frequently-selected dims relative to others, the same
+        f_i*P_i shape as standard MoE router balancing losses.
+        Accumulates into self._balance_aux_loss, reset each step() call
+        and folded into the final aux_loss there (mirrors
+        self._energy_aux_loss's own accumulate-then-combine pattern).
+        See __init__'s x_balance_loss_coef docstring."""
         freq_t = Tensor(freq.astype(np.float32))
         term = reduce_sum(power(x, 2) * freq_t, axis=None) * self.x_balance_loss_coef
         self._balance_aux_loss = term if self._balance_aux_loss is None else self._balance_aux_loss + term
