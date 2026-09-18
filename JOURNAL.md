@@ -8935,3 +8935,51 @@ run in this project's documented history to reach `vocab=126, k=3`
 simultaneously at all. Recorded in the new `MQAR_LEADERBOARD.md`
 (running log of best setups vs. param count, requested directly) as the
 current record on both steps and wall-clock.
+
+## 2026-09-18 (cont'd) -- correction: structural sparsity is a known-bad
+## direction at this model scale, caught before wasting the full budget
+
+Built and launched "test 2" for the width-scaling LR/fan-in hypothesis
+as a STRUCTURAL fan-in cap (`dense=False`, `wide_max_weights=64*
+state_width`, sized to avoid the `per_row=2` degenerate floor
+specifically) at width=288, unscaled `peak_lr=0.015`. Direct correction
+from the user, mid-run: "I've said not to do structural sparsity here a
+few times because it keeps getting set so the fan-in/out is 1 or 2
+instead of sane values" -- and that real biological fan-in (1000-10000/
+neuron) needs a larger model than this one to make sense of at all.
+
+Checked memory as this should have been checked BEFORE building the
+test (see `feedback_check_journal_before_new_mechanism`, whose scope
+this widens: applies to building a new experiment, not just diagnosing
+a fresh failure). Confirmed the precedent is real and already
+documented: `project_sili_wide_model_mqar_baseline` (dense=False + a
+pre-chosen `max_weights` budget degenerated to `per_row=2`, reversed
+back to `dense=True` + activation/gradient-only sparsity -- "we don't
+know the optimal sparse topology yet, so a pre-chosen max_weights
+budget would bake in an unvalidated guess") and
+`project_sili_synaptogenesis_pruning_testing` (structural growth/
+pruning at this same toy scale produced chance-level accuracy,
+0.09 vs 0.79 for the static-sparsity control). Avoiding the literal
+`per_row=2` floor numerically (this run's sizing gave per-neuron
+fan-in=64, well above it) does NOT make a pre-chosen structural budget
+a valid direction here -- the reversal wasn't about picking a better
+number, it was "topology itself must not be pre-guessed" at this scale
+at all.
+
+Killed the run mid-flight (before it produced a result worth trusting
+either way) and deleted both launcher scripts
+(`launch_sparse_absolute_fanin_width288.py`/`...width128.py`) rather
+than leave a known-bad design sitting in the repo to be reused by
+accident. Kept the underlying `dense: bool = True` parameter promotion
+(scripts/train_mqar_curriculum.py) -- exposing it as a real,
+default-safe parameter isn't itself the mistake, and it's what a future
+larger-scale attempt at real structural sparsity will need -- but added
+explicit warnings at both the code comment and
+`docs/research/train_mqar_curriculum.rst` doc-section not to set
+`dense=False` at the current model scale.
+
+`width_scaling_lr_fanin_hypothesis`'s pending test 2 is now reframed:
+test the same "does an absolute, non-width-proportional budget decouple
+LR from width" question via DYNAMIC per-step selection (a fixed
+absolute connection COUNT per step, not a width-proportional fraction)
+instead of a structural weight-existence cap -- not yet designed.

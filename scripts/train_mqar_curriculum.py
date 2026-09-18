@@ -296,9 +296,12 @@ def train_curriculum(
     input_sparsity_p: float | None = None,
     wide_max_weights: int | None = None,
     # See docs/research/train_mqar_curriculum.rst:train_curriculum.dense_was_hardcoded_true
-    # -- was unconditionally True (not a real param) until 2026-09-18; every prior "sparse"
-    # arm in this file's history only ever applied dynamic per-step selection on top of a
-    # fully-connected weight matrix, never genuine structural (max_weights-capped) sparsity.
+    # -- was unconditionally True (not a real param) until 2026-09-18. Leave True at this
+    # model scale: dense=False + a pre-chosen wide_max_weights has repeatedly degenerated
+    # (project_sili_wide_model_mqar_baseline, project_sili_synaptogenesis_pruning_testing
+    # memories) -- not validated as safe until state_width is large enough for a real
+    # fan-in budget (biological target 1000-10000/neuron) to fit without forcing near-full
+    # density anyway.
     dense: bool = True,
     dy_sparsity_p: float | None = None,
     use_tile_cache: bool = False,

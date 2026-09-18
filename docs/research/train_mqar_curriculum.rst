@@ -650,17 +650,39 @@ right effective-LR model is not ``lr(N)`` alone but ``lr(N, gate_density)``
 jointly -- grad-sparsity density trading off against how much the nominal
 LR needs to shrink.
 
+**Correction, 2026-09-18 (same day)**: item 2 as originally written called
+for testing this via a *structural* (``max_weights``-capped) fan-in cap.
+That is a known-bad direction at this model scale, already tried and
+reversed multiple times before this investigation -- see
+``project_sili_wide_model_mqar_baseline`` memory (``dense=False`` + a
+pre-chosen ``max_weights`` budget degenerated to ``per_row=2``, reversed
+back to ``dense=True`` + activation/gradient-only sparsity) and
+``project_sili_synaptogenesis_pruning_testing`` memory (structural
+growth/pruning at this same toy scale produced chance-level accuracy).
+Real biological fan-in (1000-10000 synapses/neuron) doesn't fit inside
+``state_width<=288`` without forcing near-full density anyway. A launched
+width=288 run under this design was killed mid-run once this was caught;
+its launcher scripts were deleted, not left around to be reused by
+accident. Don't re-attempt a pre-chosen structural budget at this scale --
+see ``feedback_check_journal_before_new_mechanism`` (check standing
+guidance before building a new mechanism for a fresh question, not just
+for a fresh failure).
+
 **Not yet confirmed -- pending before this is treated as established**:
 
 1. A third ``(N, peak_lr)`` point (e.g. ``state_width=192`` or a second
    width=288 LR value) to actually pin ``alpha`` instead of bracketing it.
-2. Same width=128-vs-288 comparison on the sparse arm with an *absolute*
-   (non-proportional) fan-in cap at a single fixed ``peak_lr`` -- does it
-   need the same LR cut dense needed, or not.
+2. Same "does an absolute, non-width-proportional budget decouple LR
+   from width" question, but via a mechanism this project has already
+   validated as safe at toy scale -- DYNAMIC per-step selection (e.g. a
+   fixed absolute *count* of active dy/x connections per step, not a
+   fraction of width, and not a static structural weight-existence cap).
+   Not yet designed.
 3. Sweep Arm C's ``dy_time_gate_cutoff`` (gate density) against required
    ``peak_lr`` at fixed width -- does a denser gate (closer to ungated)
    need dense's lower LR, and does a sparser gate tolerate the current,
-   un-scaled ``DEFAULT_PEAK_LR``.
+   un-scaled ``DEFAULT_PEAK_LR``. This is itself dynamic (not structural)
+   sparsity, so no conflict with the correction above.
 
 .. _train_curriculum.dense_was_hardcoded_true:
 
@@ -690,3 +712,15 @@ there was no way to turn `dense` off. `dense: bool = True` is now a real
 parameter (default unchanged, so every existing run/test is unaffected);
 `dense=False` plus an explicit `wide_max_weights` is required to actually
 exercise structural sparsity through this file.
+
+**Do not actually set `dense=False` at this model scale** -- direct
+correction, same day, after a launched width=288 structural-sparsity
+test was caught and killed mid-run. `project_sili_wide_model_mqar_baseline`
+and `project_sili_synaptogenesis_pruning_testing` memories already
+document this exact failure mode repeatedly: a pre-chosen `max_weights`
+budget at toy scale degenerates (`per_row=2`, or chance-level accuracy),
+reversed back to `dense=True` + activation/gradient-only sparsity each
+time it was tried. Real biological fan-in (1000-10000/neuron) doesn't
+fit inside `state_width<=288` without forcing near-full density anyway.
+The parameter exists for when model scale grows enough for a real
+fan-in budget to make sense, not for use now.
