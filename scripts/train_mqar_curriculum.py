@@ -328,6 +328,7 @@ def train_curriculum(
     dy_time_gate_phase_step: float = 0.02,
     dy_time_gate_period_range: tuple[float, float] = (50.0, 200.0),
     dy_time_gate_seed: int | None = None,
+    write_time_aux_targets: bool = False,
     target_steps_per_sec: float | None = None,
     trajectory_log_every: int | None = None,
     trajectory_log_steps: tuple[int, int] | None = None,
@@ -365,6 +366,21 @@ def train_curriculum(
     # that already pass k_first_target explicitly are unaffected either way.
     if k_first_target is not None and k_first_vocab is None:
         k_first_vocab = seq_len_for_k(k_first_target) + 4
+
+    # write_time_aux_targets: OFF by default, per direct instruction --
+    # predict-next-token only makes sense as a training signal if the
+    # next token is actually predictable, and in MQAR's random key/value
+    # layout it structurally isn't (every write position's "next token"
+    # is an unrelated random draw). _build_targets's own fallback
+    # (targets.setdefault(i, tokens[i+1]) for every non-query write
+    # position) mixes that unpredictable signal into every step
+    # alongside the real associative-recall objective. The 2026-09-07
+    # arm_nolevel_down investigation (JOURNAL.md) already found removing
+    # it helped, not hurt (bounded, if anything lower loss) -- this was
+    # previously only ever done via an ad-hoc module-level monkeypatch
+    # (scripts/sandbox_arm_launchers/run_sandbox_dense_probe.py's `_q`),
+    # never kept as a reusable, real parameter until now.
+    build_targets_fn = _build_targets if write_time_aux_targets else (lambda _tok, pairs, _k: dict(pairs))
 
     disldo_cls = PRECISION_CLS[precision]
     # AQRS (additive_rank/dynamic_rank_control) exists to give LOW-BIT
@@ -572,7 +588,7 @@ def train_curriculum(
         new_vocab_query_positions = (
             {pos for pos, _ in mqar_pairs if int(tokens[pos]) in new_key_ids} if new_key_ids else set()
         )
-        targets = _build_targets(tokens, mqar_pairs, k)
+        targets = build_targets_fn(tokens, mqar_pairs, k)
         query_positions = {pos for pos, _ in mqar_pairs}
 
         # [vocab indicator, k indicator]; see docs/research/train_mqar_curriculum.rst:

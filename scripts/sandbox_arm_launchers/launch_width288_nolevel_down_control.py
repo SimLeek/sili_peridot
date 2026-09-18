@@ -1,15 +1,21 @@
 """Direct width-288 replica of the 2026-09-07 `arm_nolevel_down` result
 (JOURNAL.md) that reached vocab=126 at embed_width=16/state_width=128:
-K_START=2 (skip the k=1 shortcut stage) + wrong_streak_threshold
-effectively infinite (LEVEL_DOWN fully disabled -- identified back then
-as the actual blocker, not capacity/architecture/BPTT) + plain dense,
-no sparsity mechanism at all. Never actually run at the current
-300k-param width=288 config -- the existing dense reference used the
-STANDARD curriculum (K_START=1), not this specific fixed one, so it
-isn't a clean apples-to-apples comparison against the historical
-success. Tests directly: does the bigger model reach vocab=126 in a
-comparable or better step count, or is something about this specific
-scaling degenerate, per direct instruction to investigate."""
+all THREE factors that run combined, now matched exactly --
+K_START=2 (skip the k=1 shortcut stage), wrong_streak_threshold
+effectively infinite (LEVEL_DOWN fully disabled), and
+write_time_aux_targets left at its new default False (the historical
+run's "no-aux-loss" ablation -- previously only ever done via an ad-hoc
+monkeypatch, now a real parameter, default-off per direct instruction:
+predict-next-token isn't a meaningful signal when the next token is an
+unrelated random draw, as it structurally is in MQAR's write positions)
+-- plus plain dense, no sparsity mechanism at all. Never actually run
+at the current 300k-param width=288 config before -- the existing
+dense reference used the standard curriculum (K_START=1) and the old
+(now-changed) write_time_aux_targets=True default, so it wasn't a
+clean apples-to-apples comparison against the historical success.
+Tests directly: does the bigger model reach vocab=126 in a comparable
+or better step count, or is something about this specific scaling
+degenerate, per direct instruction to investigate."""
 
 import sys
 
@@ -51,7 +57,8 @@ def log_fn(
 print(
     "# WIDTH-288 REPLICA of the 2026-09-07 arm_nolevel_down success "
     "(embed_width=16 originally reached vocab=126) -- K_START=2, "
-    "wrong_streak_threshold=1e8 (LEVEL_DOWN disabled), plain dense, no "
+    "wrong_streak_threshold=1e8 (LEVEL_DOWN disabled), "
+    "write_time_aux_targets=False (new default), plain dense, no "
     "sparsity mechanism. precision=fp32 max_steps=100000 seed=1000 "
     "embed_width=36 k_first_target=3 NUM_CPUS=4",
     flush=True,
