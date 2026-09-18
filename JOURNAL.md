@@ -9025,3 +9025,21 @@ polling. Once all 11 total runs (5 original + 6 new) have finished or
 clearly plateaued, draw conclusions across the whole
 `width_scaling_lr_fanin_hypothesis` question together -- that was the
 explicit point of building the full set before analyzing any of it.
+
+## 2026-09-18 (cont'd) -- launch_arm_c_plus_knee.py (standard curriculum,
+## K_START=1, margin=0.05) finished: weakest completed result so far
+
+Ran the full 100k-step budget (48,301s, ~13.4h, steps/sec=2.07 --
+arch-sandbox 4-way contended). Reached `vocab=32, k=1` at step 6,848
+and then went completely flat for the remaining 93,152 steps -- no
+further LEVEL_UP at all, unlike the width=288 dense arms' stalls which
+at least held a harder milestone (k=3). This is the weakest completed
+result in this whole investigation. Predates the LR fix (peak_lr=0.015
+unscaled) -- worth a rerun at peak_lr~=0.01 once the current queue
+clears, per the same width-scaling finding that resolved dense.
+
+Launched `launch_dy_fixed_count_width288.py` into the freed
+arch-sandbox slot (queue item 2). 3 arch-sandbox Arm C+knee variants
+and 2 local runs (alpha1-LR test, dy_fixed_count width=128) still in
+flight; 4 items remain queued (test 2's already-launched width=288 run
+was item 2, so items 3-6 -- the Arm C gate-density grid -- are next).
