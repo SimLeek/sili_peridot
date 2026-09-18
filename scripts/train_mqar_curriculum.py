@@ -329,6 +329,7 @@ def train_curriculum(
     dy_time_gate_period_range: tuple[float, float] = (50.0, 200.0),
     dy_time_gate_seed: int | None = None,
     write_time_aux_targets: bool = False,
+    max_grad_norm: float | None = None,
     target_steps_per_sec: float | None = None,
     trajectory_log_every: int | None = None,
     trajectory_log_steps: tuple[int, int] | None = None,
@@ -381,6 +382,20 @@ def train_curriculum(
     # (scripts/sandbox_arm_launchers/run_sandbox_dense_probe.py's `_q`),
     # never kept as a reusable, real parameter until now.
     build_targets_fn = _build_targets if write_time_aux_targets else (lambda _tok, pairs, _k: dict(pairs))
+
+    # max_grad_norm: None -> MAX_GRAD_NORM (the module default, 1.0),
+    # matching every existing caller's behavior unchanged. clip_grad_norm_
+    # is a GLOBAL L2 norm across every parameter tensor combined, never
+    # scaled by parameter count -- as width grows, q/k/v/o_proj's own
+    # parameter count grows with state_width^2, so the natural (pre-clip)
+    # norm grows roughly with sqrt(param count) even at unchanged
+    # per-parameter gradient magnitudes. A fixed max_norm tuned at one
+    # width clips increasingly aggressively at a wider one, silently
+    # shrinking the effective step size below what was calibrated for the
+    # narrower model. Exposed here (real parameter, not a monkeypatch --
+    # see write_time_aux_targets's own history) to test that hypothesis
+    # directly, per direct instruction.
+    effective_max_grad_norm = MAX_GRAD_NORM if max_grad_norm is None else max_grad_norm
 
     disldo_cls = PRECISION_CLS[precision]
     # AQRS (additive_rank/dynamic_rank_control) exists to give LOW-BIT
@@ -688,7 +703,7 @@ def train_curriculum(
                 if sigma_grad_debug_fn is not None:
                     # Fired before clip_grad_norm_; see ema_grad_scale_per_tensor anchor.
                     sigma_grad_debug_fn(step, model.log_sigmas.grad, model.centers.grad)
-                clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
+                clip_grad_norm_(model.parameters_for_optimizer(), effective_max_grad_norm)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
                 # See docs/research/train_mqar_curriculum.rst:
                 # train_curriculum.l2_decay_and_rank_control_ordering.
