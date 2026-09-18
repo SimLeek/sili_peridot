@@ -880,3 +880,60 @@ yet before sequence start" behavior (``input_proj``/``k_proj``/``v_proj``
 have no bias term, so a zero raw embedding really does propagate to an
 exact zero k/v row, not an approximation). Reset to None/[] at the start of
 each new training sequence, same as ``memory_prev`` gets reset to zeros.
+
+.. _per_layer_learning_rate_polyak:
+
+``layer_lr_override``/``apply_polyak_lr``: per-layer dynamic LR
+-------------------------------------------------------------------------------
+
+*ID:* ``per_layer_learning_rate_polyak``
+
+2026-09-18. Direct motivation: several full 100k-step runs were needed
+just to bracket a good ``peak_lr`` by hand for the width-scaling
+degeneracy investigation (see ``train_mqar_curriculum.rst:
+train_curriculum.width_scaling_lr_fanin_hypothesis``). Researched
+task-agnostic dynamic-LR methods (D-Adaptation/Prodigy need a distance-
+to-solution estimate that's ungrounded for a real task we don't know
+the answer to ahead of time; hypergradient descent needs consecutive-
+step gradient VECTORS, which would mean exposing per-synapse detail --
+too much; the Stochastic Polyak Step-size only needs the loss and a
+gradient-energy scalar, both cheap and already close to hand) -- direct
+instruction: Polyak, applied per-layer directly (not layered under a
+separate per-layer mechanism like trust ratio, which needs a weight
+norm -- "still kind of ridiculous" as a step-size signal, and is its
+own extra cost).
+
+``_timed_call`` (this file) already captures ``_out.grad`` -- the exact
+``dy`` a layer's own backward consumes -- for every wide-layer call,
+previously only used to update ``self._layer_surprise[name]`` (E_t/Lbar)
+when ``dy_surprise_alpha`` was set. Now UNCONDITIONAL (cheap,
+``sum(dy**2)`` over an already-realized array -- same "always track the
+diagnostic" precedent as the knee-elbow tracker in ``_to_sparse``), so
+``apply_polyak_lr`` has a real per-layer gradient-energy signal for
+free, no new engine hook needed on this side (a parallel, independent
+hook was ALSO added on ``sili__new``'s ``DISLDOLayer32`` --
+``disldo_layer_forward.last_grad_norm_sq_polyak_hook`` -- for callers
+that don't go through ``_timed_call``; this file's own training loop
+uses the simpler already-existing ``_layer_surprise`` path instead).
+
+``self.layer_lr_override: dict`` (empty by default) is checked FIRST in
+``_timed_layer_forward``, ahead of whatever scalar ``learning_rate`` was
+passed in -- only the 5 wide layers go through that method (lm_head/
+critic_head never see a per-layer override, matches ``dy_r_target``'s
+own scope exactly). ``apply_polyak_lr(loss, f_star, c, lr_max,
+bootstrap_lr)`` computes ``lr_layer = min(lr_max, c * max(loss-f_star,
+0) / E_t_layer)`` per wide layer and populates this dict -- one step
+LAGGED (uses last step's loss and last backward's E_t, same convention
+as ``_effective_dy_r_target``, unavoidable since a layer's own
+``learning_rate`` has to be fixed before its forward+backward call
+that WOULD produce this step's own E_t).
+
+TODO, not yet built (direct instruction, deferred as real extra work):
+a PER-NEURON version (one Polyak lr per row of a layer's weight
+matrix, not one per whole layer) -- structural sparsity
+(``max_weights``) and gradient sparsity (nucleus top-k,
+``dy_gate_mask``) both act ROW-WISE, so a layer-wide scalar smears
+together neurons with very different realized fan-in/update frequency
+this step in a way per-neuron wouldn't. Revisit if per-layer doesn't
+adapt well, or as its own later test -- per-layer is the first thing
+to try.

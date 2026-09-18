@@ -347,6 +347,18 @@ def train_curriculum(
     r_target_min: float = 0.05,
     use_energy: bool = False,
     energy_kwargs: dict | None = None,
+    # See docs/research/train_mqar_curriculum.rst:train_curriculum.lr_override_fn_range_test
+    # -- bypasses the warmup/accuracy-decay schedule below entirely when set: lr = lr_override_fn(step).
+    lr_override_fn=None,
+    # See docs/research/train_mqar_curriculum.rst:polyak_lr_f_star_assumption -- per-layer
+    # Stochastic-Polyak-Step-size, replacing lr for the 5 wide layers only (lm_head/embed
+    # unaffected). False (default): byte-identical to today's exact behavior.
+    polyak_lr: bool = False,
+    polyak_f_star: float = 0.0,
+    polyak_c: float = 0.5,
+    # 0.1: comfortably above the range test's found sweet spot (~0.01-0.057
+    # at width=288) without reaching its found instability regime (~0.1-0.32).
+    polyak_lr_max: float = 0.1,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -587,13 +599,27 @@ def train_curriculum(
     while step < max_steps:
         step += 1
         stage_step += 1
-        if step <= WARMUP_STEPS:
+        if lr_override_fn is not None:
+            lr = lr_override_fn(step)
+        elif step <= WARMUP_STEPS:
             lr = peak_lr * step / WARMUP_STEPS
         elif acc_ema is None:
             lr = peak_lr
         else:
             frac = max(MIN_LR_FRAC, min(1.0, 1.0 - acc_ema))
             lr = peak_lr * frac
+
+        if polyak_lr:
+            # See docs/research/train_mqar_curriculum.rst:polyak_lr_f_star_assumption
+            # -- lagged one step (uses last outer step's loss_ema + each wide layer's
+            # E_t from its own last backward call), same granularity as lr itself.
+            model.apply_polyak_lr(
+                loss_ema if loss_ema is not None else 0.0,
+                f_star=polyak_f_star,
+                c=polyak_c,
+                lr_max=polyak_lr_max,
+                bootstrap_lr=lr,
+            )
 
         vocab_size, k, phase = _current()
         seq_len = seq_len_for_k(k)

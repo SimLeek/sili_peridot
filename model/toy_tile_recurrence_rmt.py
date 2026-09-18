@@ -239,6 +239,10 @@ class ToyTileRecurrenceRMT:
         self.dy_surprise_alpha = dy_surprise_alpha
         self.dy_surprise_beta = dy_surprise_beta
         self._layer_surprise: dict = {}
+        # Per-layer LR override for apply_polyak_lr, below. Empty (default):
+        # byte-identical to today's exact behavior -- see
+        # docs/research/toy_tile_recurrence_rmt.rst:per_layer_learning_rate_polyak.
+        self.layer_lr_override: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:sparsity_phase6_design.
         self.output_dy_sparsity_p = output_dy_sparsity_p
         self._output_extra_kwargs = {"dy_sparsity_p": output_dy_sparsity_p} if output_dy_sparsity_p is not None else {}
@@ -446,17 +450,31 @@ class ToyTileRecurrenceRMT:
                 _orig()
                 _rec["bwd_s"] += time.perf_counter() - tb0
                 _rec["bwd_calls"] += 1
-                if self.dy_surprise_alpha is not None and _out.grad is not None:
+                # Always tracked (not gated on dy_surprise_alpha) -- also the
+                # per-layer gradient-energy signal for Polyak-style dynamic
+                # LR (docs/research/toy_tile_recurrence_rmt.rst:
+                # per_layer_learning_rate_polyak), same "cheap, always on"
+                # precedent as the knee-elbow diagnostic in _to_sparse.
+                if _out.grad is not None:
                     self._update_layer_surprise(_name, _out.grad)
 
             out._backward = _timed_backward
         return out
 
-    def _timed_layer_forward(self, layer, layer_name: str, *args, **kwargs) -> Tensor:
+    def _timed_layer_forward(self, layer, layer_name: str, x, learning_rate, *args, **kwargs) -> Tensor:
         """Real per-layer forward+backward timing, and the task #374
-        surprise-signal capture point. See
+        surprise-signal capture point. self.layer_lr_override (task #? --
+        see docs/research/toy_tile_recurrence_rmt.rst:
+        per_layer_learning_rate_polyak), when it has an entry for
+        layer_name, OVERRIDES the passed-in learning_rate for THIS layer
+        only -- empty dict (default): byte-identical to today's exact
+        behavior, same as every other conditional kwarg here. lm_head/
+        critic_head calls don't go through this method, so per-layer
+        overrides never reach them (mirrors self.dy_r_target's own
+        wide-layers-only scope). See
         docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
-        return self._timed_call(layer_name, layer.forward, *args, **kwargs)
+        lr = self.layer_lr_override.get(layer_name, learning_rate) if self.layer_lr_override else learning_rate
+        return self._timed_call(layer_name, layer.forward, x, lr, *args, **kwargs)
 
     def reset_layer_timing(self) -> None:
         """Zero self._layer_timing -- call at the start of a measurement
@@ -594,6 +612,51 @@ class ToyTileRecurrenceRMT:
                 current = min(r_max, current * up_factor)
             self.x_r_target[name] = current
             updated[name] = current
+        return updated
+
+    def apply_polyak_lr(
+        self,
+        loss: float,
+        f_star: float = 0.0,
+        c: float = 0.5,
+        lr_max: float = 1.0,
+        bootstrap_lr: float = 0.01,
+    ) -> dict:
+        """Per-layer Stochastic-Polyak-Step-size (SPS_max variant):
+        lr_layer = min(lr_max, c * max(loss - f_star, 0) / E_t_layer),
+        using each wide layer's OWN gradient energy (self._layer_surprise
+        [name]["E_t"], task #374's always-tracked sum(dy**2) -- see
+        _timed_call) -- same global loss, per-layer denominator, one step
+        lagged (this step's E_t was measured on last step's backward, same
+        lag convention as _effective_dy_r_target). f_star=0 assumed (SPS_max
+        -- see docs/research/train_mqar_curriculum.rst:
+        polyak_lr_f_star_assumption for why that's reasonable here, not
+        the more involved online-estimated variant). c<1 is SPS's usual
+        damping safety factor; lr_max caps runaway values from a
+        near-zero E_t (e.g. before any backward pass has run for a layer).
+        bootstrap_lr: used for any layer with no E_t yet.
+
+        TODO, not yet built: PER-NEURON Polyak (one lr per row of a
+        layer, not one per layer) -- structural/grad sparsity act
+        row-wise already, so this per-layer version can't adapt to a
+        layer whose neurons have very different realized fan-in/update
+        frequency this step. Real extra work (needs the per-row E_t
+        version of this same hook, see sili__new's
+        disldo_layer_forward.last_grad_norm_sq_polyak_hook TODO) -- try
+        per-layer first, revisit if it doesn't adapt well.
+
+        Sets self.layer_lr_override (consumed by _timed_layer_forward
+        for the 5 wide layers only, never lm_head/critic_head) and
+        returns it. See
+        docs/research/toy_tile_recurrence_rmt.rst:
+        per_layer_learning_rate_polyak."""
+        residual = max(loss - f_star, 0.0)
+        updated = {}
+        for name in self._WIDE_LAYER_NAMES:
+            e_t = self._layer_surprise.get(name, {}).get("E_t")
+            lr = bootstrap_lr if not e_t else min(lr_max, c * residual / e_t)
+            self.layer_lr_override[name] = lr
+            updated[name] = lr
         return updated
 
     def apply_cross_layer_budget_allocator(

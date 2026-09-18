@@ -744,3 +744,44 @@ time it was tried. Real biological fan-in (1000-10000/neuron) doesn't
 fit inside `state_width<=288` without forcing near-full density anyway.
 The parameter exists for when model scale grows enough for a real
 fan-in budget to make sense, not for use now.
+
+.. _train_curriculum.lr_override_fn_range_test:
+
+``lr_override_fn``: bypass hook for the LR range test
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.lr_override_fn_range_test``
+
+2026-09-18, built for ``scripts/lr_range_test.py`` in response to
+``train_curriculum.width_scaling_lr_fanin_hypothesis`` needing several
+full 100k-step runs just to bracket a good ``peak_lr`` by hand. A
+callback ``lr_override_fn(step) -> float``, checked FIRST in the LR
+block (ahead of warmup and the accuracy-decay schedule) -- when set,
+this file's own peak_lr/warmup/accuracy-based LR schedule is skipped
+entirely for the whole run, letting a caller impose an arbitrary
+per-step LR (an exponential ramp, for the range test's purposes)
+without needing to fork or reimplement any of this file's training
+loop, curriculum, logging, or model-construction logic. ``None``
+(default): zero behavior change for every existing caller.
+
+.. _train_curriculum.polyak_lr_f_star_assumption:
+
+``polyak_lr``/``polyak_f_star``: why ``f_star=0`` is reasonable here
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.polyak_lr_f_star_assumption``
+
+Per-layer Stochastic-Polyak-Step-size (SPS_max variant -- see
+``model/toy_tile_recurrence_rmt.rst:per_layer_learning_rate_polyak`` for
+the full mechanism). ``f_star`` is Polyak's assumed optimal/floor loss
+value -- the classic SPS_max trick is to just assume ``f_star=0`` rather
+than estimate it online. That's a reasonable assumption specifically
+for this task: MQAR's per-query cross-entropy loss has a genuine near-0
+floor (a solvable deterministic key->value mapping), and
+``write_time_aux_targets=False`` (this file's own default, see that
+parameter's own history) already removed the one source of structurally
+irreducible loss at non-query write positions ("predict next token"
+when the next token in MQAR's random layout isn't actually
+predictable). A more involved online-estimated ``f_star`` (parameter-
+free Polyak, Abdukhakimov et al. 2025) exists in the literature for
+tasks where 0 isn't a reasonable floor -- not needed here, not built.
