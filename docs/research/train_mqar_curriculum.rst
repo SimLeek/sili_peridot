@@ -785,3 +785,50 @@ when the next token in MQAR's random layout isn't actually
 predictable). A more involved online-estimated ``f_star`` (parameter-
 free Polyak, Abdukhakimov et al. 2025) exists in the literature for
 tasks where 0 isn't a reasonable floor -- not needed here, not built.
+
+.. _armc_gate_density_lr_equation:
+
+Arm C gate-density LR compensation: candidate equation
+-------------------------------------------------------------------------------
+
+*ID:* ``armc_gate_density_lr_equation``
+
+2026-09-18, direct request to work out an equation relating Arm C's
+gate density ``p`` (fraction of steps a given neuron is trainable) to
+its needed ``peak_lr``, and test the predicted steps-to-milestone
+against dense's own. Arm C doesn't change how STRONG an update is when
+a neuron fires, only how OFTEN -- two effects both point toward
+scaling ``lr`` up as ``p`` shrinks: (1) frequency dilution -- a neuron
+sees ``~p*T`` update events over ``T`` steps instead of ``T``, so
+matching dense's cumulative movement in the same budget needs each
+event proportionally bigger; (2) stability headroom -- the width-
+scaling law's instability comes from ALL neurons moving coherently on
+the same step (train_curriculum.width_scaling_lr_fanin_hypothesis's
+``lr ~ 1/N``); at density ``p`` only ``p*N`` move at once, so a larger
+``lr`` should be tolerable before hitting the same instability.
+
+**Naive candidate**: ``lr_armc(p) = lr_dense_optimal / p``. Bracketed
+against the milder ``lr_dense_optimal / sqrt(p)``, same caution as the
+width-scaling law's own alpha=1.0-vs-0.5 finding (the "theoretically
+justified" stronger exponent came back WORSE than the milder one
+there -- don't assume 1/p is right just because the derivation sounds
+clean).
+
+Two launchers at ``cutoff=0.3`` (``p~=0.403``, same cutoff as
+``launch_dense_forward_arm_c_backward.py``):
+``launch_armc_lr_scaled_invp.py`` (``peak_lr~=0.0248``),
+``launch_armc_lr_scaled_invsqrtp.py`` (``peak_lr~=0.0158``). Direct
+comparison point: dense's own record is ``vocab=126/k=3`` at step
+13,601 (``peak_lr=0.01``, see ``MQAR_LEADERBOARD.md``) -- does either
+compensation formula close the gap to a comparable step count, or is
+Arm C's own dynamics (see ``project_dense_vs_sparse_mqar_confusion_
+matrix`` memory -- won the confusion-matrix arm despite the LOWEST
+gradient-energy retention of any row) enough on its own that
+compensation isn't even the right frame.
+
+The UNCOMPENSATED comparison (same nominal ``peak_lr`` as dense, not
+scaled by ``p``) is already covered by test 3's grid
+(``launch_armc_gatemid_lr_unscaled.py`` etc.) -- this is specifically
+the compensated/equation-driven version, isolating whether the formula
+itself closes the gap rather than just observing that SOME lr works
+better than another.
