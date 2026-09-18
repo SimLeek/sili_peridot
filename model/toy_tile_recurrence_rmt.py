@@ -56,6 +56,10 @@ class ToyTileRecurrenceRMT:
         x_balance_bias_step: float | None = None,
         x_balance_loss_coef: float = 0.0,
         x_balance_freq_beta: float = 0.99,
+        dy_time_gate_cutoff: float | None = None,
+        dy_time_gate_phase_step: float = 0.02,
+        dy_time_gate_period_range: tuple[float, float] = (50.0, 200.0),
+        dy_time_gate_seed: int | None = None,
         r_target_min: float = 0.05,
         use_energy: bool = False,
         energy_kwargs: dict | None = None,
@@ -95,6 +99,22 @@ class ToyTileRecurrenceRMT:
             project_sparsity_floor_generalization_scoping.md's 2026-09-11
             entries for the full design rationale and MoE/biology
             precedent research.
+        dy_time_gate_cutoff, dy_time_gate_phase_step, dy_time_gate_period_range,
+        dy_time_gate_seed: Arm C -- pure time-division fairness on the
+            BACKWARD/dy axis, independent of any measured signal.
+            gate_j(t) = sin(2*pi*t/period_j + phase_j(t)) > cutoff decides
+            whether neuron j's incoming weights are updated THIS step.
+            phase_j(t) = phase_j(t-1) + N(0, phase_step) is a slow random
+            WALK (added before the sine, not a fixed deterministic phase)
+            so the co-active neuron set never exactly repeats. period_j is
+            drawn once per neuron, uniform in period_range. cutoff is the
+            single tunable density knob (higher = fewer neurons trainable
+            per step) -- the time-axis analog of dy_r_target's density
+            setpoint. No-op unless dy_time_gate_cutoff is set; mutually
+            exclusive with dy_r_target/dy_sparsity_p when active (takes
+            priority, see sili's DISLDOLayer32.forward dy_gate_mask).
+            Requires disldo_cls to support dy_gate_mask (DISLDOLayer32
+            only, currently).
         r_target_min: floor the amortized closed-loop controllers
             (apply_amortized_dy_r_target_control/apply_amortized_
             x_r_target_control/apply_cross_layer_budget_allocator) ratchet
@@ -148,6 +168,14 @@ class ToyTileRecurrenceRMT:
         self._x_balance_bias: dict = {}  # layer_name -> np.float32[n_in], Arm B
         self._x_balance_freq: dict = {}  # layer_name -> np.float32[n_in], Arm A
         self._balance_aux_loss: Tensor | None = None
+        # See __init__'s own dy_time_gate_* docstring (Arm C).
+        self.dy_time_gate_cutoff = dy_time_gate_cutoff
+        self.dy_time_gate_phase_step = dy_time_gate_phase_step
+        self.dy_time_gate_period_range = dy_time_gate_period_range
+        self._dy_time_gate_rng = np.random.default_rng(dy_time_gate_seed)
+        self._dy_time_gate_phase: dict = {}  # layer_name -> np.float64[n_out]
+        self._dy_time_gate_period: dict = {}  # layer_name -> np.float64[n_out]
+        self._dy_time_gate_t = 0
         # See docs/research/toy_tile_recurrence_rmt.rst:input_selection_stats_design.
         self.last_input_selection: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
@@ -417,11 +445,36 @@ class ToyTileRecurrenceRMT:
         r_t = r_bar * (ratio**self.dy_surprise_alpha)
         return min(max(r_t, self.r_target_min), 0.99)
 
+    def _dy_time_gate(self, layer_name: str) -> np.ndarray | None:
+        """Arm C: gate_j(t) = sin(2*pi*t/period_j + phase_j(t)) > cutoff.
+        phase_j(t) = phase_j(t-1) + N(0, phase_step), added BEFORE the
+        sine each call -- a slow per-neuron random WALK, not a fixed
+        deterministic phase, so the co-active neuron set never exactly
+        repeats. period_j is drawn once per neuron (uniform in
+        dy_time_gate_period_range) and held fixed. No-op (returns None)
+        unless dy_time_gate_cutoff is set. See __init__'s own docstring."""
+        if self.dy_time_gate_cutoff is None:
+            return None
+        n_out = getattr(self, layer_name).out_features
+        phase = self._dy_time_gate_phase.get(layer_name)
+        if phase is None:
+            phase = self._dy_time_gate_rng.uniform(0.0, 2 * np.pi, size=n_out)
+            lo, hi = self.dy_time_gate_period_range
+            self._dy_time_gate_period[layer_name] = self._dy_time_gate_rng.uniform(lo, hi, size=n_out)
+        phase = phase + self._dy_time_gate_rng.normal(0.0, self.dy_time_gate_phase_step, size=n_out)
+        self._dy_time_gate_phase[layer_name] = phase
+        period = self._dy_time_gate_period[layer_name]
+        value = np.sin(2 * np.pi * self._dy_time_gate_t / period + phase)
+        return value > self.dy_time_gate_cutoff
+
     def _wide_extra_kwargs(self, layer_name: str) -> dict:
         """Extra kwargs for ONE of the 5 affected layers' forward() calls;
         layer_name must be one of _WIDE_LAYER_NAMES. Live (not cached) since
         self.dy_r_target[name] is mutable post-construction. See
         docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design."""
+        gate = self._dy_time_gate(layer_name)
+        if gate is not None:
+            return {"dy_gate_mask": gate}
         r_target = self._effective_dy_r_target(layer_name)
         if r_target is not None:
             kw = {"dy_r_target": r_target}
@@ -844,6 +897,7 @@ class ToyTileRecurrenceRMT:
         n_mem, n_content = self.num_memory_slots, self.num_tiles
         self._energy_aux_loss = None  # see _apply_energy's own docstring
         self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
+        self._dy_time_gate_t += 1  # see _dy_time_gate's own docstring (Arm C)
 
         if content_dy_sparsity_schedule is not None:
             if len(content_dy_sparsity_schedule) != n_content:
