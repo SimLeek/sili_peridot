@@ -8619,3 +8619,109 @@ point on quality sweeps and instead prioritize the deterministic
 engine/hardware-level optimizations first (making each future test run
 in seconds rather than hours), then return to this floor sweep once
 iteration is cheap. See [[feedback_prioritize_deterministic_speedups_before_sweeps]].
+
+## Dense-vs-sparse MQAR at ~300k params: confusion matrix (mechanism x failure mode), Arm C early win
+--------------------------------------------------------------------
+
+Resumed after the engine speedups above landed. Direct instruction:
+stop asking "does sparse match dense in the SAME step count" and ask
+whether sparse EVENTUALLY matches dense within some *bounded, finite*
+extra time/compute -- and separate the FORWARD (`x_r_target`, input-axis
+top-k) and BACKWARD (`dy_r_target`, gradient-axis top-k) mechanisms
+instead of treating "sparse" as one combined condition. Full design in
+the (uncommitted, local) plan file; summarizing the results here.
+
+**Real dense reference, real kernel.** `DIDLDOLayer32` (Group B,
+`_cpu.DIDLDOLayerV`, dense weight storage) wired into
+`train_mqar_curriculum.py` as a new `"fp32_dense"` precision -- the
+existing `DISLDOLayer32(dense=True)` "dense" arm was still Group A
+(sparse/block4-capable) storage, just densely initialized, not the real
+dense engine. No compatibility shim needed in sili__new:
+`train_curriculum` already zeroes `additive_rank`/`dynamic_rank_control`
+for `precision=="fp32"` (AQRS has nothing to correct at full precision)
+and `_wide_extra_kwargs` already omits sparsity kwargs when unset --
+both just needed extending to cover `"fp32_dense"` too. Confirmed at
+200/3000 steps: same peak (vocab=16, k=3) as the old dense=True
+reference at the same seed, 1.56x faster (7.69 vs 4.92 steps/sec).
+
+**Real dense reference, full run (arch-sandbox, 100k steps, in
+progress)**: as of step 76,250/100,000, STILL STUCK at k=3, unchanged
+since step 2294 (max_streak bouncing 2-4/10, never hitting 10) -- 74k+
+steps with zero further progress. This is a significant finding on its
+own, independent of sparsity: even the fully-dense reference isn't
+cleanly progressing past k=3 at this width/curriculum/seed config within
+a very large budget. Reframes how to read every sparse-arm number below
+-- there may be a real wall in this specific config (width=288,
+embed_width=36, k_first_target=3, seed=1000) that has nothing to do with
+sparsity at all. Not yet resolved; run still going.
+
+**Confusion matrix: mechanism x failure mode, not axis x axis.**
+Corrected mid-design after direct pushback: the question isn't "which
+axis (forward/backward) is responsible" -- both independently hurt
+learning already, established by prior work (r_target_min cliff, etc.).
+The real question is which of several candidate FIX mechanisms
+addresses which of two distinct failure modes:
+- **Mode 1, input starvation**: a forward-axis dim whose activation is
+  rare/small enough that `x_r_target` top-k almost never selects it --
+  no output flows through it, so no gradient can reach it at all.
+- **Mode 2, grad signal insufficiency**: a dim IS selected on forward,
+  but `dy_r_target` top-k keeps too little of its gradient for the
+  update to be a useful learning signal.
+
+Measured via `scripts/sandbox_arm_launchers/confusion_matrix_diagnostic.py`,
+5 rows, 3000 steps each, same seed=1000, `x_r_target=dy_r_target=0.9`,
+`r_target_min=0.3` (baseline row has no balancing mechanism at all --
+"baseline" here means plain magnitude top-k on BOTH axes, NOT the dense
+arm above):
+
+| Mechanism | Peak k (3000 steps) | Mode 1 (dead dims, q/k/v_proj) | Mode 2 (mean R retained) |
+|---|---|---|---|
+| baseline (plain magnitude top-k, both axes) | 2 | 38-40% | ~0.90 |
+| Arm A (`x_balance_loss_coef`, forward aux loss) | 1 | 3.5-6% | ~0.90 |
+| Arm B (`x_balance_bias_step`, forward bias-free) | 1 | 0% | ~0.90 |
+| Arm C (sine-wave time-gate, backward axis) | **3** | ~20% | 0.35-0.47 |
+| Arm A + Arm C | 2 | 0.7-2.8% | 0.42-0.48 |
+
+**Real, unexpected result**: Arm A and Arm B dramatically fixed mode 1
+(baseline's 38-40% dead dims down to near-zero) but scored WORSE on
+final outcome than baseline (k=1 vs k=2) at this short budget -- fixing
+the diagnosed failure mode did not translate into better task
+performance here, contradicting the simple "starvation is the
+bottleneck, fix it and outcome improves" story. Arm C, despite the
+LOWEST gradient-energy retention of any row (throws away the most raw
+backward signal), reached the best outcome (k=3). One seed, one short
+(3000-step) run per row -- could well be noise, not yet a settled
+result; needs more seeds/longer budgets before trusting the ranking,
+but a real, mechanistically-interesting early signal, especially
+alongside the dense reference's own stall above.
+
+**Arm C design** (`dy_time_gate_cutoff`/`_phase_step`/`_period_range` on
+`ToyTileRecurrenceRMT`, `dy_gate_mask` hook on sili__new's
+`DISLDOLayer32.forward`): per-neuron `gate_j(t) = sin(2*pi*t/period_j +
+phase_j(t)) > cutoff` decides whether neuron j's incoming weights update
+this step -- independent of any measured signal. `phase_j(t) =
+phase_j(t-1) + N(0, phase_step)` is a slow random WALK (noise added
+BEFORE the sine, not a fixed deterministic phase) so the co-active
+neuron set never exactly repeats; `period_j` drawn once per neuron.
+`cutoff` is the single tunable density knob. Guarantees every neuron
+periodically gets a training turn BY CONSTRUCTION, sidestepping the
+self-reinforcement failure mode magnitude-only selection can hit (loud
+dims keep winning, quiet ones never prove they'd be useful) -- distinct
+from Arms A/B, which still ultimately rank by some signal.
+
+**Stated prediction, recorded before this result** (see plan file):
+magnitude-based selection should learn faster early (grabs the most
+informative signal first) but risks a ceiling; Arm C should be slower
+to start but keep closing the gap, with no analogous ceiling, since
+coverage is guaranteed by construction. What actually happened: Arm C
+was already AHEAD at step 3000, not slower -- the "no ceiling" half of
+the prediction looks right so far, the "slower start" half doesn't (at
+least not at this budget/seed). Needs more data before treating either
+half as confirmed.
+
+**Not yet done**: more seeds (this is one seed per row); longer budgets
+(3000 steps is short); resolving whether the dense reference's own k=3
+stall is a real wall in this config or will eventually clear given
+enough of its 100k-step budget; the bounded-budget confirmatory run
+(Arm C or Arm C variant at a real multiple of the dense reference's
+step count) the plan's final answer depends on.
