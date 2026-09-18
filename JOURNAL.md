@@ -8983,3 +8983,45 @@ test the same "does an absolute, non-width-proportional budget decouple
 LR from width" question via DYNAMIC per-step selection (a fixed
 absolute connection COUNT per step, not a width-proportional fraction)
 instead of a structural weight-existence cap -- not yet designed.
+
+## 2026-09-18 (cont'd) -- built and queued the redesigned test 2 + test 3
+
+Built both remaining tests from `width_scaling_lr_fanin_hypothesis`'s
+pending list, per direct instruction ("build those and queue them up.
+We want to be able to draw conclusions once all the tests are done").
+
+**Test 2 (redesigned, dynamic not structural)**: `dy_k_min=dy_k_max=64`
+forces an absolute per-step backward-selection count regardless of
+width (clamps the nucleus top-k's result past whatever `dy_r_target`
+would pick), `dense=True` kept at its default -- structural
+connectivity untouched, the mechanism validated as safe at this scale.
+`launch_dy_fixed_count_width128.py` / `launch_dy_fixed_count_width288.py`,
+both unscaled `peak_lr=0.015`.
+
+**Test 3**: 2x2 grid, Arm C `dy_time_gate_cutoff` in {0.0 (~50%
+density), 0.6 (~29.5% density)} x `peak_lr` in {0.015 unscaled, 0.01
+scaled}, width=288, dense forward. `launch_armc_gatemid_lr_unscaled.py`
+/ `launch_armc_gatemid_lr_scaled.py` /
+`launch_armc_gatesparse_lr_unscaled.py` /
+`launch_armc_gatesparse_lr_scaled.py`.
+
+All 6 smoke-tested, full pytest green, committed (`4c378fc`).
+
+**Queue** (6 new runs, on top of the 5 already in flight: 1 local
+alpha1-LR test + 4 arch-sandbox Arm C+knee variants). Local has one
+free 4-core slot right now; arch-sandbox is full (16/16). Launch order,
+by informativeness first / cheap-and-fast-to-free-a-slot second:
+
+1. `launch_dy_fixed_count_width128.py` -- LAUNCHED locally (this entry).
+2. `launch_dy_fixed_count_width288.py`
+3. `launch_armc_gatemid_lr_unscaled.py`
+4. `launch_armc_gatemid_lr_scaled.py`
+5. `launch_armc_gatesparse_lr_unscaled.py`
+6. `launch_armc_gatesparse_lr_scaled.py`
+
+Launch each remaining one (in this order) into whichever machine frees
+a slot next, tracked via Monitor completion notifications rather than
+polling. Once all 11 total runs (5 original + 6 new) have finished or
+clearly plateaued, draw conclusions across the whole
+`width_scaling_lr_fanin_hypothesis` question together -- that was the
+explicit point of building the full set before analyzing any of it.
