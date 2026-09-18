@@ -1,0 +1,17 @@
+seed=2000 (1/12) det=0.8667 stoch=0.8667
+seed=2001 (2/12) det=0.5333 stoch=0.4667
+seed=2002 (3/12) det=0.7667 stoch=0.7667
+seed=2003 (4/12) det=0.9333 stoch=0.9333
+seed=2004 (5/12) det=0.9333 stoch=0.9000
+seed=2005 (6/12) det=0.8000 stoch=0.8333
+seed=2006 (7/12) det=0.7000 stoch=0.7000
+seed=2007 (8/12) det=0.7333 stoch=0.7000
+seed=2008 (9/12) det=0.6667 stoch=0.6667
+seed=2009 (10/12) det=0.7333 stoch=0.7000
+seed=2010 (11/12) det=0.7667 stoch=0.8000
+seed=2011 (12/12) det=0.6000 stoch=0.6333
+
+n_seeds=12 state_width=512
+det:    mean=0.7528 std=0.1218 sem=0.0352
+stoch:  mean=0.7472 std=0.1306 sem=0.0377
+gap (det-stoch): mean=0.0056 paired_sem=0.0090 paired_t=0.62

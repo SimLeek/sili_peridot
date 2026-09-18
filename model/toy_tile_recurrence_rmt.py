@@ -616,12 +616,16 @@ class ToyTileRecurrenceRMT:
     def report_ranks(self) -> dict:
         """{layer_name: (scale_rank, additive_rank)} for every real layer
         with a C++ backend -- the answer to "what best rank numbers does
-        dynamic control end up with" (task #292)."""
+        dynamic control end up with" (task #292). additive_rank reads 0
+        for backends without AQRS's additive branch (e.g. DISLDOLayerV/
+        fp32) rather than crashing -- get_scale_rank alone doesn't imply
+        get_additive_rank exists."""
         results = {}
         for name, layer in self._named_real_layers():
             c = getattr(layer, "_c", None)
             if c is not None and hasattr(c, "get_scale_rank"):
-                results[name] = (c.get_scale_rank(), c.get_additive_rank())
+                additive_rank = c.get_additive_rank() if hasattr(c, "get_additive_rank") else 0
+                results[name] = (c.get_scale_rank(), additive_rank)
         return results
 
     def _apply_energy(self, x: Tensor, region: str) -> Tensor:

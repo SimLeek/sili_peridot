@@ -1,0 +1,48 @@
+# Calibrated MQAR sweep, seed=1000, plan=[(2, 50000, 5000), (4, 20000, 2000), (8, 7000, 700)]
+K=1 (reused from prior calibration run): {'num_kv_pairs': 1, 'seq_len': 4, 'acc': 0.16666666666666666, 'elapsed_s': 8103.2, 'note': "reused from mqar_k1_calibration.py's 200000-step run"}
+
+=== K=2 (seq_len=8, train_steps=50000) ===
+  [K=2] step=  5000/50000  mean_query_loss=4.8627  acc=0.0125  (575s elapsed, 0.1150s/step)
+  [K=2] step= 10000/50000  mean_query_loss=4.8599  acc=0.0000  (1158s elapsed, 0.1158s/step)
+  [K=2] step= 15000/50000  mean_query_loss=4.8527  acc=0.0000  (1746s elapsed, 0.1164s/step)
+  [K=2] step= 20000/50000  mean_query_loss=4.8474  acc=0.0125  (2329s elapsed, 0.1164s/step)
+  [K=2] step= 25000/50000  mean_query_loss=4.8465  acc=0.0625  (2908s elapsed, 0.1163s/step)
+  [K=2] step= 30000/50000  mean_query_loss=4.8498  acc=0.0375  (3484s elapsed, 0.1161s/step)
+  [K=2] step= 35000/50000  mean_query_loss=4.8460  acc=0.0375  (4063s elapsed, 0.1161s/step)
+  [K=2] step= 40000/50000  mean_query_loss=4.8443  acc=0.0000  (4641s elapsed, 0.1160s/step)
+  [K=2] step= 45000/50000  mean_query_loss=4.8450  acc=0.0125  (5219s elapsed, 0.1160s/step)
+  [K=2] step= 50000/50000  mean_query_loss=4.8470  acc=0.0125  (5799s elapsed, 0.1160s/step)
+K=2 FINAL: {'num_kv_pairs': 2, 'seq_len': 8, 'acc': 0.008333333333333333, 'elapsed_s': 5800.420422077179}  (total 5800s)
+
+=== K=4 (seq_len=16, train_steps=20000) ===
+  [K=4] step=  2000/20000  mean_query_loss=4.8503  acc=0.0000  (660s elapsed, 0.3298s/step)
+  [K=4] step=  4000/20000  mean_query_loss=4.8379  acc=0.0000  (1312s elapsed, 0.3281s/step)
+  [K=4] step=  6000/20000  mean_query_loss=4.8448  acc=0.0125  (1966s elapsed, 0.3276s/step)
+  [K=4] step=  8000/20000  mean_query_loss=4.8479  acc=0.0125  (2624s elapsed, 0.3280s/step)
+  [K=4] step= 10000/20000  mean_query_loss=4.8490  acc=0.0125  (3283s elapsed, 0.3283s/step)
+  [K=4] step= 12000/20000  mean_query_loss=4.8466  acc=0.0125  (3936s elapsed, 0.3280s/step)
+  [K=4] step= 14000/20000  mean_query_loss=4.8479  acc=0.0000  (4588s elapsed, 0.3277s/step)
+  [K=4] step= 16000/20000  mean_query_loss=4.8490  acc=0.0125  (5253s elapsed, 0.3283s/step)
+  [K=4] step= 18000/20000  mean_query_loss=4.8488  acc=0.0063  (5920s elapsed, 0.3289s/step)
+  [K=4] step= 20000/20000  mean_query_loss=4.8498  acc=0.0312  (6581s elapsed, 0.3291s/step)
+K=4 FINAL: {'num_kv_pairs': 4, 'seq_len': 16, 'acc': 0.004166666666666667, 'elapsed_s': 6585.398051738739}  (total 6585s)
+
+=== K=8 (seq_len=32, train_steps=7000) ===
+  [K=8] step=   700/7000  mean_query_loss=4.8321  acc=0.0063  (726s elapsed, 1.0370s/step)
+  [K=8] step=  1400/7000  mean_query_loss=4.8231  acc=0.0125  (1448s elapsed, 1.0340s/step)
+  [K=8] step=  2100/7000  mean_query_loss=4.8269  acc=0.0063  (2171s elapsed, 1.0339s/step)
+  [K=8] step=  2800/7000  mean_query_loss=4.8321  acc=0.0031  (2895s elapsed, 1.0338s/step)
+  [K=8] step=  3500/7000  mean_query_loss=4.8331  acc=0.0125  (3619s elapsed, 1.0340s/step)
+  [K=8] step=  4200/7000  mean_query_loss=4.8376  acc=0.0031  (4345s elapsed, 1.0345s/step)
+  [K=8] step=  4900/7000  mean_query_loss=4.8407  acc=0.0125  (5068s elapsed, 1.0343s/step)
+  [K=8] step=  5600/7000  mean_query_loss=4.8442  acc=0.0063  (5786s elapsed, 1.0333s/step)
+  [K=8] step=  6300/7000  mean_query_loss=4.8458  acc=0.0094  (6508s elapsed, 1.0331s/step)
+  [K=8] step=  7000/7000  mean_query_loss=4.8483  acc=0.0125  (7239s elapsed, 1.0342s/step)
+K=8 FINAL: {'num_kv_pairs': 8, 'seq_len': 32, 'acc': 0.004166666666666667, 'elapsed_s': 7251.624039173126}  (total 7252s)
+
+# SUMMARY
+   K   seq_len       acc
+   1         4    0.1667
+   2         8    0.0083
+   4        16    0.0042
+   8        32    0.0042
