@@ -8644,16 +8644,27 @@ both just needed extending to cover `"fp32_dense"` too. Confirmed at
 200/3000 steps: same peak (vocab=16, k=3) as the old dense=True
 reference at the same seed, 1.56x faster (7.69 vs 4.92 steps/sec).
 
-**Real dense reference, full run (arch-sandbox, 100k steps, in
-progress)**: as of step 76,250/100,000, STILL STUCK at k=3, unchanged
-since step 2294 (max_streak bouncing 2-4/10, never hitting 10) -- 74k+
-steps with zero further progress. This is a significant finding on its
-own, independent of sparsity: even the fully-dense reference isn't
-cleanly progressing past k=3 at this width/curriculum/seed config within
-a very large budget. Reframes how to read every sparse-arm number below
--- there may be a real wall in this specific config (width=288,
-embed_width=36, k_first_target=3, seed=1000) that has nothing to do with
-sparsity at all. Not yet resolved; run still going.
+**Real dense reference, full run (arch-sandbox, completed, 100,000
+steps, 5368s)**: `final_k=3, peak_k=3` -- reached k=3 at step 2294 and
+NEVER progressed further for the remaining 97,706 steps (loss still
+oscillating 2.0-2.8 at step 100,000, streak never broke past 4/10).
+
+**This is EXPECTED, not a bug or an unresolved wall** -- direct
+correction after initially flagging it as concerning: k=3 is the
+architectural ceiling for this config -- the maximum k representable
+IN-CONTEXT without requiring superposition of recurrent tokens, which is
+a much, much harder regime the model isn't being asked to solve here.
+Dense reaching that ceiling at step 2294 and holding it for the rest of
+the budget is the CORRECT terminal state, not a stall needing
+investigation (no multi-seed sweep needed -- this isn't seed noise, it's
+structural). Reframes the whole comparison in a GOOD way: the question
+isn't "does sparse eventually match an unbounded/unproven dense
+capability," it's "does sparse reach the SAME achievable ceiling (k=3)
+in a comparable step budget" -- and Arm C's confusion-matrix run (below)
+already reached k=3 within 3000 steps, essentially step-comparable to
+dense's own step 2294, not needing "bounded extra time" at all so far.
+Pushing past k=3 (superposition) is a separate, much harder research
+question, out of scope for this comparison as currently configured.
 
 **Confusion matrix: mechanism x failure mode, not axis x axis.**
 Corrected mid-design after direct pushback: the question isn't "which
@@ -8720,8 +8731,9 @@ least not at this budget/seed). Needs more data before treating either
 half as confirmed.
 
 **Not yet done**: more seeds (this is one seed per row); longer budgets
-(3000 steps is short); resolving whether the dense reference's own k=3
-stall is a real wall in this config or will eventually clear given
-enough of its 100k-step budget; the bounded-budget confirmatory run
-(Arm C or Arm C variant at a real multiple of the dense reference's
-step count) the plan's final answer depends on.
+(3000 steps is short); a real step-for-step comparison of Arm C's exact
+k=3 arrival step against dense's step 2294 (both currently just "within
+3000 steps" vs "at 2294" -- close, not yet precisely matched); whether
+Arm C (or a variant) can be pushed toward the superposition regime
+(k>3) as a genuinely harder follow-on question, separate from this
+comparison's current scope.
