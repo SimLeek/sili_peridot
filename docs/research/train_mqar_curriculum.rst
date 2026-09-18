@@ -661,3 +661,32 @@ LR needs to shrink.
    ``peak_lr`` at fixed width -- does a denser gate (closer to ungated)
    need dense's lower LR, and does a sparser gate tolerate the current,
    un-scaled ``DEFAULT_PEAK_LR``.
+
+.. _train_curriculum.dense_was_hardcoded_true:
+
+``dense``: promoted from a hardcoded ``True`` to a real parameter
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.dense_was_hardcoded_true``
+
+2026-09-18, discovered while designing an absolute (non-width-proportional)
+fan-in-cap test for
+``train_curriculum.width_scaling_lr_fanin_hypothesis``. `ToyTileRecurrenceRMT`'s
+``dense`` constructor kwarg (forces every layer's ``max_weights`` up to
+``in_features*out_features`` and preseeds fully connected -- see
+``sili__new``'s ``DISLDOLayer32`` docstring) was unconditionally hardcoded to
+``True`` at this file's model-construction call site -- not exposed as a
+``train_curriculum`` parameter at all.
+
+**Consequence, now fixed but worth recording**: every "sparse" arm run under
+this curriculum to date (Arm A/B/C, the knee-adaptive `x_r_target`, all of
+it) applied its sparsity ONLY as dynamic per-step top-k/nucleus SELECTION
+(`x_r_target`/`dy_r_target`/`dy_gate_mask`) on top of a genuinely
+fully-connected weight matrix underneath. None of them tested real
+STRUCTURAL sparsity -- a bounded total synapse count
+(`wide_max_weights`, grown/pruned via synaptogenesis,
+`sili__new`'s `reserve_connections`/`synap_compute_cutoff`) -- because
+there was no way to turn `dense` off. `dense: bool = True` is now a real
+parameter (default unchanged, so every existing run/test is unaffected);
+`dense=False` plus an explicit `wide_max_weights` is required to actually
+exercise structural sparsity through this file.

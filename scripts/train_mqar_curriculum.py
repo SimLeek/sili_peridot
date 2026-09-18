@@ -295,6 +295,11 @@ def train_curriculum(
     embed_width: int = EMBED_WIDTH,
     input_sparsity_p: float | None = None,
     wide_max_weights: int | None = None,
+    # See docs/research/train_mqar_curriculum.rst:train_curriculum.dense_was_hardcoded_true
+    # -- was unconditionally True (not a real param) until 2026-09-18; every prior "sparse"
+    # arm in this file's history only ever applied dynamic per-step selection on top of a
+    # fully-connected weight matrix, never genuine structural (max_weights-capped) sparsity.
+    dense: bool = True,
     dy_sparsity_p: float | None = None,
     use_tile_cache: bool = False,
     output_dy_sparsity_p: float | None = None,
@@ -430,7 +435,7 @@ def train_curriculum(
         MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS,
         disldo_cls=disldo_cls,
-        dense=True,
+        dense=dense,
         clip_range=clip_range,
         l1_sparsity_coef=L1_SPARSITY_COEF,
         synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]),
