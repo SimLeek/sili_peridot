@@ -8863,34 +8863,60 @@ Two anchor points:
   exponent, just consistent with alpha somewhere in [0.5, 1.0] and
   closer to 0.5 than 1.0 so far.
 
-**Your framing, recorded verbatim as the key open hypothesis**: this
-scaling requirement should be a property of DENSE connectivity
-specifically, not width per se -- because it's driven by realized
-fan-in/fan-out (how many synapses actually feed into/out of a given
-neuron), and dense connectivity is the special case where realized
-fan-in/fan-out EQUALS total layer width `N` and therefore grows
-without bound as the model scales. If instead a layer's sparsity is
-capped at an ABSOLUTE synapse budget per neuron (your figure:
-1000-10000 synapses/neuron) rather than a budget proportional to
-width, then past the point where layer width `N` exceeds that cap,
-adding more width just adds more low-fan-in neurons -- it does NOT
-raise any given neuron's realized fan-in further. Under this framing,
-`lr` should stop needing to shrink once sparsity has capped realized
-fan-in, even as nominal width `N` keeps growing -- decoupling LR
-scaling from width entirely in the sparse regime.
+**Your framing, recorded as the key open hypothesis**: this scaling
+requirement should be a property of DENSE connectivity specifically,
+not width per se -- because it's driven by realized fan-in/fan-out
+(how many synapses actually feed into/out of a given neuron), and
+dense connectivity is the special case where realized fan-in/fan-out
+EQUALS total layer width `N` and therefore grows without bound as the
+model scales.
+
+**Correction (same day, direct pushback on the first draft of this)**:
+sparsity does NOT necessarily cap this. `x_r_target`/`dy_r_target` are
+PROPORTIONAL -- a fraction of layer width -- so realized fan-in under
+them still scales with `N` exactly like dense does; only an ABSOLUTE,
+width-independent per-neuron synapse budget (figure: 1000-10000
+synapses/neuron, `max_weights`-style sized as a fixed count rather than
+`in*out`, see [[feedback_disldo_max_weights_sizing]]) would decouple
+fan-in from width and, on this hypothesis, remove the need to keep
+lowering `peak_lr` as `N` grows.
+
+**Second correction, also direct**: Arm C's backward sine-wave
+time-gate is itself a form of GRADIENT sparsity that may explain its
+own confusion-matrix win via a related but distinct mechanism --
+gating which neurons update at a given step reduces the coherent
+per-step change a wide layer's rank-1 update would otherwise cause
+(the same instability this LR law is about), without touching nominal
+`peak_lr` at all. If that reading holds, the right effective-LR model
+isn't `lr(N)` alone but `lr(N, gate_density)` jointly -- grad-sparsity
+density trading off against how much nominal LR needs to shrink. Not
+yet tested.
 
 **Why this matters for the broader dense-vs-sparse-amortization
-question** ([[project_dense_vs_sparse_mqar_confusion_matrix]]): this
-would be a SECOND, independent way sparsity could beat dense at scale,
-distinct from the original "sparse eventually catches up given enough
-steps" question -- dense strictly requires ever-shrinking LR (and
-therefore, all else equal, ever-slower convergence) as it's scaled up
-with no ceiling, while absolute-budget sparse connectivity would not.
-Not yet tested -- the natural next experiment is the same width=128
-vs width=288 comparison, but on the SPARSE arm with an absolute (not
-width-proportional) `dy_r_target`/`max_weights`-style fan-in cap, at
-a single fixed `peak_lr`, checking whether width=288 needs the same
-LR cut dense needed or not.
+question** ([[project_dense_vs_sparse_mqar_confusion_matrix]]): if the
+absolute-fan-in-budget framing holds, it's a SECOND, independent way
+sparsity could beat dense at scale, distinct from the original "sparse
+eventually catches up given enough steps" question -- dense strictly
+requires ever-shrinking LR (and therefore, all else equal, ever-slower
+convergence) as it's scaled up with no ceiling, while absolute-budget
+sparse connectivity would not.
+
+**Recorded, not yet confirmed** -- added as a hedged code comment +
+companion-doc section (`scripts/train_mqar_curriculum.py`'s
+`DEFAULT_PEAK_LR`,
+`docs/research/train_mqar_curriculum.rst:train_curriculum.width_scaling_lr_fanin_hypothesis`)
+so it's visible at the exact constant someone would touch when scaling
+the model, per direct instruction -- explicitly marked UNCONFIRMED,
+not to be reported as settled until these land:
+
+1. A third `(N, peak_lr)` data point to actually pin `alpha` (currently
+   only bracketed 0.5-1.0 by theory, matched at alpha=0.5 by one run).
+2. Same width=128-vs-288 comparison on the SPARSE arm with an absolute
+   (not width-proportional) fan-in cap, at a single fixed `peak_lr` --
+   does width=288 need dense's LR cut or not.
+3. Sweep Arm C's `dy_time_gate_cutoff` (gate density) against required
+   `peak_lr` at fixed width -- tests the joint `lr(N, gate_density)`
+   reading above.
 
 Six overnight/local runs from the write_time_aux_targets fix are still
 either completed (dense baseline, dense-fwd+ArmC-bwd, both plateaued

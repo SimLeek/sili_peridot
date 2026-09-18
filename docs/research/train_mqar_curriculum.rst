@@ -601,3 +601,63 @@ behavior change for existing callers.
 alongside the binary correct/incorrect outcome so a caller can compute
 real confidence/hedging signals (target-token probability, entropy)
 itself instead of only seeing whether the prediction was right.
+
+.. _train_curriculum.width_scaling_lr_fanin_hypothesis:
+
+``DEFAULT_PEAK_LR``: width-scaling LR/fan-in hypothesis (UNCONFIRMED)
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.width_scaling_lr_fanin_hypothesis``
+
+2026-09-18, dense-vs-sparse-mqar-300k investigation (full writeup in
+``JOURNAL.md`` under this date; memory ``project_width_scaling_lr_fanin_law``).
+A dense ``state_width=288`` run stalled at vocab=64/k=3 for 86,257 of
+100,000 steps; ``peak_lr=0.01`` broke straight past that wall (vocab=126/k=3
+by step 13,601), while scaling ``max_grad_norm`` instead did nothing
+comparable. Isolates the cause to the fixed learning rate, not gradient
+clipping.
+
+**Rough law, one data point, not yet confirmed**::
+
+    lr(N) ~= lr_base * (N_base / N) ^ alpha,   0.5 <= alpha <= 1.0
+
+for dense hidden-to-hidden matrices (``q``/``k``/``v``/``o_proj``, each
+``N x N``, ``N = state_width``, realized fan-in = fan-out = ``N``).
+``alpha=1.0`` is muP's known hidden-layer prescription (rank-1 weight
+update, coherent effect across all ``N`` inputs, needs ``lr ~ 1/N`` to stay
+O(1)); ``alpha=0.5`` is naive per-element/NTK scaling and is the value that
+happened to match the one tested point (``0.01`` vs. predicted ``0.0067``
+at alpha=1.0). Do not treat either exponent as settled from a single run.
+
+**Correction to an earlier draft of this hypothesis**: sparsity does NOT
+automatically cap this. ``x_r_target``/``dy_r_target`` (this file's own
+selection knobs) are *proportional* -- a fraction of the layer's width --
+so realized fan-in under them still scales with ``N`` exactly like dense
+does; only an *absolute*, width-independent per-neuron synapse budget
+(``max_weights``-style, sized as a fixed count rather than ``in*out``,
+see ``sili__new``'s own ``disldo_max_weights_sizing`` guidance) would
+decouple fan-in from width and, on this hypothesis, remove the need to
+keep lowering ``peak_lr`` as ``N`` grows.
+
+Separately, Arm C's backward sine-wave time-gate (this file's
+``dy_time_gate_cutoff``, see ``train_curriculum.cli_gradient_sparsity_args``)
+is itself a form of gradient sparsity that may already be doing something
+like this by a different mechanism -- gating which neurons update *this
+step* reduces the coherent per-step change a wide layer's rank-1 update
+would otherwise cause, the same instability this LR law is about, without
+touching the nominal ``peak_lr`` at all. If that reading is right, the
+right effective-LR model is not ``lr(N)`` alone but ``lr(N, gate_density)``
+jointly -- grad-sparsity density trading off against how much the nominal
+LR needs to shrink.
+
+**Not yet confirmed -- pending before this is treated as established**:
+
+1. A third ``(N, peak_lr)`` point (e.g. ``state_width=192`` or a second
+   width=288 LR value) to actually pin ``alpha`` instead of bracketing it.
+2. Same width=128-vs-288 comparison on the sparse arm with an *absolute*
+   (non-proportional) fan-in cap at a single fixed ``peak_lr`` -- does it
+   need the same LR cut dense needed, or not.
+3. Sweep Arm C's ``dy_time_gate_cutoff`` (gate density) against required
+   ``peak_lr`` at fixed width -- does a denser gate (closer to ungated)
+   need dense's lower LR, and does a sparser gate tolerate the current,
+   un-scaled ``DEFAULT_PEAK_LR``.

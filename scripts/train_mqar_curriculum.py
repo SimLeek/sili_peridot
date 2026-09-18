@@ -90,6 +90,8 @@ PRECISION_SYNAPSE_KWARGS = {
     "fp32_dense": NOCAPS_KWARGS_FP32,
 }
 
+# See docs/research/train_mqar_curriculum.rst:train_curriculum.width_scaling_lr_fanin_hypothesis
+# -- UNCONFIRMED: tuned near state_width=128, wider dense state_width may need this lowered.
 DEFAULT_PEAK_LR = 0.015
 DEFAULT_NUM_TILES = 16  # fixed local-attention window (model param, not a task param)
 LEVEL_UP_TOKEN = VOCAB - 2  # 126 -- reserved, never chosen as an MQAR key/value
