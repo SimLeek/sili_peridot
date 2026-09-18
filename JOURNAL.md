@@ -8924,3 +8924,14 @@ below vocab=126) or in flight (4x Arm C + knee variants on
 arch-sandbox) -- unaffected by this LR finding since none scaled
 `peak_lr`; worth rerunning the more promising sparse arms at a
 width-288-appropriate LR once this scaling law has more data points.
+
+**`launch_dense_lr_scaled.py` (peak_lr=0.01) completed its full 100k
+steps** (14,399s, final steps/sec=6.95): held `vocab=126, k=3` for the
+entire remaining 86,399 steps after reaching it at step 13,601, no
+regression (LEVEL_DOWN disabled) and no further LEVEL_UP to k=4 --
+consistent with k=3 being this config's expected architectural ceiling
+(established earlier this same day), not a new stall to chase. First
+run in this project's documented history to reach `vocab=126, k=3`
+simultaneously at all. Recorded in the new `MQAR_LEADERBOARD.md`
+(running log of best setups vs. param count, requested directly) as the
+current record on both steps and wall-clock.
