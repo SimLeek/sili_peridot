@@ -9077,3 +9077,49 @@ number as "the" width-288 LR.
 Freed a local slot -- launched queue item 3,
 `launch_armc_gatemid_lr_unscaled.py` (Arm C gate cutoff=0.0 ~50%
 density, peak_lr=0.015 unscaled).
+
+## 2026-09-18 (cont'd) -- per-layer Polyak dynamic LR built (`polyak_lr`)
+
+Researched task-agnostic dynamic-LR methods per direct request before
+building anything further: D-Adaptation/Prodigy need a distance-to-
+solution estimate that's ungrounded without knowing the answer ahead
+of time; hypergradient descent needs consecutive-step gradient
+VECTORS (per-synapse detail, too much to expose); Stochastic Polyak
+Step-size only needs loss + a gradient-energy scalar. Direct
+instruction: apply Polyak per-layer directly (not via a separate
+mechanism like trust ratio, which needs a weight norm -- "still kind
+of ridiculous" as a signal), per-neuron noted as a TODO (real extra
+work, try per-layer first).
+
+Built across both repos:
+- `sili__new` (`feature/dy-external-gate-hook`, commit `c5cddc2`):
+  `DISLDOLayer32._bwd()` now stores `self._last_grad_norm_sq` (universal
+  hook, ahead of every sparsification branch). Turned out NOT to be
+  needed for this mechanism (see below) but harmless/tested/kept for
+  other future non-`_timed_call` callers.
+- `sili_peridot` (commit `0e2ba63`): discovered `_timed_call` already
+  captures each layer's own `dy` for the `dy_surprise_alpha` mechanism
+  -- just needed to make that capture UNCONDITIONAL (same "always track
+  the diagnostic" precedent as the knee-elbow tracker) rather than
+  building a new hook. `apply_polyak_lr(loss, f_star=0, c=0.5,
+  lr_max=0.1)` computes `lr_layer = min(lr_max, c*max(loss-f_star,0)/
+  E_t_layer)` per wide layer, lagged one step (same convention as
+  `_effective_dy_r_target`); `self.layer_lr_override` is checked first
+  in `_timed_layer_forward`, empty by default (byte-identical when
+  unused, confirmed: full 338-test suite green).
+  `f_star=0` (SPS_max) is reasonable here specifically -- MQAR's
+  cross-entropy loss has a genuine near-0 floor, and
+  `write_time_aux_targets=False` already removed the one irreducible-
+  loss source. `polyak_lr_max` defaults to 0.1, informed directly by
+  the LR range test's own found instability regime (~0.1-0.32).
+
+Smoke-tested (200-300 steps): loss decreases steadily, no
+instability, no warnings once `lr_max` was tightened from an initial
+1.0 (which did trigger the engine's high-lr warning early on, before
+any layer had a real E_t yet).
+
+Queued `launch_polyak_lr_width288.py` (commit `8976574`) -- direct
+validation against the current leaderboard record (`peak_lr=0.01`,
+step 13,601): does `polyak_lr=True`, with NO peak_lr tuned by hand at
+all, reach `vocab=126/k=3` comparably or better. Both machines fully
+loaded, added to the back of the existing queue.
