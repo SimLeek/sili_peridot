@@ -833,6 +833,20 @@ the compensated/equation-driven version, isolating whether the formula
 itself closes the gap rather than just observing that SOME lr works
 better than another.
 
+**Update, 2026-09-19: test 3's grid complete, and it doesn't cleanly
+support either direction.** cutoff=0.0 (~50%)/unscaled=0.015 and
+cutoff=0.6 (~29.5%)/scaled=0.01 BOTH reached ``vocab=126, k=3``; both
+cross-combinations (~50%/scaled, ~29.5%/unscaled) got stuck at
+``k=2``. A genuine crossover with only 2 LR samples per density --
+reads more like each density has its OWN narrow LR sweet spot (same
+non-monotonic shape ``width_scaling_lr_fanin_hypothesis`` already
+found for dense: 0.01 good, 0.015 too high, 0.0067 too low) than like
+a clean monotonic ``lr(p)`` trend in either direction. The two
+compensation tests here (both scaling LR UP as density drops) are one
+more data point toward mapping that sweet-spot surface, not a
+confirmation or refutation of ``1/p``/``1/sqrt(p)`` specifically --
+don't over-read either result alone.
+
 .. _armc_polyak_threshold_not_selection:
 
 Polyak + Arm C: threshold-level control only, not selection -- design note, not built

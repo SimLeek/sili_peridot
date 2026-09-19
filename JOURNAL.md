@@ -9288,3 +9288,34 @@ variants remain running (skip-k1, margin=0.15).
 Freed arch-sandbox slot -- synced code, launched queue item 5:
 `launch_armc_lr_scaled_invp.py` (Arm C gate-density LR compensation,
 1/p, cutoff=0.3).
+
+## 2026-09-19 (cont'd) -- test 3 grid complete: a crossover, not a
+## monotonic density-vs-LR trend
+
+`launch_armc_gatesparse_lr_scaled.py` (cutoff=0.6, ~29.5% density,
+peak_lr=0.01) finished: `vocab=126, k=3` at step 43,905 -- the
+slowest Arm C milestone yet, but a real success. Completes the 2x2
+grid:
+
+| cutoff (density) | peak_lr | result |
+|---|---|---|
+| 0.0 (~50%) | 0.015 unscaled | **k=3 @ 24,331** |
+| 0.0 (~50%) | 0.01 scaled | k=2, stuck |
+| 0.6 (~29.5%) | 0.015 unscaled | k=2, stuck |
+| 0.6 (~29.5%) | 0.01 scaled | **k=3 @ 43,905** |
+
+A genuine crossover: denser+higher-LR succeeded, sparser+lower-LR
+succeeded, both cross-combinations failed at k=2. Neither "sparser
+needs more LR" (the compensation-equation direction just tested via
+`launch_armc_lr_scaled_invp.py`/`invsqrtp.py`) nor "sparser needs less
+LR" holds as a clean rule from this data -- with only 2 LR samples per
+density, this reads more like each density has its OWN narrow LR sweet
+spot (matching how tight the pure-dense sweet spot already turned out:
+0.01 good, 0.015 too high, 0.0067 too low) than like a real monotonic
+trend either direction. Flagging this explicitly since the two
+compensation-equation tests currently running both scale LR UP as
+density drops (cutoff=0.3, p~=0.403, between the two grid points) --
+this grid doesn't confirm that direction is right, though it doesn't
+rule it out either given the different cutoff. Treat their result as
+one more data point toward mapping the (density, LR) sweet-spot
+surface, not as confirmation/refutation of a single clean formula.
