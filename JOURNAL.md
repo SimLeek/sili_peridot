@@ -9456,3 +9456,24 @@ reliable rule, it's a narrow per-density sweet spot each time.
 `launch_armc_lr_scaled_invsqrtp.py` (the milder bracket, same cutoff,
 peak_lr~=0.0158) still running locally -- one more data point before
 treating "scale LR up with sparsity" as settled either way for Arm C.
+
+## 2026-09-19 (cont'd) -- 1/sqrt(p) compensation test finished: better
+## than 1/p, but still hits a wall
+
+`launch_armc_lr_scaled_invsqrtp.py` finished: `vocab=64, k=3` at step
+9,521, then flat for the remaining 90,479 steps -- never reached
+vocab=126. Better than its 1/p sibling (which only reached k=2) on
+both counts -- k=3 not k=2, and genuinely FAST early progress (step
+9,521 to vocab=64/k=3 is comparable to dense's own record-setting run,
+which hit the same milestone at step 8,467). Same alpha=1.0-vs-0.5
+lesson as the width-scaling law itself: the milder exponent beat the
+more "theoretically justified" stronger one.
+
+But neither compensation formula reached the full vocab=126 milestone
+that test 3's own grid found at nearby densities/LRs -- this one hits
+a hard wall at vocab=64, the same SHAPE as the original unscaled-dense
+run's own permanent stall. Both compensation-equation tests are now
+complete: 2/2 fell short of vocab=126, adding more weight to test 3's
+own conclusion that there's no clean, extrapolatable lr(p) formula for
+Arm C -- each (density, LR) combination seems to have its own narrow
+window, not a rule that generalizes from a couple of anchor points.
