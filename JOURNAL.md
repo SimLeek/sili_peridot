@@ -9442,3 +9442,17 @@ designed.
 
 Freed arch-sandbox slot -- no queue items remain to launch (everything
 built this session is now running or complete).
+
+## 2026-09-19 (cont'd) -- 1/p LR compensation test finished weak, adds
+## to the "no clean monotonic lr(p) trend" picture
+
+`launch_armc_lr_scaled_invp.py` (cutoff=0.3, ~40.3% density,
+peak_lr=0.01/p~=0.0248, the naive 1/p compensation formula) finished:
+`vocab=64, k=2` at step 16,724, then flat for the remaining 83,276
+steps -- never reached k=3, weaker than BOTH of test 3 grid's
+successful cells (which each reached k=3). Consistent with the grid's
+own crossover finding: scaling LR up as gate density drops isn't a
+reliable rule, it's a narrow per-density sweet spot each time.
+`launch_armc_lr_scaled_invsqrtp.py` (the milder bracket, same cutoff,
+peak_lr~=0.0158) still running locally -- one more data point before
+treating "scale LR up with sparsity" as settled either way for Arm C.
