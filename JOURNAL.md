@@ -9123,3 +9123,25 @@ validation against the current leaderboard record (`peak_lr=0.01`,
 step 13,601): does `polyak_lr=True`, with NO peak_lr tuned by hand at
 all, reach `vocab=126/k=3` comparably or better. Both machines fully
 loaded, added to the back of the existing queue.
+
+## 2026-09-18 (cont'd) -- test 2's width=128 leg finished: worst result
+## of the whole investigation
+
+`launch_dy_fixed_count_width128.py` (dy_k_min=dy_k_max=64, dense=True,
+unscaled peak_lr=0.015) completed 100k steps (9,080s, 11.01 steps/sec):
+ONE level-up at step 925 (vocab=16, k=2->3), then completely flat for
+the remaining 99,075 steps -- the worst result recorded so far, worse
+even than the abandoned structural-sparsity attempt's own concerns.
+Suggests forcing `dy_k_min=dy_k_max=64` (exactly half of state_width=
+128's output columns per sample, overriding `dy_r_target=0.9`'s own
+natural energy-based selection) is itself actively harmful, not
+necessarily a safe stand-in for the structural cap it was meant to
+replace. Holding judgment until the width=288 companion
+(`launch_dy_fixed_count_width288.py`, still running on arch-sandbox)
+reports back -- if it ALSO stalls hard, that's a real negative result
+for the dy_k_min/dy_k_max=64 approach generally, not a width=128-
+specific fluke.
+
+Launched queue item 1 into the freed local slot:
+`launch_armc_gatemid_lr_scaled.py` (Arm C gate cutoff=0.0, peak_lr=0.01
+scaled).
