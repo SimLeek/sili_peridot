@@ -9166,3 +9166,31 @@ Launched queue item 2 into the freed local slot:
 `launch_armc_gatesparse_lr_unscaled.py` (Arm C gate cutoff=0.6, ~29.5%
 density, peak_lr=0.015 unscaled) -- the sparser-gate counterpart, will
 tell us whether tolerance improves further as density drops.
+
+## 2026-09-18 (cont'd) -- reversal: dense's own best LR is WORSE for Arm C
+
+`launch_armc_gatemid_lr_scaled.py` (same cutoff=0.0/~50% density as
+the unscaled row above, but peak_lr=0.01 -- dense's own best value)
+finished: `vocab=126, k=2` at step 20,642, then flat for the remaining
+79,358 steps -- NEVER reached k=3. Compared directly against its
+unscaled sibling (same gate density, peak_lr=0.015): that one reached
+vocab=126 SOONER (step 17,146 vs 20,642) and went on to reach k=3 at
+step 24,331. So for Arm C at this density, the lower LR that helped
+dense is not just unnecessary, it's actively WORSE on both axes.
+
+Plausible reading: Arm C's own time-gating may already provide some of
+the same effective-step-size moderation dense needed a lower nominal
+LR for (per `armc_gate_density_lr_equation`'s stability-headroom
+argument) -- stacking a LOWER lr on top of that gives none of
+`lr(N, gate_density)`'s predicted benefit, and may just be leaving
+useful signal on the table (too conservative). This is consistent
+with (and lends support to) the two just-launched compensation-
+equation tests
+(`launch_armc_lr_scaled_invp.py`/`launch_armc_lr_scaled_invsqrtp.py`),
+both of which scale LR UP, not down, for Arm C -- the opposite
+direction from what dense needed.
+
+Launched queue item 3 into the freed local slot:
+`launch_armc_gatesparse_lr_scaled.py` (Arm C gate cutoff=0.6, ~29.5%
+density, peak_lr=0.01 scaled) -- will show whether this reversal holds
+at the sparser gate density too, or is specific to ~50% density.
