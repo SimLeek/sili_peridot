@@ -9319,3 +9319,36 @@ this grid doesn't confirm that direction is right, though it doesn't
 rule it out either given the different cutoff. Treat their result as
 one more data point toward mapping the (density, LR) sweet-spot
 surface, not as confirmation/refutation of a single clean formula.
+
+## 2026-09-19 (cont'd) -- caught a real seed confound in test 3's grid,
+## corrected to statistical power not seed-pinning
+
+Direct instinct on the grid's crossover: "That's weird... I hope we
+can figure out exactly what it is." Checked `dy_time_gate_seed` --
+defaulted to `None` (OS-entropy seeded) in all 4 of test 3's original
+launchers, so each cell got a DIFFERENT, uncontrolled Arm C phase/
+period realization. First attempt at a fix (4 new launchers, all
+pinned to the SAME `dy_time_gate_seed=42`) was itself wrong -- direct
+correction: "seeds don't matter for this run length but for the
+neuron backprop sin thing for arm C it might depending on how long
+that sin period is... fixing the seed or randomness actually tells us
+nothing, statistics from multiple runs does." For a gate whose period
+is comparable to the run length, ONE fixed seed just relocates the
+same problem to a different arbitrary realization -- exactly
+`feedback_statistical_power_not_seeding`'s lesson, applied here.
+
+Deleted the 4 single-seed launchers, built
+`armc_gate_density_lr_seed_sweep.py` instead: same 2x2 grid x 3
+independent seeds (1000/2000/3000), short budget (25,000 steps --
+covers every original cell's vocab=64/k=3 milestone, up to step
+28,083 for the slowest) instead of the full 100k needed for the
+disputed vocab=126/k=3 milestone (up to 43,905 steps in the original
+data) -- cheap enough to get real statistical signal before committing
+more compute. Launched on arch-sandbox (12 sequential short runs,
+progress printed per combo).
+
+Also: `launch_arm_c_plus_knee_skip_k1.py` (the last-but-one of the
+original 4 knee variants) finished -- `vocab=64, k=2` at step 34,813,
+then flat. Best of the 4 (the others topped out at vocab=32) but still
+never reached k=3; still predates the LR fix. Only `margin=0.15`
+remains running from that batch.
