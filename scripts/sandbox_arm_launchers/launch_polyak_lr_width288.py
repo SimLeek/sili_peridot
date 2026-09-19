@@ -52,7 +52,7 @@ def log_fn(
 
 
 print(
-    "# DENSE + POLYAK_LR (f_star=0, c=0.5, lr_max=0.1), K_START=2, "
+    "# DENSE + POLYAK_LR (f_star=0, c=0.0005, lr_max=0.05, denom=Lbar), K_START=2, "
     "write_time_aux_targets=False precision=fp32 max_steps=100000 seed=1000 "
     "embed_width=36 k_first_target=3 NUM_CPUS=4",
     flush=True,
