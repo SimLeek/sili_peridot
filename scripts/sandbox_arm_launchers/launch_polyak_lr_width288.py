@@ -1,13 +1,17 @@
 """Validates per_layer_learning_rate_polyak against the current
-leaderboard record: does polyak_lr=True (defaults: f_star=0,
-c=0.5, lr_max=0.1) reach vocab=126/k=3 comparably to or better than
-the hand-found peak_lr=0.01 (step 13,601, ~30min), without needing any
-peak_lr tuned by hand at all. Otherwise identical to
-launch_dense_lr_scaled.py (full dense, K_START=2,
-write_time_aux_targets=False, LEVEL_DOWN disabled) -- peak_lr itself
-is irrelevant here (only used as polyak_lr's bootstrap_lr for the very
-first step, before any layer has an E_t yet) since polyak_lr overrides
-it for all 5 wide layers every step after that. See
+leaderboard record: does polyak_lr=True (defaults, recalibrated
+2026-09-19: f_star=0, c=0.0005, lr_max=0.05, denominator=Lbar not raw
+E_t -- see apply_polyak_lr's own docstring for the recalibration
+story) reach vocab=126/k=3 comparably to or better than the hand-found
+peak_lr=0.01 (step 13,601, ~30min), without needing any peak_lr tuned
+by hand at all. Otherwise identical to launch_dense_lr_scaled.py (full
+dense, K_START=2, write_time_aux_targets=False, LEVEL_DOWN disabled)
+-- peak_lr itself is irrelevant here (only used as polyak_lr's
+bootstrap_lr for the very first step, before any layer has an Lbar
+yet) since polyak_lr overrides it for all 5 wide layers every step
+after that. First run (old c=0.5/lr_max=0.1/raw-E_t defaults) failed
+to learn at all (vocab=16/k=3, flat for 99,287 steps) -- this is the
+re-run under the fixed calibration. See
 docs/research/toy_tile_recurrence_rmt.rst:per_layer_learning_rate_polyak."""
 
 import sys
