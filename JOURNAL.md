@@ -9352,3 +9352,28 @@ original 4 knee variants) finished -- `vocab=64, k=2` at step 34,813,
 then flat. Best of the 4 (the others topped out at vocab=32) but still
 never reached k=3; still predates the LR fix. Only `margin=0.15`
 remains running from that batch.
+
+## 2026-09-19 (cont'd) -- all 4 original Arm C+knee variants complete
+
+`launch_arm_c_plus_knee_margin15.py` finished: `vocab=126, k=2` at
+step 34,660, then flat for the remaining 65,340 steps -- never reached
+k=3, but the ONLY one of the 4 to reach full vocab. Full picture, all
+4 now done, all at unscaled peak_lr=0.015 (predate the LR fix):
+
+| variant | peak result |
+|---|---|
+| standard (K_START=1, margin=0.05) | vocab=32, k=1 |
+| margin=0.0 (K_START=2) | vocab=32, k=2 |
+| skip-k1 (K_START=2, margin=0.05) | vocab=64, k=2 |
+| **margin=0.15 (K_START=2)** | **vocab=126, k=2** -- best |
+
+None reached k=3 -- this combined mechanism (knee-adaptive FORWARD
+sparsity + Arm C BACKWARD sparsity together, distinct from the
+backward-only-with-dense-forward Arm C runs in test 3, several of
+which DID reach k=3) still hasn't cleared full mastery at this LR.
+margin=0.15 is the natural candidate for a rerun at the corrected
+peak_lr~=0.01-ish regime, given how much both the LR fix and Arm C's
+own density/LR pairing have mattered elsewhere in this investigation --
+not yet queued, no free machine slot right now (arch-sandbox at 3/3
+jobs including the just-launched seed sweep, local at its own 2
+already-running jobs).
