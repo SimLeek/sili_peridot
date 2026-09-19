@@ -9275,3 +9275,16 @@ reach vocab=126/k=3 -- the fix is more likely "amortize better" than
 `docs/research/train_mqar_curriculum.rst:
 armc_polyak_threshold_not_selection`, memory
 `project_dense_vs_sparse_mqar_confusion_matrix`.
+
+## 2026-09-19 (cont'd) -- arm_c_plus_knee_margin0.py finished: another
+## weak, LR-fix-predating result; launched queue item 5
+
+`launch_arm_c_plus_knee_margin0.py` (K_START=2, margin=0.0, unscaled
+peak_lr=0.015) finished: `vocab=32, k=2` at step 4,483, then flat for
+the remaining 95,517 steps -- consistent with the other 2 completed
+Arm C+knee variants (all weak, all predate the LR fix). 2 of 4 knee
+variants remain running (skip-k1, margin=0.15).
+
+Freed arch-sandbox slot -- synced code, launched queue item 5:
+`launch_armc_lr_scaled_invp.py` (Arm C gate-density LR compensation,
+1/p, cutoff=0.3).
