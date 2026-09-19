@@ -847,6 +847,24 @@ more data point toward mapping that sweet-spot surface, not a
 confirmation or refutation of ``1/p``/``1/sqrt(p)`` specifically --
 don't over-read either result alone.
 
+**Real confound found, 2026-09-19 (same day)**: ``dy_time_gate_seed``
+defaulted to ``None`` (OS-entropy seeded) in all 4 of test 3's grid
+launchers -- each cell got a different, uncontrolled Arm C phase/
+period realization, so the crossover above could be partly or wholly
+an artifact of that rather than a real (density, LR) interaction.
+Direct correction on the fix: a single FIXED seed across cells doesn't
+control anything either -- for a sine-wave gate whose period
+(``dy_time_gate_period_range``, default 50-200 steps) is comparable to
+the run length, one fixed seed just picks a different arbitrary phase
+realization to compare against. Resolving this needs statistical power
+(multiple independent seeds per cell), not seed-pinning -- see
+``feedback_statistical_power_not_seeding`` memory, the same lesson.
+``armc_gate_density_lr_seed_sweep.py``: same 2x2 grid x 3 seeds, short
+budget (25000 steps, covers the vocab=64/k=3 milestone every original
+cell reached by step 28,083) -- reports step-of-vocab=64/k=3 per cell
+so within-cell seed spread can be compared against the between-cell
+gap before trusting the crossover as real.
+
 .. _armc_polyak_threshold_not_selection:
 
 Polyak + Arm C: threshold-level control only, not selection -- design note, not built
