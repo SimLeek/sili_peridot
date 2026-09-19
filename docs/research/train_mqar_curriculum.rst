@@ -832,3 +832,53 @@ scaled by ``p``) is already covered by test 3's grid
 the compensated/equation-driven version, isolating whether the formula
 itself closes the gap rather than just observing that SOME lr works
 better than another.
+
+.. _armc_polyak_threshold_not_selection:
+
+Polyak + Arm C: threshold-level control only, not selection -- design note, not built
+-------------------------------------------------------------------------------------------
+
+*ID:* ``armc_polyak_threshold_not_selection``
+
+2026-09-18/19, resolving a real conflict found while exploring
+combined dynamic-LR + dynamic-grad-sparsity: Polyak step size is
+inherently SCALE-TRACKING (``lr`` must shrink as the residual/gradient
+magnitude shrinks near convergence -- that's the whole point of its
+annealing behavior). Magnitude-based selection (top-k, ``dy_r_target``)
+is inherently SCALE-INVARIANT (always grabs "the biggest k available,"
+whatever their absolute magnitude that step) -- so a Polyak ``lr``
+computed from a magnitude-selected subset's own gradient norm can't
+track true convergence progress (top-k keeps re-normalizing itself),
+while a Polyak ``lr`` computed from the PRE-selection full gradient
+describes a step that isn't the one actually applied. Neither resolves
+cleanly -- Polyak and NAIVE magnitude-based (top-k-style) selection are
+genuinely in tension, not just awkward to combine.
+
+**Resolution (design note, not yet built)**: Arm C's gate is NOT
+magnitude-based at all -- ``gate_j(t) = sin(...) > cutoff`` selects
+WHICH neurons update this step from pure time/phase dynamics,
+completely independent of gradient magnitude. That sidesteps the
+conflict above by construction: a Polyak-style (or any residual-
+tracking) controller could safely adjust Arm C's ``cutoff`` (the
+DENSITY knob, a single scalar) as the residual shrinks, WITHOUT ever
+touching the actual on/off selection identity -- no self-normalizing
+top-k feedback loop to fight, since which neurons fire this step stays
+governed by phase/time alone. Two cleanly separated roles: Polyak-like
+control over HOW MUCH sparsity (the threshold/density), pure amortized
+time-division over WHICH neurons.
+
+**Broader principle, empirically grounded, not just theoretical**:
+every SIGNAL-GUIDED grad-sparsity selection mechanism tried in this
+investigation (``project_dense_vs_sparse_mqar_confusion_matrix``'s Arm
+A/B, magnitude/energy-based ``dy_r_target`` itself) has underperformed
+Arm C's pure time-division amortization on final outcome, despite Arm C
+having the LOWEST gradient-energy retention of any row tested. Grad
+sparsity's real value here looks like temporal amortization -- fair,
+guaranteed turn-taking over time -- not a signal to be found and
+optimized; repeated attempts at finding a good selection SIGNAL haven't
+borne fruit. Worth remembering specifically if a future attempt at a
+FULLY sparse model (both forward AND backward, not just Arm C's
+backward-only-with-dense-forward setup tested so far) struggles to
+reach the full vocab=126/k=3 milestone -- the fix is more likely to be
+"amortize better" (time-division, coverage guarantees) than "select
+better" (a smarter magnitude/energy signal).

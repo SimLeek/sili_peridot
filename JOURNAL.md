@@ -9226,3 +9226,52 @@ assumption isn't holding up so far.
 Launched queue item 4 into the freed local slot:
 `launch_polyak_lr_width288.py` (per-layer Polyak dynamic LR
 validation, no hand-tuned peak_lr at all).
+
+## 2026-09-19 -- Polyak + naive top-k are mathematically in tension; Arm C's
+## threshold (not selection) is the clean place for Polyak to act
+
+Direct question: does a "Polyak dynamic-grad-sparsity" or "Polyak
+dynamic-grad-sparsity + dynamic-LR" exist mathematically, even if not
+in the literature. Researched (searched "Adaptive Top-K in SGD",
+"Sparse Polyak" -- neither is quite this: the former adapts k under a
+communication-cost constraint, not Polyak's own residual signal; the
+latter is about a sparse PARAMETER estimate, not sparse gradient
+computation).
+
+Worked through the math with direct pushback ("I think polyak and
+naive top-k sparsity might be mutually exclusive") that turned out to
+be exactly right: Polyak step size is scale-TRACKING by construction
+(lr must shrink with the residual to anneal correctly near
+convergence). Magnitude-based top-k selection is scale-INVARIANT by
+construction (always grabs "the biggest k available" regardless of
+absolute scale, self-renormalizing every step). Try to compute Polyak's
+lr from a top-k'd gradient and neither choice of gradient norm (pre- or
+post-selection) resolves it: pre-selection describes a step that isn't
+the one actually applied; post-selection loses the absolute-scale
+signal Polyak's annealing needs, because top-k keeps re-finding "the
+current biggest k" regardless of how far training has actually
+progressed.
+
+Resolution (direct instruction, recorded as a design note, NOT built):
+Arm C's sine-wave gate isn't magnitude-based at all, so it sidesteps
+this conflict by construction. A Polyak-style (or any residual-
+tracking) controller could safely shrink Arm C's `cutoff` (the density
+threshold, a single scalar) as training progresses, WITHOUT touching
+which specific neurons fire each step -- that stays pure time/phase
+amortization, untouched by any gradient signal. Two cleanly separated
+roles instead of one conflicted one.
+
+Broader principle worth keeping, stated directly: grad sparsity's real
+value in this investigation looks like AMORTIZATION over time (fair,
+guaranteed turn-taking), not a signal to be found and optimized --
+every signal-guided selection mechanism tried (Arm A/B, `dy_r_target`
+itself) has underperformed Arm C's pure time-division on final outcome,
+despite Arm C's own lowest gradient-energy retention of any row.
+Recorded specifically because it'll matter if a future attempt at a
+FULLY sparse model (both forward AND backward, not just Arm C's
+backward-only-with-dense-forward setup tested so far) struggles to
+reach vocab=126/k=3 -- the fix is more likely "amortize better" than
+"select better." Full writeup:
+`docs/research/train_mqar_curriculum.rst:
+armc_polyak_threshold_not_selection`, memory
+`project_dense_vs_sparse_mqar_confusion_matrix`.
