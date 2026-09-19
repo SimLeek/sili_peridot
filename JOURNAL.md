@@ -9377,3 +9377,48 @@ own density/LR pairing have mattered elsewhere in this investigation --
 not yet queued, no free machine slot right now (arch-sandbox at 3/3
 jobs including the just-launched seed sweep, local at its own 2
 already-running jobs).
+
+## 2026-09-19 (cont'd) -- polyak_lr's first validation run failed
+## completely; root-caused, fixed, re-running
+
+`launch_polyak_lr_width288.py` finished: `vocab=16, k=3` at step 713,
+then completely flat (loss oscillating 2.2-2.7, never trending down,
+streak never past 2-4/10) for the remaining 99,287 steps -- far worse
+than the hand-tuned `peak_lr=0.01` record. Diagnosed directly by
+patching `apply_polyak_lr` to log its own inputs/outputs (first
+attempt used a shallow copy of `self._layer_surprise` and gave
+misleadingly "frozen" readings -- every snapshot showed the object's
+FINAL mutated state, not its value at capture time; fixed with a real
+deep copy).
+
+Real finding: raw per-call `E_t` for q/k/v/o_proj swings across orders
+of magnitude call to call (observed range ~0 to ~2000 for a single
+layer within one short run), so `c * residual / E_t` constantly
+saturated against `lr_max=0.1` regardless of its value -- and 0.1 is
+already well into the instability regime the LR range test found
+(~0.1-0.32). Training 4 of 5 wide layers at ~0.1 nearly every step for
+100k steps plausibly explains the observed frozen failure outright.
+
+Fixed: switched the denominator to `Lbar` (EMA-smoothed, already
+computed by the same hook, just unused before) instead of noisy raw
+`E_t`, and recalibrated `c` from a literature-typical SPS damping
+factor (0.5) down to `0.0005`, `lr_max` from `0.1` to `0.05` --
+empirically, to land computed values in the ~0.01-0.06 range already
+found safe rather than trusting an off-the-shelf constant that didn't
+transfer to this setup's actual per-layer gradient-energy scale. Short
+(1500-step) smoke test confirms: sane, decreasing lr values (mostly
+0.0006-0.05, falling as loss falls -- real annealing behavior) and
+genuine progress (loss 3.8->1.8, reached k=3) instead of the frozen
+pattern. Caught and fixed two stale hardcoded strings (docstring, then
+the actual runtime print banner) that still claimed the old c=0.5/
+lr_max=0.1 before relaunching, so the log wouldn't be mislabeled for
+its full ~4h run.
+
+One residual imperfection, not yet addressed: `input_proj`'s computed
+lr is driven near-zero (its `Lbar` runs on a different scale than
+q/k/v/o_proj's -- likely from its asymmetric dimensions,
+`embed_width x state_width` vs `state_width x state_width`) -- a
+single shared `c` doesn't calibrate all 5 layers equally well. Worth
+revisiting if the full-length re-run underperforms despite the fix.
+Re-launched on the freed local slot, full 100k-step budget, direct
+comparison against the `peak_lr=0.01` record still pending.
