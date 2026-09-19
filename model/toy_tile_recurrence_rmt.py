@@ -618,23 +618,35 @@ class ToyTileRecurrenceRMT:
         self,
         loss: float,
         f_star: float = 0.0,
-        c: float = 0.5,
-        lr_max: float = 1.0,
+        c: float = 0.0005,
+        lr_max: float = 0.05,
         bootstrap_lr: float = 0.01,
     ) -> dict:
         """Per-layer Stochastic-Polyak-Step-size (SPS_max variant):
-        lr_layer = min(lr_max, c * max(loss - f_star, 0) / E_t_layer),
-        using each wide layer's OWN gradient energy (self._layer_surprise
-        [name]["E_t"], task #374's always-tracked sum(dy**2) -- see
-        _timed_call) -- same global loss, per-layer denominator, one step
-        lagged (this step's E_t was measured on last step's backward, same
-        lag convention as _effective_dy_r_target). f_star=0 assumed (SPS_max
-        -- see docs/research/train_mqar_curriculum.rst:
-        polyak_lr_f_star_assumption for why that's reasonable here, not
-        the more involved online-estimated variant). c<1 is SPS's usual
-        damping safety factor; lr_max caps runaway values from a
-        near-zero E_t (e.g. before any backward pass has run for a layer).
-        bootstrap_lr: used for any layer with no E_t yet.
+        lr_layer = min(lr_max, c * max(loss - f_star, 0) / Lbar_layer),
+        using each wide layer's OWN EMA-smoothed gradient energy
+        (self._layer_surprise[name]["Lbar"] -- see _timed_call) -- same
+        global loss, per-layer denominator, one step lagged (this
+        step's Lbar reflects last step's backward, same lag convention
+        as _effective_dy_r_target). f_star=0 assumed (SPS_max -- see
+        docs/research/train_mqar_curriculum.rst:
+        polyak_lr_f_star_assumption). bootstrap_lr: used for any layer
+        with no Lbar yet.
+
+        Uses Lbar (EMA-smoothed), NOT the raw per-call E_t -- direct
+        finding, 2026-09-19: E_t swings by orders of magnitude call to
+        call (observed range ~0 to ~2000 for a single wide layer),
+        constantly saturating the formula against lr_max regardless of
+        its value. c=0.5 (a typical SPS damping factor from the
+        literature) was also wildly miscalibrated for THIS setup's
+        actual Lbar scale (~0.02-0.15 typically) -- empirically
+        recalibrated to c=0.0005, lr_max=0.05 so computed values land
+        in the same range the LR range test/grid search already found
+        safe (~0.01-0.06), not a literature default that turned out not
+        to transfer. See
+        docs/research/toy_tile_recurrence_rmt.rst:
+        per_layer_learning_rate_polyak's update for the full story
+        (first validation run, uncalibrated, failed to learn at all).
 
         TODO, not yet built: PER-NEURON Polyak (one lr per row of a
         layer, not one per layer) -- structural/grad sparsity act
@@ -653,8 +665,8 @@ class ToyTileRecurrenceRMT:
         residual = max(loss - f_star, 0.0)
         updated = {}
         for name in self._WIDE_LAYER_NAMES:
-            e_t = self._layer_surprise.get(name, {}).get("E_t")
-            lr = bootstrap_lr if not e_t else min(lr_max, c * residual / e_t)
+            lbar = self._layer_surprise.get(name, {}).get("Lbar")
+            lr = bootstrap_lr if not lbar else min(lr_max, c * residual / lbar)
             self.layer_lr_override[name] = lr
             updated[name] = lr
         return updated

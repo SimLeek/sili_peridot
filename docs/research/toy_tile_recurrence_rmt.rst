@@ -937,3 +937,40 @@ together neurons with very different realized fan-in/update frequency
 this step in a way per-neuron wouldn't. Revisit if per-layer doesn't
 adapt well, or as its own later test -- per-layer is the first thing
 to try.
+
+**Recalibration, 2026-09-19: first validation run failed to learn at
+all under the initial defaults.** ``launch_polyak_lr_width288.py``'s
+first run reached only ``vocab=16, k=3`` at step 713, then flat/noisy
+for the remaining 99,287 steps of its 100k budget -- far worse than
+the hand-tuned ``peak_lr=0.01`` record (``vocab=126, k=3`` at step
+13,601). Diagnosed directly (patched ``apply_polyak_lr`` to log its
+own inputs/outputs, a first attempt with a shallow-copied snapshot
+gave misleadingly frozen-looking values -- fixed with a proper deep
+copy): the raw per-call ``E_t`` for q/k/v/o_proj swings across orders
+of magnitude call to call (observed range ~0 to ~2000 for a single
+layer), so ``c * residual / E_t`` constantly saturated against
+``lr_max`` regardless of its value -- and ``lr_max=0.1`` (the original
+default) is already well into the instability regime the LR range test
+found (~0.1-0.32). Training 4 of 5 wide layers at ~0.1 nearly every
+step for 100k steps is a very plausible explanation for the observed
+flat/noisy failure.
+
+Fixed: switched the denominator to ``Lbar`` (the EMA-smoothed running
+gradient energy, already computed by the same ``_update_layer_surprise``
+call, just unused before) instead of the noisy raw ``E_t`` -- and
+recalibrated ``c`` from a literature-typical SPS damping factor (0.5)
+down to ``0.0005``, ``lr_max`` from ``0.1`` down to ``0.05``, both
+empirically, to land the computed values in the same ~0.01-0.06 range
+the LR range test and grid search already found safe rather than
+trusting an off-the-shelf constant that turned out not to transfer to
+this setup's actual per-layer gradient-energy scale. A short (1500-
+step) smoke test with the new defaults shows sane, decreasing lr
+values (mostly 0.0006-0.05 for q/k/v/o_proj, falling as loss falls --
+real annealing behavior) and genuine progress (reached k=3, loss
+3.8->1.8) instead of the frozen pattern. One residual imperfection,
+not yet addressed: ``input_proj``'s computed lr is driven near-zero
+(its ``Lbar`` runs on a different scale than q/k/v/o_proj's, likely
+from its different input/output dimensions -- ``embed_width x
+state_width`` vs ``state_width x state_width``) -- a single shared
+``c`` doesn't calibrate all 5 layers equally well. Worth watching if a
+longer validation run underperforms.

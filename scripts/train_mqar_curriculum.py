@@ -355,10 +355,12 @@ def train_curriculum(
     # unaffected). False (default): byte-identical to today's exact behavior.
     polyak_lr: bool = False,
     polyak_f_star: float = 0.0,
-    polyak_c: float = 0.5,
-    # 0.1: comfortably above the range test's found sweet spot (~0.01-0.057
-    # at width=288) without reaching its found instability regime (~0.1-0.32).
-    polyak_lr_max: float = 0.1,
+    # c=0.5 (a typical literature SPS damping factor) was wildly miscalibrated
+    # for this setup's actual per-layer Lbar scale -- see apply_polyak_lr's
+    # own docstring for the recalibration story (first validation run failed
+    # to learn at all under the old c=0.5/lr_max=0.1 defaults).
+    polyak_c: float = 0.0005,
+    polyak_lr_max: float = 0.05,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
