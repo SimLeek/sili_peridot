@@ -9194,3 +9194,35 @@ Launched queue item 3 into the freed local slot:
 `launch_armc_gatesparse_lr_scaled.py` (Arm C gate cutoff=0.6, ~29.5%
 density, peak_lr=0.01 scaled) -- will show whether this reversal holds
 at the sparser gate density too, or is specific to ~50% density.
+
+## 2026-09-19 -- sparser gate did worse, not better, at the same LR
+
+`launch_armc_gatesparse_lr_unscaled.py` (cutoff=0.6, ~29.5% density,
+peak_lr=0.015 unscaled) finished: `vocab=126, k=2` at step 30,097, then
+flat for the remaining 69,903 steps -- NEVER reached k=3. Direct
+comparison, same LR, only density differs: the ~50%-density sibling
+(`launch_armc_gatemid_lr_unscaled.py`) reached vocab=126 sooner (step
+17,146 vs 30,097) AND went on to reach k=3 (step 24,331). Test 3's
+grid so far (3 of 4 cells done):
+
+| cutoff (density) | peak_lr | result |
+|---|---|---|
+| 0.0 (~50%) | 0.015 unscaled | **vocab=126, k=3 @ step 24,331 -- best Arm C result so far** |
+| 0.0 (~50%) | 0.01 scaled | vocab=126, k=2 @ step 20,642, stuck |
+| 0.6 (~29.5%) | 0.015 unscaled | vocab=126, k=2 @ step 30,097, stuck |
+| 0.6 (~29.5%) | 0.01 scaled | running |
+
+Within this small grid, MORE density (not less) and the HIGHER,
+un-scaled LR (not the width-scaled-down one) both independently helped
+-- cuts against a naive "sparser gate tolerates/benefits from more
+aggressive LR" reading. Plausible cause: sparser gating compounds the
+already-low gradient-energy retention Arm C showed in the original
+confusion-matrix run (0.35-0.47 R vs baseline's 0.90) -- going sparser
+may be trading away real signal faster than any LR-robustness benefit
+can make up for. Waiting on the 4th cell before drawing a firmer
+conclusion; genuinely useful either way -- the "sparser is better"
+assumption isn't holding up so far.
+
+Launched queue item 4 into the freed local slot:
+`launch_polyak_lr_width288.py` (per-layer Polyak dynamic LR
+validation, no hand-tuned peak_lr at all).
