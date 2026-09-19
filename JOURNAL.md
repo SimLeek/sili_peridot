@@ -9145,3 +9145,24 @@ specific fluke.
 Launched queue item 1 into the freed local slot:
 `launch_armc_gatemid_lr_scaled.py` (Arm C gate cutoff=0.0, peak_lr=0.01
 scaled).
+
+## 2026-09-18 (cont'd) -- test 3 data point: Arm C tolerates the
+## unscaled LR that broke dense
+
+`launch_armc_gatemid_lr_unscaled.py` (Arm C backward gate cutoff=0.0,
+~50% density, dense forward, peak_lr LEFT UNSCALED at 0.015) finished:
+reached `vocab=126, k=3` at step 24,331 (100k steps, 19,803s total,
+5.05 steps/sec). This is the SAME unscaled peak_lr that left the fully-
+dense arm permanently stuck at vocab=64/k=3 for its whole remaining
+budget -- direct, clean confirmation of the `lr(N, gate_density)`
+reading: gate density really does let a layer tolerate an LR that
+breaks the fully-dense arm outright. Not FASTER than the LR-fixed
+dense record (24,331 steps / ~80min est. vs dense's 13,601 steps /
+~30min) -- Arm C here is trading LR-robustness for raw speed at this
+particular density/cutoff, not beating dense on both axes the way
+`peak_lr=0.01` alone did.
+
+Launched queue item 2 into the freed local slot:
+`launch_armc_gatesparse_lr_unscaled.py` (Arm C gate cutoff=0.6, ~29.5%
+density, peak_lr=0.015 unscaled) -- the sparser-gate counterpart, will
+tell us whether tolerance improves further as density drops.
