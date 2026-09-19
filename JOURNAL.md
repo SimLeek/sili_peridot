@@ -9422,3 +9422,23 @@ single shared `c` doesn't calibrate all 5 layers equally well. Worth
 revisiting if the full-length re-run underperforms despite the fix.
 Re-launched on the freed local slot, full 100k-step budget, direct
 comparison against the `peak_lr=0.01` record still pending.
+
+## 2026-09-19 (cont'd) -- test 2 (dy_k_min=dy_k_max=64) complete: negative
+## at both widths, not a width-128-specific fluke
+
+`launch_dy_fixed_count_width288.py` finished: `vocab=32, k=2` at step
+25,688, then flat for the remaining 74,312 steps. Confirms width=128's
+own earlier stall (one level-up at step 925, then completely flat)
+wasn't a fluke -- width=288 got somewhat further before stalling, but
+both are far short of what dense or Arm C reach at their respective
+widths. This closes out test 2 as designed: forcing an EXACT fixed
+count via `dy_k_min=dy_k_max=64` (overriding `dy_r_target`'s own
+natural energy-based selection entirely) looks actively harmful, not a
+safe dynamic stand-in for the structural fan-in cap that got abandoned
+earlier. The underlying "does an absolute, non-width-proportional
+budget decouple LR from width" question stays open -- would need a
+genuinely different dynamic mechanism to test properly, not yet
+designed.
+
+Freed arch-sandbox slot -- no queue items remain to launch (everything
+built this session is now running or complete).

@@ -684,15 +684,21 @@ for a fresh failure).
 
 1. A third ``(N, peak_lr)`` point (e.g. ``state_width=192`` or a second
    width=288 LR value) to actually pin ``alpha`` instead of bracketing it.
-2. **Designed and queued (2026-09-18)**: same "does an absolute,
-   non-width-proportional budget decouple LR from width" question, via a
-   mechanism this project has already validated as safe at toy scale --
-   DYNAMIC per-step selection, forced to a fixed absolute count via
-   ``dy_k_min=dy_k_max=64`` (clamps the nucleus top-k's result regardless
-   of ``dy_r_target``), ``dense=True`` kept at its default (structural
-   connectivity untouched). ``launch_dy_fixed_count_width128.py`` /
-   ``launch_dy_fixed_count_width288.py``, both at the unscaled
-   ``peak_lr=0.015``.
+2. **Done, 2026-09-19 -- NEGATIVE at both widths.** ``dy_k_min=
+   dy_k_max=64`` (forcing an exact fixed count, overriding ``dy_r_target``'s
+   own natural energy-based selection entirely) stalled hard at both
+   widths: ``launch_dy_fixed_count_width128.py`` reached only
+   ``vocab=16/k=3`` (one level-up, step 925, then flat for 99,075
+   steps); ``launch_dy_fixed_count_width288.py`` reached ``vocab=32/k=2``
+   (step 25,688, then flat) -- got further before stalling but still far
+   short of the dense/Arm C results at either width. Confirmed NOT a
+   width-specific fluke. Reads as: forcing an EXACT count via this
+   clamp, rather than letting ``dy_r_target`` pick its own natural k, is
+   itself actively harmful -- not a safe dynamic stand-in for the
+   abandoned structural fan-in cap after all. The underlying "does an
+   absolute, non-width-proportional budget decouple LR from width"
+   question is still open; a real answer needs a DIFFERENT dynamic
+   mechanism than this one, not yet designed.
 3. **Designed and queued (2026-09-18)**: sweep Arm C's
    ``dy_time_gate_cutoff`` (gate density) against required ``peak_lr`` at
    fixed width=288 -- does a denser gate (closer to ungated) need dense's
