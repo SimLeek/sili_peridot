@@ -974,3 +974,49 @@ from its different input/output dimensions -- ``embed_width x
 state_width`` vs ``state_width x state_width``) -- a single shared
 ``c`` doesn't calibrate all 5 layers equally well. Worth watching if a
 longer validation run underperforms.
+
+.. _arm_c_single_state_angle_fix:
+
+Arm C gate: corrected from a 3-state design to 1-state, 2026-09-19/20
+-------------------------------------------------------------------------------
+
+*ID:* ``arm_c_single_state_angle_fix``
+
+Direct correction, caught in conversation, not by review of the running
+code: the implementation built earlier this session
+(``gate_j(t) = sin(2*pi*t/period_j + phase_j(t)) > cutoff``) used THREE
+stateful pieces per neuron -- a shared global step counter ``t``, a
+per-neuron period drawn once from ``Uniform(dy_time_gate_period_range)``
+and held fixed, and a separately-accumulated additive phase random walk
+``phase_j(t) = phase_j(t-1) + N(0, phase_step)`` -- none of which matches
+the original spec ("small infinitesimals added to vars on each neuron
+before sin is computed"). ``t`` was never supposed to be an absolute
+training-step counter; ``period_j`` varying per neuron was unnecessary
+complexity; the separate phase-noise term on top of a deterministic
+``t/period`` term was two mechanisms doing one job.
+
+**Fixed**: ``angle_j(t) = angle_j(t-1) + N(2*pi/period, phase_step)`` --
+ONE accumulating per-neuron state (``self._dy_time_gate_angle``),
+started uniform in ``[0, 2*pi)``, advanced each call by a single normal
+draw whose MEAN is a fixed shared constant (``2*pi/dy_time_gate_period``,
+same for every neuron -- no more per-neuron period draw) and whose
+spread (``dy_time_gate_phase_step``, unchanged default 0.02) supplies
+the "infinitesimal" wobble directly, with no separate phase term needed.
+``gate_j(t) = sin(angle_j(t)) > cutoff``, same formula shape, same
+density-vs-cutoff relationship (verified empirically:
+``density(cutoff=0.3)`` measured 0.4030 over 20,000 steps/2,000 neurons
+vs the theoretical ``0.5 - arcsin(0.3)/pi = 0.40301`` -- matches to 4
+decimal places). No global step counter needed at all --
+``self._dy_time_gate_t`` and its increment in ``step()`` were removed.
+
+**Scope caveat**: every Arm C result recorded in this investigation so
+far (the original confusion-matrix win, test 3's full grid, the
+gate-density LR compensation tests, the 12-run seed sweep) used the OLD
+three-state mechanism, not this corrected one. The qualitative
+conclusions (Arm C beating signal-guided selection, the density-driven
+reliability finding from the seed sweep, the LR-tolerance findings) are
+not expected to flip from this fix -- the underlying behavior (each
+neuron gets periodic, non-repeating trainable windows, density set by
+cutoff) is the same in spirit -- but the EXACT numbers (which specific
+neurons were on when, on any specific run) are not reproducible against
+the old code anymore. Not rerun yet.
