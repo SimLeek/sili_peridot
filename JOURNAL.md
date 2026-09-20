@@ -9477,3 +9477,51 @@ complete: 2/2 fell short of vocab=126, adding more weight to test 3's
 own conclusion that there's no clean, extrapolatable lr(p) formula for
 Arm C -- each (density, LR) combination seems to have its own narrow
 window, not a rule that generalizes from a couple of anchor points.
+
+## 2026-09-20 -- seed sweep resolves the mystery: it's not a crossover,
+## it's density-driven RELIABILITY
+
+`armc_gate_density_lr_seed_sweep.py` finished all 12 runs (2 densities
+x 2 LRs x 3 seeds, 25,000-step budget). Steps to `vocab=64/k=3` (the
+sweep's target metric) per cell, across seeds 1000/2000/3000:
+
+| cell | seed 1000 | seed 2000 | seed 3000 | reached within budget |
+|---|---|---|---|---|
+| gatemid (~50%) unscaled=0.015 | 12,905 | 9,065 | 7,025 | 3/3 |
+| gatemid (~50%) scaled=0.01 | 19,193 | 11,532 | 8,055 | 3/3 |
+| gatesparse (~29.5%) unscaled=0.015 | DNF | DNF | 8,677 | 1/3 |
+| gatesparse (~29.5%) scaled=0.01 | DNF | 13,659 | DNF | 1/3 |
+
+Not a crossover at all. The denser gate reliably reaches the milestone
+REGARDLESS of which LR is used (3/3 both times); the sparser gate is
+unreliable regardless of LR (1/3 both times). The original single-seed
+grid's apparent crossover (denser+unscaled and sparser+scaled both
+"succeeding," both cross-combinations "failing") was almost certainly
+just which single seed got drawn landing on the sparser gate's lucky
+~1-in-3 outcome for two different LR values -- not a genuine
+(density, LR) interaction. Density drives RELIABILITY here, not a
+paired sweet spot with LR. Mechanistically sensible: fewer active
+neurons per step means more variance in which specific neurons get
+useful updates when, so more seed-to-seed spread in outcomes.
+
+This resolves the "that's weird" thread cleanly: the direct instinct
+to check for a seed confound, then the correction to use statistical
+power instead of seed-pinning, both turned out to be exactly right --
+the real answer only showed up once enough independent samples existed
+to separate signal (density matters) from noise (which single seed you
+happened to run).
+
+Also: `launch_polyak_lr_width288.py`'s recalibrated re-run finished --
+`vocab=32, k=3` at step 6,149 (100k steps, 13,176s, 7.59 steps/sec).
+Real progress this time (vs the first run's frozen vocab=16), and
+genuinely fast to its own milestones (k=3 at vocab=16 by step 1,056,
+vocab=32/k=3 by step 6,149) -- but still well short of the hand-tuned
+peak_lr=0.01 record (vocab=126/k=3 at step 13,601). The calibration
+fix clearly worked (real learning, not frozen) but the mechanism
+itself doesn't yet match a hand-tuned constant LR at this width --
+input_proj's still-near-zero lr (noted as a residual imperfection when
+the fix landed) is the most likely next thing to dig into if this is
+worth pursuing further.
+
+All originally-running jobs have now finished; machines are idle, no
+queue items remain.
