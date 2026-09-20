@@ -361,6 +361,22 @@ def train_curriculum(
     # to learn at all under the old c=0.5/lr_max=0.1 defaults).
     polyak_c: float = 0.0005,
     polyak_lr_max: float = 0.05,
+    # See docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design --
+    # EXPERIMENTAL critical-learning-periods/loss-of-plasticity forgetting.
+    # None (default): byte-identical to today's exact behavior, matching
+    # l2_decay_chunk_size's own off-by-default convention.
+    loss_adjusted_decay_chunk_size: int | None = None,
+    loss_adjusted_decay_importance_strength: float = 0.3,
+    # weight_strength default 0 -- see apply_loss_adjusted_decay's own
+    # docstring: it shares l2_decay_chunk_size's C++ weight-decay cursor,
+    # do not set this nonzero in the same run that also sets
+    # l2_decay_chunk_size.
+    loss_adjusted_decay_weight_strength: float = 0.0,
+    loss_adjusted_decay_ramp_steps: int = 200,
+    loss_adjusted_decay_beta_fast: float = 0.9,
+    loss_adjusted_decay_beta_floor: float = 0.999,
+    loss_adjusted_decay_improve_tol: float = 1e-3,
+    loss_adjusted_decay_min_decay_factor: float = 0.5,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -747,6 +763,21 @@ def train_curriculum(
                 # train_curriculum.l2_decay_and_rank_control_ordering.
                 if l2_decay_chunk_size is not None:
                     model.apply_amortized_l2_decay(l2_decay_chunk_size, l2_decay_adaptation_rate)
+                if loss_adjusted_decay_chunk_size is not None:
+                    # Uses loss_ema (not the raw per-token loss), same
+                    # smoothing convention apply_polyak_lr already uses for
+                    # its own residual -- see loss_adjusted_decay_design.
+                    model.apply_loss_adjusted_decay(
+                        loss_ema if loss_ema is not None else float(loss.data),
+                        loss_adjusted_decay_chunk_size,
+                        importance_strength=loss_adjusted_decay_importance_strength,
+                        weight_strength=loss_adjusted_decay_weight_strength,
+                        ramp_steps=loss_adjusted_decay_ramp_steps,
+                        beta_fast=loss_adjusted_decay_beta_fast,
+                        beta_floor=loss_adjusted_decay_beta_floor,
+                        improve_tol=loss_adjusted_decay_improve_tol,
+                        min_decay_factor=loss_adjusted_decay_min_decay_factor,
+                    )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,
