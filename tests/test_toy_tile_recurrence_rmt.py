@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-from sili.sparse_rnn import DISLDOLayer
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
 from sili.tensor import Tensor
 
 from model.toy_recall_models import AdamOptimizer, cross_entropy_sum
@@ -16,7 +16,7 @@ STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
 MAX_WEIGHTS = STATE_WIDTH * 16
 
 
-def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0):
+def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0, dense=False, rng=None):
     return ToyTileRecurrenceRMT(
         VOCAB,
         EMBED_WIDTH,
@@ -27,6 +27,8 @@ def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0):
         num_cpus=num_cpus,
         disldo_cls=disldo_cls,
         l1_sparsity_coef=l1_sparsity_coef,
+        dense=dense,
+        rng=rng,
     )
 
 
@@ -1226,3 +1228,102 @@ class TestStepContentDySparsitySchedule:
             raise AssertionError("expected ValueError for mismatched schedule length")
         except ValueError:
             pass
+
+
+class TestLossAdjustedDecay:
+    """apply_loss_adjusted_decay -- critical-learning-periods/loss-of-
+    plasticity forgetting (EXPERIMENTAL, added 2026-09-20). See
+    docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design.
+    Direct instruction: "add tests to make sure things match in any edge
+    cases the code indicates" -- covers the exact bug caught by manual
+    testing during implementation (a tie/filter-transient dip must NOT
+    count as genuine improvement), plus stall accumulation, reset on real
+    improvement, per-arm toggling, and block4 coverage under dense=True."""
+
+    def test_perfectly_flat_loss_accumulates_stall_every_step(self):
+        # Regression test for a real bug caught during implementation: a
+        # plain `ema <= floor` comparison let the EMA's own settling to
+        # its initial value read as "improvement" on every single call,
+        # even for loss that never actually changes -- permanently
+        # masking a real stall. Fixed via a required relative margin
+        # (improve_tol). A flat loss must accumulate stall_steps == the
+        # number of calls, every time, no exceptions.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
+        out = None
+        for _ in range(50):
+            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+        assert model._decay_stall_steps == 50
+        assert out["input_proj"]["stall_frac"] == pytest.approx(50 / 200, abs=1e-9)
+
+    def test_noisy_but_flat_loss_still_registers_stall(self):
+        # A loss oscillating narrowly around a fixed mean (no real
+        # learning happening) must not be mistaken for improvement just
+        # because the EMA occasionally dips below its own filter-
+        # transient floor by a tiny amount -- improve_tol must reject
+        # noise-sized dips.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(1))
+        for i in range(300):
+            loss = 2.0 + (0.001 if i % 2 == 0 else -0.001)
+            out = model.apply_loss_adjusted_decay(loss, chunk_size=1000)
+        assert out["input_proj"]["stall_frac"] > 0.5, "noisy-flat loss must still register a real stall"
+
+    def test_sustained_improvement_keeps_resetting_stall(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(2))
+        loss = 5.0
+        out = None
+        for _ in range(100):
+            loss *= 0.98  # steadily, genuinely decreasing
+            out = model.apply_loss_adjusted_decay(loss, chunk_size=1000)
+        assert model._decay_stall_steps < 5
+        assert out["input_proj"]["stall_frac"] < 0.05
+
+    def test_importance_arm_default_on_weight_arm_default_off(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
+        out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+        assert out["input_proj"]["importance"] is not None
+        assert out["input_proj"]["weight"] is None
+
+    def test_zero_strength_arm_is_an_exact_noop(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
+        out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000, importance_strength=0.0, weight_strength=0.0)
+        for entry in out.values():
+            assert entry["importance"] is None
+            assert entry["weight"] is None
+
+    def test_weight_arm_opt_in_actually_decays_block4_weight(self):
+        # dense=True routes DISLDOLayer32's weights into block4 storage --
+        # a sustained stall must measurably shrink the REAL (block4) weight
+        # magnitude, not just report a no-op on empty scattered padding.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
+        w_before = np.abs(np.array(model.input_proj.weights)).mean()
+        out = None
+        for _ in range(250):
+            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000, weight_strength=0.5)
+        assert out["input_proj"]["weight"] is not None
+        assert out["input_proj"]["weight"]["decay_factor"] < 1.0
+        assert out["input_proj"]["weight"]["block4"]["n"] > 0
+        w_after = np.abs(np.array(model.input_proj.weights)).mean()
+        assert w_after < w_before, "sustained stall + weight arm should measurably shrink real block4 weights"
+
+    def test_scattered_backend_has_no_block4_key(self):
+        # FP4 (DISLDOLayer, scattered-only) has no block4 concept at all --
+        # the block4 sub-call must be skipped entirely (hasattr-guarded),
+        # not attempted-and-erroring.
+        model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(6))
+        out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+        assert out["input_proj"]["importance"] is not None
+        assert "block4" not in out["input_proj"]["importance"]
+
+    def test_stall_frac_saturates_at_one(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(7))
+        out = None
+        for _ in range(500):  # far past ramp_steps=200
+            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+        assert out["input_proj"]["stall_frac"] == 1.0
+
+    def test_min_decay_factor_floors_the_decay(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(8))
+        out = None
+        for _ in range(500):
+            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000, importance_strength=1.0, min_decay_factor=0.7)
+        assert out["input_proj"]["importance"]["decay_factor"] == pytest.approx(0.7)

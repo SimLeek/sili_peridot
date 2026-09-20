@@ -567,6 +567,95 @@ still converges to the same correct fixed point, just slower/faster,
 unlike a 2x-off half-life which directly sets the wrong equilibrium
 magnitude.
 
+.. _toy_tile_recurrence_rmt.loss_adjusted_decay_design:
+
+``apply_loss_adjusted_decay``: sustained-loss-triggered forgetting (critical-learning-periods hypothesis)
+------------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.loss_adjusted_decay_design``
+
+Direct instruction, following a rejected "variance in useful updates"
+explanation for stalled/failed training runs ("no, there is no 'luck'.
+This is pure math. If you're just getting lucky in math you're doing it
+wrong."): the alternative hypothesis is that the network structurally
+CAN'T UN-LEARN early bad adaptations -- matching the real
+critical-learning-periods / loss-of-plasticity literature (Achille et al.
+2019; Dohare et al., *Nature* 2024), which finds adaptive optimizers'
+accumulated second-moment state specifically contributes to "frozen
+units" that resist further updates, and that decaying that state (or, in
+one study, full unit resets) is a documented mitigation. This fit the
+observed crash-then-permanent-plateau shape of several stalled runs
+(dense-unscaled, Polyak, Arm C+knee variants) far better than a gradual
+variance story would.
+
+Direct instruction: "implement the decays, implement them both while
+making sure to note that we're actively testing them and may delete one
+or more of the forms of decay if it doesn't work well in testing" --
+``apply_loss_adjusted_decay`` implements BOTH arms as independently
+toggleable strengths (``importance_strength``, ``weight_strength``):
+
+- **Importance decay** -- this project's per-synapse ``importance`` field
+  plays the exact role of an Adam/RMSprop second-moment accumulator (see
+  ``feedback_importance_is_already_the_optimizer``), so this is the
+  direct, mechanism-specific fix: shrink the accumulator that's doing the
+  freezing. Default-enabled (``importance_strength=0.3``) -- has its own
+  dedicated C++ cursor (``_importance_decay_cursor``, see
+  ``sili__new``'s ``docs/research/delta_csr_types.rst:
+  amortized_decay.chunked_cursor``), no conflict with any other
+  mechanism.
+- **Weight/value decay** -- the more classic forgetting mechanism
+  (biologically: synaptic decay, not optimizer-state decay). Default-OFF
+  (``weight_strength=0.0``): it shares the SAME per-layer C++
+  weight-decay cursor as the existing, already-in-production
+  ``apply_amortized_l2_decay`` (RMS-closed-loop regularization, a
+  different, unrelated mechanism -- see
+  ``amortized_l2_decay_design`` above) -- there is only one
+  ``_decay_cursor`` per layer in C++, so running both in the same
+  training loop drives it out of sync with either mechanism's own intent.
+  Enable this arm only in a loop that does NOT also call
+  ``apply_amortized_l2_decay`` every step.
+
+Direct instruction on granularity: "we need to limit the bits per synapse
+to what they currently are" (no new per-synapse storage) and prefer
+per-neuron over per-layer where possible. Loss is a single global scalar
+with no natural per-neuron decomposition here, so this lands at
+PER-LAYER granularity, uniformly applied via each real layer's own
+``apply_amortized_importance_decay``/``apply_amortized_l2_decay`` call --
+the same limitation ``per_layer_learning_rate_polyak`` already documents
+for its own per-layer (not per-neuron) Polyak LR.
+
+**Stall signal, not instantaneous loss**: a fast EMA of loss
+(``beta_fast=0.9``) is compared against a slow-relaxing floor
+(``beta_floor=0.999``) tracking the EMA's own best-ever value.
+``self._decay_stall_steps`` counts consecutive steps since the EMA last
+beat the floor, resetting to 0 the instant it does; the floor itself
+still relaxes slowly upward on non-improving steps so a genuine
+curriculum-driven loss increase (a harder level starting) doesn't read as
+a permanent stall forever. ``stall_frac = min(1, stall_steps/ramp_steps)``
+is the actual 0..1 signal driving decay -- deliberately insensitive to a
+single noisy step (matching the "pure math, not luck" correction: a
+single loss spike is noise, ``ramp_steps`` consecutive non-improving
+steps is a real stall), saturating only after sustained elevation.
+
+Per active arm, per layer: ``decay_factor = max(min_decay_factor, 1 -
+stall_frac * strength)`` -- ``strength=0`` is an exact no-op (the arm is
+disabled), higher ``strength`` reaches ``min_decay_factor`` (default 0.5,
+i.e. a hard floor of never more than halving per touch) faster as the
+stall persists. Both arms also call each layer's block4 counterpart when
+present (``apply_amortized_block4_importance_decay``/
+``apply_amortized_block4_l2_decay``, ``sili__new`` task added
+2026-09-20), since ``dense=True`` -- this investigation's actually-used
+config throughout -- routes ``DISLDOLayerV`` weights into block4 storage,
+not the scattered CSR path either arm's base call alone would cover; see
+``feedback_block4_scattered_parity_required``.
+
+**Status: not yet empirically tested** against the stalled runs this
+hypothesis was built to explain -- built and unit-tested at the engine
+level (``sili__new``'s ``test_block4_amortized_decay.cpp``/
+``test_amortized_decay_stats.cpp``), not yet run against real training.
+Next: relaunch one or more of the known-stalled configs with this
+mechanism enabled and compare against their original stalled trajectory.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph

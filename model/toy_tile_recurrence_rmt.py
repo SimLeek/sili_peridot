@@ -325,6 +325,13 @@ class ToyTileRecurrenceRMT:
         self.critic_head = None
         # See docs/research/toy_tile_recurrence_rmt.rst:amortized_l2_decay_design.
         self._l2_decay_factor: dict = {}
+        # EXPERIMENTAL, added 2026-09-20 -- critical-learning-periods/
+        # loss-of-plasticity forgetting mechanism, sustained-loss stall
+        # tracking for apply_loss_adjusted_decay. See
+        # docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design.
+        self._decay_loss_ema: float | None = None
+        self._decay_loss_floor: float | None = None
+        self._decay_stall_steps: int = 0
         # See docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design.
         self._layer_timing: dict = {}
         if use_critic:
@@ -754,6 +761,116 @@ class ToyTileRecurrenceRMT:
                     self._l2_decay_factor[name] = decay_factor
                 stats = dict(stats, target=target, decay_factor=decay_factor)
                 results[name] = stats
+        return results
+
+    def apply_loss_adjusted_decay(
+        self,
+        loss: float,
+        chunk_size: int,
+        importance_strength: float = 0.3,
+        weight_strength: float = 0.0,
+        ramp_steps: int = 200,
+        beta_fast: float = 0.9,
+        beta_floor: float = 0.999,
+        improve_tol: float = 1e-3,
+        min_decay_factor: float = 0.5,
+    ) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- critical-learning-periods/
+        loss-of-plasticity forgetting (Achille et al. 2019 "Critical
+        Learning Periods in Deep Neural Networks"; Dohare et al., *Nature*
+        2024 "Loss of plasticity in deep continual learning"). Direct
+        hypothesis this implements: a training stall isn't "variance" --
+        the network structurally can't un-learn early bad adaptations
+        (matching real critical-learning-periods findings), so SUSTAINED
+        high loss (not one noisy step) should trigger MORE forgetting to
+        restore plasticity. See
+        docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design.
+
+        Two INDEPENDENT, separately-toggleable arms -- direct instruction:
+        implement both, note both are actively being tested, either may
+        be removed if it doesn't show benefit:
+
+        1. ``importance_strength`` (default on): decays each layer's
+           per-synapse IMPORTANCE -- this project's RMSprop-style
+           second-moment accumulator (see
+           feedback_importance_is_already_the_optimizer) -- the
+           mechanism-specific fix for adaptive optimizers' own
+           documented "freezing" of heavily-used units.
+        2. ``weight_strength`` (default OFF): decays each layer's actual
+           WEIGHT -- the more classic forgetting mechanism. Shares the
+           SAME per-layer C++ weight-decay cursor as
+           ``apply_amortized_l2_decay`` (there is only one
+           ``_decay_cursor`` per layer) -- do not enable this arm in a
+           training loop that also calls ``apply_amortized_l2_decay``
+           every step; both would drive the same cursor out of sync with
+           each other's own decay_factor intent. Off by default for
+           exactly this reason.
+
+        Stall signal: a fast EMA of loss (``beta_fast``) vs a
+        slow-relaxing floor (``beta_floor``) -- ``self._decay_stall_steps``
+        counts consecutive steps since the EMA last beat the floor by at
+        least ``improve_tol`` (relative) -- a TIE or a smaller dip does
+        NOT reset stall (real bug caught by testing: a plain ``<=``
+        comparison let the EMA's own filter-transient settling from its
+        initial value read as continuous "improvement" on a genuinely
+        flat/oscillating loss, permanently masking a real stall -- fixed
+        by requiring a real margin, not just a decrease). Reset to 0 the
+        instant a genuine improvement occurs. The floor still relaxes
+        slowly upward on non-improving steps so a genuine curriculum-driven
+        loss increase (harder level) doesn't read as a permanent stall
+        forever. ``stall_frac = min(1, stall_steps/ramp_steps)`` is the
+        smoothed 0..1 sustained-stall signal that actually drives decay --
+        a single bad step barely moves it; ``ramp_steps`` consecutive
+        non-improving steps saturates it. Per active arm, per layer:
+        ``decay_factor = max(min_decay_factor, 1 - stall_frac*strength)``.
+
+        Applied UNIFORMLY across every real layer -- loss is a single
+        global signal, no finer-than-per-layer signal is available
+        without new per-neuron instrumentation (same per-layer, not
+        per-neuron, limitation ``apply_polyak_lr`` already documents for
+        itself). Per direct instruction, decay is never per-synapse.
+
+        Calls the block4 counterpart
+        (``apply_amortized_block4_l2_decay``/
+        ``apply_amortized_block4_importance_decay``) too when the layer
+        has one, since ``dense=True`` routes weights into block4 storage
+        -- see feedback_block4_scattered_parity_required.
+
+        Returns ``{layer_name: {"stall_frac": ..., "importance": {...} |
+        None, "weight": {...} | None}}``."""
+        if self._decay_loss_ema is None:
+            self._decay_loss_ema = loss
+            self._decay_loss_floor = loss
+        else:
+            self._decay_loss_ema = beta_fast * self._decay_loss_ema + (1.0 - beta_fast) * loss
+        if self._decay_loss_ema < self._decay_loss_floor * (1.0 - improve_tol):
+            self._decay_loss_floor = self._decay_loss_ema
+            self._decay_stall_steps = 0
+        else:
+            self._decay_stall_steps += 1
+            self._decay_loss_floor = beta_floor * self._decay_loss_floor + (1.0 - beta_floor) * self._decay_loss_ema
+        stall_frac = min(1.0, self._decay_stall_steps / max(ramp_steps, 1))
+
+        results = {}
+        for name, layer in self._named_real_layers():
+            if layer.nnz <= 0:
+                continue
+            entry = {"stall_frac": stall_frac, "importance": None, "weight": None}
+            if importance_strength > 0.0 and hasattr(layer, "apply_amortized_importance_decay"):
+                imp_decay_factor = max(min_decay_factor, 1.0 - stall_frac * importance_strength)
+                stats = layer.apply_amortized_importance_decay(chunk_size, imp_decay_factor)
+                if hasattr(layer, "apply_amortized_block4_importance_decay"):
+                    stats = dict(
+                        stats, block4=layer.apply_amortized_block4_importance_decay(chunk_size, imp_decay_factor)
+                    )
+                entry["importance"] = dict(stats, decay_factor=imp_decay_factor)
+            if weight_strength > 0.0 and hasattr(layer, "apply_amortized_l2_decay"):
+                w_decay_factor = max(min_decay_factor, 1.0 - stall_frac * weight_strength)
+                stats = layer.apply_amortized_l2_decay(chunk_size, w_decay_factor)
+                if hasattr(layer, "apply_amortized_block4_l2_decay"):
+                    stats = dict(stats, block4=layer.apply_amortized_block4_l2_decay(chunk_size, w_decay_factor))
+                entry["weight"] = dict(stats, decay_factor=w_decay_factor)
+            results[name] = entry
         return results
 
     def apply_dynamic_rank_control(
