@@ -777,6 +777,7 @@ class ToyTileRecurrenceRMT:
         max_chunk: int = 2048,
         importance_half_life_touches: float | None = 500.0,
         weight_half_life_touches: float | None = None,
+        min_stall_steps: int = 200,
         ramp_steps: int = 200,
         beta_fast: float = 0.9,
         beta_floor: float = 0.999,
@@ -868,10 +869,27 @@ class ToyTileRecurrenceRMT:
         check against). The floor still relaxes slowly upward on
         non-improving steps so a genuine curriculum-driven loss increase
         (harder level) doesn't read as a permanent stall forever.
-        ``stall_frac = min(1, stall_steps/ramp_steps)`` is the smoothed
-        0..1 sustained-stall signal that actually drives decay severity --
-        a single bad step barely moves it; ``ramp_steps`` consecutive
-        non-improving steps saturates it.
+        ``min_stall_steps``: a REAL BASELINE/GRACE PERIOD, not merely a
+        gentle ramp -- real gap caught by direct question ("I feel like
+        it would need to establish a baseline and shouldn't necessarily
+        decay all the time"): without this, ``stall_frac`` (and therefore
+        ``decay_factor``) is technically nonzero after almost every call,
+        since ``stall_steps`` starts incrementing from the very FIRST call
+        (the initial ``ema==floor`` tie never counts as improvement) and
+        keeps incrementing on any call that doesn't beat the floor by a
+        full ``improve_tol`` -- ordinary noisy-but-productive training
+        doesn't clear a fresh margin every single call either, so decay
+        was ALWAYS slightly active, just negligibly so most of the time --
+        never a clean, exact "off" state. Fixed: ``stall_frac`` is now
+        EXACTLY 0 (``decay_factor`` exactly 1.0, a true no-op) for the
+        first ``min_stall_steps`` consecutive non-improving calls, only
+        ramping in afterward:
+        ``stall_frac = min(1, max(0, stall_steps - min_stall_steps) /
+        ramp_steps)``. Default 200 (same order as ``ramp_steps``, so full
+        severity is reached only after ~400 consecutive non-improving
+        calls total) -- small relative to the historical stalls' own
+        74,000-99,000+ step length, but large enough that ordinary
+        training noise/short plateaus never trigger any decay at all.
 
         The DECAY_FACTOR (how hard each touched synapse decays) is applied
         UNIFORMLY across every real layer -- loss is a single global
@@ -955,7 +973,7 @@ class ToyTileRecurrenceRMT:
         else:
             self._decay_stall_steps += 1
             self._decay_loss_floor = beta_floor * self._decay_loss_floor + (1.0 - beta_floor) * self._decay_loss_ema
-        stall_frac = min(1.0, self._decay_stall_steps / max(ramp_steps, 1))
+        stall_frac = min(1.0, max(0, self._decay_stall_steps - min_stall_steps) / max(ramp_steps, 1))
 
         results = {}
         for name, layer in self._named_real_layers():

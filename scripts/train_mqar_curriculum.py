@@ -389,6 +389,12 @@ def train_curriculum(
     # do not set this nonzero in the same run that also sets
     # l2_decay_chunk_size.
     loss_adjusted_decay_weight_half_life_touches: float | None = None,
+    # Real baseline/grace period -- see apply_loss_adjusted_decay's own
+    # min_stall_steps docstring section (direct question: "I feel like it
+    # would need to establish a baseline and shouldn't necessarily decay
+    # all the time"). Decay is an EXACT no-op for this many consecutive
+    # non-improving calls before it starts ramping in at all.
+    loss_adjusted_decay_min_stall_steps: int = 200,
     loss_adjusted_decay_ramp_steps: int = 200,
     loss_adjusted_decay_beta_fast: float = 0.9,
     loss_adjusted_decay_beta_floor: float = 0.999,
@@ -790,6 +796,7 @@ def train_curriculum(
                         max_chunk=loss_adjusted_decay_max_chunk,
                         importance_half_life_touches=loss_adjusted_decay_importance_half_life_touches,
                         weight_half_life_touches=loss_adjusted_decay_weight_half_life_touches,
+                        min_stall_steps=loss_adjusted_decay_min_stall_steps,
                         ramp_steps=loss_adjusted_decay_ramp_steps,
                         beta_fast=loss_adjusted_decay_beta_fast,
                         beta_floor=loss_adjusted_decay_beta_floor,

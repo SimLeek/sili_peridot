@@ -1253,16 +1253,38 @@ class TestLossAdjustedDecay:
         for _ in range(50):
             out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
         assert model._decay_stall_steps == 50
-        assert out["input_proj"]["stall_frac"] == pytest.approx(50 / 200, abs=1e-9)
+        # stall_steps itself accumulates every call regardless -- but with
+        # the default min_stall_steps=200 grace period, 50 calls hasn't
+        # cleared the baseline yet, so stall_frac (and therefore
+        # decay_factor) must be an EXACT no-op, not "small but nonzero".
+        assert out["input_proj"]["stall_frac"] == 0.0
+        assert out["input_proj"]["importance"]["decay_factor"] == 1.0
+
+    def test_min_stall_steps_is_a_real_baseline_not_just_a_gentler_ramp(self):
+        # Direct design question: "I feel like it would need to establish
+        # a baseline and shouldn't necessarily decay all the time." Before
+        # min_stall_steps existed, stall_frac (and decay_factor) were
+        # technically nonzero after almost every call, since the very
+        # first call already sets stall_steps=1. Verify the grace period
+        # gives a genuine dead zone: exactly at the boundary, stall_frac
+        # must still be 0; one call past it, it must be nonzero.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(20))
+        out = None
+        for _ in range(200):
+            out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, min_stall_steps=200)
+        assert out["input_proj"]["stall_frac"] == 0.0, "exactly at the grace-period boundary, decay must still be off"
+        out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, min_stall_steps=200)
+        assert out["input_proj"]["stall_frac"] > 0.0, "one call past the grace period, decay must start ramping in"
 
     def test_noisy_but_flat_loss_still_registers_stall(self):
         # A loss oscillating narrowly around a fixed mean (no real
         # learning happening) must not be mistaken for improvement just
         # because the EMA occasionally dips below its own filter-
         # transient floor by a tiny amount -- improve_tol must reject
-        # noise-sized dips.
+        # noise-sized dips. 500 calls: enough to clear the default
+        # min_stall_steps=200 grace period AND ramp_steps=200 on top of it.
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(1))
-        for i in range(300):
+        for i in range(500):
             loss = 2.0 + (0.001 if i % 2 == 0 else -0.001)
             out = model.apply_loss_adjusted_decay(loss, touch_fraction=1.0, max_chunk=1_000_000)
         assert out["input_proj"]["stall_frac"] > 0.5, "noisy-flat loss must still register a real stall"
@@ -1357,7 +1379,8 @@ class TestLossAdjustedDecay:
         # Saturate stall_frac to 1.0 first, at a deliberately negligible
         # half-life (near-1.0 decay_factor) so this warm-up phase doesn't
         # itself perturb the weight before the timed window below starts.
-        for _ in range(210):
+        # Needs > min_stall_steps(200) + ramp_steps(200) = 400 calls.
+        for _ in range(410):
             model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=1e9)
         w_before = np.abs(np.array(model.q_proj.weights)).mean()
         half_life = 30.0
