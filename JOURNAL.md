@@ -9590,3 +9590,28 @@ underperforming its own historical peak): worth investigating once
 arm_c's result is in, in parallel with any follow-up runs (more seeds,
 or an ablation isolating reset_fraction/dead_fraction) rather than
 serially after.
+
+`launch_arm_c_plus_knee_margin15_plasticity_reset.py` finished (100k
+steps, 34,939s, 2.86 steps/sec). Raw result: FINAL vocab=32/k=2, PEAK
+vocab=32/k=2 -- reached that (vocab,k) pair at step 4,867 and sat flat
+for the remaining ~95,133 steps. The historical (no plasticity_reset)
+arm_c run peaked at vocab=126/k=2 (never reached k=3), flat for its
+final 65,340 steps. This run's peak is far LOWER than the historical
+peak (32 vs 126 vocab) -- same shape as dense's underperformance, not
+polyak's exact-match.
+
+All 3 plasticity_reset runs are now finished:
+
+| arm | this run's PEAK | historical PEAK | result |
+|---|---|---|---|
+| dense_lr_unscaled | vocab=32/k=2 | vocab=64/k=3 | worse |
+| polyak_lr_width288 | vocab=32/k=3 | vocab=32/k=3 | exact match |
+| arm_c_plus_knee_margin15 | vocab=32/k=2 | vocab=126/k=2 (never k=3) | much worse |
+
+Two of three underperformed their own historical stall point; the
+third matched it exactly. None broke past its historical peak. No
+keep/prune call made -- presented to the user as raw results, per
+[[feedback_present_before_keep_prune_decisions]]. Next: investigate
+WHY dense (the plain no-sparsity control, no seed-variance excuse
+available) regressed, likely in parallel with follow-up
+runs/ablations rather than blocking on the investigation first.
