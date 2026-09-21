@@ -9572,3 +9572,21 @@ polyak_lr_width288 and arm_c_plus_knee_margin15 are still running on
 the same fixed engine; results pending. No keep/prune decision made
 yet -- presenting raw per-arm results only until all three are in and
 reviewed together.
+
+`launch_polyak_lr_width288_plasticity_reset.py` finished (100k steps,
+29,539s, 3.39 steps/sec). Raw result: FINAL vocab=32/k=3, PEAK
+vocab=32/k=3 -- reached vocab=32/k=3 at step 68,648 and stayed flat
+there through step 100,000 (~31,352 steps flat). The historical (no
+plasticity_reset) polyak run also peaked at exactly vocab=32/k=3, flat
+for ~94,000 steps. This run's peak EXACTLY MATCHES the historical
+stall point -- it did not break past it, arriving via a different path
+(cycled through lower k-levels longer before settling at k=3).
+
+Direct question raised (dense already had no meaningful seed-to-seed
+variance to begin with, being the plain no-sparsity control, and
+plasticity_reset's whole premise is to REDUCE variance-driven
+stalling, not add it -- so "just unlucky" doesn't explain dense
+underperforming its own historical peak): worth investigating once
+arm_c's result is in, in parallel with any follow-up runs (more seeds,
+or an ablation isolating reset_fraction/dead_fraction) rather than
+serially after.
