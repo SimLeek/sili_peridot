@@ -399,6 +399,24 @@ def train_curriculum(
     loss_adjusted_decay_beta_fast: float = 0.9,
     loss_adjusted_decay_beta_floor: float = 0.999,
     loss_adjusted_decay_improve_tol: float = 1e-3,
+    # See docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design --
+    # EXPERIMENTAL per-neuron utility-based plasticity reset
+    # (Continual-Backprop-inspired), SUPERSEDES loss_adjusted_decay above
+    # as the primary mechanism under test. False (default): byte-identical
+    # to today's exact behavior. NO loss argument needed -- purely local
+    # per-column signals, unlike loss_adjusted_decay.
+    plasticity_reset_enable: bool = False,
+    plasticity_reset_touch_fraction: float = 0.01,
+    plasticity_reset_min_chunk: int = 4,
+    plasticity_reset_max_chunk: int = 2048,
+    plasticity_reset_eta: float = 0.99,
+    plasticity_reset_eta_slow: float = 0.99,
+    plasticity_reset_eta_slow_catchup: float = 0.95,
+    plasticity_reset_eta_fast: float = 0.5,
+    plasticity_reset_blend: float = 0.10,
+    plasticity_reset_reset_fraction: float = 0.01,
+    plasticity_reset_dead_fraction: float = 0.01,
+    plasticity_reset_k: float = 0.5,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -801,6 +819,21 @@ def train_curriculum(
                         beta_fast=loss_adjusted_decay_beta_fast,
                         beta_floor=loss_adjusted_decay_beta_floor,
                         improve_tol=loss_adjusted_decay_improve_tol,
+                    )
+                if plasticity_reset_enable:
+                    # No loss argument -- purely local per-column signals.
+                    model.apply_plasticity_reset(
+                        touch_fraction=plasticity_reset_touch_fraction,
+                        min_chunk=plasticity_reset_min_chunk,
+                        max_chunk=plasticity_reset_max_chunk,
+                        eta=plasticity_reset_eta,
+                        eta_slow=plasticity_reset_eta_slow,
+                        eta_slow_catchup=plasticity_reset_eta_slow_catchup,
+                        eta_fast=plasticity_reset_eta_fast,
+                        blend=plasticity_reset_blend,
+                        reset_fraction=plasticity_reset_reset_fraction,
+                        dead_fraction=plasticity_reset_dead_fraction,
+                        k=plasticity_reset_k,
                     )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(

@@ -1391,3 +1391,90 @@ class TestLossAdjustedDecay:
         w_after = np.abs(np.array(model.q_proj.weights)).mean()
         ratio = w_after / w_before
         assert 0.3 < ratio < 0.7, f"expected ~0.5 shrink after half_life_touches calls, got ratio={ratio}"
+
+
+class TestPlasticityReset:
+    """apply_plasticity_reset -- per-neuron utility-based plasticity reset
+    (Continual-Backprop-inspired, EXPERIMENTAL, added 2026-09-20). See
+    docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    Replaces apply_loss_adjusted_decay as the primary mechanism under
+    test -- NOT loss-gated at all (no loss argument anywhere), driven
+    entirely by each column's own local importance/gradient-activity
+    signal. TDD: written against the sili__new engine primitives
+    (apply_amortized_plasticity_reset/apply_amortized_block4_plasticity_reset)
+    already built, tested, and committed there -- this class covers the
+    orchestration layer (per-layer touch_fraction chunk sizing,
+    block4/scattered dispatch, block4 tile-vs-cell division) on top of
+    them."""
+
+    def test_touch_fraction_sizing_across_real_nnz_range(self):
+        # Reuses the exact chunk-sizing convention proven correct for
+        # apply_loss_adjusted_decay (touch_fraction of EACH layer's own
+        # nnz, clipped to [min_chunk, max_chunk], block4 chunk divided by
+        # _BLOCK4_TILE_SLOTS) -- just needs to run without error across
+        # this test file's real ~small-but-varied layer sizes.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
+        out = model.apply_plasticity_reset()
+        assert set(out.keys()) >= {"input_proj", "q_proj", "k_proj", "v_proj", "o_proj", "lm_head"}
+        for entry in out.values():
+            assert "importance" in entry
+            assert entry["importance"] is not None
+
+    def test_non_fp32_backend_reports_nothing_yet(self):
+        # Direct instruction: this mechanism is tested against fp32
+        # (DISLDOLayer32/DISLDOLayerV, dense=True -> block4) FIRST --
+        # matching this whole investigation's actual config throughout --
+        # and only extended to FP4/FP8 later if it proves worthwhile.
+        # FP4 (DISLDOLayer) has NO apply_amortized_plasticity_reset bound
+        # at all yet -- the model method's hasattr guard must skip those
+        # layers entirely (not error, not report a partial/wrong entry).
+        model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(1))
+        out = model.apply_plasticity_reset()
+        assert out == {}, f"FP4 layers should report nothing yet (not wired), got keys: {list(out)}"
+
+    def test_block4_backend_reports_block4_substats(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(2))
+        out = model.apply_plasticity_reset()
+        assert "block4" in out["input_proj"]["importance"]
+
+    def test_runs_many_cycles_without_error_and_reports_sane_stats(self):
+        # Real end-to-end smoke: enough calls to complete several full
+        # amortized cycles on a small real layer, confirm the mechanism
+        # never crashes and reports internally-consistent stats
+        # (n_reset_this_cycle/n_dead_this_cycle are non-negative counts,
+        # cycle_complete is a real bool).
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
+        out = None
+        for _ in range(500):
+            out = model.apply_plasticity_reset()
+        entry = out["input_proj"]["importance"]
+        assert isinstance(entry["cycle_complete"], bool)
+        assert entry["n_reset_this_cycle"] >= 0
+        assert entry["n_dead_this_cycle"] >= 0
+        if "block4" in entry:
+            assert entry["block4"]["n_reset_this_cycle"] >= 0
+            assert entry["block4"]["n_dead_this_cycle"] >= 0
+
+    def test_no_loss_argument_needed(self):
+        # Direct requirement: unlike apply_loss_adjusted_decay, this
+        # mechanism takes NO loss argument at all -- purely local
+        # per-column signals.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
+        out = model.apply_plasticity_reset()  # no loss/loss_ema argument
+        assert out is not None
+
+    def test_custom_knobs_are_threaded_through(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
+        out = model.apply_plasticity_reset(
+            touch_fraction=1.0,
+            max_chunk=1_000_000,
+            eta=0.5,
+            eta_slow=0.9,
+            eta_slow_catchup=0.8,
+            eta_fast=0.3,
+            blend=0.05,
+            reset_fraction=0.5,
+            dead_fraction=0.5,
+            k=1.0,
+        )
+        assert out["input_proj"]["importance"] is not None

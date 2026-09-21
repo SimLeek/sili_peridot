@@ -1011,6 +1011,64 @@ class ToyTileRecurrenceRMT:
             results[name] = entry
         return results
 
+    def apply_plasticity_reset(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        eta: float = 0.99,
+        eta_slow: float = 0.99,
+        eta_slow_catchup: float = 0.95,
+        eta_fast: float = 0.5,
+        blend: float = 0.10,
+        reset_fraction: float = 0.01,
+        dead_fraction: float = 0.01,
+        k: float = 0.5,
+    ) -> dict:
+        """EXPERIMENTAL -- per-neuron utility-based plasticity reset
+        (Continual-Backprop-inspired), replacing ``apply_loss_adjusted_decay``
+        as the primary mechanism under test. See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+        for the full derivation. No ``loss`` argument -- purely local
+        per-column signals. Always active when called (mirrors
+        ``apply_amortized_l2_decay``'s always-on shape). Same
+        ``touch_fraction``/``_BLOCK4_TILE_SLOTS`` chunk sizing as
+        ``apply_loss_adjusted_decay``. Two independent selection pools
+        (``reset_fraction``/``dead_fraction=0.0`` disables either):
+        top-K FROZEN (high importance, gated by local gradient deviation)
+        and bottom-K DEAD (idle columns, ungated). Returns
+        ``{layer_name: {"importance": {...}}}``, nested ``"block4"`` key
+        when that layer has block4 storage."""
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            if not hasattr(layer, "apply_amortized_plasticity_reset"):
+                continue
+            stats = layer.apply_amortized_plasticity_reset(
+                chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k
+            )
+            if hasattr(layer, "apply_amortized_block4_plasticity_reset"):
+                stats = dict(
+                    stats,
+                    block4=layer.apply_amortized_block4_plasticity_reset(
+                        block4_chunk_size,
+                        eta,
+                        eta_slow,
+                        eta_slow_catchup,
+                        eta_fast,
+                        blend,
+                        reset_fraction,
+                        dead_fraction,
+                        k,
+                    ),
+                )
+            results[name] = {"importance": stats}
+        return results
+
     def apply_dynamic_rank_control(
         self,
         tau_death: float = 0.05,

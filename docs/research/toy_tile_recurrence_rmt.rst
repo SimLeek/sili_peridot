@@ -725,16 +725,180 @@ layer whose tiles are all still dense-format -- true for every
 ``dense=True`` config tested so far, since 16 live cells/tile at init
 exceeds ``switch_point``'s 14-cell sparse threshold).
 
+**Status: SUPERSEDED** by ``apply_plasticity_reset`` (below) as the
+primary mechanism under test -- kept available, still fully tested, may
+still be worth combining (Ablation D in the plasticity design) but is no
+longer the first thing queued against the known-stalled configs. Built,
+unit-tested at the engine level (``sili__new``'s
+``test_block4_amortized_decay.cpp``/``test_amortized_decay_stats.cpp``)
+and the model level (``TestLossAdjustedDecay`` in
+``tests/test_toy_tile_recurrence_rmt.py``, 11 cases including the
+tie/filter-transient regression, the ``min_stall_steps`` real-baseline
+regression, and a direct half-life-halves-in-N-touches check), parameters
+recalibrated against real width=288 nnz numbers.
+
+.. _toy_tile_recurrence_rmt.plasticity_reset_design:
+
+``apply_plasticity_reset``: per-neuron utility-based plasticity reset (Continual Backprop-style)
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.plasticity_reset_design``
+
+Replaces ``apply_loss_adjusted_decay`` as the primary mechanism under
+test for the critical-learning-periods/loss-of-plasticity hypothesis,
+after web-verifying the actual mechanism the source paper (Dohare et
+al. 2024, *Nature*, "Loss of plasticity in deep continual learning")
+uses -- **Continual Backprop**: continuously resets the LOWEST-utility
+MATURE hidden units at a tiny constant rate
+(``u[i] = η·u[i] + (1-η)·|activation_i|·Σ|outgoing_weight_i|``), never
+gated on loss at all. This is architecturally different from the
+loss-stall-triggered design above in two ways that matter: (1) it
+naturally never touches a genuinely-useful unit regardless of whether
+global loss is flat -- an optimal, converged, flat-loss network is full
+of high-utility units, protected by construction, no "is loss still
+bad" threshold hack needed; (2) it's inherently per-NEURON, the
+granularity gap the loss-based design could only flag as tracked debt.
+
+**Direct refinements to the literal paper mechanism** (from
+conversation, before implementation even started):
+
+- Utility uses ``importance`` (this project's own per-synapse
+  RMSprop-style accumulator, see ``feedback_importance_is_already_the_optimizer``)
+  times ``|weight|``, not raw activation -- "in our current importance,
+  an 'annoying' or noisy synapse will likely have high 'importance' but
+  low value since it's mostly important to ignore, which means low
+  actual utility." Sidesteps needing brand-new activation-tracking
+  infrastructure.
+- Amortized on TWO axes, not one -- not "reset one whole unit rarely"
+  (the paper's literal shape) but "touch ~1% of a layer's own cell-grid
+  every call" (reusing the SAME ``touch_fraction`` convention
+  ``apply_loss_adjusted_decay`` already proved correct) AND make each
+  touch a small BLEND toward the reset target, never an instant swap --
+  "I don't like things that could add up and cause blips or stalls, but
+  doing any compute that involves individual synapses will be expensive
+  so we don't want to do all of it at once."
+
+**A real, worked-through flaw, found and fixed before ever launching a
+run**: direct question -- "calculate when, hopefully before the end of
+the universe, a historically high utility column that was important for
+5000 steps, that is now giving the wrong answer thanks to a new
+curriculum, will take to become low enough utility again for this
+algorithm to actually affect it." Worked the math: `col_util` (an EMA of
+``importance*|weight|``) can only chase whatever that product CURRENTLY
+is -- it can't fall below a value that isn't itself falling. The
+literature's actual "frozen unit" failure mode is that a LARGE
+accumulated ``importance`` suppresses the effective learning rate (the
+update divides by ~√importance), so weight barely moves EVEN THOUGH the
+column is now wrong and receiving real error signal -- and real error
+signal means the gradient feeding ``importance`` stays large too, so
+``importance`` stays high or keeps growing PRECISELY BECAUSE the column
+is stuck. Self-sustaining bad equilibrium: **worst case, the answer is
+never, not "a long time."** A mechanism built to fix loss-of-plasticity
+that structurally cannot see the frozen-unit pathology wasn't testing
+the hypothesis it claimed to test.
+
+**Fixed design** (sili__new engine primitives:
+``apply_amortized_plasticity_reset``/``apply_amortized_block4_plasticity_reset``,
+``docs/research/delta_csr_types.rst:plasticity_reset.per_neuron_utility``
+has the full engine-level derivation) -- two independent selection
+pools sharing one amortized traversal:
+
+- **FROZEN pool**: TOP-K by ``col_importance`` (high accumulated
+  importance = frozen-risk, matching this project's own original
+  hypothesis and the already-built ``apply_loss_adjusted_decay``
+  importance arm, now per-neuron). Gated by a LOCAL per-column
+  gradient-ACTIVITY deviation, not global loss -- "we're
+  backpropagating through the whole model. 'Loss' is as local as we
+  need it to be... a much, much, much better signal than 'global
+  loss'." Two EMAs at different timescales
+  (``col_grad_slow``/``col_grad_fast``) of a per-column
+  gradient-activity signal; ``deviation = fast/slow``,
+  ``plasticity_boost = max(0, deviation-(1+k))`` -- a column whose
+  recent activity has spiked well above its own established baseline is
+  frozen-and-now-demonstrably-wrong, attributed to THAT column, not a
+  whole-network scalar. **Engine-safety correction, found DURING
+  implementation**: the real backward kernel has 6+ SIMD-vectorized
+  per-synapse update sites, too risky to hook correctly (this project's
+  own documented fragility history around these exact kernels) -- so
+  ``col_grad_slow``/``col_grad_fast`` are derived from
+  ``col_importance``'s own per-CYCLE delta instead (``importance`` is
+  already ``EMA(g²)``, only grows from real gradient activity, so its
+  own trajectory is a safe, already-available proxy at this
+  traversal's own cadence), never a real-kernel hook. Asymmetric EMA
+  rate on ``col_grad_slow``: fast catchup on a genuine drop
+  (improvement -- "the distribution can update its distribution"
+  quickly), slow on a rise (so a real spike isn't instantly absorbed,
+  which would defeat detecting it).
+- **DEAD pool**: a SEPARATE, independent bottom-K by
+  ``col_util_dead`` (``importance*|weight|``, the ORIGINAL formula --
+  found, by the worst-case-timing math above, to be structurally unable
+  to detect FROZEN columns, but honestly rescoped as exactly what it's
+  good at: genuinely idle columns, a DIFFERENT pathology gradient-
+  magnitude deviation alone can't tell apart from "optimal, low
+  activity." Direct follow-up question confirmed this gap: "do those
+  equations actually distinguish whether loss is above or below the
+  usual in all cases" -- no, low gradient activity is ambiguous between
+  "converged" and "dead/saturated," so this pool exists precisely to
+  catch what the frozen-pool's gate structurally cannot). Full ``blend``
+  rate, ungated -- lower risk of disturbing something still legitimately
+  useful than the frozen pool, so the extra caution isn't needed.
+  Mutually exclusive with the frozen pool by construction.
+
+Both pools reset gradually (``blend``/``blend*plasticity_boost`` per
+touch) toward a fan-in-scaled fresh sample
+(``fp4_stochastic_normal01()``), never a sudden full swap -- and since
+selection re-runs every cycle, a column that recovers (leaves the top/
+bottom fraction, or whose deviation settles back down) simply stops
+being touched. No fixed schedule fights against genuine continual
+learning.
+
+**Scale-invariance** (direct instruction: parameters "may be related to
+... the average number of steps in [the model's] lifetime ... but if we
+can get some non-infinite number as steps approaches infinite that could
+give us an infinite time horizon setup too"): every quantity here is a
+fixed-memory EMA, never a cumulative/growing running average -- an EMA's
+responsiveness to new data is CONSTANT regardless of total elapsed
+steps, so none of this mechanism's hyperparameters need retuning as a
+deployment's total lifetime grows, unlike ``apply_loss_adjusted_decay``'s
+own ``half_life_touches``, which WAS explicitly anchored to "the
+historical stalls' observed 74k-99k-step length" (a finite-horizon
+calibration this mechanism has no equivalent of).
+
+**No ``loss`` argument anywhere** in ``apply_plasticity_reset`` -- purely
+local per-column signals, cleanly distinct from
+``apply_loss_adjusted_decay``, which is global-scalar-loss-gated.
+Always structurally active when called (mirrors
+``apply_amortized_l2_decay``'s own always-on shape).
+
+Fp32-first, by direct instruction ("we're testing this for fp32 first
+and then applying to everything if it works right") -- only wired on
+``DISLDOLayerV``/``DISLDOLayer32`` (matching this whole investigation's
+actually-used config, ``dense=True`` routing through block4) so far;
+FP4/FP8 scattered classes NOT extended yet, a real, tracked follow-up
+gap, not silently dropped -- ``TestPlasticityReset::test_non_fp32_backend_reports_nothing_yet``
+pins down the current (intentional) behavior: an FP4-backed model
+reports an empty dict from ``apply_plasticity_reset``, no error.
+
+TDD throughout on the sili__new side (every primitive's test written
+and confirmed red before its implementation existed) -- see
+``docs/research/delta_csr_types.rst:plasticity_reset.per_neuron_utility``
+for the full engine-level test inventory (21 C++ unit tests across 3
+files, including a scattered-vs-block4 bit-equivalence check and a
+dedicated worst-case-timing regression test). Model level:
+``TestPlasticityReset`` in ``tests/test_toy_tile_recurrence_rmt.py`` (6
+cases: touch_fraction sizing across this test file's real nnz range,
+fp32-only backend dispatch, block4 substats present/absent as expected,
+many-cycle smoke test with sane internally-consistent stats, no ``loss``
+argument required, custom knobs threaded through correctly).
+
 **Status: not yet empirically tested** against the stalled runs this
-hypothesis was built to explain -- built, unit-tested at the engine
-level (``sili__new``'s ``test_block4_amortized_decay.cpp``/
-``test_amortized_decay_stats.cpp``) and the model level
-(``TestLossAdjustedDecay`` in ``tests/test_toy_tile_recurrence_rmt.py``,
-10 cases including the tie/filter-transient regression and a direct
-half-life-halves-in-N-touches check), parameters recalibrated against
-real width=288 nnz numbers, not yet run against real training. Next:
-relaunch known-stalled configs with this mechanism enabled and compare
-against their original stalled trajectory.
+hypothesis was built to explain. Next: relaunch the same 3 known-stalled
+configs already identified for ``apply_loss_adjusted_decay``
+(``launch_width288_nolevel_down_control.py`` dense-unscaled,
+``launch_polyak_lr_width288.py`` Polyak, and
+``launch_arm_c_plus_knee_margin15.py`` Arm C+knee) with
+``plasticity_reset_enable=True`` instead, compare against their original
+stalled trajectory.
 
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
