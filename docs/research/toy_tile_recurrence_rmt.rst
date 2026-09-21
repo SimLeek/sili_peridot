@@ -592,20 +592,21 @@ Direct instruction: "implement the decays, implement them both while
 making sure to note that we're actively testing them and may delete one
 or more of the forms of decay if it doesn't work well in testing" --
 ``apply_loss_adjusted_decay`` implements BOTH arms as independently
-toggleable strengths (``importance_strength``, ``weight_strength``):
+toggleable half-lives (``importance_half_life_touches``,
+``weight_half_life_touches``):
 
 - **Importance decay** -- this project's per-synapse ``importance`` field
   plays the exact role of an Adam/RMSprop second-moment accumulator (see
   ``feedback_importance_is_already_the_optimizer``), so this is the
   direct, mechanism-specific fix: shrink the accumulator that's doing the
-  freezing. Default-enabled (``importance_strength=0.3``) -- has its own
-  dedicated C++ cursor (``_importance_decay_cursor``, see
+  freezing. Default-enabled (``importance_half_life_touches=500``) -- has
+  its own dedicated C++ cursor (``_importance_decay_cursor``, see
   ``sili__new``'s ``docs/research/delta_csr_types.rst:
   amortized_decay.chunked_cursor``), no conflict with any other
   mechanism.
 - **Weight/value decay** -- the more classic forgetting mechanism
   (biologically: synaptic decay, not optimizer-state decay). Default-OFF
-  (``weight_strength=0.0``): it shares the SAME per-layer C++
+  (``weight_half_life_touches=None``): it shares the SAME per-layer C++
   weight-decay cursor as the existing, already-in-production
   ``apply_amortized_l2_decay`` (RMS-closed-loop regularization, a
   different, unrelated mechanism -- see
@@ -622,39 +623,118 @@ with no natural per-neuron decomposition here, so this lands at
 PER-LAYER granularity, uniformly applied via each real layer's own
 ``apply_amortized_importance_decay``/``apply_amortized_l2_decay`` call --
 the same limitation ``per_layer_learning_rate_polyak`` already documents
-for its own per-layer (not per-neuron) Polyak LR.
+for its own per-layer (not per-neuron) Polyak LR. Direct correction,
+2026-09-20: a fully dense layer's uniform fan-in does NOT make per-layer
+and per-neuron equivalent even there -- different neurons still receive
+different gradient signal / contribute differently to the loss with
+identical fan-in. Per-layer is accepted for now on granularity parity
+with the source literature (Achille/Dohare test unit-/layer-level
+interventions, not a loss-attributed per-neuron scheme either), not
+because this method's dense case happens to erase the distinction. KNOWN
+GAP, HIGH PRIORITY, tracked not fixed: a real per-neuron version needs
+either a per-row-aware cursor or a per-row decay_factor scaled by that
+row's own realized fan-in/gradient signal -- required before trusting
+this on genuinely sparse layers with heterogeneous per-row nnz.
 
-**Stall signal, not instantaneous loss**: a fast EMA of loss
-(``beta_fast=0.9``) is compared against a slow-relaxing floor
-(``beta_floor=0.999``) tracking the EMA's own best-ever value.
-``self._decay_stall_steps`` counts consecutive steps since the EMA last
-beat the floor, resetting to 0 the instant it does; the floor itself
-still relaxes slowly upward on non-improving steps so a genuine
-curriculum-driven loss increase (a harder level starting) doesn't read as
-a permanent stall forever. ``stall_frac = min(1, stall_steps/ramp_steps)``
-is the actual 0..1 signal driving decay -- deliberately insensitive to a
-single noisy step (matching the "pure math, not luck" correction: a
-single loss spike is noise, ``ramp_steps`` consecutive non-improving
-steps is a real stall), saturating only after sustained elevation.
+**Stall signal, purely LOSS-based, not instantaneous loss, never
+accuracy/correctness**: a fast EMA of loss (``beta_fast=0.9``) is
+compared against a slow-relaxing floor (``beta_floor=0.999``) tracking
+the EMA's own best-ever value. Direct correction, 2026-09-20: the
+``loss`` argument is whatever loss signal a caller has (prediction,
+curiosity, external-input, ...) -- never correctness/accuracy/streak
+(this project's curriculum advancement separately tracks its own
+``acc_ema``/``streak`` for THEIR purposes, but neither feeds this
+mechanism), since a deployed system may not have ground truth to check
+predictions against. ``self._decay_stall_steps`` counts consecutive
+steps since the EMA last beat the floor by a real margin
+(``improve_tol``, relative) -- a TIE does NOT reset stall (real bug
+caught by manual testing before ever launching a run: a plain ``<=``
+comparison let the EMA's own filter-transient settling from its initial
+value read as continuous "improvement" on a genuinely flat/oscillating
+loss, permanently masking a real stall). Reset to 0 the instant a
+genuine improvement occurs; the floor itself still relaxes slowly upward
+on non-improving steps so a genuine curriculum-driven loss increase (a
+harder level starting) doesn't read as a permanent stall forever.
+``stall_frac = min(1, stall_steps/ramp_steps)`` is the actual 0..1 signal
+driving decay severity -- deliberately insensitive to a single noisy
+step (matching the "pure math, not luck" correction: a single loss spike
+is noise, ``ramp_steps`` consecutive non-improving steps is a real
+stall), saturating only after sustained elevation.
 
-Per active arm, per layer: ``decay_factor = max(min_decay_factor, 1 -
-stall_frac * strength)`` -- ``strength=0`` is an exact no-op (the arm is
-disabled), higher ``strength`` reaches ``min_decay_factor`` (default 0.5,
-i.e. a hard floor of never more than halving per touch) faster as the
-stall persists. Both arms also call each layer's block4 counterpart when
-present (``apply_amortized_block4_importance_decay``/
+**Severity: half-life in touches, not an ad hoc strength/floor pair --
+real miscalibration caught and fixed before ever launching a real run.**
+The first version used ``decay_factor = max(min_decay_factor, 1 -
+stall_frac*strength)`` with NO principled connection to how many times a
+synapse actually gets touched over a real stall's duration -- and the
+known historical stalls this hypothesis targets ran FLAT for
+74,000-99,000+ training steps once stalled. At ``strength=0.3``, full
+stall settled at ``decay_factor=0.7`` per touch (``min_decay_factor=0.5``
+was never even reached -- ``max(0.5, 1-0.3)=0.7``); compounded over the
+~100-call amortized cycle (see the touch_fraction paragraph below), an
+empirical width=288 test crushed a real layer's weights to float-ZERO
+within ~1400 calls -- a small fraction of one historical stall's real
+length. That would have made the very thing under test ("does BOUNDED,
+recoverable forgetting restore plasticity") into an accidental full
+deletion well before the stall it's meant to help with even finishes.
+
+Fixed by deriving ``decay_factor`` from a HALF-LIFE IN TOUCHES, the same
+style this project's own ``apply_amortized_l2_decay`` docs already
+establish for decay_factor derivation (``2^(-cycle_length/H)`` for a
+chosen half-life ``H``): ``decay_factor_at_full_stall =
+2**(-1/half_life_touches)``, interpolated toward 1.0 (no decay) as
+``stall_frac`` falls: ``decay_factor = 1 - stall_frac*(1 -
+decay_factor_at_full_stall)``. A synapse touched
+``half_life_touches`` times in a row under FULLY saturated stall is
+reduced to exactly half, never to numerical zero. Default 500 touches
+(~50,000 calls at the default ``touch_fraction=0.01``, the SAME order of
+magnitude as the historical stalls' own real length) to halve at worst.
+Re-verified empirically at real width=288 scale over a 60,000-call
+simulated full stall: ``lm_head``'s mean |weight| shrank from 0.137 to
+0.0136 (~10x, the smallest/fastest-cycling layer), ``q_proj``'s from
+0.047 to 0.0205 (~2.3x) -- bounded, gradual, real, and nowhere near
+float-zero. ``None`` disables an arm entirely (an exact no-op, not
+merely a large half-life).
+
+**touch_fraction, not a raw chunk_size -- second real bug caught before
+ever launching a run.** This project's layers span a ~150x nnz range at
+width=288 (``lm_head`` early in the vocab curriculum: 576; q/k/v/o_proj
+fully dense: 82944). One shared absolute chunk_size either barely
+touches the big layers (a practical no-op) or, for the small layers,
+exceeds their own nnz entirely -- the amortized cursor then wraps and
+touches every synapse in that layer more than once per call, compounding
+much faster than the half-life above assumes (each "touch" the half-life
+counts is meant to be ~one per amortized cycle, not several per call).
+``touch_fraction`` (default 0.01) sizes each layer's own chunk_size as
+``clip(round(nnz*touch_fraction), min_chunk, max_chunk)``, making every
+layer's own full amortized cycle take roughly ``1/touch_fraction`` calls
+(~100 at the default) regardless of its absolute size.
+
+Both arms also call each layer's block4 counterpart when present
+(``apply_amortized_block4_importance_decay``/
 ``apply_amortized_block4_l2_decay``, ``sili__new`` task added
 2026-09-20), since ``dense=True`` -- this investigation's actually-used
 config throughout -- routes ``DISLDOLayerV`` weights into block4 storage,
 not the scattered CSR path either arm's base call alone would cover; see
-``feedback_block4_scattered_parity_required``.
+``feedback_block4_scattered_parity_required``. block4's own chunk_size
+counts TILES (``_BLOCK4_TILE_SLOTS=16`` cells each), not individual
+synapses -- reusing the scattered chunk_size directly there would
+over-touch a block4-resident layer by roughly 16x relative to
+touch_fraction's intent, so the block4 call gets its own chunk_size
+divided by ``_BLOCK4_TILE_SLOTS`` (exact, not just an upper bound, for a
+layer whose tiles are all still dense-format -- true for every
+``dense=True`` config tested so far, since 16 live cells/tile at init
+exceeds ``switch_point``'s 14-cell sparse threshold).
 
 **Status: not yet empirically tested** against the stalled runs this
-hypothesis was built to explain -- built and unit-tested at the engine
+hypothesis was built to explain -- built, unit-tested at the engine
 level (``sili__new``'s ``test_block4_amortized_decay.cpp``/
-``test_amortized_decay_stats.cpp``), not yet run against real training.
-Next: relaunch one or more of the known-stalled configs with this
-mechanism enabled and compare against their original stalled trajectory.
+``test_amortized_decay_stats.cpp``) and the model level
+(``TestLossAdjustedDecay`` in ``tests/test_toy_tile_recurrence_rmt.py``,
+10 cases including the tie/filter-transient regression and a direct
+half-life-halves-in-N-touches check), parameters recalibrated against
+real width=288 nnz numbers, not yet run against real training. Next:
+relaunch known-stalled configs with this mechanism enabled and compare
+against their original stalled trajectory.
 
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 

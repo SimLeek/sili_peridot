@@ -363,20 +363,36 @@ def train_curriculum(
     polyak_lr_max: float = 0.05,
     # See docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design --
     # EXPERIMENTAL critical-learning-periods/loss-of-plasticity forgetting.
-    # None (default): byte-identical to today's exact behavior, matching
+    # False (default): byte-identical to today's exact behavior, matching
     # l2_decay_chunk_size's own off-by-default convention.
-    loss_adjusted_decay_chunk_size: int | None = None,
-    loss_adjusted_decay_importance_strength: float = 0.3,
-    # weight_strength default 0 -- see apply_loss_adjusted_decay's own
+    loss_adjusted_decay_enable: bool = False,
+    # touch_fraction, not a raw chunk_size -- real bug caught before ever
+    # launching a real run: see apply_loss_adjusted_decay's own
+    # touch_fraction docstring section (a single shared absolute
+    # chunk_size either barely touches big layers or, for small ones,
+    # over-touches past their own nnz -- compounding toward an
+    # accidental full-layer wipe rather than gradual, testable decay).
+    loss_adjusted_decay_touch_fraction: float = 0.01,
+    loss_adjusted_decay_min_chunk: int = 4,
+    loss_adjusted_decay_max_chunk: int = 2048,
+    # Half-life in TOUCHES (~1 per amortized cycle), not an abstract
+    # severity knob -- real miscalibration caught before ever launching a
+    # real run: see apply_loss_adjusted_decay's own SEVERITY docstring
+    # section (an earlier strength/floor design crushed a real layer's
+    # weights to float-zero within ~1400 calls under full stall, a small
+    # fraction of one historical stall's real 74k-99k-step length).
+    # 500 touches (~50,000 calls at the default touch_fraction, the same
+    # order of magnitude as those historical stalls) to halve at worst.
+    loss_adjusted_decay_importance_half_life_touches: float | None = 500.0,
+    # weight arm default OFF -- see apply_loss_adjusted_decay's own
     # docstring: it shares l2_decay_chunk_size's C++ weight-decay cursor,
     # do not set this nonzero in the same run that also sets
     # l2_decay_chunk_size.
-    loss_adjusted_decay_weight_strength: float = 0.0,
+    loss_adjusted_decay_weight_half_life_touches: float | None = None,
     loss_adjusted_decay_ramp_steps: int = 200,
     loss_adjusted_decay_beta_fast: float = 0.9,
     loss_adjusted_decay_beta_floor: float = 0.999,
     loss_adjusted_decay_improve_tol: float = 1e-3,
-    loss_adjusted_decay_min_decay_factor: float = 0.5,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -763,20 +779,21 @@ def train_curriculum(
                 # train_curriculum.l2_decay_and_rank_control_ordering.
                 if l2_decay_chunk_size is not None:
                     model.apply_amortized_l2_decay(l2_decay_chunk_size, l2_decay_adaptation_rate)
-                if loss_adjusted_decay_chunk_size is not None:
+                if loss_adjusted_decay_enable:
                     # Uses loss_ema (not the raw per-token loss), same
                     # smoothing convention apply_polyak_lr already uses for
                     # its own residual -- see loss_adjusted_decay_design.
                     model.apply_loss_adjusted_decay(
                         loss_ema if loss_ema is not None else float(loss.data),
-                        loss_adjusted_decay_chunk_size,
-                        importance_strength=loss_adjusted_decay_importance_strength,
-                        weight_strength=loss_adjusted_decay_weight_strength,
+                        touch_fraction=loss_adjusted_decay_touch_fraction,
+                        min_chunk=loss_adjusted_decay_min_chunk,
+                        max_chunk=loss_adjusted_decay_max_chunk,
+                        importance_half_life_touches=loss_adjusted_decay_importance_half_life_touches,
+                        weight_half_life_touches=loss_adjusted_decay_weight_half_life_touches,
                         ramp_steps=loss_adjusted_decay_ramp_steps,
                         beta_fast=loss_adjusted_decay_beta_fast,
                         beta_floor=loss_adjusted_decay_beta_floor,
                         improve_tol=loss_adjusted_decay_improve_tol,
-                        min_decay_factor=loss_adjusted_decay_min_decay_factor,
                     )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(

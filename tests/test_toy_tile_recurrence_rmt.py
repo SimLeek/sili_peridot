@@ -1251,7 +1251,7 @@ class TestLossAdjustedDecay:
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
         out = None
         for _ in range(50):
-            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+            out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
         assert model._decay_stall_steps == 50
         assert out["input_proj"]["stall_frac"] == pytest.approx(50 / 200, abs=1e-9)
 
@@ -1264,7 +1264,7 @@ class TestLossAdjustedDecay:
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(1))
         for i in range(300):
             loss = 2.0 + (0.001 if i % 2 == 0 else -0.001)
-            out = model.apply_loss_adjusted_decay(loss, chunk_size=1000)
+            out = model.apply_loss_adjusted_decay(loss, touch_fraction=1.0, max_chunk=1_000_000)
         assert out["input_proj"]["stall_frac"] > 0.5, "noisy-flat loss must still register a real stall"
 
     def test_sustained_improvement_keeps_resetting_stall(self):
@@ -1273,19 +1273,25 @@ class TestLossAdjustedDecay:
         out = None
         for _ in range(100):
             loss *= 0.98  # steadily, genuinely decreasing
-            out = model.apply_loss_adjusted_decay(loss, chunk_size=1000)
+            out = model.apply_loss_adjusted_decay(loss, touch_fraction=1.0, max_chunk=1_000_000)
         assert model._decay_stall_steps < 5
         assert out["input_proj"]["stall_frac"] < 0.05
 
     def test_importance_arm_default_on_weight_arm_default_off(self):
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
-        out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+        out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
         assert out["input_proj"]["importance"] is not None
         assert out["input_proj"]["weight"] is None
 
-    def test_zero_strength_arm_is_an_exact_noop(self):
+    def test_none_half_life_arm_is_an_exact_noop(self):
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
-        out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000, importance_strength=0.0, weight_strength=0.0)
+        out = model.apply_loss_adjusted_decay(
+            2.0,
+            touch_fraction=1.0,
+            max_chunk=1_000_000,
+            importance_half_life_touches=None,
+            weight_half_life_touches=None,
+        )
         for entry in out.values():
             assert entry["importance"] is None
             assert entry["weight"] is None
@@ -1298,19 +1304,22 @@ class TestLossAdjustedDecay:
         w_before = np.abs(np.array(model.input_proj.weights)).mean()
         out = None
         for _ in range(250):
-            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000, weight_strength=0.5)
+            out = model.apply_loss_adjusted_decay(
+                2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=20.0
+            )
         assert out["input_proj"]["weight"] is not None
         assert out["input_proj"]["weight"]["decay_factor"] < 1.0
         assert out["input_proj"]["weight"]["block4"]["n"] > 0
         w_after = np.abs(np.array(model.input_proj.weights)).mean()
         assert w_after < w_before, "sustained stall + weight arm should measurably shrink real block4 weights"
+        assert w_after > 0.0, "bounded half-life decay must not annihilate weights within one short test run"
 
     def test_scattered_backend_has_no_block4_key(self):
         # FP4 (DISLDOLayer, scattered-only) has no block4 concept at all --
         # the block4 sub-call must be skipped entirely (hasattr-guarded),
         # not attempted-and-erroring.
         model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(6))
-        out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+        out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
         assert out["input_proj"]["importance"] is not None
         assert "block4" not in out["input_proj"]["importance"]
 
@@ -1318,12 +1327,44 @@ class TestLossAdjustedDecay:
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(7))
         out = None
         for _ in range(500):  # far past ramp_steps=200
-            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000)
+            out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
         assert out["input_proj"]["stall_frac"] == 1.0
 
-    def test_min_decay_factor_floors_the_decay(self):
+    def test_half_life_sets_the_decay_factor_at_full_stall(self):
+        # decay_factor at fully-saturated stall (stall_frac=1) must equal
+        # exactly 2**(-1/half_life_touches) -- the defining property of
+        # "half_life_touches touches under full stall halves the value,"
+        # not an arbitrary severity knob.
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(8))
         out = None
-        for _ in range(500):
-            out = model.apply_loss_adjusted_decay(2.0, chunk_size=1000, importance_strength=1.0, min_decay_factor=0.7)
-        assert out["input_proj"]["importance"]["decay_factor"] == pytest.approx(0.7)
+        for _ in range(500):  # far past ramp_steps=200 -> stall_frac saturates at 1.0
+            out = model.apply_loss_adjusted_decay(
+                2.0, touch_fraction=1.0, max_chunk=1_000_000, importance_half_life_touches=10.0
+            )
+        assert out["input_proj"]["stall_frac"] == 1.0
+        assert out["input_proj"]["importance"]["decay_factor"] == pytest.approx(2.0 ** (-1.0 / 10.0))
+
+    def test_half_life_touches_actually_halves_after_that_many_full_stall_touches(self):
+        # End-to-end check of the half-life's own defining property: with
+        # touch_fraction=1.0 (whole layer touched every call) and stall
+        # already fully saturated, N calls at weight_half_life_touches=N
+        # should shrink |weight| by very close to 2x -- not near-zero
+        # (the original strength/floor design's failure mode) and not
+        # unchanged (a no-op). Uses WEIGHT, not importance: a fresh dense
+        # init starts importance at exactly 0, which can't demonstrate a
+        # halving ratio.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(9))
+        # Saturate stall_frac to 1.0 first, at a deliberately negligible
+        # half-life (near-1.0 decay_factor) so this warm-up phase doesn't
+        # itself perturb the weight before the timed window below starts.
+        for _ in range(210):
+            model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=1e9)
+        w_before = np.abs(np.array(model.q_proj.weights)).mean()
+        half_life = 30.0
+        for _ in range(int(half_life)):
+            model.apply_loss_adjusted_decay(
+                2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=half_life
+            )
+        w_after = np.abs(np.array(model.q_proj.weights)).mean()
+        ratio = w_after / w_before
+        assert 0.3 < ratio < 0.7, f"expected ~0.5 shrink after half_life_touches calls, got ratio={ratio}"

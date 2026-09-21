@@ -763,17 +763,24 @@ class ToyTileRecurrenceRMT:
                 results[name] = stats
         return results
 
+    # block4 tiles are BLOCK4_TILE x BLOCK4_TILE (4x4=16) cells -- a block4
+    # chunk_size counts TILES, not individual synapses, unlike every other
+    # storage type's decay call. See apply_loss_adjusted_decay's own
+    # touch_fraction docstring section for why this matters.
+    _BLOCK4_TILE_SLOTS = 16
+
     def apply_loss_adjusted_decay(
         self,
         loss: float,
-        chunk_size: int,
-        importance_strength: float = 0.3,
-        weight_strength: float = 0.0,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        importance_half_life_touches: float | None = 500.0,
+        weight_half_life_touches: float | None = None,
         ramp_steps: int = 200,
         beta_fast: float = 0.9,
         beta_floor: float = 0.999,
         improve_tol: float = 1e-3,
-        min_decay_factor: float = 0.5,
     ) -> dict:
         """EXPERIMENTAL, added 2026-09-20 -- critical-learning-periods/
         loss-of-plasticity forgetting (Achille et al. 2019 "Critical
@@ -790,21 +797,58 @@ class ToyTileRecurrenceRMT:
         implement both, note both are actively being tested, either may
         be removed if it doesn't show benefit:
 
-        1. ``importance_strength`` (default on): decays each layer's
-           per-synapse IMPORTANCE -- this project's RMSprop-style
-           second-moment accumulator (see
+        1. ``importance_half_life_touches`` (default on, 500 touches):
+           decays each layer's per-synapse IMPORTANCE -- this project's
+           RMSprop-style second-moment accumulator (see
            feedback_importance_is_already_the_optimizer) -- the
            mechanism-specific fix for adaptive optimizers' own
            documented "freezing" of heavily-used units.
-        2. ``weight_strength`` (default OFF): decays each layer's actual
-           WEIGHT -- the more classic forgetting mechanism. Shares the
-           SAME per-layer C++ weight-decay cursor as
-           ``apply_amortized_l2_decay`` (there is only one
+        2. ``weight_half_life_touches`` (default OFF, ``None``): decays
+           each layer's actual WEIGHT -- the more classic forgetting
+           mechanism. Shares the SAME per-layer C++ weight-decay cursor
+           as ``apply_amortized_l2_decay`` (there is only one
            ``_decay_cursor`` per layer) -- do not enable this arm in a
            training loop that also calls ``apply_amortized_l2_decay``
            every step; both would drive the same cursor out of sync with
            each other's own decay_factor intent. Off by default for
            exactly this reason.
+
+        SEVERITY, real miscalibration caught before ever launching a real
+        run: the first version used an abstract 0..1 "strength" combined
+        with a per-touch floor (``decay_factor = max(min_decay_factor, 1 -
+        stall_frac*strength)``) with NO principled connection to how many
+        TIMES a synapse actually gets touched over a real stall's
+        duration -- and the known historical stalls this hypothesis is
+        meant to address ran FLAT for 74,000-99,000+ training steps once
+        stalled. At ``strength=0.3``, full stall settled at
+        ``decay_factor=0.7`` per touch (the ``min_decay_factor=0.5`` floor
+        was never even reached -- ``max(0.5, 1-1*0.3)=0.7``); compounded
+        over the ~100-call amortized cycle this design already uses,
+        that's ~0.7 per ~100 calls per synapse, and empirically crushed a
+        real width=288 layer's weights to float-zero within ~1400 calls
+        -- a small fraction of one historical stall's real length. That
+        would have made the very thing under test ("does BOUNDED,
+        recoverable forgetting restore plasticity") into an accidental
+        full deletion instead, well before the stall it's meant to help
+        with even finishes.
+
+        Fixed by deriving ``decay_factor`` from a HALF-LIFE IN TOUCHES
+        instead, the same style ``apply_amortized_l2_decay``'s own
+        RST docs already establish for THIS project's decay_factor
+        derivations (``2^(-cycle_length/H)`` for a chosen half-life
+        ``H``): ``decay_factor_at_full_stall = 2**(-1/half_life_touches)``
+        -- a synapse touched ``half_life_touches`` times in a row under
+        FULLY saturated stall (``stall_frac=1``) is reduced to exactly
+        half, not to numerical zero. Interpolated toward 1.0 (no decay) as
+        ``stall_frac`` falls: ``decay_factor = 1 - stall_frac*(1 -
+        decay_factor_at_full_stall)``. Default ``500`` touches, each
+        touch spaced ~1 amortized cycle (~100 calls at the default
+        ``touch_fraction``) apart -- ~50,000 calls, the same ORDER OF
+        MAGNITUDE as the historical stalls' own real length, to halve at
+        worst -- bounded, testable, and deliberately conservative for a
+        first empirical run rather than a guessed severity. ``None``
+        disables an arm entirely (an exact no-op, not merely a large
+        half-life).
 
         Stall signal: a fast EMA of loss (``beta_fast``) vs a
         slow-relaxing floor (``beta_floor``) -- ``self._decay_stall_steps``
@@ -815,26 +859,88 @@ class ToyTileRecurrenceRMT:
         initial value read as continuous "improvement" on a genuinely
         flat/oscillating loss, permanently masking a real stall -- fixed
         by requiring a real margin, not just a decrease). Reset to 0 the
-        instant a genuine improvement occurs. The floor still relaxes
-        slowly upward on non-improving steps so a genuine curriculum-driven
-        loss increase (harder level) doesn't read as a permanent stall
-        forever. ``stall_frac = min(1, stall_steps/ramp_steps)`` is the
-        smoothed 0..1 sustained-stall signal that actually drives decay --
+        instant a genuine improvement occurs -- purely from LOSS (the
+        ``loss`` argument, whatever a caller's own loss signal is --
+        prediction/curiosity/external-input, never accuracy/correctness:
+        this project's curriculum advancement separately tracks
+        ``acc_ema``/``streak`` for its OWN purposes, but neither is an
+        input here, since a deployed system may not have ground truth to
+        check against). The floor still relaxes slowly upward on
+        non-improving steps so a genuine curriculum-driven loss increase
+        (harder level) doesn't read as a permanent stall forever.
+        ``stall_frac = min(1, stall_steps/ramp_steps)`` is the smoothed
+        0..1 sustained-stall signal that actually drives decay severity --
         a single bad step barely moves it; ``ramp_steps`` consecutive
-        non-improving steps saturates it. Per active arm, per layer:
-        ``decay_factor = max(min_decay_factor, 1 - stall_frac*strength)``.
+        non-improving steps saturates it.
 
-        Applied UNIFORMLY across every real layer -- loss is a single
-        global signal, no finer-than-per-layer signal is available
-        without new per-neuron instrumentation (same per-layer, not
-        per-neuron, limitation ``apply_polyak_lr`` already documents for
-        itself). Per direct instruction, decay is never per-synapse.
+        The DECAY_FACTOR (how hard each touched synapse decays) is applied
+        UNIFORMLY across every real layer -- loss is a single global
+        signal, no finer-than-per-layer signal is available without new
+        per-neuron instrumentation (same per-layer, not per-neuron,
+        limitation ``apply_polyak_lr`` already documents for itself).
+
+        KNOWN GAP, high priority, not yet fixed (direct instruction:
+        prefer per-neuron over per-layer wherever possible, since
+        synapses-per-neuron differ between neurons in any genuinely
+        sparse layer): the decay_factor itself is per-layer, and the
+        CHUNK/touch selection below is not neuron-aware either -- it
+        walks the flat underlying array/cursor, not per-row (per-neuron).
+        NOTE, corrected 2026-09-20: a fully dense layer having uniform
+        fan-in does NOT make per-layer and per-neuron equivalent, even
+        there -- different neurons still receive different gradient
+        signal / contribute differently to the loss even with identical
+        fan-in, so a genuinely per-neuron mechanism would still decay
+        them differently. The reason per-layer is acceptable FOR NOW is
+        granularity parity with the source literature (Achille et al.
+        2019; Dohare et al. 2024 test unit-/layer-level interventions,
+        not a loss-attributed per-neuron scheme either) -- not that this
+        method's fan-in-uniform case happens to make the two identical.
+        A genuinely sparse layer additionally has heterogeneous per-row
+        nnz on top of that (a high-fan-in neuron and a low-fan-in
+        neuron's few synapses could be touched at very different
+        effective rates purely from the flat cursor's walk order) --
+        must be fixed (e.g. a per-row-aware cursor, or scaling each row's
+        own decay_factor by its own realized fan-in or gradient signal)
+        before trusting this on sparse configs, and ideally before
+        trusting the PER-NEURON claim at all even on dense ones. Tracked,
+        not silently dropped.
+
+        ``touch_fraction``: FRACTION OF EACH LAYER'S OWN nnz to touch per
+        call (chunk_size = clip(round(nnz*touch_fraction), min_chunk,
+        max_chunk)), NOT one shared absolute chunk_size -- real bug
+        caught before ever launching a real run: this project's layers
+        span a ~150x nnz range at width=288 (lm_head early in the vocab
+        curriculum: 576; q/k/v/o_proj fully dense: 82944). One shared
+        absolute chunk_size either barely touches the big layers (a
+        practical no-op) or, for the SMALL layers, exceeds their own nnz
+        entirely -- the amortized cursor then wraps around and touches
+        (decays) EVERY synapse in that layer more than once per call,
+        which compounds much faster than the half-life above assumes
+        (each "touch" the half-life counts is meant to be ~one per
+        amortized cycle, not several per call). touch_fraction makes
+        every
+        layer's own full amortized cycle take roughly ``1/touch_fraction``
+        calls regardless of its absolute size, sidestepping both
+        failure modes.
 
         Calls the block4 counterpart
         (``apply_amortized_block4_l2_decay``/
         ``apply_amortized_block4_importance_decay``) too when the layer
         has one, since ``dense=True`` routes weights into block4 storage
-        -- see feedback_block4_scattered_parity_required.
+        -- see feedback_block4_scattered_parity_required. block4's own
+        chunk_size counts TILES (``_BLOCK4_TILE_SLOTS=16`` cells each),
+        not individual synapses -- reusing the scattered chunk_size
+        directly there would over-touch a block4-resident layer by
+        roughly 16x relative to touch_fraction's intent, so the block4
+        call gets its own chunk_size divided by ``_BLOCK4_TILE_SLOTS``.
+        Exact (not just an upper bound) for a layer whose tiles are all
+        still dense-format -- true for every ``dense=True`` config tested
+        so far (16 live cells/tile at init exceeds ``switch_point``'s
+        14-cell sparse threshold, forcing dense format from the start);
+        becomes a slight over-touch approximation if synaptogenesis later
+        demotes some tiles to sparse-packed (fewer than 16 live cells
+        each) -- not yet a concern for any config this has been run
+        against.
 
         Returns ``{layer_name: {"stall_frac": ..., "importance": {...} |
         None, "weight": {...} | None}}``."""
@@ -853,23 +959,37 @@ class ToyTileRecurrenceRMT:
 
         results = {}
         for name, layer in self._named_real_layers():
-            if layer.nnz <= 0:
+            nnz = layer.nnz
+            if nnz <= 0:
                 continue
+            # Per-LAYER (not per-neuron -- see the docstring's KNOWN GAP
+            # section) touch amount, sized relative to THIS layer's own
+            # nnz so a full amortized cycle takes ~1/touch_fraction calls
+            # regardless of absolute layer size -- see touch_fraction's
+            # own docstring section for the no-op/deletion-op failure
+            # modes this avoids.
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            # block4 chunk_size counts TILES, not synapses -- see
+            # _BLOCK4_TILE_SLOTS's own docstring section.
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
             entry = {"stall_frac": stall_frac, "importance": None, "weight": None}
-            if importance_strength > 0.0 and hasattr(layer, "apply_amortized_importance_decay"):
-                imp_decay_factor = max(min_decay_factor, 1.0 - stall_frac * importance_strength)
+            if importance_half_life_touches is not None and hasattr(layer, "apply_amortized_importance_decay"):
+                floor = 2.0 ** (-1.0 / importance_half_life_touches)
+                imp_decay_factor = 1.0 - stall_frac * (1.0 - floor)
                 stats = layer.apply_amortized_importance_decay(chunk_size, imp_decay_factor)
                 if hasattr(layer, "apply_amortized_block4_importance_decay"):
                     stats = dict(
-                        stats, block4=layer.apply_amortized_block4_importance_decay(chunk_size, imp_decay_factor)
+                        stats,
+                        block4=layer.apply_amortized_block4_importance_decay(block4_chunk_size, imp_decay_factor),
                     )
-                entry["importance"] = dict(stats, decay_factor=imp_decay_factor)
-            if weight_strength > 0.0 and hasattr(layer, "apply_amortized_l2_decay"):
-                w_decay_factor = max(min_decay_factor, 1.0 - stall_frac * weight_strength)
+                entry["importance"] = dict(stats, decay_factor=imp_decay_factor, chunk_size=chunk_size)
+            if weight_half_life_touches is not None and hasattr(layer, "apply_amortized_l2_decay"):
+                floor = 2.0 ** (-1.0 / weight_half_life_touches)
+                w_decay_factor = 1.0 - stall_frac * (1.0 - floor)
                 stats = layer.apply_amortized_l2_decay(chunk_size, w_decay_factor)
                 if hasattr(layer, "apply_amortized_block4_l2_decay"):
-                    stats = dict(stats, block4=layer.apply_amortized_block4_l2_decay(chunk_size, w_decay_factor))
-                entry["weight"] = dict(stats, decay_factor=w_decay_factor)
+                    stats = dict(stats, block4=layer.apply_amortized_block4_l2_decay(block4_chunk_size, w_decay_factor))
+                entry["weight"] = dict(stats, decay_factor=w_decay_factor, chunk_size=chunk_size)
             results[name] = entry
         return results
 
