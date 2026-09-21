@@ -36,15 +36,25 @@ def log_fn(
     x_r_target=None,
     layer_timing=None,
     window_wall_s=None,
+    plasticity_totals=None,
 ):
     loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
     acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
     tag = f"  [{event}]" if event else ""
     sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
     streak_s = f"  max_streak={max_streak:>2}/10" if max_streak is not None else ""
+    plast_s = ""
+    if plasticity_totals:
+        n_reset = sum(t["n_reset"] for t in plasticity_totals.values())
+        n_dead = sum(t["n_dead"] for t in plasticity_totals.values())
+        worst_key, worst = max(plasticity_totals.items(), key=lambda kv: kv[1]["last_deviation"])
+        plast_s = (
+            f"  plasticity[reset={n_reset} dead={n_dead} "
+            f"worst={worst_key}(dev={worst['last_deviation']:.2f},imp={worst['last_importance']:.4f})]"
+        )
     print(
         f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-        f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}",
+        f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{sps_s}{streak_s}{plast_s}",
         flush=True,
     )
 

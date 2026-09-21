@@ -1023,7 +1023,8 @@ class ToyTileRecurrenceRMT:
         blend: float = 0.10,
         reset_fraction: float = 0.01,
         dead_fraction: float = 0.01,
-        k: float = 0.5,
+        k: float = 2.0,
+        eta_var: float = 0.9,
     ) -> dict:
         """EXPERIMENTAL -- per-neuron utility-based plasticity reset
         (Continual-Backprop-inspired), replacing ``apply_loss_adjusted_decay``
@@ -1035,8 +1036,11 @@ class ToyTileRecurrenceRMT:
         ``touch_fraction``/``_BLOCK4_TILE_SLOTS`` chunk sizing as
         ``apply_loss_adjusted_decay``. Two independent selection pools
         (``reset_fraction``/``dead_fraction=0.0`` disables either):
-        top-K FROZEN (high importance, gated by local gradient deviation)
-        and bottom-K DEAD (idle columns, ungated). Returns
+        top-K FROZEN (high importance, gated by a local gradient-activity
+        z-score -- ``k`` is std-devs above baseline, not a ratio, and
+        ``eta_var`` tracks that variance, inflated at reset time so the
+        mechanism's own perturbation never looks like a real spike) and
+        bottom-K DEAD (idle columns, ungated). Returns
         ``{layer_name: {"importance": {...}}}``, nested ``"block4"`` key
         when that layer has block4 storage."""
         results = {}
@@ -1049,7 +1053,16 @@ class ToyTileRecurrenceRMT:
             if not hasattr(layer, "apply_amortized_plasticity_reset"):
                 continue
             stats = layer.apply_amortized_plasticity_reset(
-                chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k
+                chunk_size,
+                eta,
+                eta_slow,
+                eta_slow_catchup,
+                eta_fast,
+                blend,
+                reset_fraction,
+                dead_fraction,
+                k,
+                eta_var,
             )
             if hasattr(layer, "apply_amortized_block4_plasticity_reset"):
                 stats = dict(
@@ -1064,6 +1077,7 @@ class ToyTileRecurrenceRMT:
                         reset_fraction,
                         dead_fraction,
                         k,
+                        eta_var,
                     ),
                 )
             results[name] = {"importance": stats}

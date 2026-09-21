@@ -9525,3 +9525,50 @@ worth pursuing further.
 
 All originally-running jobs have now finished; machines are idle, no
 queue items remain.
+
+## 2026-09-21 -- apply_plasticity_reset (Continual-Backprop-inspired
+## per-neuron utility reset): first result in, dense arm underperforms
+## its own historical stall
+
+`launch_dense_lr_unscaled_plasticity_reset.py` finished (100k steps,
+27,894s, 3.59 steps/sec). Raw result: FINAL vocab=32/k=2, PEAK
+vocab=32/k=2 -- reached that (vocab,k) pair at step 4,997 and sat flat
+there for the remaining ~95,000 steps. The historical (no
+plasticity_reset) dense-unscaled run reached vocab=64/k=3 before
+flatlining for its final 86,257 steps. So this arm's peak is LOWER than
+the historical peak -- it did not break the stall, it stalled earlier
+and never reached vocab=64 at all.
+
+Before this result, two real bugs were found and fixed in the
+mechanism itself (both in sili__new's
+`delta_csr_types.hpp:plasticity_select_cycle_boundary`, both caught via
+new per-cycle diagnostic logging added specifically because the first
+loss-instability symptom couldn't otherwise be attributed to a cause):
+1. Cold-start: `col_grad_slow`/`col_grad_fast` both zero-initialized,
+   and because they update at different EMA rates, every column showed
+   a spurious ~50x deviation spike for many cycles after training
+   started -- nothing to do with real frozen columns. Fixed via
+   warm-start (first real delta replaces the zero sentinel directly).
+2. Reset-induced feedback loop: the reset action's own `(1-strength)`
+   importance decay produces a large artificial per-cycle delta next
+   cycle, which (unaccounted for) corrupted `col_grad_slow` and caused
+   the SAME column to be re-flagged repeatedly -- confirmed via a real
+   smoke run showing `dev` pinned at ~16-17 on the same layer/pool
+   across multiple cycles instead of settling. Fixed by adding a
+   variance tracker (`col_grad_var`) and switching the deviation
+   formula from a ratio (`fast/slow`) to a signed z-score
+   (`(fast-slow)/std`), with variance explicitly inflated at reset time
+   proportional to the reset's own perturbation size.
+
+Both fixes are unit-tested (new `test_cold_start_no_spurious_deviation`
+and `test_reset_inflates_variance_preventing_immediate_reflag` in
+`test_amortized_plasticity_reset.cpp`), full regression held at
+baseline throughout (sili__new ctest 175/180 same 5 pre-existing
+failures, sili_peridot pytest 355/11/40 unchanged), and confirmed via
+smoke test before the real 100k-step relaunch (deviation dropped from
+~47 to ~1.5-1.8 and stopped pinning to the same layer).
+
+polyak_lr_width288 and arm_c_plus_knee_margin15 are still running on
+the same fixed engine; results pending. No keep/prune decision made
+yet -- presenting raw per-arm results only until all three are in and
+reviewed together.

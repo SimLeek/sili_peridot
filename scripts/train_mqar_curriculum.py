@@ -416,7 +416,8 @@ def train_curriculum(
     plasticity_reset_blend: float = 0.10,
     plasticity_reset_reset_fraction: float = 0.01,
     plasticity_reset_dead_fraction: float = 0.01,
-    plasticity_reset_k: float = 0.5,
+    plasticity_reset_k: float = 2.0,
+    plasticity_reset_eta_var: float = 0.9,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -562,6 +563,10 @@ def train_curriculum(
     new_key_ids: list = []
     streak_has_new_vocab = False
     max_streak_seen = 0  # best streak between log points; see wrong_streak_threshold_reward_hacking anchor
+    # Per-layer/pool cumulative counts + latest deviation, so log_fn can
+    # attribute a loss spike to plasticity_reset actually firing (vs some
+    # other cause) instead of only seeing the downstream loss effect.
+    plasticity_totals: dict = {}
     stage_step = 0
     queries_since_level_change = 0
     pending_level_token = None
@@ -822,7 +827,7 @@ def train_curriculum(
                     )
                 if plasticity_reset_enable:
                     # No loss argument -- purely local per-column signals.
-                    model.apply_plasticity_reset(
+                    _plasticity_stats = model.apply_plasticity_reset(
                         touch_fraction=plasticity_reset_touch_fraction,
                         min_chunk=plasticity_reset_min_chunk,
                         max_chunk=plasticity_reset_max_chunk,
@@ -834,7 +839,26 @@ def train_curriculum(
                         reset_fraction=plasticity_reset_reset_fraction,
                         dead_fraction=plasticity_reset_dead_fraction,
                         k=plasticity_reset_k,
+                        eta_var=plasticity_reset_eta_var,
                     )
+                    for _layer_name, _layer_stats in _plasticity_stats.items():
+                        _scattered = _layer_stats.get("importance")
+                        if _scattered is None:
+                            continue
+                        for _pool_name, _leaf in (
+                            ("scattered", _scattered),
+                            ("block4", _scattered.get("block4")),
+                        ):
+                            if _leaf is None or not _leaf.get("cycle_complete"):
+                                continue
+                            _key = f"{_layer_name}.{_pool_name}"
+                            _tot = plasticity_totals.setdefault(
+                                _key, {"n_reset": 0, "n_dead": 0, "last_deviation": 0.0, "last_importance": 0.0}
+                            )
+                            _tot["n_reset"] += _leaf.get("n_reset_this_cycle", 0)
+                            _tot["n_dead"] += _leaf.get("n_dead_this_cycle", 0)
+                            _tot["last_deviation"] = _leaf.get("mean_deviation", 0.0)
+                            _tot["last_importance"] = _leaf.get("mean_col_importance", 0.0)
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,
@@ -905,6 +929,7 @@ def train_curriculum(
                     x_r_target=model.x_r_target,
                     layer_timing=layer_timing_snapshot,
                     window_wall_s=window_wall_s,
+                    plasticity_totals=(plasticity_totals if plasticity_reset_enable else None),
                 )
             max_streak_seen = 0
 
@@ -1051,6 +1076,21 @@ def main():
         parts.append(f"other={other_s:.2f}s({other_pct:.0f}%)")
         return "  t[" + " ".join(parts) + f" / {window_wall_s:.2f}s]"
 
+    def _plasticity_totals_str(totals):
+        # Attributes a loss spike to plasticity_reset actually firing (and
+        # on which layer/pool, at what deviation) instead of only showing
+        # the downstream loss effect -- see feedback_present_before_keep_prune_decisions
+        # (needed to untangle results DURING the run, not just at the end).
+        if not totals:
+            return ""
+        n_reset = sum(t["n_reset"] for t in totals.values())
+        n_dead = sum(t["n_dead"] for t in totals.values())
+        worst_key, worst = max(totals.items(), key=lambda kv: kv[1]["last_deviation"])
+        return (
+            f"  plasticity[reset={n_reset} dead={n_dead} "
+            f"worst={worst_key}(dev={worst['last_deviation']:.2f},imp={worst['last_importance']:.4f})]"
+        )
+
     def log_fn(
         step,
         vocab_size,
@@ -1066,6 +1106,7 @@ def main():
         x_r_target=None,
         layer_timing=None,
         window_wall_s=None,
+        plasticity_totals=None,
     ):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
@@ -1075,6 +1116,7 @@ def main():
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
         timing_s = _layer_timing_str(layer_timing, window_wall_s)
+        plasticity_s = _plasticity_totals_str(plasticity_totals)
 
         def _r_target_str(label, d):
             # Shared dy_r_target/x_r_target formatter; see cli_gradient_sparsity_args anchor.
@@ -1089,7 +1131,8 @@ def main():
         x_r_s = _r_target_str("x_r_target", x_r_target)
         print(
             f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{timing_s}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}",
+            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{timing_s}{sps_s}{streak_s}{dy_r_s}{x_r_s}"
+            f"{_ranks_str(ranks)}{plasticity_s}",
             flush=True,
         )
 
