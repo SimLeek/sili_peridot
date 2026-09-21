@@ -1022,8 +1022,7 @@ class ToyTileRecurrenceRMT:
         eta_fast: float = 0.5,
         blend: float = 0.10,
         reset_fraction: float = 0.01,
-        dead_fraction: float = 0.01,
-        k: float = 2.0,
+        k: float = 1.0,
         eta_var: float = 0.9,
     ) -> dict:
         """EXPERIMENTAL -- per-neuron utility-based plasticity reset
@@ -1034,15 +1033,20 @@ class ToyTileRecurrenceRMT:
         per-column signals. Always active when called (mirrors
         ``apply_amortized_l2_decay``'s always-on shape). Same
         ``touch_fraction``/``_BLOCK4_TILE_SLOTS`` chunk sizing as
-        ``apply_loss_adjusted_decay``. Two independent selection pools
-        (``reset_fraction``/``dead_fraction=0.0`` disables either):
-        top-K FROZEN (high importance, gated by a local gradient-activity
-        z-score -- ``k`` is std-devs above baseline, not a ratio, and
-        ``eta_var`` tracks that variance, inflated at reset time so the
-        mechanism's own perturbation never looks like a real spike) and
-        bottom-K DEAD (idle columns, ungated). Returns
-        ``{layer_name: {"importance": {...}}}``, nested ``"block4"`` key
-        when that layer has block4 storage."""
+        ``apply_loss_adjusted_decay``. Single pool: top-K FROZEN (high
+        importance, gated by a local gradient-activity z-score -- ``k``
+        is std-devs above baseline, not a ratio, and ``eta_var`` tracks
+        that variance, inflated at reset time so the mechanism's own
+        perturbation never looks like a real spike). The DEAD pool
+        (bottom-K by importance*|weight|, ungated) was pruned after a
+        real relaunch showed a self-reinforcing spiral: its own touch
+        shrank importance further, making a touched column MORE likely
+        to be re-selected next cycle -- see the design doc's
+        dead_pool_pruned section. ``k=1.0`` default recalibrated from a
+        real deviation distribution (see k_recalibration in the design
+        doc) after the original k=2.0 guess turned out to never fire.
+        Returns ``{layer_name: {"importance": {...}}}``, nested
+        ``"block4"`` key when that layer has block4 storage."""
         results = {}
         for name, layer in self._named_real_layers():
             nnz = layer.nnz
@@ -1060,7 +1064,6 @@ class ToyTileRecurrenceRMT:
                 eta_fast,
                 blend,
                 reset_fraction,
-                dead_fraction,
                 k,
                 eta_var,
             )
@@ -1075,7 +1078,6 @@ class ToyTileRecurrenceRMT:
                         eta_fast,
                         blend,
                         reset_fraction,
-                        dead_fraction,
                         k,
                         eta_var,
                     ),

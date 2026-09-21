@@ -415,8 +415,7 @@ def train_curriculum(
     plasticity_reset_eta_fast: float = 0.5,
     plasticity_reset_blend: float = 0.10,
     plasticity_reset_reset_fraction: float = 0.01,
-    plasticity_reset_dead_fraction: float = 0.01,
-    plasticity_reset_k: float = 2.0,
+    plasticity_reset_k: float = 1.0,
     plasticity_reset_eta_var: float = 0.9,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
@@ -837,7 +836,6 @@ def train_curriculum(
                         eta_fast=plasticity_reset_eta_fast,
                         blend=plasticity_reset_blend,
                         reset_fraction=plasticity_reset_reset_fraction,
-                        dead_fraction=plasticity_reset_dead_fraction,
                         k=plasticity_reset_k,
                         eta_var=plasticity_reset_eta_var,
                     )
@@ -853,11 +851,19 @@ def train_curriculum(
                                 continue
                             _key = f"{_layer_name}.{_pool_name}"
                             _tot = plasticity_totals.setdefault(
-                                _key, {"n_reset": 0, "n_dead": 0, "last_deviation": 0.0, "last_importance": 0.0}
+                                _key,
+                                {
+                                    "n_reset": 0,
+                                    "last_deviation": 0.0,
+                                    "last_min_deviation": 0.0,
+                                    "last_max_deviation": 0.0,
+                                    "last_importance": 0.0,
+                                },
                             )
                             _tot["n_reset"] += _leaf.get("n_reset_this_cycle", 0)
-                            _tot["n_dead"] += _leaf.get("n_dead_this_cycle", 0)
                             _tot["last_deviation"] = _leaf.get("mean_deviation", 0.0)
+                            _tot["last_min_deviation"] = _leaf.get("min_deviation", 0.0)
+                            _tot["last_max_deviation"] = _leaf.get("max_deviation", 0.0)
                             _tot["last_importance"] = _leaf.get("mean_col_importance", 0.0)
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
@@ -1084,11 +1090,12 @@ def main():
         if not totals:
             return ""
         n_reset = sum(t["n_reset"] for t in totals.values())
-        n_dead = sum(t["n_dead"] for t in totals.values())
         worst_key, worst = max(totals.items(), key=lambda kv: kv[1]["last_deviation"])
         return (
-            f"  plasticity[reset={n_reset} dead={n_dead} "
-            f"worst={worst_key}(dev={worst['last_deviation']:.2f},imp={worst['last_importance']:.4f})]"
+            f"  plasticity[reset={n_reset} "
+            f"worst={worst_key}(dev={worst['last_deviation']:.2f}"
+            f"[{worst['last_min_deviation']:.2f},{worst['last_max_deviation']:.2f}]"
+            f",imp={worst['last_importance']:.4f})]"
         )
 
     def log_fn(

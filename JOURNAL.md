@@ -9615,3 +9615,100 @@ keep/prune call made -- presented to the user as raw results, per
 WHY dense (the plain no-sparsity control, no seed-variance excuse
 available) regressed, likely in parallel with follow-up
 runs/ablations rather than blocking on the investigation first.
+
+## 2026-09-21 -- root cause found from existing data alone (no new
+## instrumentation needed): the dead pool, not the frozen pool
+
+Dug into all 3 finished logs before running anything new. Two checks,
+both cheap (`grep`/`awk` over the existing log files):
+
+1. **Frozen pool never fired, in any of the 3 runs.** `dev` (the
+   z-score gating the top-K-by-importance pool) topped out at 1.82
+   across ~1,200 total log lines and mostly sat 0.6-1.5; with the
+   `k=2.0` default (a blind "standard z-score" guess, never calibrated
+   against real data), `plasticity_boost = max(0, dev-k)` was 0 on
+   literally every touch, all 3 runs, the entire 100k steps. Confirmed
+   via `grep dev= | awk '$1>2.0'` returning zero matches across all
+   three full logs. The frozen pool selected candidates every cycle
+   (hence the climbing `reset=` counter) but never actually moved a
+   single weight.
+2. **Accuracy declined progressively through the whole plateau in all
+   3 runs, not just dropped once and stabilized.** Checked against the
+   TRUE historical (no plasticity_reset) control: it also shows a
+   sharp accuracy drop right after leveling up (task got harder), but
+   then CONVERGES to a stable floor (`width288_nolevel_down_control`'s
+   own vocab=64 plateau: 0.30 -> 0.03 -> 0.03 -> 0.03 -> 0.03, flat).
+   The plasticity_reset runs never converge -- dense's 5 equal-sized
+   chunks across its plateau: 0.10 -> 0.064 -> 0.070 -> 0.055 -> 0.048,
+   still dropping at the end. Same pattern in arm_c. This is active,
+   ongoing harm, not a normal hard stall.
+
+Since the frozen pool is provably inert, the only thing left that
+could cause (2) is the DEAD pool (bottom-K by `importance*|weight|`,
+ungated, full-strength every touch). Traced its own update formula
+(not just the data): `new_imp = (1-blend)*imp` fires as a side effect
+of the SAME touch that selected the column for being low-importance --
+so a column the dead pool just touched comes out with even LOWER
+importance, making it MORE likely to qualify as "dead" again next
+cycle. Only a single-cycle maturity gate (~100 calls) stands between a
+column and immediate re-selection. For a column that's genuinely
+useful but only intermittently active -- exactly what MQAR associative
+recall produces, a key/value pathway silent except when its specific
+token is queried -- one cycle isn't enough time to re-earn importance
+before the next round of "who's lowest now." A self-reinforcing spiral
+built into the formula itself, independent of any particular run's
+data. The original design (see the "Refinement" section of the
+now-superseded plan) explicitly assumed dead-pool targets carried much
+less risk than frozen-pool targets and left it ungated on purpose --
+that assumption is exactly what this data falsifies for a sparse-recall
+task.
+
+Direct instruction, rather than trying to patch the dead pool's
+cooldown timing: prune it entirely, fix the frozen pool, relaunch.
+`dead_fraction=0` was considered as a cheaper ablation but rejected --
+with the frozen pool already confirmed inert, that would just reproduce
+the historical baseline, which 3 existing runs already show.
+
+Two changes made, both in sili__new (`delta_csr_types.hpp`,
+`block4_plasticity_TODO_DELETE.hpp`, `cpu_backend.cpp`,
+`sparse_rnn.py`) plus threading through sili_peridot
+(`model/toy_tile_recurrence_rmt.py`, `scripts/train_mqar_curriculum.py`,
+the 3 launchers):
+1. **Dead pool removed entirely** -- `col_util_dead`, `col_dead_active`,
+   `dead_fraction`, `n_dead_this_cycle`, `mean_col_util_dead` all
+   deleted, not just disabled. Frozen pool is now the only pool.
+2. **Frozen pool's `k` recalibrated from 2.0 to 1.0** -- a best
+   estimate from the tick-level maxima observed in the 3 finished runs
+   (still not the full per-cycle distribution, which wasn't logged).
+   Added `min_deviation`/`max_deviation` to `PlasticityStats`
+   (computed over the actual candidate set each cycle, not just the
+   worst) so a future relaunch can calibrate from real data instead of
+   guessing again.
+
+Verification before relaunch: new/updated C++ unit tests (dead-pool
+tests removed, `test_deviation_distribution_min_max_tracked` added),
+full regression held (sili__new ctest 175/180 same 5 pre-existing
+failures; sili_peridot pytest 355/11/40, two tests fixed for the
+removed `dead_fraction` kwarg). Smoke test on dense confirmed: no
+`dead=` field in the log (pool fully gone), `dev` now genuinely crosses
+`k=1.0` (e.g. `dev=1.81[1.81,1.81]` at step 250, `dev=1.30[1.09,1.49]`
+at step 1000) -- the frozen pool is actually firing now, not silently
+inert. Unexpected bonus: steps/sec roughly TRIPLED (~3.6 -> ~10.7) on
+the smoke run, since removing the dead pool's per-cell `col_util_dead`
+update cut real per-touch overhead.
+
+All 3 relaunched fresh (v2): `dense_lr_unscaled_plasticity_reset`,
+`polyak_lr_width288_plasticity_reset`,
+`arm_c_plus_knee_margin15_plasticity_reset`. Results pending.
+
+Also confirmed already available for a future round, if v2 doesn't
+fully resolve this: `apply_amortized_importance_decay` (+ block4
+counterpart) -- an existing, unconditional, always-on, ungated
+per-synapse importance decay, the raw primitive `apply_loss_adjusted_decay`
+already wraps with a loss-gate. Plus the remaining ablations from the
+original plan (ranking formula, blend/reset_fraction magnitude,
+maturity window length, per-layer reset_fraction, importance-only
+reset, k/eta_slow/eta_fast timescale sweep, gated-vs-ungated frozen
+pool, asymmetric-vs-symmetric catchup) and a head-to-head run of
+`apply_loss_adjusted_decay` itself against the now-fixed
+`apply_plasticity_reset`.

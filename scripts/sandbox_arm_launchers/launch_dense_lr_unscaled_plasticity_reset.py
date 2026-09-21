@@ -1,14 +1,23 @@
-"""Exact replica of launch_width288_nolevel_down_control.py -- the
-"dense-unscaled" reference stall (peak_lr=0.015, plain dense, no
-sparsity mechanism, K_START=2, LEVEL_DOWN disabled): that run reached
-vocab=64/k=3 then sat completely flat for its final 86,257 steps of a
-100k-step budget. Only intentional difference here: plasticity_reset
-enabled at its default calibration (top-K frozen pool gated by local
-gradient deviation + bottom-K dead pool, both at 1%/1% -- see
-docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design).
-Supersedes launch_dense_lr_unscaled_loss_decay.py as the primary test
-against this specific stall -- everything else held identical (same
-seed=1000, same architecture, same curriculum)."""
+"""v2 relaunch, same base config as launch_width288_nolevel_down_control.py
+(the "dense-unscaled" reference stall: peak_lr=0.015, plain dense, no
+sparsity mechanism, K_START=2, LEVEL_DOWN disabled; historical peak
+vocab=64/k=3, flat for its final 86,257 steps). v1
+(dead_fraction=0.01, k=2.0) UNDERPERFORMED the historical stall --
+peaked at only vocab=32/k=2, with accuracy actively declining across
+the whole plateau rather than converging to a stable floor like the
+true historical stall did. Root cause (worked out from the finished
+v1 logs + the engine's own formula, not just correlation): the frozen
+pool's dev never crossed k=2.0 in any of 3 full 100k-step runs
+(confirmed via grep, gate was a permanent no-op), leaving the
+(ungated, full-strength) dead pool as the only active mechanism -- and
+its own touch shrinks importance further, making a touched column
+MORE likely to be re-selected next cycle, a self-reinforcing spiral
+with no real protection for genuinely-useful-but-intermittently-active
+columns (exactly what MQAR associative recall produces). v2: dead pool
+PRUNED entirely, frozen pool's k recalibrated to 1.0 (from the real
+dev distribution observed in v1, not a blind guess) so it can actually
+fire. See docs/research/toy_tile_recurrence_rmt.rst:
+plasticity_reset_design for the full derivation."""
 
 import sys
 
@@ -44,11 +53,12 @@ def log_fn(
     plast_s = ""
     if plasticity_totals:
         n_reset = sum(t["n_reset"] for t in plasticity_totals.values())
-        n_dead = sum(t["n_dead"] for t in plasticity_totals.values())
         worst_key, worst = max(plasticity_totals.items(), key=lambda kv: kv[1]["last_deviation"])
         plast_s = (
-            f"  plasticity[reset={n_reset} dead={n_dead} "
-            f"worst={worst_key}(dev={worst['last_deviation']:.2f},imp={worst['last_importance']:.4f})]"
+            f"  plasticity[reset={n_reset} "
+            f"worst={worst_key}(dev={worst['last_deviation']:.2f}"
+            f"[{worst['last_min_deviation']:.2f},{worst['last_max_deviation']:.2f}]"
+            f",imp={worst['last_importance']:.4f})]"
         )
     print(
         f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
@@ -58,7 +68,7 @@ def log_fn(
 
 
 print(
-    "# DENSE-UNSCALED + PLASTICITY_RESET (reset_fraction=0.01, dead_fraction=0.01), "
+    "# DENSE-UNSCALED + PLASTICITY_RESET v2 (dead pool pruned, k=1.0, reset_fraction=0.01), "
     "K_START=2, write_time_aux_targets=False precision=fp32 "
     "max_steps=100000 seed=1000 embed_width=36 k_first_target=3 NUM_CPUS=4 -- "
     "testing against the original's flat vocab=64/k=3 stall (86,257 steps flat)",

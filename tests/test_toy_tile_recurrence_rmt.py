@@ -1441,8 +1441,8 @@ class TestPlasticityReset:
         # Real end-to-end smoke: enough calls to complete several full
         # amortized cycles on a small real layer, confirm the mechanism
         # never crashes and reports internally-consistent stats
-        # (n_reset_this_cycle/n_dead_this_cycle are non-negative counts,
-        # cycle_complete is a real bool).
+        # (n_reset_this_cycle is a non-negative count, min/max_deviation
+        # bracket mean_deviation, cycle_complete is a real bool).
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
         out = None
         for _ in range(500):
@@ -1450,10 +1450,10 @@ class TestPlasticityReset:
         entry = out["input_proj"]["importance"]
         assert isinstance(entry["cycle_complete"], bool)
         assert entry["n_reset_this_cycle"] >= 0
-        assert entry["n_dead_this_cycle"] >= 0
+        assert entry["max_deviation"] >= entry["min_deviation"]
         if "block4" in entry:
             assert entry["block4"]["n_reset_this_cycle"] >= 0
-            assert entry["block4"]["n_dead_this_cycle"] >= 0
+            assert entry["block4"]["max_deviation"] >= entry["block4"]["min_deviation"]
 
     def test_no_loss_argument_needed(self):
         # Direct requirement: unlike apply_loss_adjusted_decay, this
@@ -1474,7 +1474,6 @@ class TestPlasticityReset:
             eta_fast=0.3,
             blend=0.05,
             reset_fraction=0.5,
-            dead_fraction=0.5,
             k=1.0,
         )
         assert out["input_proj"]["importance"] is not None
