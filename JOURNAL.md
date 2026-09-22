@@ -9712,3 +9712,50 @@ reset, k/eta_slow/eta_fast timescale sweep, gated-vs-ungated frozen
 pool, asymmetric-vs-symmetric catchup) and a head-to-head run of
 `apply_loss_adjusted_decay` itself against the now-fixed
 `apply_plasticity_reset`.
+
+## 2026-09-21 -- per-column data collection for fitting a real
+## reset-selection equation from training data
+
+Direct question after reviewing the log files this investigation
+already produces (importance, loss, accuracy): could a real
+reset-selection equation be FIT from actual data instead of hand-
+derived heuristically? Scoped to per-COLUMN state (not per-synapse) --
+the mechanism only ever selects at column granularity, so per-synapse
+snapshots (up to ~120GB uncompressed/step by a rough estimate) would
+add cost with no added signal for this specific goal; per-column state
+at cycle boundaries is ~3 orders of magnitude cheaper.
+
+Added (both repos): `DISLDOLayerV::plasticity_column_state()`/`_block4()`
+(sili__new) -- zero-copy views into `PlasticityState`'s own arrays
+(`col_importance`, `col_grad_slow`/`col_grad_fast`/`col_grad_var`,
+`col_age`, `col_reset_active`), matching the `get_weights_vals`/
+`get_importance` precedent. `apply_plasticity_reset(include_column_state=True)`
+(sili_peridot) copies these for any pool whose cycle just completed;
+`train_mqar_curriculum.py`'s new `plasticity_column_log_dir` writes one
+small `.npz` per completed cycle per layer/pool, with
+`step`/`loss_ema`/`acc_ema` attached -- the ~1% reset each cycle vs
+the ~99% left alone gives a free treatment/control comparison, no
+separate intervention needed.
+
+Real bug found via smoke-testing the actual wiring (not caught in
+planning): a dense-loaded layer's SCATTERED arm has 0 nnz for the
+whole run (`load_dense_values` routes entirely through
+`block4_load_dense_fp32`) -- its `cycle_complete` trivially fires every
+single call via the engine's empty-nnz early-return path, with
+all-zero column state the whole time. A naive 500-step smoke run wrote
+3036 files, almost entirely that noise. Fixed with a new `scattered_nnz`
+accessor (distinct from the existing combined `.nnz`) gating
+column-state attachment to arms that actually have real content --
+re-verified: 36 files, 408KB, genuine non-zero varying values. TDD
+throughout (6 new sili__new tests, 4 new sili_peridot tests, including
+a dedicated regression test for this exact bug). Both repos committed
++ pushed.
+
+Launched a 4th concurrent run (`launch_dense_lr_unscaled_plasticity_reset_column_log.py`,
+reusing the dense-unscaled v2 config -- cleanest, most-understood arm,
+no polyak_lr/Arm-C confounds -- with logging enabled) alongside the 3
+already-running v2 comparison runs, at `NUM_CPUS=2` (vs the others'
+`NUM_CPUS=4`) since machine load was already ~12.4 on 8 cores before
+adding this one. Storage extrapolates to ~80MB for a full 100k-step
+run (negligible against 180GB free). Data collection only -- no
+results/conclusions from this run yet.
