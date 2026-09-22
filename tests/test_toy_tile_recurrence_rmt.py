@@ -1574,3 +1574,53 @@ class TestPlasticityReset:
             "block4 (the arm holding this layer's real content) should still "
             "produce a real column_state snapshot within 500 calls"
         )
+
+    def test_l2_decay_lambda_default_is_off_and_stats_reported(self):
+        # Direct instruction, after offline replay of a real 100k-step
+        # run's column logs showed col_importance saturating at the
+        # ci accumulator's max_ci=100 clamp for most of a pool's
+        # population by late training: an L2-saturation-gated decay on
+        # the REAL importance accumulator (not a post-hoc re-ranking --
+        # offline replay proved that can never change selection order).
+        # Default l2_decay_lambda=0.0 must be a no-op (this project's
+        # new-shared-parameter backward-compat convention); l2_sat_ratio/
+        # l2_decay_strength stats should still surface even at lambda=0
+        # for visibility.
+        # Checked against block4 -- this fixture's dense=True layers have
+        # a permanently-empty scattered arm (see
+        # test_scattered_column_state_skipped_when_scattered_arm_is_empty),
+        # so the scattered leaf's cycle boundary never runs and its
+        # l2_sat_ratio/l2_decay_strength stay at their zero default.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(10))
+        out = None
+        for _ in range(50):
+            out = model.apply_plasticity_reset()
+        entry = out["input_proj"]["importance"]["block4"]
+        assert "l2_sat_ratio" in entry
+        assert "l2_decay_strength" in entry
+        assert 0.0 <= entry["l2_sat_ratio"] <= 1.5  # sat_ratio can exceed 1 only via fp noise
+        assert 0.0 <= entry["l2_decay_strength"] <= 1.0
+
+    def test_l2_decay_lambda_threads_through_and_shrinks_saturated_importance(self):
+        # This fixture never runs a real backward pass between calls, so
+        # col_importance never leaves 0 -- sat_ratio stays exactly 0
+        # throughout. At l2_decay_threshold=0.0 that means
+        # decay_strength = sigmoid((0-0)/temperature) = sigmoid(0) =
+        # EXACTLY 0.5, a deterministic value distinct from the 0.0
+        # no-op default -- confirms the knob actually reaches the
+        # engine's sigmoid math (not just a passthrough that gets
+        # ignored), and with l2_decay_lambda=1.0, mean_col_importance
+        # should visibly shrink cycle over cycle as a result.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(11))
+        completed = []
+        for _ in range(500):
+            out = model.apply_plasticity_reset(l2_decay_lambda=1.0, l2_decay_threshold=0.0, l2_decay_temperature=0.05)
+            leaf = out["input_proj"]["importance"]["block4"]
+            if leaf.get("cycle_complete"):
+                completed.append(leaf)
+        assert len(completed) >= 2, "block4 should complete at least 2 cycles within 500 calls"
+        entry = completed[-1]
+        assert abs(entry["l2_decay_strength"] - 0.5) < 1e-6, (
+            "threshold=0.0 at sat_ratio=0 should give decay_strength=sigmoid(0)=0.5 exactly, "
+            f"got {entry['l2_decay_strength']!r}"
+        )

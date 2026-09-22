@@ -945,6 +945,80 @@ free on this machine, and far cheaper than a full per-synapse weight
 snapshot (which would have run into the tens-of-GB range for the same
 horizon).
 
+.. _toy_tile_recurrence_rmt.l2_saturation_decay:
+
+L2-saturation-gated decay: from offline replay to a real engine change
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.l2_saturation_decay``
+
+Direct instruction: once real per-column data existed (see
+``plasticity_column_state`` above), "we should be able to run various
+functions on it much, much more quickly and see what python or other
+functions would've allowed the model to learn better or not." An
+offline analysis script (``scripts/analyze_column_log.py``, disposable)
+loaded the collected ``.npz`` snapshots and found ``col_importance``
+saturating at the ci accumulator's ``max_ci=100`` clamp by late
+training in several pools (``v_proj`` 288/288 columns tied at the
+ceiling by the run's end, ``k_proj`` 285/288, ``input_proj`` 280/288),
+with population std collapsing from real spread to the fp32 noise
+floor -- top-K-by-importance selection stops discriminating once most
+of a pool is tied.
+
+Two candidate fixes were replayed against the SAME real run, split at
+its own success/stall boundary (level-ups stopped at step 18837; the
+run held vocab=126/k=2 flat for the remaining ~81k steps):
+
+- ``rank(importance) + rank(deviation)`` (combined-rank selection):
+  rejected -- it was already far more exploratory DURING the success
+  period too (repeat rate collapsed from raw's 34-91% to 3-13%, touched
+  2-4x more distinct columns), not a surgical fix targeted at the
+  stall.
+- Age-decayed effective importance (``col_importance *
+  (1-lambda)^col_age``): showed the right asymmetric property in replay
+  (near no-op during success, 0% repeat rate during stall in every
+  saturated pool) but was explicitly rejected on a different ground,
+  direct instruction: "If col_age is steps, time, or some other
+  counter, that counter will eventually hit an overflow error or have
+  other numerical instability, so we want to avoid it since we're
+  targeting long term learning." This project's plasticity mechanisms
+  are held to an infinite-horizon-safe standard throughout (every knob
+  a fixed-memory EMA, nothing anchored to total elapsed steps) --
+  ``col_age`` as a decay EXPONENT breaks that even though it's already
+  tracked elsewhere in the state for the maturity gate.
+
+**Accepted design, direct instruction** ("I feel like an L2 norm would
+be an easy way to check if all the importances were close to 100...
+soft threshold if we can not hard"): ``sat_ratio =
+||col_importance||_2 / (max_ci*sqrt(n_out))``, a pure function of
+CURRENT state, passed through a soft sigmoid (not the earlier
+clipped-linear ramp) so there's no discontinuity at the threshold. A
+first version applied this as a UNIFORM per-cycle scalar re-score of
+the ALREADY-LOGGED historical trajectory and was mathematically
+guaranteed to be a no-op for selection -- multiplying an entire
+population by the same positive scalar can never change which columns
+rank highest (confirmed empirically: identical selection in every
+single replayed row). Real decay had to move into the actual engine
+(see ``docs/research/delta_csr_types.rst:plasticity_reset.l2_saturation_decay``
+for the full engine-side design) so it opposes ``col_importance``'s
+real growth during training, not a fixed log.
+
+``apply_plasticity_reset``'s new ``l2_decay_lambda``/
+``l2_decay_threshold``/``l2_decay_temperature``/``max_ci`` thread
+straight through to the engine primitive. Default ``l2_decay_lambda=0.0``
+is an exact no-op. Launched as v3
+(``launch_dense_lr_unscaled_plasticity_reset_v3_l2decay_column_log.py``,
+``lambda=0.05``, ``threshold=0.9``, ``temperature=0.05``) alongside the
+3 already-running v2 arms, with column logging enabled (direct
+instruction: "once we have it we can launch it with the column logging
+enabled too so we can see how it really did in detail") -- at
+``NUM_CPUS=4`` (matching dense v2 exactly, NOT the earlier data-
+collection run's ``NUM_CPUS=2``), a direct consequence of this
+session's own thread-ID-seeded-RNG finding: a different ``NUM_CPUS`` is
+an uncontrolled extra random seed, and this arm is meant as an actual
+controlled comparison against v2, not another data-collection-only
+pass.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph

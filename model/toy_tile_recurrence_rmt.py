@@ -1024,6 +1024,10 @@ class ToyTileRecurrenceRMT:
         reset_fraction: float = 0.01,
         k: float = 1.0,
         eta_var: float = 0.9,
+        l2_decay_lambda: float = 0.0,
+        l2_decay_threshold: float = 0.9,
+        l2_decay_temperature: float = 0.05,
+        max_ci: float = 100.0,
         include_column_state: bool = False,
     ) -> dict:
         """EXPERIMENTAL -- per-neuron utility-based plasticity reset
@@ -1039,7 +1043,15 @@ class ToyTileRecurrenceRMT:
         for any pool whose cycle just completed -- see
         plasticity_column_state in the design doc. Returns
         ``{layer_name: {"importance": {...}}}``, nested ``"block4"`` key
-        when that layer has block4 storage."""
+        when that layer has block4 storage.
+
+        ``l2_decay_lambda=0.0`` (default) is an exact no-op. When >0, a
+        SEPARATE population-level decay shrinks every touched column's
+        REAL underlying importance accumulator (not just the frozen-pool
+        picks), gated by a soft sigmoid on how close the population's L2
+        norm sits to the ``max_ci`` ceiling -- see
+        plasticity_reset_design.l2_saturation_decay. Deliberately NOT
+        gated on any step/age counter (infinite-horizon requirement)."""
         results = {}
         for name, layer in self._named_real_layers():
             nnz = layer.nnz
@@ -1059,6 +1071,10 @@ class ToyTileRecurrenceRMT:
                 reset_fraction,
                 k,
                 eta_var,
+                l2_decay_lambda,
+                l2_decay_threshold,
+                l2_decay_temperature,
+                max_ci,
             )
             # scattered_nnz gate: a dense-loaded real layer's content lives
             # ENTIRELY in block4 (load_dense_values -> block4_load_dense_fp32),
@@ -1088,6 +1104,10 @@ class ToyTileRecurrenceRMT:
                     reset_fraction,
                     k,
                     eta_var,
+                    l2_decay_lambda,
+                    l2_decay_threshold,
+                    l2_decay_temperature,
+                    max_ci,
                 )
                 if (
                     include_column_state

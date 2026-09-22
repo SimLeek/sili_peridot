@@ -418,6 +418,16 @@ def train_curriculum(
     plasticity_reset_reset_fraction: float = 0.01,
     plasticity_reset_k: float = 1.0,
     plasticity_reset_eta_var: float = 0.9,
+    # L2-saturation-gated decay on col_importance (direct instruction,
+    # after offline replay of a real 100k-step run's column logs showed
+    # importance saturating at the ci accumulator's max_ci clamp for
+    # most of a pool's population by late training). 0.0 (default):
+    # byte-identical no-op. See
+    # docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay.
+    plasticity_reset_l2_decay_lambda: float = 0.0,
+    plasticity_reset_l2_decay_threshold: float = 0.9,
+    plasticity_reset_l2_decay_temperature: float = 0.05,
+    plasticity_reset_max_ci: float = 100.0,
     # Offline data collection toward fitting a reset-selection equation
     # from real training data (direct instruction: per-column, not
     # per-synapse -- the mechanism only ever selects at column
@@ -848,6 +858,10 @@ def train_curriculum(
                         reset_fraction=plasticity_reset_reset_fraction,
                         k=plasticity_reset_k,
                         eta_var=plasticity_reset_eta_var,
+                        l2_decay_lambda=plasticity_reset_l2_decay_lambda,
+                        l2_decay_threshold=plasticity_reset_l2_decay_threshold,
+                        l2_decay_temperature=plasticity_reset_l2_decay_temperature,
+                        max_ci=plasticity_reset_max_ci,
                         include_column_state=(plasticity_column_log_dir is not None),
                     )
                     for _layer_name, _layer_stats in _plasticity_stats.items():
@@ -869,6 +883,8 @@ def train_curriculum(
                                     "last_min_deviation": 0.0,
                                     "last_max_deviation": 0.0,
                                     "last_importance": 0.0,
+                                    "last_l2_sat_ratio": 0.0,
+                                    "last_l2_decay_strength": 0.0,
                                 },
                             )
                             _tot["n_reset"] += _leaf.get("n_reset_this_cycle", 0)
@@ -876,6 +892,8 @@ def train_curriculum(
                             _tot["last_min_deviation"] = _leaf.get("min_deviation", 0.0)
                             _tot["last_max_deviation"] = _leaf.get("max_deviation", 0.0)
                             _tot["last_importance"] = _leaf.get("mean_col_importance", 0.0)
+                            _tot["last_l2_sat_ratio"] = _leaf.get("l2_sat_ratio", 0.0)
+                            _tot["last_l2_decay_strength"] = _leaf.get("l2_decay_strength", 0.0)
                             _col_state = _leaf.get("column_state")
                             if plasticity_column_log_dir is not None and _col_state is not None:
                                 _snap_dir = os.path.join(plasticity_column_log_dir, f"{_layer_name}.{_pool_name}")
@@ -886,6 +904,8 @@ def train_curriculum(
                                     loss_ema=(loss_ema if loss_ema is not None else float("nan")),
                                     acc_ema=(acc_ema if acc_ema is not None else float("nan")),
                                     n_reset_this_cycle=_leaf.get("n_reset_this_cycle", 0),
+                                    l2_sat_ratio=_leaf.get("l2_sat_ratio", 0.0),
+                                    l2_decay_strength=_leaf.get("l2_decay_strength", 0.0),
                                     **_col_state,
                                 )
                 if dynamic_rank_control:

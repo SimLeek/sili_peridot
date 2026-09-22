@@ -9788,3 +9788,52 @@ finding above -- but as a second independent random substrate it did
 also break past the historical v1 wall (vocab=64 cap), same as all 3
 controlled v2 arms. Equation-fitting against the collected per-column
 data has not started yet.
+
+2026-09-21 -- offline replay found real importance saturation, an
+L2-saturation-gated decay built and launched as v3
+
+Direct instruction: "now that we have the column log, we should be
+able to run various functions on it much, much more quickly and see
+what python or other functions would've allowed the model to learn
+better or not." Built `scripts/analyze_column_log.py` (disposable) and
+found the actual explanation for a previously-flagged, never-diagnosed
+log pattern (the exact same `dev=`/`imp=` line repeating verbatim
+across many ticks): `col_importance` climbs to the ci accumulator's
+`max_ci=100` clamp by ~step 20k-50k, and by run's end most of several
+pools' populations sit tied at that ceiling (`v_proj` 288/288,
+`k_proj` 285/288, `input_proj` 280/288) -- population std of raw
+importance collapses from real spread to the fp32 noise floor,
+degenerating top-K-by-importance selection into whatever a sort's
+tie-break lands on.
+
+Asked whether the current selection criterion actually helps at the
+run's real critical-fail period (a hard stall from step 18837 onward,
+vocab=126/k=2 flat for ~81k steps) without disturbing the success
+period before it -- replayed two candidate fixes split at that exact
+boundary: combined-rank selection (`rank(importance)+rank(deviation)`)
+was NOT surgical, already far more exploratory during the success
+period too; an age-decayed proxy (`col_importance*(1-lambda)^col_age`)
+showed the right asymmetric property but was rejected on a different
+ground -- `col_age` as a decay exponent is a step counter, and this
+project's plasticity mechanisms are held to an infinite-horizon-safe
+standard (fixed-memory EMAs only, nothing anchored to elapsed steps).
+
+Accepted design: an L2-norm saturation ratio
+(`||col_importance||_2/(max_ci*sqrt(n))`, current state only) through
+a SOFT sigmoid (not the earlier clipped-linear ramp). A uniform
+post-hoc re-score of the already-logged trajectory was tried first and
+proven mathematically to be a no-op for selection (top-K under any
+positive scalar multiply is unchanged) -- real decay had to move into
+the actual engine so it opposes real importance growth during
+training, not a frozen log. Built with TDD in sili__new (5 new tests,
+scattered+block4, full 173/173 regression green), wired through
+`apply_plasticity_reset`'s new `l2_decay_lambda`/`l2_decay_threshold`/
+`l2_decay_temperature`/`max_ci` params (default lambda=0.0 exact
+no-op), 361/361 sili_peridot regression green. Smoke-tested, then
+launched as a 4th concurrent run
+(`launch_dense_lr_unscaled_plasticity_reset_v3_l2decay_column_log.py`,
+lambda=0.05 threshold=0.9 temperature=0.05, column logging enabled) at
+`NUM_CPUS=4` (matching dense v2, not the earlier data-collection run's
+`NUM_CPUS=2`) -- a deliberate choice for a clean, controlled comparison
+given this session's own thread-ID-seeded-RNG finding. Data/results
+only -- no comparison yet.
