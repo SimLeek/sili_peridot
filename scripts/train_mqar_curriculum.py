@@ -19,6 +19,7 @@ trajectory_log_every semantics. See each CLI arg's own comment in main() below f
 from __future__ import annotations
 
 import json
+import os
 import resource
 import sys
 import time
@@ -417,6 +418,15 @@ def train_curriculum(
     plasticity_reset_reset_fraction: float = 0.01,
     plasticity_reset_k: float = 1.0,
     plasticity_reset_eta_var: float = 0.9,
+    # Offline data collection toward fitting a reset-selection equation
+    # from real training data (direct instruction: per-column, not
+    # per-synapse -- the mechanism only ever selects at column
+    # granularity). None (default): no extra work, byte-identical to
+    # today. When set, one small .npz per completed cycle per
+    # layer/pool is written under this directory -- see
+    # docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+    # plasticity_column_data_collection section.
+    plasticity_column_log_dir: str | None = None,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -838,6 +848,7 @@ def train_curriculum(
                         reset_fraction=plasticity_reset_reset_fraction,
                         k=plasticity_reset_k,
                         eta_var=plasticity_reset_eta_var,
+                        include_column_state=(plasticity_column_log_dir is not None),
                     )
                     for _layer_name, _layer_stats in _plasticity_stats.items():
                         _scattered = _layer_stats.get("importance")
@@ -865,6 +876,18 @@ def train_curriculum(
                             _tot["last_min_deviation"] = _leaf.get("min_deviation", 0.0)
                             _tot["last_max_deviation"] = _leaf.get("max_deviation", 0.0)
                             _tot["last_importance"] = _leaf.get("mean_col_importance", 0.0)
+                            _col_state = _leaf.get("column_state")
+                            if plasticity_column_log_dir is not None and _col_state is not None:
+                                _snap_dir = os.path.join(plasticity_column_log_dir, f"{_layer_name}.{_pool_name}")
+                                os.makedirs(_snap_dir, exist_ok=True)
+                                np.savez(
+                                    os.path.join(_snap_dir, f"step{step:08d}.npz"),
+                                    step=step,
+                                    loss_ema=(loss_ema if loss_ema is not None else float("nan")),
+                                    acc_ema=(acc_ema if acc_ema is not None else float("nan")),
+                                    n_reset_this_cycle=_leaf.get("n_reset_this_cycle", 0),
+                                    **_col_state,
+                                )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,

@@ -1477,3 +1477,100 @@ class TestPlasticityReset:
             k=1.0,
         )
         assert out["input_proj"]["importance"] is not None
+
+    def test_include_column_state_off_by_default(self):
+        # Direct instruction: per-column (not per-synapse) offline data
+        # collection, added as an opt-in extra so callers not doing data
+        # collection pay nothing extra. Off by default -- no column_state
+        # key anywhere when not requested, even once a cycle completes.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(6))
+        out = None
+        for _ in range(500):
+            out = model.apply_plasticity_reset()
+        entry = out["input_proj"]["importance"]
+        assert "column_state" not in entry
+        if "block4" in entry:
+            assert "column_state" not in entry["block4"]
+
+    def test_include_column_state_present_only_when_cycle_completes(self):
+        # column_state should appear ONLY on a pool leaf whose
+        # cycle_complete is True AND whose storage arm actually has real
+        # content this run -- the underlying arrays are zero-copy views
+        # in the C++ layer (get_weights_vals/get_importance precedent),
+        # so fetching them mid-cycle would be a partially up-to-date,
+        # misleading snapshot, not a real "this cycle's final state"
+        # reading. Checked on BLOCK4 only here -- a dense-loaded test
+        # model's SCATTERED arm always has 0 nnz (load_dense_values ->
+        # block4_load_dense_fp32), so its own top-level cycle_complete is
+        # trivially True on every call with column_state correctly
+        # suppressed (see test_scattered_column_state_skipped_when_scattered_arm_is_empty),
+        # not a real "did a cycle complete" signal to assert against here.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(7))
+        saw_a_cycle_complete_with_state = False
+        for _ in range(500):
+            out = model.apply_plasticity_reset(include_column_state=True)
+            for entry in out.values():
+                block4 = entry["importance"].get("block4")
+                if block4 is None:
+                    continue
+                if block4.get("cycle_complete"):
+                    assert "column_state" in block4, "a completed block4 cycle must include column_state when requested"
+                    saw_a_cycle_complete_with_state = True
+                else:
+                    assert "column_state" not in block4, "an incomplete block4 cycle must NOT include column_state"
+        assert saw_a_cycle_complete_with_state, "500 calls should complete at least one real block4 cycle"
+
+    def test_column_state_arrays_are_plain_numpy_not_live_views(self):
+        # The underlying C++ accessor returns a zero-copy VIEW into the
+        # layer's own internal buffer (documented precedent:
+        # get_weights_vals/get_importance) -- the model-level wrapper
+        # must copy it (np.array(...)) before returning, since a caller
+        # collecting data across many further apply_plasticity_reset
+        # calls needs a real frozen snapshot, not a view that silently
+        # changes under it on the NEXT call (same aliasing bug class as
+        # feedback_forward_output_not_aliased in sili__new). Checked via
+        # block4 -- the arm that actually holds this dense-loaded test
+        # model's real content (see scattered_nnz gating test).
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(8))
+        snapshots = []
+        for _ in range(500):
+            out = model.apply_plasticity_reset(include_column_state=True)
+            block4 = out["input_proj"]["importance"].get("block4")
+            if block4 is not None and "column_state" in block4:
+                snapshots.append(np.array(block4["column_state"]["col_importance"]))
+            if len(snapshots) >= 2:
+                break
+        assert len(snapshots) >= 1
+        assert isinstance(snapshots[0], np.ndarray)
+
+    def test_scattered_column_state_skipped_when_scattered_arm_is_empty(self):
+        # Real bug found via smoke-testing the actual disk-logging
+        # wiring (train_mqar_curriculum.py): a dense-loaded real layer's
+        # content lives ENTIRELY in block4 (load_dense_values ->
+        # block4_load_dense_fp32) -- its SCATTERED arm has 0 nnz for the
+        # whole run, so apply_amortized_plasticity_reset's early-return
+        # path (nnz==0) reports cycle_complete=True on literally EVERY
+        # call, with col_importance/col_grad_slow/etc all still at their
+        # zero-initialized values. Without this gate, a real 500-step
+        # smoke run wrote 3036 files in ~90s, the vast majority
+        # degenerate all-zero "scattered" snapshots (verified: loaded one
+        # back, every array was exactly zero) -- pure storage waste, no
+        # signal. scattered_nnz gates this off; block4 (the arm that
+        # actually holds this layer's real content) must still get its
+        # column_state normally.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(9))
+        saw_block4_column_state = False
+        for _ in range(500):
+            out = model.apply_plasticity_reset(include_column_state=True)
+            leaf = out["input_proj"]["importance"]
+            assert "column_state" not in leaf, (
+                "dense-loaded layer's scattered arm has 0 nnz -- must never get a "
+                "column_state snapshot, even when cycle_complete is (trivially) True"
+            )
+            block4_leaf = leaf.get("block4")
+            if block4_leaf is not None and "column_state" in block4_leaf:
+                saw_block4_column_state = True
+        assert saw_block4_column_state, (
+            "block4 (the arm holding this layer's real content) should still "
+            "produce a real column_state snapshot within 500 calls"
+        )

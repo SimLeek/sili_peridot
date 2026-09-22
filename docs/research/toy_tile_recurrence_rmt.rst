@@ -900,6 +900,51 @@ configs already identified for ``apply_loss_adjusted_decay``
 ``plasticity_reset_enable=True`` instead, compare against their original
 stalled trajectory.
 
+.. _toy_tile_recurrence_rmt.plasticity_column_state:
+
+Per-column state logging for offline reset-equation fitting
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.plasticity_column_state``
+
+Direct instruction, after reviewing the log files this investigation
+already produces (importance, loss, accuracy): could a real
+reset-selection equation be FIT from actual training data instead of
+hand-derived heuristically? Scoped to per-COLUMN state, not
+per-synapse -- the mechanism only ever selects at column granularity
+(``col_importance``/deviation/age are per-column aggregates already),
+so per-synapse snapshots (the original, much larger storage estimate)
+would add cost without adding signal for this specific goal.
+
+``apply_plasticity_reset(..., include_column_state=True)`` fetches a
+copy of ``PlasticityState``'s own arrays (see
+``docs/research/delta_csr_types.rst:plasticity_reset.plasticity_column_state``
+for the engine-level accessor) for any pool whose cycle just
+completed -- off by default (extra work most callers don't need).
+``train_mqar_curriculum.py``'s ``plasticity_column_log_dir`` writes one
+small ``.npz`` per completed cycle per layer/pool, including
+``step``/``loss_ema``/``acc_ema`` alongside the column arrays -- the
+~1% of columns reset each cycle serve as a natural "treatment" group
+against the ~99% left alone, without needing any separate intervention.
+
+**Real bug found via smoke-testing the actual wiring** (not caught in
+planning): a dense-loaded real layer's content lives entirely in
+block4 (``load_dense_values`` routes through ``block4_load_dense_fp32``
+only) -- its scattered arm has 0 nnz for the whole run, so its own
+``cycle_complete`` trivially fires on literally every call via the
+engine's empty-nnz early-return path, with all-zero column state. A
+naive 500-step smoke run wrote 3036 files, almost entirely that noise.
+Fixed with ``scattered_nnz`` (sili__new), gating column-state
+attachment to arms with real content -- re-verified: 36 files, all
+holding genuine non-zero values.
+
+Storage cost is small at this granularity: the same 500-step smoke run
+produced 408KB total (block4 arms only). A full 100k-step run
+extrapolates to roughly 80MB per arm -- negligible against the 180GB
+free on this machine, and far cheaper than a full per-synapse weight
+snapshot (which would have run into the tens-of-GB range for the same
+horizon).
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph

@@ -1024,29 +1024,22 @@ class ToyTileRecurrenceRMT:
         reset_fraction: float = 0.01,
         k: float = 1.0,
         eta_var: float = 0.9,
+        include_column_state: bool = False,
     ) -> dict:
         """EXPERIMENTAL -- per-neuron utility-based plasticity reset
-        (Continual-Backprop-inspired), replacing ``apply_loss_adjusted_decay``
-        as the primary mechanism under test. See
+        (Continual-Backprop-inspired). See
         docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
-        for the full derivation. No ``loss`` argument -- purely local
-        per-column signals. Always active when called (mirrors
-        ``apply_amortized_l2_decay``'s always-on shape). Same
+        for the full derivation (single top-K FROZEN pool, gated by a
+        local gradient-activity z-score; the dead pool was pruned after
+        a real relaunch showed a self-reinforcing spiral; k=1.0
+        recalibrated from real data). No ``loss`` argument. Same
         ``touch_fraction``/``_BLOCK4_TILE_SLOTS`` chunk sizing as
-        ``apply_loss_adjusted_decay``. Single pool: top-K FROZEN (high
-        importance, gated by a local gradient-activity z-score -- ``k``
-        is std-devs above baseline, not a ratio, and ``eta_var`` tracks
-        that variance, inflated at reset time so the mechanism's own
-        perturbation never looks like a real spike). The DEAD pool
-        (bottom-K by importance*|weight|, ungated) was pruned after a
-        real relaunch showed a self-reinforcing spiral: its own touch
-        shrank importance further, making a touched column MORE likely
-        to be re-selected next cycle -- see the design doc's
-        dead_pool_pruned section. ``k=1.0`` default recalibrated from a
-        real deviation distribution (see k_recalibration in the design
-        doc) after the original k=2.0 guess turned out to never fire.
-        Returns ``{layer_name: {"importance": {...}}}``, nested
-        ``"block4"`` key when that layer has block4 storage."""
+        ``apply_loss_adjusted_decay``. ``include_column_state=True``
+        additionally fetches a per-column snapshot (plain numpy copies)
+        for any pool whose cycle just completed -- see
+        plasticity_column_state in the design doc. Returns
+        ``{layer_name: {"importance": {...}}}``, nested ``"block4"`` key
+        when that layer has block4 storage."""
         results = {}
         for name, layer in self._named_real_layers():
             nnz = layer.nnz
@@ -1067,21 +1060,45 @@ class ToyTileRecurrenceRMT:
                 k,
                 eta_var,
             )
-            if hasattr(layer, "apply_amortized_block4_plasticity_reset"):
+            # scattered_nnz gate: a dense-loaded real layer's content lives
+            # ENTIRELY in block4 (load_dense_values -> block4_load_dense_fp32),
+            # so the scattered arm's apply call trivially reports
+            # cycle_complete=True on every single call (early-return path
+            # for nnz==0) with degenerate all-zero column state -- skip
+            # attaching that noise rather than logging a stream of
+            # meaningless snapshots for an arm that will never have real
+            # content for this run's config.
+            if (
+                include_column_state
+                and stats.get("cycle_complete")
+                and hasattr(layer, "plasticity_column_state")
+                and getattr(layer, "scattered_nnz", 1) > 0
+            ):
                 stats = dict(
-                    stats,
-                    block4=layer.apply_amortized_block4_plasticity_reset(
-                        block4_chunk_size,
-                        eta,
-                        eta_slow,
-                        eta_slow_catchup,
-                        eta_fast,
-                        blend,
-                        reset_fraction,
-                        k,
-                        eta_var,
-                    ),
+                    stats, column_state={key: np.array(v) for key, v in layer.plasticity_column_state().items()}
                 )
+            if hasattr(layer, "apply_amortized_block4_plasticity_reset"):
+                block4_stats = layer.apply_amortized_block4_plasticity_reset(
+                    block4_chunk_size,
+                    eta,
+                    eta_slow,
+                    eta_slow_catchup,
+                    eta_fast,
+                    blend,
+                    reset_fraction,
+                    k,
+                    eta_var,
+                )
+                if (
+                    include_column_state
+                    and block4_stats.get("cycle_complete")
+                    and hasattr(layer, "plasticity_column_state_block4")
+                ):
+                    block4_stats = dict(
+                        block4_stats,
+                        column_state={key: np.array(v) for key, v in layer.plasticity_column_state_block4().items()},
+                    )
+                stats = dict(stats, block4=block4_stats)
             results[name] = {"importance": stats}
         return results
 
