@@ -437,6 +437,22 @@ def train_curriculum(
     # docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
     # plasticity_column_data_collection section.
     plasticity_column_log_dir: str | None = None,
+    # Diagnostic (direct instruction, after finding col_importance is a
+    # SECOND EMA on top of the real per-synapse ci accumulator, making it
+    # impossible to see the real accumulator's own recovery dynamics
+    # between plasticity touches): when True, each plasticity_column_log_dir
+    # snapshot ALSO includes the raw, unsmoothed per-synapse importance
+    # matrix (layer.importance reshaped to (in_features, out_features)),
+    # not just the column aggregate. False (default): byte-identical,
+    # no extra work. See
+    # docs/research/toy_tile_recurrence_rmt.rst:raw_ci_landscape_capture.
+    plasticity_raw_importance_log: bool = False,
+    # Diagnostic: called once per REAL weight update (right after
+    # opt.step()), as raw_ci_sample_fn(step, model) -- lets a caller
+    # track individual synapse values at the TRUE update cadence (every
+    # real step), unlike the once-per-cycle snapshots above. None
+    # (default): no extra work.
+    raw_ci_sample_fn=None,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -823,6 +839,8 @@ def train_curriculum(
                     sigma_grad_debug_fn(step, model.log_sigmas.grad, model.centers.grad)
                 clip_grad_norm_(model.parameters_for_optimizer(), effective_max_grad_norm)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+                if raw_ci_sample_fn is not None:
+                    raw_ci_sample_fn(step, model)
                 # See docs/research/train_mqar_curriculum.rst:
                 # train_curriculum.l2_decay_and_rank_control_ordering.
                 if l2_decay_chunk_size is not None:
@@ -845,6 +863,8 @@ def train_curriculum(
                         improve_tol=loss_adjusted_decay_improve_tol,
                     )
                 if plasticity_reset_enable:
+                    if plasticity_raw_importance_log:
+                        _layers_by_name = dict(model._named_real_layers())
                     # No loss argument -- purely local per-column signals.
                     _plasticity_stats = model.apply_plasticity_reset(
                         touch_fraction=plasticity_reset_touch_fraction,
@@ -898,6 +918,20 @@ def train_curriculum(
                             if plasticity_column_log_dir is not None and _col_state is not None:
                                 _snap_dir = os.path.join(plasticity_column_log_dir, f"{_layer_name}.{_pool_name}")
                                 os.makedirs(_snap_dir, exist_ok=True)
+                                _extra = {}
+                                if plasticity_raw_importance_log:
+                                    # Raw, unsmoothed per-synapse importance --
+                                    # NOT col_importance (a second EMA on top of
+                                    # this). Safe reshape: scattered_nnz==0 for
+                                    # every dense-loaded real layer throughout
+                                    # training (verified), so layer.importance
+                                    # is exactly in_features*out_features long,
+                                    # in row-major order. See
+                                    # raw_ci_landscape_capture anchor.
+                                    _layer = _layers_by_name[_layer_name]
+                                    _extra["raw_importance"] = np.array(_layer.importance).reshape(
+                                        _layer.in_features, _layer.out_features
+                                    )
                                 np.savez(
                                     os.path.join(_snap_dir, f"step{step:08d}.npz"),
                                     step=step,
@@ -907,6 +941,7 @@ def train_curriculum(
                                     l2_sat_ratio=_leaf.get("l2_sat_ratio", 0.0),
                                     l2_decay_strength=_leaf.get("l2_decay_strength", 0.0),
                                     **_col_state,
+                                    **_extra,
                                 )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(

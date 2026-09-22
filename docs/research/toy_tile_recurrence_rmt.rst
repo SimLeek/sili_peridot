@@ -1019,6 +1019,78 @@ an uncontrolled extra random seed, and this arm is meant as an actual
 controlled comparison against v2, not another data-collection-only
 pass.
 
+.. _toy_tile_recurrence_rmt.raw_ci_landscape_capture:
+
+v3 result: decay never won, and why the fix needs new diagnostics first
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.raw_ci_landscape_capture``
+
+v3 finished (100k steps): final/peak vocab=126/k=2, held flat from step
+11573, ``l2sat``/``l2decay`` sustained at ~1.00/0.88 from ~step 21500
+onward, never backing off. Offline replay of the collected per-column
+data confirmed the mechanism did NOT do its job: fine-grained,
+cycle-by-cycle deltas in ``v_proj``'s population-mean ``col_importance``
+average +0.00087/cycle once decay is fully active (std 0.029) --
+statistically indistinguishable from zero. Decay isn't losing to
+growth, it's in an almost exact tie. Separately, comparing v3's loss/
+acc plateau (loss=4.62, acc=0.046) against the UNDECAYED column_log
+run's own plateau at the same vocab=126/k=2 level (loss=4.73,
+acc=0.031) showed they're statistically indistinguishable -- the
+earlier-flagged "loss crash coincides with decay onset" correlation
+was confounded by both events following the same curriculum level-up,
+not decay causing harm.
+
+**Why a naive "increase lambda" fix isn't trustworthy without new
+data**: direct instruction, after being asked "sustained decrease to
+what number exactly, because importance 100 is around the ceiling...
+[decay] is potentially fighting more than just this decay" --
+``col_importance`` (the only per-column signal actually logged) is a
+SECOND EMA (``eta=0.99``) applied once per touch on top of the REAL
+per-synapse accumulator, whose own update rule
+(``ci_new = beta2*ci_old + (1-beta2)*(g^2+contrib^2)``, default
+``beta2=0.999``, found in ``delta_csr_types.hpp``'s ``update_ci``) is
+a SEPARATE, faster-reacting EMA. Two stacked smoothing processes at
+different rates, both compressed into one logged number, means the
+observed "+4.4 units/cycle growth-vs-decay tie" can't be trusted as a
+measurement of the real accumulator's own recovery dynamics between
+touches -- it might reflect a genuinely gradual real recovery (more
+lambda or touch frequency would help, roughly linearly), or it might
+be almost entirely ``col_importance``'s own lag catching up to a raw
+value that ALREADY re-saturated within 1-2 real steps (in which case
+no amount of once-per-cycle decay, however strong, can win -- only a
+much higher touch frequency or a direct per-step hook would).
+
+**Fix, built as new diagnostics rather than guessing** (direct
+instruction: "let's do 1 [better diagnostics]... even if there's some
+completely different mechanism at play we can still find it"):
+
+1. ``layer.importance`` (``DISLDOLayerV::get_importance()``, already
+   bound, no new engine code) returns the REAL raw per-synapse ``ci``,
+   with no ``col_importance``-style secondary smoothing. Verified safe
+   to reshape to ``(in_features, out_features)`` directly against the
+   real model class (not a hand-built layer, which can carry stray
+   default scattered content that contaminates the merge) --
+   ``scattered_nnz==0`` and ``len(layer.importance) ==
+   in_features*out_features`` exactly for every real dense-loaded
+   layer throughout training.
+2. ``train_curriculum``'s ``plasticity_column_log_dir`` snapshots gain
+   an opt-in ``plasticity_raw_importance_log=False`` flag: when set,
+   each once-per-cycle snapshot ALSO includes the raw
+   ``(in_features, out_features)`` importance matrix (a "landscape
+   frame"), not just the column aggregate -- cheap enough (~6ms/layer)
+   to run for a whole production run, giving a full-run visual/
+   spatial "video" of saturation if rendered from the stacked frames
+   later (raw float32 ``.npz`` is the stored source of truth; a
+   lossless video is an optional follow-up render, not the primary
+   artifact, to avoid 8-bit quantization losing the ~4-unit-scale
+   detail the earlier finding turned on).
+3. A new ``raw_ci_sample_fn(step, model)`` hook fires once per REAL
+   weight update (right after ``opt.step()``), at the true update
+   cadence -- unlike the once-per-~50-step cycle snapshots, this can
+   resolve whether an individual synapse's raw ``ci`` recovers in 1-2
+   steps or over many, directly answering the open question above.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph

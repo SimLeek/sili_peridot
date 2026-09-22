@@ -9879,3 +9879,52 @@ triggered). Final loss_ema=4.63, acc_ema=0.008 at step 100000. All 4
 comparison runs (dense v2, polyak v2, arm_c v2, v3 l2decay) are now
 complete. Raw facts only -- no comparison or keep/prune verdict; that
 review is the user's.
+
+2026-09-22 -- v3 decay confirmed to have failed its one job, and why
+guessing the fix isn't safe
+
+Offline replay of v3's collected column data (fine-grained, per-cycle
+deltas, not the earlier coarse 10-point sample): `v_proj`'s
+population-mean `col_importance` averages +0.00087/cycle once decay
+is fully active (std 0.029) -- statistically zero net drift. Decay
+isn't losing to growth, it's tied. Separately, v3's loss/acc plateau
+(loss=4.62, acc=0.046) is statistically indistinguishable from the
+undecayed column_log run's own plateau at the same vocab=126/k=2
+level (loss=4.73, acc=0.031) -- the earlier-flagged "loss crash
+coincides with decay onset" correlation during monitoring was
+confounded by both events following the same curriculum level-up, not
+decay causing harm.
+
+Direct instruction, after I proposed just doubling lambda/touch
+frequency: "sustained decrease to what number exactly, because
+importance 100 is around the ceiling, so if importance is limited
+then it's potentially fighting more than just this decay." Correct --
+`col_importance` (the only signal logged) is a SECOND EMA on top of
+the real per-synapse accumulator's own update rule (`ci_new =
+beta2*ci_old + (1-beta2)*(g^2+contrib^2)`, `beta2=0.999` default,
+found in `update_ci`, `delta_csr_types.hpp`), so the "+4.4/cycle tie"
+can't distinguish a genuinely gradual real recovery (more
+lambda/frequency would help) from `col_importance`'s own lag catching
+up to a raw value that already re-saturated within 1-2 real steps (in
+which case no amount of once-per-cycle decay would ever win).
+
+Direct instruction: "let's do 1 [better diagnostics]... even if
+there's some completely different mechanism at play we can still find
+it. You could even store a video of the ci over time." Built two new
+opt-in captures rather than guessing at a fix: (1)
+`plasticity_raw_importance_log=True` adds the raw, unsmoothed
+per-synapse importance matrix (reshaped to (in_features,out_features))
+to each existing once-per-cycle snapshot -- a full-run "landscape",
+verified safe against the real model class first (a bare hand-built
+layer carries stray scattered content that contaminates the reshape;
+the real model's layers don't, confirmed `scattered_nnz==0` and exact
+length match); (2) `raw_ci_sample_fn(step, model)` fires once per REAL
+weight update (the true cadence, not once per ~50-step cycle),
+tracking 32 sampled synapses/layer, to directly resolve the
+1-step-vs-many-step recovery question. Stored as float32 `.npz`
+(lossless, directly analyzable); a video can be rendered from the same
+data afterward if useful, but isn't the primary artifact (8-bit
+quantization would lose the ~4-unit-scale detail this whole
+investigation turned on). Smoke-tested, then launched as a 30k-step
+diagnostic run (not a comparison arm) -- see
+docs/research/toy_tile_recurrence_rmt.rst:raw_ci_landscape_capture.
