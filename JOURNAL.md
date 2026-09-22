@@ -9843,3 +9843,18 @@ only -- no comparison yet.
 regression), reached at step 19893 via level-ups at
 924/1966/6740/19893, held flat for the remaining ~80,107 steps,
 steps_per_sec=2.59, wall_clock=38599s. Raw fact only.
+
+`dense_lr_unscaled_plasticity_reset` v2 finished (100k steps,
+`NUM_CPUS=4`): final/peak vocab=64/k=3 (peak == final), reached step
+19916 via level-ups at 922/4876/6404/8283/19916, held flat for the
+remaining ~80,084 steps, steps_per_sec=2.13, wall_clock=46992s.
+Matches (not exceeds) the historical reference stall point (vocab=64/
+k=3, historically flat for 86,257 steps). Raw fact only.
+
+v3 (l2decay) observation, still running: since ~step 21500 the
+L2-saturation decay has been persistently active (`l2decay`~0.88
+sustained across `v_proj`/`input_proj`/`o_proj`, not brief spikes).
+Over the same ~17k-step window, `loss_ema` has stayed elevated
+(4.6-4.85, vs ~3.2-3.6 beforehand) and `acc_ema` down to 0.003-0.04
+(vs 0.30-0.49 beforehand). Raw, sustained trend -- not yet interpreted
+as cause-effect, no verdict.
