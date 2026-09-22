@@ -9837,3 +9837,9 @@ lambda=0.05 threshold=0.9 temperature=0.05, column logging enabled) at
 `NUM_CPUS=2`) -- a deliberate choice for a clean, controlled comparison
 given this session's own thread-ID-seeded-RNG finding. Data/results
 only -- no comparison yet.
+
+`polyak_lr_width288_plasticity_reset` v2 finished (100k steps,
+`NUM_CPUS=4`): final/peak vocab=64/k=2 (peak == final, no late
+regression), reached at step 19893 via level-ups at
+924/1966/6740/19893, held flat for the remaining ~80,107 steps,
+steps_per_sec=2.59, wall_clock=38599s. Raw fact only.
