@@ -9858,3 +9858,14 @@ Over the same ~17k-step window, `loss_ema` has stayed elevated
 (4.6-4.85, vs ~3.2-3.6 beforehand) and `acc_ema` down to 0.003-0.04
 (vs 0.30-0.49 beforehand). Raw, sustained trend -- not yet interpreted
 as cause-effect, no verdict.
+
+`arm_c_plus_knee_margin15_plasticity_reset` v2 finished (100k steps,
+`NUM_CPUS=4`): final/peak vocab=64/k=2 (peak == final, no late
+regression), reached step 11921 via level-ups at
+1834/4119/7861/11921, held flat for the remaining ~88,079 steps,
+steps_per_sec=1.98, wall_clock=50569s. Raw fact only.
+
+All 3 v2 comparison arms (dense, polyak, arm_c) are now finished; only
+v3 (l2decay) remains running, holding the same loss/acc plateau
+described above (l2sat/l2decay still cycling ~0.85-1.00/0.71-0.88),
+now at higher steps/sec (5.2, up from ~2-3) with CPU contention gone.
