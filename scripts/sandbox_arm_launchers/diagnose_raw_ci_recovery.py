@@ -43,7 +43,7 @@ m.K_START = 2
 MAX_STEPS = 100000
 N_SAMPLES_PER_LAYER = 32
 FLUSH_EVERY = 1000
-SAMPLE_DIR = "logs/raw_ci_diagnostic/dense_lr_unscaled_v3_samples"
+SAMPLE_DIR = "logs/raw_ci_diagnostic/dense_lr_unscaled_v3_samples_run2"
 os.makedirs(SAMPLE_DIR, exist_ok=True)
 
 _sampled_indices: dict[str, np.ndarray] = {}
@@ -137,7 +137,7 @@ r = m.train_curriculum(
     plasticity_reset_l2_decay_lambda=0.05,
     plasticity_reset_l2_decay_threshold=0.9,
     plasticity_reset_l2_decay_temperature=0.05,
-    plasticity_column_log_dir="logs/plasticity_column_snapshots/dense_lr_unscaled_v3_diagnostic",
+    plasticity_column_log_dir="logs/plasticity_column_snapshots/dense_lr_unscaled_v3_diagnostic_run2",
     plasticity_raw_importance_log=True,
     raw_ci_sample_fn=raw_ci_sample_fn,
     log_every=250,
