@@ -1130,6 +1130,31 @@ deviation (growth RATE) when ``True`` -- see
 for the full engine-side derivation and test coverage. The reset/blend
 action on a selected column is unchanged; only what gets selected.
 
+**Update -- the first deployed version of this (v5 launcher) harmed the
+base model, root cause found and fixed** (direct instruction after
+the finding: "How ... did you think that would not harm the base
+model? Try to do the second option unless you can actually find a k
+value based on an equation and not a guess. I vastly prefer not to add
+guessed hyperparameters."). v5 (``select_by_deviation=True``, L2 decay
+off) stayed stuck at vocab=16/k=3 for 37,750+ steps, far worse than
+every other comparison arm. Root cause: since selection under this
+mode always returns the population's own MAXIMUM deviation each cycle,
+gating it against a fixed ``k=1.0`` (calibrated for the unrelated
+top-importance mode's own, non-maximal deviation distribution) opened
+the gate almost every cycle -- confirmed via direct log analysis, 97.25%
+open-rate vs 22.25% under top-importance selection -- so near-full-
+strength resets fired continuously instead of only on genuine
+anomalies. Fixed with an EQUATION-derived threshold rather than a new
+guessed constant: since ``deviation`` is a z-score, the expected
+maximum of ``N`` approximately-standard-normal draws is the classical
+Gaussian extreme-value asymptotic ``sqrt(2*ln(N))`` (Fisher-Tippett-
+Gnedenko) -- closed-form in the candidate population size alone, no
+data calibration needed, and it scales up automatically for wider
+layers (more candidates -> larger expected maximum by pure chance, a
+Bonferroni-style correction for the implicit multiple comparisons).
+Full derivation, log-analysis numbers, and test coverage:
+``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation``.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph

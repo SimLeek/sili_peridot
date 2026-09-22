@@ -9989,3 +9989,66 @@ left OFF to isolate this one new variable rather than compounding it
 with the l2_saturation_decay work) -- see
 docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection.
 No results yet.
+
+## 2026-09-22 -- v5 harmed the base model; root cause found (gate
+## defeated by construction) and fixed with an equation-derived
+## threshold, not a guessed one
+
+v5 never progressed past vocab=16/k=3, even after 37,750+ steps --
+strictly worse than every other comparison arm, including the plain
+baseline. Direct correction after the first (wrong) instinct was to
+just recalibrate `k` empirically: "How ... did you think that would
+not harm the base model? Try to do the second option unless you can
+actually find a k value based on an equation and not a guess. I
+vastly prefer not to add guessed hyperparameters."
+
+Root cause, confirmed via direct log analysis (grepped the `dev=`
+value logged for the "worst" column each cycle from both v5's log and
+v3's log, counted what fraction exceeded the gate threshold `k=1.0`):
+`select_by_deviation` selects the TOP `reset_fraction` of the mature
+population's deviations every single cycle -- by construction, an
+extreme order statistic, never a typical one. The gate
+(`plasticity_boost = max(0, deviation-k)`) reused the SAME fixed
+`k=1.0` that had been calibrated for the *unrelated* top-importance
+mode's own, non-maximal deviation distribution. v5: 177/182 cycles
+(97.25%) exceeded k=1.0 -- gate open almost every cycle. v3
+(top-importance mode): only 89/400 (22.25%). Near-full-strength resets
+were firing continuously regardless of whether anything was actually
+pathological, defeating the mechanism's entire "only intervene on
+genuine anomalies" purpose by construction, not by a badly-tuned
+constant.
+
+Fixed with a real equation instead of a new guessed constant:
+`deviation_by_col[j]` is built as a z-score, so under a "nothing
+pathological" null hypothesis it's approximately standard-normal per
+column. Selecting the top order statistics of `N` such draws each
+cycle means the right comparison is "bigger than what pure chance
+among N columns already produces" -- exactly the classical Gaussian
+extreme-value asymptotic (Fisher-Tippett-Gnedenko): the expected
+maximum of `N` i.i.d. standard normals is `sqrt(2*ln(N))`, closed-form
+in the population size alone, no data calibration needed, and it
+scales UP automatically for wider layers (more candidates -> a larger
+expected maximum by pure chance, the same correction a
+Bonferroni-style threshold applies for `N` implicit simultaneous
+comparisons). `k_effective = sqrt(2*ln(mature.size()))` now replaces
+the passed-in `k` ONLY when `select_by_deviation=true`; `k` is used
+unchanged (its own separate calibration) when
+`select_by_deviation=false`, so the default mode is untouched.
+
+TDD (sili__new): 2 new RED-first tests, one per scattered/block4 --
+a 4-mature-column scenario (N=4, expected threshold
+sqrt(2*ln(4))~=1.665) confirms the passed-in `k` has NO effect under
+`select_by_deviation=true` (re-run at k=0 vs k=1000, identical
+result), and that the resulting `plasticity_boost` exactly matches
+`max(0, deviation - sqrt(2*ln(N)))` computed independently from the
+engine's own post-call state -- the literal formula, not just "a
+different number." A companion regression test confirms default mode
+still uses the passed `k` directly. Full regression: 175/180 sili__new
+ctest (same 5 pre-existing `pre_existing_failure` failures, no new
+ones). See
+docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation.
+
+v5 (PID 1953623) and run2 (PID 1949671, the raw-ci-recovery diagnostic
+hoping to capture a matched "stuck" trajectory) were both still
+running when this fix landed -- decision on what to do with them
+(let finish, kill, relaunch a corrected v6) not yet made.
