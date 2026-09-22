@@ -19,9 +19,15 @@ real model class before use:
    synapses per layer, to directly resolve the 1-step-vs-many-step
    recovery question.
 
-Bounded to 30000 steps (well past the ~20000-step decay-onset point
-seen in v3) -- this is a diagnostic, not a full comparison run, no
-need to reach 100k steps."""
+Run at the full 100000 steps, matching v2/v3's length -- a first
+30000-step attempt was discarded: checked against v3's OWN step~30000
+snapshot (not a later step), which was already fully saturated
+(col_importance_mean 99.4-99.99, l2sat~0.99-1.0, l2decay~0.87-0.88
+across all 4 pools) while the short diagnostic run was nowhere close
+(means 1.6-19.5, l2decay=0.0) -- a real divergence at matched step
+count, not an artifact of comparing different points in a schedule.
+Direct instruction: relaunch at matching length instead of guessing at
+why a truncated run differed."""
 
 import os
 import sys
@@ -34,7 +40,7 @@ import scripts.train_mqar_curriculum as m
 m.NUM_CPUS = 4
 m.K_START = 2
 
-MAX_STEPS = 30000
+MAX_STEPS = 100000
 N_SAMPLES_PER_LAYER = 32
 FLUSH_EVERY = 1000
 SAMPLE_DIR = "logs/raw_ci_diagnostic/dense_lr_unscaled_v3_samples"
