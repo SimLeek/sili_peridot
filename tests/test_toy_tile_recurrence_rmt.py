@@ -1624,3 +1624,20 @@ class TestPlasticityReset:
             "threshold=0.0 at sat_ratio=0 should give decay_strength=sigmoid(0)=0.5 exactly, "
             f"got {entry['l2_decay_strength']!r}"
         )
+
+    def test_select_by_deviation_off_by_default_and_threads_through(self):
+        # Direct instruction, after comparing a graduated real run
+        # against a stuck real run's collected column data: rank
+        # candidates by deviation (growth RATE) instead of col_importance
+        # (absolute LEVEL) when select_by_deviation=True. Default False
+        # is an exact no-op (existing top-K-by-importance selection) --
+        # see select_by_deviation_early_detection in the design doc. The
+        # real selection-swap behavior is covered precisely at the
+        # engine level (test_amortized_plasticity_reset.cpp /
+        # test_block4_plasticity_reset.cpp); this just confirms the knob
+        # reaches the engine without error at the model layer.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(12))
+        out_default = model.apply_plasticity_reset()
+        assert out_default["input_proj"]["importance"] is not None
+        out_by_deviation = model.apply_plasticity_reset(select_by_deviation=True)
+        assert out_by_deviation["input_proj"]["importance"] is not None

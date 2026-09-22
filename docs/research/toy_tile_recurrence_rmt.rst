@@ -1091,6 +1091,45 @@ completely different mechanism at play we can still find it"):
    resolve whether an individual synapse's raw ``ci`` recovers in 1-2
    steps or over many, directly answering the open question above.
 
+.. _toy_tile_recurrence_rmt.select_by_deviation_early_detection:
+
+select_by_deviation: growth-RATE selection, found by comparing runs
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.select_by_deviation_early_detection``
+
+Direct instruction, after the raw-ci diagnostic run (above) graduated
+early (step 18366) instead of getting stuck like the original v3
+comparison run: "let's see if we can get a run that doesn't graduate
+in 100k steps with a full recording, and investigate the difference
+between runs with what we have in the meantime." Comparing the two
+runs' collected column-log data at MATCHED step counts found the
+stuck run's `col_importance` was already growing 17-147x faster than
+the graduated run's across every q/k/v/o_proj pool, visible from as
+early as step 5000-8000 -- well before either run's `l2_sat_ratio`/
+`l2_decay_strength` had done anything, and long before the absolute
+importance LEVEL itself became distinguishable.
+
+Direct instruction on what to do with that finding: "if we can
+determine some mathematical difference that would push the
+non-graduated run's columns... to be more like the graduated run's...
+but only when it's showing the same signs... so it doesn't affect the
+graduating run... we might have a good plasticity function from that."
+The existing frozen-pool selection (top-K by `col_importance`, an
+absolute LEVEL) structurally cannot use this signal -- a column
+accelerating fast while its level is still low never enters the
+candidate pool. `col_grad_fast`/`slow`/`var` (and the deviation z-score
+they feed) are already tracked for every mature column each cycle, not
+just the selected ones -- the gap was in what SELECTS, not what's
+tracked.
+
+``apply_plasticity_reset``'s new ``select_by_deviation=False`` (default,
+exact no-op preserving today's behavior) flips the ranking key to
+deviation (growth RATE) when ``True`` -- see
+``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection``
+for the full engine-side derivation and test coverage. The reset/blend
+action on a selected column is unchanged; only what gets selected.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph

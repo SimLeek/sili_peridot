@@ -428,6 +428,13 @@ def train_curriculum(
     plasticity_reset_l2_decay_threshold: float = 0.9,
     plasticity_reset_l2_decay_temperature: float = 0.05,
     plasticity_reset_max_ci: float = 100.0,
+    # False (default): byte-identical top-K-by-importance selection.
+    # True: rank candidates by deviation (growth RATE) instead of
+    # col_importance (absolute LEVEL) -- direct instruction, after
+    # comparing a graduated real run against a stuck real run's
+    # collected data. See
+    # docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection.
+    plasticity_reset_select_by_deviation: bool = False,
     # Offline data collection toward fitting a reset-selection equation
     # from real training data (direct instruction: per-column, not
     # per-synapse -- the mechanism only ever selects at column
@@ -882,6 +889,7 @@ def train_curriculum(
                         l2_decay_threshold=plasticity_reset_l2_decay_threshold,
                         l2_decay_temperature=plasticity_reset_l2_decay_temperature,
                         max_ci=plasticity_reset_max_ci,
+                        select_by_deviation=plasticity_reset_select_by_deviation,
                         include_column_state=(plasticity_column_log_dir is not None),
                     )
                     for _layer_name, _layer_stats in _plasticity_stats.items():

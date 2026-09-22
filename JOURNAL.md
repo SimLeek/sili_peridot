@@ -9928,3 +9928,64 @@ quantization would lose the ~4-unit-scale detail this whole
 investigation turned on). Smoke-tested, then launched as a 30k-step
 diagnostic run (not a comparison arm) -- see
 docs/research/toy_tile_recurrence_rmt.rst:raw_ci_landscape_capture.
+
+2026-09-22 -- the 30k diagnostic was tossed for being too short, a
+re-run at matching length graduated instead of getting stuck, and
+comparing that against the stuck v3 run found a real early-warning
+signal -- select_by_deviation built and launched as v5
+
+The first raw-ci diagnostic (above) was discarded: checked against
+v3's OWN step~30000 snapshot (not a later one), which was already
+fully saturated across all 4 pools while the 30k-step run was nowhere
+close -- a real divergence at matched step count, not an artifact of
+comparing different schedule phases. Relaunched at the full 100k
+steps. That run graduated early (step 18366, vocab=126/k=4) instead of
+getting stuck like the original v3 run -- confirmed via a literal diff
+that the two scripts' `train_curriculum(...)` calls are byte-identical
+(same seed, same everything); the only additions are two read-only
+diagnostic hooks (`layer.importance` reads, never writes to weights/
+synapses). Genuine run-to-run variance in a system that doesn't fully
+reproduce given "the same seed" alone, not a config difference.
+
+Direct instruction: launch a second attempt hoping for a stuck
+trajectory to compare against the graduated one, and investigate what's
+already collected in the meantime. Comparing the graduated run (run1)
+against the original stuck v3 run at MATCHED step counts found:
+`col_importance` in every q/k/v/o_proj pool was already growing
+17-147x faster in the stuck run than the graduated run, visible from
+as early as step 5000-8000 -- well before either run's `l2_sat_ratio`/
+`l2_decay_strength` had done anything, and long before the absolute
+importance LEVEL itself became distinguishable. Verified this wasn't
+driven by a few outlier columns (checked full population std/max/p90
+at matched steps): `q_proj` showed a fairly uniform population-wide
+shift, `o_proj` showed a skewed few-outlier pattern -- genuinely mixed,
+not one simple story. Verified the ABSOLUTE per-cycle delta (not just
+a noisy first/second-half ratio) stayed 17-147x elevated in the stuck
+run across the whole 9000-18000 step window.
+
+Direct instruction on what to build from this: "if we can determine
+some mathematical difference that would push the non-graduated run's
+columns... to be more like the graduated run's... but only when it's
+showing the same signs... we might have a good plasticity function."
+Found the structural gap: `col_grad_fast`/`slow`/`var` (and the
+deviation z-score they feed, already used to gate blend STRENGTH) are
+tracked for every mature column each cycle, not just the selected
+ones -- but the frozen pool's candidates are chosen by top-K
+`col_importance` (absolute LEVEL), so a column accelerating fast while
+still at a low absolute level can never enter the candidate pool,
+regardless of how anomalous its growth rate already is.
+
+Built `select_by_deviation` (sili__new, TDD, 2 new tests each for
+scattered/block4, full 173/173 regression green): default `false` is
+an exact no-op preserving today's top-K-by-importance selection;
+`true` ranks the frozen pool by deviation (growth RATE) instead.
+Deviation is now computed for the whole mature population up front
+(previously only for the already-selected top-K) so either ranking
+needs no duplicated computation -- the reset/blend action on a
+selected column is unchanged, only what gets selected. Wired through
+the model/training script (362/362 sili_peridot regression green),
+smoke-tested, and launched as v5 (`select_by_deviation=True`, L2 decay
+left OFF to isolate this one new variable rather than compounding it
+with the l2_saturation_decay work) -- see
+docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection.
+No results yet.

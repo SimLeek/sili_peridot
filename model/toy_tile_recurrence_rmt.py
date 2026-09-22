@@ -1028,6 +1028,7 @@ class ToyTileRecurrenceRMT:
         l2_decay_threshold: float = 0.9,
         l2_decay_temperature: float = 0.05,
         max_ci: float = 100.0,
+        select_by_deviation: bool = False,
         include_column_state: bool = False,
     ) -> dict:
         """EXPERIMENTAL -- per-neuron utility-based plasticity reset
@@ -1051,7 +1052,18 @@ class ToyTileRecurrenceRMT:
         picks), gated by a soft sigmoid on how close the population's L2
         norm sits to the ``max_ci`` ceiling -- see
         plasticity_reset_design.l2_saturation_decay. Deliberately NOT
-        gated on any step/age counter (infinite-horizon requirement)."""
+        gated on any step/age counter (infinite-horizon requirement).
+
+        ``select_by_deviation=False`` (default) ranks candidates by
+        ``col_importance`` (absolute LEVEL). ``True`` ranks by deviation
+        (growth RATE) instead -- catches a column accelerating fast
+        while its absolute level is still low, which top-K-by-level
+        structurally cannot see. Found by directly comparing a real run
+        that graduated against a real run that got stuck: the stuck
+        run's importance was already growing 17-147x faster from early
+        in training, well before either run's importance reached a high
+        absolute level. See
+        select_by_deviation_early_detection."""
         results = {}
         for name, layer in self._named_real_layers():
             nnz = layer.nnz
@@ -1075,6 +1087,7 @@ class ToyTileRecurrenceRMT:
                 l2_decay_threshold,
                 l2_decay_temperature,
                 max_ci,
+                select_by_deviation,
             )
             # scattered_nnz gate: a dense-loaded real layer's content lives
             # ENTIRELY in block4 (load_dense_values -> block4_load_dense_fp32),
@@ -1108,6 +1121,7 @@ class ToyTileRecurrenceRMT:
                     l2_decay_threshold,
                     l2_decay_temperature,
                     max_ci,
+                    select_by_deviation,
                 )
                 if (
                     include_column_state
