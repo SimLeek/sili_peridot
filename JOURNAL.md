@@ -9759,3 +9759,32 @@ already-running v2 comparison runs, at `NUM_CPUS=2` (vs the others'
 adding this one. Storage extrapolates to ~80MB for a full 100k-step
 run (negligible against 180GB free). Data collection only -- no
 results/conclusions from this run yet.
+
+Direct question mid-run: "why is column_log beating dense? Are you
+running the control on it?" First answer (threading-order
+nondeterminism) was wrong and explicitly rejected -- "No I don't care
+about the threading order dependence ffs... It does not meaningfully
+affect this... that doesn't matter for statistical averages." Correct
+mechanism, found by reading the code: `fp4_stochastic_rng_state()` in
+`fp4quant.hpp` seeds each thread's xorshift64* state from
+`std::hash<std::thread::id>{}(std::this_thread::get_id())` -- the OS
+thread ID, not the run's logical seed. This RNG drives both stochastic
+weight-quantization rounding AND `plasticity_reset`'s `fresh_sample`
+draws. Different `NUM_CPUS` changes thread count/partitioning, which
+changes which random stream produces every stochastic draw from step
+one -- functionally an uncontrolled extra seed for the whole run, not
+floating-point reduction-order noise (a different, unrelated effect
+already tracked in `project_backward_sparse_threading_nondeterminism`).
+column_log's own trajectory is therefore not a controlled comparison to
+dense v2 -- it's an accidental second random substrate.
+
+column_log finished (100k steps, `NUM_CPUS=2`): final/peak
+vocab=126/k=2 (peak == final, no late regression), reached at step
+18837 and held for the remaining ~81k steps, steps_per_sec=7.32,
+wall_clock=13657s. Final snapshot count: 12537 `.npz` files, 139MB
+under `logs/plasticity_column_snapshots/dense_lr_unscaled/`. Raw fact
+only, not a comparison to dense v2's own numbers, per the NUM_CPUS/RNG
+finding above -- but as a second independent random substrate it did
+also break past the historical v1 wall (vocab=64 cap), same as all 3
+controlled v2 arms. Equation-fitting against the collected per-column
+data has not started yet.
