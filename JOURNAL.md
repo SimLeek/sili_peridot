@@ -9869,3 +9869,13 @@ All 3 v2 comparison arms (dense, polyak, arm_c) are now finished; only
 v3 (l2decay) remains running, holding the same loss/acc plateau
 described above (l2sat/l2decay still cycling ~0.85-1.00/0.71-0.88),
 now at higher steps/sec (5.2, up from ~2-3) with CPU contention gone.
+
+v3 (l2decay) finished (100k steps, `NUM_CPUS=4`): final/peak
+vocab=126/k=2 (peak == final), reached step 11573 via level-ups at
+922/3359/4478/6255/9154/11573, held flat for the remaining ~88,427
+steps, steps_per_sec=6.12, wall_clock=16331s. Final l2sat/l2decay:
+1.00/0.88 (sustained since ~step 21500, never backed off once
+triggered). Final loss_ema=4.63, acc_ema=0.008 at step 100000. All 4
+comparison runs (dense v2, polyak v2, arm_c v2, v3 l2decay) are now
+complete. Raw facts only -- no comparison or keep/prune verdict; that
+review is the user's.
