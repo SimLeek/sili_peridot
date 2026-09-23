@@ -1709,5 +1709,47 @@ no-op, no window opened) is independent of
 ``plasticity_column_log_dir`` -- you can watch live without writing
 npz snapshots to disk, or do both.
 
-Full regression: 374 passed (362 baseline + 12 new), 11 skipped, 40
-deselected -- no regressions.
+**Superseded by a replay tool, same session**: a live-attached view is
+bound to the real training cadence -- one frame per completed
+amortized cycle, roughly once every several seconds per pool, nowhere
+close to smooth. Direct instruction after watching a real replay of
+already-recorded data and seeing what smooth playback actually looks
+like: "Tbh I'd prefer to see the replay unless it's running from
+30-60fps." New module ``scripts/replay_synapse_display.py`` reuses the
+exact same composition functions from ``live_synapse_display.py`` (no
+duplicated rendering logic) -- only the data source (recorded
+``.npz`` snapshots instead of a live training loop) and pacing model
+(a fixed frame rate, decoupled from real wall-clock training time)
+differ. ``discover_pools``/``build_event_timeline`` merge every pool's
+recorded snapshots into one step-sorted timeline (preserving the real
+chronological order events were recorded in, even though playback
+itself runs at a constant fps); ``replay()`` steps through it, pushing
+one frame per snapshot at the target rate. Unit tested (pure
+filesystem-reading logic against a real ``tmp_path`` tree, plus a
+dependency-injected fake display for the pacing/early-exit paths --
+``tests/test_replay_synapse_display.py``).
+
+Requires ``plasticity_raw_importance_log=True`` on the run that
+produced the snapshots (now captures ``raw_weight`` alongside
+``raw_importance`` in the same npz, same safe reshape guarantee, so
+replay can show both panels exactly like the live version) --
+``replay()`` raises clearly if a snapshot is missing it rather than
+silently rendering a blank panel. v8's launcher
+(``launch_dense_lr_unscaled_plasticity_reset_v8_select_by_deviation_replay_capture.py``)
+runs v7's exact config with full capture enabled, meant to run
+normally (background is fine, nothing to watch live) -- then replay it
+afterward: ``python scripts/replay_synapse_display.py
+logs/plasticity_column_snapshots/<run> --fps 30``.
+
+Smoke-tested against real, already-recorded data from an earlier run
+(the original v3 L2-decay diagnostic, the only prior run with
+``raw_importance`` captured) -- multiple pools rendered correctly side
+by side, playing smoothly through hundreds of real recorded steps.
+Direct observation from that replay, about the DATA rather than the
+tool: "pretty, but synapses weren't doing much through that process"
+-- consistent with what was already known about that particular run
+(confirmed saturated/stuck for most of its length), not a finding
+about a new mechanism.
+
+Full regression: 382 passed (374 + 8 new), 11 skipped, 40 deselected
+-- no regressions.

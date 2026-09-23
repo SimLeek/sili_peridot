@@ -960,9 +960,17 @@ def train_curriculum(
                                     # training (verified), so layer.importance
                                     # is exactly in_features*out_features long,
                                     # in row-major order. See
-                                    # raw_ci_landscape_capture anchor.
+                                    # raw_ci_landscape_capture anchor. Also
+                                    # captures the raw weight matrix (same
+                                    # reshape, same safety guarantee) so a
+                                    # later replay can show the actual synapse
+                                    # values alongside importance, matching
+                                    # live_synapse_display's own two panels.
                                     _layer = _layers_by_name[_layer_name]
                                     _extra["raw_importance"] = np.array(_layer.importance).reshape(
+                                        _layer.in_features, _layer.out_features
+                                    )
+                                    _extra["raw_weight"] = np.array(_layer.weights).reshape(
                                         _layer.in_features, _layer.out_features
                                     )
                                 np.savez(

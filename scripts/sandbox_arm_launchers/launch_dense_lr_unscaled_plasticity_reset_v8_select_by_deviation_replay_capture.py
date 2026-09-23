@@ -1,20 +1,25 @@
 """v8: identical config to v7 (percentile-derived gate k, same base
-dense-unscaled setup) -- NOT meant to run detached in the background.
+dense-unscaled setup), but captures full per-synapse snapshots
+(plasticity_raw_importance_log=True, both raw_importance AND
+raw_weight) for later REPLAY rather than a live-attached display.
+
 Direct instruction after v7's counterintuitive result (a genuinely-
 firing gate did WORSE than a permanently-inert one): "let's ... get
 displayarray ... working and display all of the networks side by side
-... and I'll just look at all of the synapses for the next run."
+... I'll just look at all of the synapses for the next run." Then,
+after noting a live-attached view is bound to the real training
+cadence (nowhere near 30-60fps): "Tbh I'd prefer to see the replay
+unless it's running from 30-60fps."
 
-Run this yourself, in a terminal you can see, so the live window stays
-up: `python scripts/sandbox_arm_launchers/launch_dense_lr_unscaled_plasticity_reset_v8_select_by_deviation_live_display.py`
-Press ESC on the "synapses" window to stop watching (training keeps
-running in the background after that -- the window just closes).
-
-See scripts/live_synapse_display.py and
+Run this normally (background is fine -- it's just collecting data,
+nothing to watch live). Once it's finished (or has collected enough),
+replay it yourself in a visible terminal:
+    python scripts/replay_synapse_display.py \\
+        logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture \\
+        --fps 30
+See scripts/replay_synapse_display.py and
 docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display for what
-each panel means: per pool, top to bottom -- label, weight heatmap
-("the synapse"), the deviation/reset strip (red = this column's
-z-score, green flag = selected/reset THIS cycle), importance heatmap."""
+each panel means."""
 
 import sys
 
@@ -64,8 +69,10 @@ def log_fn(
 
 print(
     "# DENSE-UNSCALED + PLASTICITY_RESET v8 (select_by_deviation=True, percentile-derived gate, "
-    "identical config to v7) + LIVE SYNAPSE DISPLAY -- run this yourself in a visible terminal, "
-    "not detached. max_steps=100000 seed=1000 embed_width=36 k_first_target=3 NUM_CPUS=4",
+    "identical config to v7) + FULL SYNAPSE CAPTURE for later replay (plasticity_raw_importance_log=True, "
+    "raw_importance+raw_weight per snapshot) -- max_steps=100000 seed=1000 embed_width=36 "
+    "k_first_target=3 NUM_CPUS=4 -- logging to "
+    "logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture/",
     flush=True,
 )
 r = m.train_curriculum(
@@ -80,7 +87,8 @@ r = m.train_curriculum(
     k_first_target=3,
     plasticity_reset_enable=True,
     plasticity_reset_select_by_deviation=True,
-    plasticity_live_display=True,
+    plasticity_column_log_dir="logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture",
+    plasticity_raw_importance_log=True,
     log_every=250,
     log_fn=log_fn,
 )
@@ -92,4 +100,4 @@ print(
 )
 print(f"PEAK peak_vocab={r['peak_stage']['vocab']} peak_k={r['peak_stage']['k']}", flush=True)
 print(f"STAGE_HISTORY {r['stage_history']}", flush=True)
-print("DONE_DENSE_LR_UNSCALED_PLASTICITY_RESET_V8_SELECT_BY_DEVIATION_LIVE_DISPLAY", flush=True)
+print("DONE_DENSE_LR_UNSCALED_PLASTICITY_RESET_V8_SELECT_BY_DEVIATION_REPLAY_CAPTURE", flush=True)

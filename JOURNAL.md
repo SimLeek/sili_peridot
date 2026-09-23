@@ -10226,8 +10226,43 @@ pixels") -- fixed to `cell_px=1` (literal one pixel per synapse) as
 the default.
 
 Full regression: 374 passed (362 baseline + 12 new), 11 skipped, 40
-deselected -- clean. See
-docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display for the
-full design writeup. Not yet run against a real full training run --
-the user will run the next select_by_deviation attempt themselves,
-interactively, with this attached.
+deselected -- clean.
+
+## 2026-09-23 -- live view superseded by a replay tool (real training
+## cadence isn't close to smooth); smoke-tested against real data
+
+Direct instruction: "Tbh I'd prefer to see the replay unless it's
+running from 30-60fps" -- correct: each pool only completes an
+amortized cycle roughly once every several seconds, nowhere near
+smooth as a live-attached view. Built `scripts/replay_synapse_display.py`,
+reusing every composition function from `live_synapse_display.py`
+(only the data source and pacing model differ): merges all pools'
+recorded `.npz` snapshots into one step-sorted timeline, plays them
+back at a fixed target fps (default 30). Unit tested (pure
+filesystem-reading logic + a dependency-injected fake display,
+`tests/test_replay_synapse_display.py`, 8 new tests).
+
+Extended `plasticity_raw_importance_log` to also capture `raw_weight`
+(same safe reshape as `raw_importance`) so replay can show both panels
+like the live version did. Smoke-tested against a REAL prior run's
+already-recorded data (`dense_lr_unscaled_v3_diagnostic_run2`, the
+only earlier run with raw_importance captured) -- multiple pools
+rendered and played back smoothly through hundreds of real steps
+(screenshot-verified). User's own observation from watching that
+replay: "pretty, but synapses weren't doing much through that process"
+-- expected, since that particular run (v3's original L2-decay
+diagnostic) was already known to be saturated/stuck for most of its
+length; not a new finding, confirms the tool shows what's actually
+there.
+
+New v8 launcher
+(`launch_dense_lr_unscaled_plasticity_reset_v8_select_by_deviation_replay_capture.py`,
+replacing the earlier live-display version) runs v7's exact config
+(percentile-gated select_by_deviation) with full per-synapse capture
+enabled, meant to run normally (background, nothing to watch live) --
+replay it afterward with `scripts/replay_synapse_display.py`. Not yet
+launched as a full run.
+
+Full regression: 382 passed (374 + 8 new), 11 skipped, 40 deselected
+-- clean. See docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display
+for the full writeup (both the live version and its replay successor).
