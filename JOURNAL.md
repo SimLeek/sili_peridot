@@ -10156,4 +10156,37 @@ v7 (same config as v5/v6) -- see
 docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection
 and docs/research/delta_csr_types.rst (sili__new side)
 `plasticity_reset.select_by_deviation_early_detection.k_derivation`
-for the full two-round derivation. No results yet.
+for the full two-round derivation.
+
+## 2026-09-23 -- v7 finished: the gate genuinely fired this time, but
+## the run did WORSE than v6 (which never fired at all), raw facts only
+
+v7 ran the full 100,000 steps (11856s, steps/sec=8.43). Raw numbers,
+no keep/prune verdict (see `feedback_present_before_keep_prune_decisions`):
+
+- FINAL: final_vocab=32, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=32, peak_k=3 (peak == final)
+- STAGE_HISTORY (3 level_ups total, all by step 4998):
+  - step 1990: vocab=16,k=2 -> vocab=16,k=3
+  - step 4337: vocab=16,k=3 -> vocab=32,k=2
+  - step 4998: vocab=32,k=2 -> vocab=32,k=3 (last level_up of the run)
+- No further level_ups across the remaining ~95,000 steps. loss_ema
+  hovered ~2.9-3.2 for most of the back half; acc_ema mostly 0.02-0.13,
+  noisy and low.
+
+Compared directly against v6 (EVT-derived gate, confirmed via its own
+column log to have NEVER fired a single real reset the whole run): v6
+still reached vocab=64/k=3 by step 9468. v7, with a gate that DID
+genuinely open (this was checked, not assumed -- the `dev=`/`imp=`
+values logged each cycle show real spread, e.g. step 95000's worst
+column `q_proj.block4(dev=1.19,imp=83.40)` vs v6's late-run values
+which were uniformly capped near the EVT ceiling), plateaued at the
+LOWER vocab=32/k=3 -- worse than a version of the mechanism that did
+nothing at all. Whether this means select_by_deviation resets are
+actively counterproductive once they're allowed to fire on this task,
+or whether v7's specific percentile threshold is firing on the WRONG
+columns (columns that are actually still useful, not genuinely
+pathological), or something else entirely, is not analyzed here --
+raw facts only, same as v6's own column log is available for v7 too
+(`logs/plasticity_column_snapshots/dense_lr_unscaled_v7_select_by_deviation_percentile_k/`)
+if that investigation is wanted next.
