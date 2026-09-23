@@ -1753,3 +1753,90 @@ about a new mechanism.
 
 Full regression: 382 passed (374 + 8 new), 11 skipped, 40 deselected
 -- no regressions.
+
+.. _toy_tile_recurrence_rmt.plasticity_algorithm_sandbox:
+
+Offline Python sandbox for screening candidate plasticity algorithms against real recorded data
+----------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.plasticity_algorithm_sandbox``
+
+Direct instruction, after replaying v8 and observing q/k/v_proj's
+importance saturate to max_ci=100 by step ~30k while weight matrices
+lost per-synapse individuality (v_proj: dense plaid grid; o_proj:
+collapsed into a few wide uniform stripes): "I think we could try some
+algorithms to see if we can get the post 8000 or 30k step state to
+look more like the pre-8000 state by accumulating whatever the
+algorithm does to all the arrays over time and accumulating the
+deviation. The goal is to keep the network plastic enough to learn the
+new challenges."
+
+New ``scripts/plasticity_sim.py``: a faithful Python port of
+``delta_csr_types.hpp:plasticity_select_cycle_boundary``'s grad-tracking
++ deviation + percentile/EVT-k math (``update_grad_tracking``,
+``compute_deviation``, ``percentile_k``, ``evt_k``, ``cycle_boundary``),
+validated with a PRECISION cross-check against sili__new's own C++
+unit test's exact numbers (4-column fixture: deviation~=1.2392/-1.4837,
+k~=-0.803, boost~=2.042 -- exact match, not just plausible). Loads a
+run's recorded ``.npz`` snapshots (``load_pool_trajectory``), replays
+its per-cycle "natural delta" (``natural_deltas``) against a candidate
+algorithm's own selection/gating decisions (``simulate`` for the
+real engine's select-then-deviation-gate shape;
+``simulate_level_based`` for candidates with a genuinely different,
+non-history-based criterion), entirely offline -- no new C++ engine
+run needed per candidate.
+
+**Stated approximation, not hidden**: the "natural delta" is the real
+run's OWN recorded per-cycle change, which at cycles/columns the real
+run's own algorithm reset, bakes in that real intervention's effect,
+not pure gradient growth -- there's no recorded way to exactly invert
+it (the real reset's random ``fresh`` weight sample was never saved,
+and even col_importance's own EMA read happens BEFORE its per-cell
+decay is applied). Checked directly, honestly, before trusting
+anything: replaying a run with ZERO further intervention exactly
+reproduces its real recorded trajectory (0.0 max abs diff on real v8
+data -- confirms the loader/replay mechanics); replaying v8's OWN
+exact algorithm does NOT reproduce v8's real outcome (21-62%
+reset-event overlap, 0-26% simulated final saturation vs 100% real) --
+switching from the recorded ``col_importance`` EMA aggregate to
+``raw_mean_ci`` (mean of the recorded ``raw_importance`` matrix, closer
+to ground truth) did not improve this, confirming the dominant cause
+is confound-compounding over the ~30 average resets/column across a
+full run, not a signal-choice artifact. Direct confirmation this is
+expected and acceptable: "this is of course going to be an
+approximation... This just allows us to see if the algorithm is
+continually at least pushing the model towards a good state and not
+away from a good state" -- a directional screening signal, not a
+quantitative forecast; promising candidates still need a real engine
+run to validate.
+
+First candidate tested beyond replaying v8's own algorithm:
+``ceiling_decay_step`` -- decay any column above 90% of max_ci,
+strength ramping to 5%/cycle at max_ci itself, a purely LEVEL-based
+rule (no growth-rate history at all), deliberately a different
+criterion shape than select_by_deviation's RATE-based one. Replayed
+against v8's real ``raw_mean_ci`` growth pressure: 0% saturation
+throughout the ENTIRE run in all 6 pools (vs real 50-100%, vs the
+replayed v8-algorithm baseline's own fluctuating 0-77%).
+
+**Export back to the SAME .npz schema the replay tool reads**
+(``export_simulated_trajectory``, naming convention ``sim_export_dir``
+-- ``<real_run>_sim_<candidate_name>/<pool>/``, so multiple candidates'
+exports against the same real run never collide) -- direct instruction:
+"to make sure, I could also watch the npz vids with the algorithmic
+accumulation applied to double check." ``raw_importance`` in the
+export is approximated (the real run's own per-synapse texture,
+rescaled per column to match the simulated aggregate level) --
+``raw_weight`` reset events can't be exactly reconstructed (same
+unrecorded-``fresh``-sample limitation), documented, not hidden.
+
+Tested in ``tests/test_plasticity_sim.py`` (22 tests): the C++-engine
+precision cross-check above, cold-start/asymmetric-catchup grad
+tracking, percentile/EVT-k formulas, the zero-intervention replay
+fidelity guarantee (both signals), the ceiling-decay candidate's
+level-based behavior, and the npz export schema. Full regression: 404
+passed (382 + 22 new), clean.
+
+Not yet compared visually by the user, not yet tried against
+additional candidates or literature, not yet validated with a real
+engine run -- raw findings only, no keep/prune verdict.

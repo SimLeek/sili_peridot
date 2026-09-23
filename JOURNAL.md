@@ -10266,3 +10266,76 @@ launched as a full run.
 Full regression: 382 passed (374 + 8 new), 11 skipped, 40 deselected
 -- clean. See docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display
 for the full writeup (both the live version and its replay successor).
+
+## 2026-09-23 -- v8 finished; replay revealed importance saturation and
+## per-synapse collapse post-~8k steps; built an offline Python
+## sandbox to screen candidate plasticity algorithms against real data
+
+v8 ran the full 100k steps. Replaying it (with the now-labeled panels)
+showed, per direct observation at step~30k (raw facts, not verdicts):
+input_proj's importance had gone to a flat, undifferentiated block;
+q_proj/k_proj/v_proj's importance was solid yellow (saturated near
+max_ci=100) while their weight matrices had lost per-synapse
+individuality (v_proj: dense repeating plaid grid; q_proj/k_proj: still
+fine noise); o_proj's weight had collapsed into a handful of wide
+uniform vertical stripes, importance showing distinct (non-saturated)
+purple/blue stripes; lm_head alone stayed rich and varied throughout.
+Pre-8k ("low rank") weight structure was confirmed normal/expected for
+transformer-style nets, not itself a concern.
+
+Direct instruction: build a fast, offline (pure-Python, no C++ engine
+run needed) sandbox to test candidate plasticity algorithms against
+the REAL recorded data, screening cheaply before committing to a real
+run -- "accumulating whatever the algorithm does to all the arrays
+over time and accumulating the deviation... see if the algorithm is
+continually at least pushing the model towards a good state and not
+away from a good state." New `scripts/plasticity_sim.py`: a faithful
+Python port of `plasticity_select_cycle_boundary`'s grad-tracking +
+deviation + percentile/EVT-k math, validated with a PRECISION
+cross-check against sili__new's own C++ unit test numbers (4-column
+fixture, deviation~=1.2392/-1.4837, k~=-0.803, boost~=2.042 -- exact
+match). 22 new tests, `tests/test_plasticity_sim.py`.
+
+**Honest fidelity check before trusting anything** (matching this
+project's "verify before trusting" discipline): replaying v8's OWN
+exact algorithm against its own recorded natural deltas does NOT
+reproduce v8's real outcome -- reset-event overlap only 21-62%
+(col_importance signal) or 9-17% (raw_mean_ci signal, tried as a
+fix -- did NOT improve fidelity), final saturation 0-26% simulated vs
+100% real. Root cause: each column gets reset ~30 times on average
+over a full 2955-cycle run, and the "natural delta" signal at every
+one of those touches bakes in whatever the real algorithm ACTUALLY did
+that cycle (a documented, expected confound, not a bug) -- with that
+many repeated touches per column, small per-event divergences compound
+into a completely different long-run trajectory. User's direct
+response, confirming this is expected and the intended use is
+directional, not quantitative: "this is of course going to be an
+approximation... This just allows us to see if the algorithm is
+continually at least pushing the model towards a good state and not
+away from a good state."
+
+Built a second, genuinely different candidate as a first real test:
+`ceiling_decay_step` -- a simple LEVEL-based rule (decay any column
+above 90% of max_ci, strength ramping to a max of 5%/cycle at max_ci
+itself), no growth-rate/deviation history needed at all, unlike
+select_by_deviation's RATE-based criterion. Replayed against v8's real
+`raw_mean_ci` growth pressure for all 6 pools: 0% saturation
+throughout the ENTIRE run in every pool (vs real 50-100%, vs the
+replayed v8-algorithm baseline's own fluctuating 0-77%) -- expected by
+construction (it structurally can't let a column sit near max_ci) but
+confirms it actually does that under the real recorded growth
+pressure. Exported to the replay tool's own .npz schema (new
+`export_simulated_trajectory`/`sim_export_dir` -- naming convention
+`<real_run>_sim_<candidate_name>/<pool>/`, direct instruction to keep
+multiple candidates' exports from colliding) so this can be watched
+the same way the real run was:
+`logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture_sim_ceiling_decay/`.
+
+raw_importance in the export is approximated (rescaled from the real
+run's own per-synapse texture to match the simulated column-level
+aggregate) -- weight-level resets can't be exactly reconstructed (the
+real reset's random `fresh` sample was never recorded), documented as
+a known limitation, not hidden. Full regression: 404 passed (382 + 22
+new), clean. Not yet compared visually by the user, not yet tried
+against additional candidates or literature, not yet validated with a
+real engine run -- raw findings only, no keep/prune verdict.
