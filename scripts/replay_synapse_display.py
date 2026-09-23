@@ -66,17 +66,22 @@ def replay(
     cell_px: int = 1,
     pool_order: list[str] | None = None,
     display: LiveSynapseDisplay | None = None,
+    window_name: str | None = None,
 ) -> int:
     """Play back every recorded snapshot under column_log_dir, oldest
     to newest, at a fixed frame rate. Returns the number of frames
     actually played (fewer than the event count if the window was
-    closed early)."""
+    closed early). window_name defaults to column_log_dir's own
+    basename, so multiple replay windows opened at once (e.g. to
+    compare candidates side by side) are distinguishable -- displayarray's
+    own default title is otherwise just "synapses" for every window."""
     pools = pool_order or discover_pools(column_log_dir)
     events = build_event_timeline(column_log_dir, pools)
     if not events:
         raise FileNotFoundError(f"No .npz snapshots found under {column_log_dir}")
     if display is None:
-        display = LiveSynapseDisplay(pool_order=pools, cell_px=cell_px)
+        name = window_name or os.path.basename(os.path.normpath(column_log_dir))
+        display = LiveSynapseDisplay(pool_order=pools, cell_px=cell_px, window_name=name)
     frame_interval = 1.0 / fps
     n_played = 0
     for step, pool, path in events:
@@ -106,8 +111,9 @@ def main():
     parser.add_argument("column_log_dir", help="e.g. logs/plasticity_column_snapshots/<run>")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--cell-px", type=int, default=1)
+    parser.add_argument("--window-name", default=None, help="defaults to column_log_dir's basename")
     args = parser.parse_args()
-    n = replay(args.column_log_dir, fps=args.fps, cell_px=args.cell_px)
+    n = replay(args.column_log_dir, fps=args.fps, cell_px=args.cell_px, window_name=args.window_name)
     print(f"Replayed {n} frames.")
 
 

@@ -10413,3 +10413,46 @@ touches, preserves rank, max importance 54-65), l2_init at two rates
 (0% saturation, max importance 0.4 vs 77 depending on rate). No
 keep/prune verdict -- raw findings and exports only, per this
 project's standing convention.
+
+## 2026-09-23 -- real-engine validation launched for both promising
+## sandbox candidates: layer_l2_decay (v9) and a newly-built L2 Init (v10)
+
+After watching layer_l2_decay's and l2_init_rate0001's replays side by
+side, direct instruction to move to real validation: "let's try both
+of them and record while seeing if it helps reliably beat mqar rather
+than randomly stalling." First, a UX fix from watching two windows at
+once: both were titled "synapses" with no way to tell them apart --
+`scripts/replay_synapse_display.py`'s `replay()` now defaults
+`window_name` to the run directory's own basename (overridable via
+`--window-name`), 2 new tests.
+
+**v9 (layer_l2_decay)**: this mechanism already existed in the real
+engine (built earlier this session, never enabled -- lambda was 0.0
+everywhere). Launched with `reset_fraction=0.0` to isolate it as the
+ONLY active mechanism, matching exactly what the sandbox tested in
+isolation -- `lambda=0.05 threshold=0.9 temperature=0.05`, same as the
+sandbox run. Running now; early observation (step ~12750, raw fact,
+no verdict): still stuck at vocab=16/k=3, `l2sat` pinned near 1.00
+despite the mechanism being active -- worth watching whether this
+changes as the run continues.
+
+**v10 (L2 Init)**: did NOT exist as a real mechanism before this --
+only tested in the offline sandbox until now. Built for real in
+sili__new (`apply_amortized_l2_init`/`apply_amortized_block4_l2_init`,
+TDD, both scattered/block4, full regression 177/182 clean, same 5
+pre-existing failures) -- see sili__new's own JOURNAL-equivalent
+(`docs/research/delta_csr_types.rst:plasticity_reset.l2_init`) for the
+engine-side details. Wired through `sparse_rnn.py`,
+`toy_tile_recurrence_rmt.py` (new `apply_l2_init` model method), and
+`train_mqar_curriculum.py` (new `l2_init_enable`/`l2_init_rate` etc.
+flags) -- 6 new shallow threading tests
+(`tests/test_toy_tile_recurrence_rmt.py::TestL2Init`). Launched with
+`rate=0.0001` (the sandbox-validated saner rate) and
+`plasticity_reset_enable=True, reset_fraction=0.0` (a deliberate no-op,
+kept only to reuse the existing column-log capture pathway so this run
+stays replayable) -- `l2_init_enable=True` is the only mechanism
+actually touching weights. Smoke-tested before the full launch. Full
+sili_peridot regression: 418 passed (412 + 6 new), clean.
+
+Both v9 and v10 running now, full 100k-step runs, neither finished --
+raw progress only, no keep/prune verdict yet.

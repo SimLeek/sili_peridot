@@ -477,6 +477,17 @@ def train_curriculum(
     # Raise only if you deliberately want fewer, larger pools on
     # screen. Only used when plasticity_live_display.
     plasticity_live_display_cell_px: int = 1,
+    # L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025, arXiv:2308.11958)
+    # -- EXPERIMENTAL, see
+    # docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    # False (default): byte-identical, no extra work. Independent of
+    # plasticity_reset_enable -- separate mechanism, separate cursor,
+    # can run alongside it or alone.
+    l2_init_enable: bool = False,
+    l2_init_touch_fraction: float = 0.01,
+    l2_init_min_chunk: int = 4,
+    l2_init_max_chunk: int = 2048,
+    l2_init_rate: float = 0.0001,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -995,6 +1006,13 @@ def train_curriculum(
                                 _live_display.update_pool(_key, step, _imp, _w, _dev, _col_state["col_reset_active"])
                                 if _live_display.closed():
                                     _live_display = None
+                if l2_init_enable:
+                    model.apply_l2_init(
+                        touch_fraction=l2_init_touch_fraction,
+                        min_chunk=l2_init_min_chunk,
+                        max_chunk=l2_init_max_chunk,
+                        rate=l2_init_rate,
+                    )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,

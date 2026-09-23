@@ -114,3 +114,33 @@ class TestReplay:
         (tmp_path / "a").mkdir()
         with pytest.raises(FileNotFoundError):
             replay(str(tmp_path), pool_order=["a"], display=_FakeDisplay())
+
+    def test_window_name_defaults_to_run_dir_basename(self, tmp_path, monkeypatch):
+        _write_snapshot(str(tmp_path / "a" / "step00000050.npz"), 50)
+        captured = {}
+
+        class _StubDisplay(_FakeDisplay):
+            def __init__(self, pool_order=None, cell_px=1, window_name="synapses"):
+                super().__init__()
+                captured["window_name"] = window_name
+
+        import scripts.replay_synapse_display as mod
+
+        monkeypatch.setattr(mod, "LiveSynapseDisplay", _StubDisplay)
+        replay(str(tmp_path), fps=1000.0, pool_order=["a"])
+        assert captured["window_name"] == os.path.basename(str(tmp_path))
+
+    def test_window_name_override_respected(self, tmp_path, monkeypatch):
+        _write_snapshot(str(tmp_path / "a" / "step00000050.npz"), 50)
+        captured = {}
+
+        class _StubDisplay(_FakeDisplay):
+            def __init__(self, pool_order=None, cell_px=1, window_name="synapses"):
+                super().__init__()
+                captured["window_name"] = window_name
+
+        import scripts.replay_synapse_display as mod
+
+        monkeypatch.setattr(mod, "LiveSynapseDisplay", _StubDisplay)
+        replay(str(tmp_path), fps=1000.0, pool_order=["a"], window_name="custom_name")
+        assert captured["window_name"] == "custom_name"

@@ -1136,6 +1136,38 @@ class ToyTileRecurrenceRMT:
             results[name] = {"importance": stats}
         return results
 
+    def apply_l2_init(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        rate: float = 0.0001,
+    ) -> dict:
+        """EXPERIMENTAL -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs
+        2025, arXiv:2308.11958). See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+        Regularizes weight toward its OWN initial value, not zero and
+        not a population-relative ceiling. Always-on, no selection/
+        gating step, independent cursor from apply_plasticity_reset.
+        `rate` is highly sensitive -- the 0.0001 default reflects real
+        sandbox findings, not a guess (0.01 crushed importance to
+        near-zero over a ~3000-cycle run)."""
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            if not hasattr(layer, "apply_amortized_l2_init"):
+                continue
+            stats = layer.apply_amortized_l2_init(chunk_size, rate)
+            if hasattr(layer, "apply_amortized_block4_l2_init"):
+                block4_stats = layer.apply_amortized_block4_l2_init(block4_chunk_size, rate)
+                stats = dict(stats, block4=block4_stats)
+            results[name] = stats
+        return results
+
     def apply_dynamic_rank_control(
         self,
         tau_death: float = 0.05,

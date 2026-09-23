@@ -1641,3 +1641,52 @@ class TestPlasticityReset:
         assert out_default["input_proj"]["importance"] is not None
         out_by_deviation = model.apply_plasticity_reset(select_by_deviation=True)
         assert out_by_deviation["input_proj"]["importance"] is not None
+
+
+class TestL2Init:
+    """apply_l2_init -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025,
+    arXiv:2308.11958), EXPERIMENTAL, see
+    docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    TDD: written against the sili__new engine primitives
+    (apply_amortized_l2_init/apply_amortized_block4_l2_init) already
+    built and tested there -- this class covers the orchestration layer
+    only (chunk sizing, block4/scattered dispatch)."""
+
+    def test_touch_fraction_sizing_across_real_nnz_range(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
+        out = model.apply_l2_init()
+        assert set(out.keys()) >= {"input_proj", "q_proj", "k_proj", "v_proj", "o_proj", "lm_head"}
+
+    def test_non_fp32_backend_reports_nothing_yet(self):
+        model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(1))
+        out = model.apply_l2_init()
+        assert out == {}, f"FP4 layers should report nothing yet (not wired), got keys: {list(out)}"
+
+    def test_block4_backend_reports_block4_substats(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(2))
+        out = model.apply_l2_init()
+        assert "block4" in out["input_proj"]
+
+    def test_runs_many_cycles_without_error(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
+        out = None
+        for _ in range(500):
+            out = model.apply_l2_init()
+        entry = out["input_proj"]
+        assert isinstance(entry["cycle_complete"], bool)
+        assert entry["n_touched"] >= 0
+        if "block4" in entry:
+            assert entry["block4"]["n_touched"] >= 0
+
+    def test_custom_knobs_are_threaded_through(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
+        out = model.apply_l2_init(touch_fraction=1.0, max_chunk=1_000_000, rate=0.5)
+        assert out["input_proj"] is not None
+
+    def test_first_touch_does_not_yet_regularize(self):
+        # A weight's very first touch only captures the reference value.
+        # Exact behavior is verified at the engine test level; this just
+        # confirms one real call doesn't error or silently no-op here.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
+        out = model.apply_l2_init(rate=0.5)
+        assert out["input_proj"]["n_touched"] > 0

@@ -1899,3 +1899,23 @@ own-sandbox baseline). 6 new tests in
 ``tests/test_plasticity_sim.py`` (28 total for this module). Full
 regression: 410 passed (404 + 6 new), clean. No keep/prune verdict --
 raw findings and exports only.
+
+**Update -- real-engine validation launched for both**: direct
+instruction, after watching ``layer_l2_decay`` and ``l2_init_rate0001``
+side by side: "let's try both of them and record while seeing if it
+helps reliably beat mqar rather than randomly stalling." ``v9``
+enables ``layer_l2_decay`` (already existed in the real engine, never
+turned on before -- ``reset_fraction=0.0`` isolates it as the only
+active mechanism, matching the sandbox test exactly). ``v10`` required
+building L2 Init as a genuinely new real mechanism first (it only
+existed in the offline sandbox) --
+``model.apply_l2_init(rate=0.0001, ...)``, new
+``l2_init_enable``/``l2_init_rate`` flags on ``train_curriculum``, see
+sili__new's ``docs/research/delta_csr_types.rst:plasticity_reset.l2_init``
+for the engine-side implementation (TDD, scattered+block4, full
+regression clean). Both launched as full 100k-step runs; neither
+finished yet -- raw progress only.
+
+Also: watching two replay windows side by side surfaced a real UX gap
+(both titled "synapses," no way to tell them apart) -- ``replay()``
+now defaults ``window_name`` to the run directory's own basename.
