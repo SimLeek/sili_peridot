@@ -10103,3 +10103,57 @@ v6 itself then plateaus at vocab=64/k=3 for the remaining ~90k steps
 of its own run. Whether that plateau is itself a further, separate
 problem (and if so whether it resembles any other observed
 stuck-signature) is not yet analyzed here -- raw facts only.
+
+## 2026-09-22 -- v6's plateau investigated using its own column log:
+## the EVT-derived gate never fired, not once, for the whole run --
+## replaced with a percentile-based threshold, launched as v7
+
+Direct instruction: "check what happened with v6 when it stalled and
+what updates to the equation would fix it, and test those on the log
+a bit if we can before trying another run." v6's launcher had column
+logging enabled (`plasticity_column_log_dir`), giving per-cycle
+`col_grad_fast`/`col_grad_slow`/`col_grad_var`/`col_reset_active`
+snapshots for all 6 pools across the entire 100k-step run --
+`scripts/analyze_v6_stall.py` (disposable, not kept) reconstructed
+per-column deviation and the EVT threshold `sqrt(2*ln(mature_count))`
+from this data directly, no new run needed.
+
+Finding: `gate_open_frac` (fraction of selected columns whose
+deviation actually exceeded the EVT threshold, i.e. got a nonzero
+`plasticity_boost`) was EXACTLY 0.000 in every one of the 6 pools --
+not just during the post-step-9468 plateau, across the ENTIRE run
+including the early climbing phase. Real per-column deviation never
+exceeded ~1.0-1.8 anywhere in the run; the EVT threshold sits at
+~3.1-3.4. So the mechanism was a silent, permanent no-op for the whole
+100k steps -- v6's early progress (clearing vocab=16/k=3, the exact
+point v5 got stuck at) owed nothing to select_by_deviation actually
+doing anything; the reset gate simply never opened. The EVT
+derivation's premise -- that deviation behaves like an
+iid-standard-normal z-score -- doesn't hold in practice, most likely
+because the EMA-lag structure of `col_grad_fast`/`col_grad_slow` (plus
+the asymmetric catchup rate) produces a much more tightly-clustered
+real distribution than the idealized theory assumed.
+
+Tested an alternative directly against the SAME v6 log data before
+implementing anything: instead of a theoretical asymptotic, use the
+population's own empirical `(1-reset_fraction)`-percentile as the
+threshold each cycle (`np.percentile(dev, 99)` for
+`reset_fraction=0.01`) -- still equation-derived (a real order
+statistic, no new guessed constant), self-calibrating to whatever the
+actual spread happens to be. Recomputed on v6's real late-phase
+deviations: this rule would have opened the gate 46.9-100% of the time
+across the 6 pools (input_proj 55.3%, q_proj 50.2%, k_proj 46.9%,
+v_proj 67.5%, o_proj 77.9%, lm_head 100%) -- a sane middle ground
+between the EVT rule's 0% and the original fixed `k=1.0`'s 97.25%.
+
+Implemented in sili__new (TDD, both scattered/block4, full 175/180
+regression green -- same 5 pre-existing failures): `k_effective` under
+`select_by_deviation=true` is now the linear-interpolated percentile
+(matching `numpy.percentile`'s default method) of the mature
+population's own deviation values this cycle, at percentile
+`100*(1-reset_fraction)`. Wired through, smoke-tested, and launched as
+v7 (same config as v5/v6) -- see
+docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection
+and docs/research/delta_csr_types.rst (sili__new side)
+`plasticity_reset.select_by_deviation_early_detection.k_derivation`
+for the full two-round derivation. No results yet.

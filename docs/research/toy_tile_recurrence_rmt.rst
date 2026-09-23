@@ -1155,6 +1155,40 @@ Bonferroni-style correction for the implicit multiple comparisons).
 Full derivation, log-analysis numbers, and test coverage:
 ``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation``.
 
+**Second update -- the EVT-derived k was ALSO wrong, found by checking
+the real data before trusting it, not by assuming the theory held**
+(direct instruction: "Better, but it didn't graduate. We have the log
+though now, right? So we should be able to check what happened with
+v6 when it stalled and what updates to the equation would fix it, and
+test those on the log a bit if we can before trying another run.").
+v6 (same config, running the EVT-derived-k fix) ran the full 100k
+steps but plateaued at vocab=64/k=3 for the last ~90k of them.
+Analyzing v6's own per-cycle column snapshots (recorded for all 6
+pools across the whole run) found the gate's open-rate was EXACTLY
+0.000 in every pool, across the ENTIRE run, not just the plateau --
+real deviation never approached the theoretical
+:math:`\\sqrt{2\\ln N}\\approx 3.1\\text{-}3.4` threshold (observed
+max ~1.0-1.8 throughout), meaning the mechanism's own EMA-lag
+structure doesn't actually produce the iid-standard-normal statistics
+the EVT derivation assumed. The fix that stopped v5's over-triggering
+had over-corrected into a permanent no-op -- v6's early progress owed
+nothing to the mechanism, which never fired a single real reset the
+whole run.
+
+Fixed again, still equation-derived but now calibrated against the
+population's own OBSERVED distribution instead of a theoretical
+asymptotic: ``k = percentile(mature population's deviation values this
+cycle, 100*(1-reset_fraction))`` -- a genuine order statistic of real
+data (no new guessed constant), reusing the existing ``reset_fraction``
+knob instead of introducing a new one. Validated against the SAME v6
+log data before implementing: recomputed on the exact recorded
+late-plateau deviations, this rule would have opened the gate 47-100%
+of the time across all 6 pools, vs 0% for the EVT rule and 97.25% for
+the original fixed ``k=1.0``. Full derivation, log-analysis numbers,
+and test coverage:
+``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation``
+(same anchor, updated in place with both rounds). Launched as v7.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph
