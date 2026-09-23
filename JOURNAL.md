@@ -10052,3 +10052,23 @@ v5 (PID 1953623) and run2 (PID 1949671, the raw-ci-recovery diagnostic
 hoping to capture a matched "stuck" trajectory) were both still
 running when this fix landed -- decision on what to do with them
 (let finish, kill, relaunch a corrected v6) not yet made.
+
+## 2026-09-22 -- v6 (EVT-derived k) early signal: clears vocab=16/k=3
+## by step ~5000, where v5 stayed stuck for 37,750+ steps
+
+Both v5 and run2 were killed (direct instruction) and v6 launched:
+identical config to v5, but running against the fixed engine
+(`k_effective = sqrt(2*ln(N))` instead of the old fixed `k=1.0` that
+was defeated by construction -- see the entry above). Smoke-tested
+(300 steps, clean) before queuing the full 100k-step run.
+
+Early result, raw numbers only (no keep/prune verdict yet -- see
+`feedback_present_before_keep_prune_decisions`): v6 passed vocab=16/
+k=3 (the EXACT point v5 got permanently stuck at) by roughly step
+4750-6250, and by step 16250 had already reached vocab=64/k=3,
+loss_ema~=3.0, acc_ema~=0.2-0.3, steps/sec~=8.5. v5, by contrast, never
+left vocab=16/k=3 across 37,750+ observed steps under the old gate.
+This is a clean early signal that the EVT-derived threshold restores
+the mechanism's intended behavior, though the run is still in
+progress (100k steps total) and hasn't been compared against the
+other arms' own final outcomes yet.
