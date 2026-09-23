@@ -460,6 +460,23 @@ def train_curriculum(
     # real step), unlike the once-per-cycle snapshots above. None
     # (default): no extra work.
     raw_ci_sample_fn=None,
+    # Direct instruction ("let's ... get displayarray ... working and
+    # display all of the networks side by side ... I'll just look at
+    # all of the synapses for the next run"): when True, pushes a
+    # live, tiled visualization (every pool's weight + importance
+    # heatmaps plus the plasticity_reset algorithm's own live
+    # selection/deviation state) to an on-screen window every time any
+    # pool completes an amortized cycle -- see
+    # scripts/live_synapse_display.py and
+    # docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display.
+    # False (default): byte-identical, no extra work, no window opened.
+    plasticity_live_display: bool = False,
+    # Pixels per synapse cell in the live display. Default 1: literal
+    # one pixel per synapse, no artificial zoom (direct correction --
+    # upsampling by default was solving a problem that didn't exist).
+    # Raise only if you deliberately want fewer, larger pools on
+    # screen. Only used when plasticity_live_display.
+    plasticity_live_display_cell_px: int = 1,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -609,6 +626,14 @@ def train_curriculum(
     # attribute a loss spike to plasticity_reset actually firing (vs some
     # other cause) instead of only seeing the downstream loss effect.
     plasticity_totals: dict = {}
+    _live_display = None
+    if plasticity_live_display:
+        from scripts.live_synapse_display import LiveSynapseDisplay
+
+        _live_display = LiveSynapseDisplay(
+            pool_order=[f"{n}.{p}" for n, _ in model._named_real_layers() for p in ("scattered", "block4")],
+            cell_px=plasticity_live_display_cell_px,
+        )
     stage_step = 0
     queries_since_level_change = 0
     pending_level_token = None
@@ -870,7 +895,7 @@ def train_curriculum(
                         improve_tol=loss_adjusted_decay_improve_tol,
                     )
                 if plasticity_reset_enable:
-                    if plasticity_raw_importance_log:
+                    if plasticity_raw_importance_log or plasticity_live_display:
                         _layers_by_name = dict(model._named_real_layers())
                     # No loss argument -- purely local per-column signals.
                     _plasticity_stats = model.apply_plasticity_reset(
@@ -890,7 +915,7 @@ def train_curriculum(
                         l2_decay_temperature=plasticity_reset_l2_decay_temperature,
                         max_ci=plasticity_reset_max_ci,
                         select_by_deviation=plasticity_reset_select_by_deviation,
-                        include_column_state=(plasticity_column_log_dir is not None),
+                        include_column_state=(plasticity_column_log_dir is not None or plasticity_live_display),
                     )
                     for _layer_name, _layer_stats in _plasticity_stats.items():
                         _scattered = _layer_stats.get("importance")
@@ -951,6 +976,17 @@ def train_curriculum(
                                     **_col_state,
                                     **_extra,
                                 )
+                            if _live_display is not None and _col_state is not None:
+                                _layer = _layers_by_name[_layer_name]
+                                _imp = np.array(_layer.importance).reshape(_layer.in_features, _layer.out_features)
+                                _w = np.array(_layer.weights).reshape(_layer.in_features, _layer.out_features)
+                                _fast = _col_state["col_grad_fast"]
+                                _slow = _col_state["col_grad_slow"]
+                                _var = _col_state["col_grad_var"]
+                                _dev = (_fast - _slow) / (np.sqrt(np.maximum(_var, 0.0)) + 1e-8)
+                                _live_display.update_pool(_key, step, _imp, _w, _dev, _col_state["col_reset_active"])
+                                if _live_display.closed():
+                                    _live_display = None
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,

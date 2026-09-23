@@ -10190,3 +10190,44 @@ pathological), or something else entirely, is not analyzed here --
 raw facts only, same as v6's own column log is available for v7 too
 (`logs/plasticity_column_snapshots/dense_lr_unscaled_v7_select_by_deviation_percentile_k/`)
 if that investigation is wanted next.
+
+## 2026-09-23 -- live, side-by-side synapse visualization built for
+## direct visual inspection, instead of another blind equation-guess
+
+Direct instruction, after v7's counterintuitive result (a genuinely-
+firing gate did WORSE than a permanently-inert one): "my visual cortex
+is still more advanced than probably any tech on this planet. Let's
+either get displayarray (my lib) or opencv working and display all of
+the networks side by side with labels next to each other in lock step
+and I'll just look at all of the synapses for the next run."
+
+Installed `displayarray` (the user's own PyPI library) into
+`.venv_peridot`. Built `scripts/live_synapse_display.py`: pure,
+GUI-free composition functions (unit tested,
+`tests/test_live_synapse_display.py`, 12 new tests) plus a thin
+`LiveSynapseDisplay` class. Per pool, top to bottom: label -> weight
+heatmap ("the synapse") -> deviation/reset strip (red intensity =
+z-score, green flag = selected/reset THIS cycle -- "the algorithm
+acting on them," at the exact boundary between the two matrices it
+touches) -> importance heatmap. All 6 pools tile side by side in one
+window, reusing the exact same per-pool data
+(`column_state`/`raw_importance`) the existing npz column-log snapshots
+already compute -- no duplicated instrumentation. New
+`plasticity_live_display` flag (default False, no-op), independent of
+`plasticity_column_log_dir`.
+
+Smoke-tested against a REAL short run with a real X11 window
+(screenshot-verified, not just no-exception-checked): weight heatmap,
+deviation/reset strip, and importance heatmap all render correctly,
+labels correct, multiple pools tiled side by side. First version
+defaulted to 2-3px/cell upsampling "for visibility" -- direct
+correction ("why so zoomed in... the pixels should just be able to be
+pixels") -- fixed to `cell_px=1` (literal one pixel per synapse) as
+the default.
+
+Full regression: 374 passed (362 baseline + 12 new), 11 skipped, 40
+deselected -- clean. See
+docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display for the
+full design writeup. Not yet run against a real full training run --
+the user will run the next select_by_deviation attempt themselves,
+interactively, with this attached.

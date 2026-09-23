@@ -1642,3 +1642,72 @@ neuron gets periodic, non-repeating trainable windows, density set by
 cutoff) is the same in spirit -- but the EXACT numbers (which specific
 neurons were on when, on any specific run) are not reproducible against
 the old code anymore. Not rerun yet.
+
+.. _toy_tile_recurrence_rmt.live_synapse_display:
+
+Live, side-by-side synapse visualization for direct visual inspection during training
+---------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.live_synapse_display``
+
+Direct instruction, after v7 (percentile-gated ``select_by_deviation``,
+confirmed via log analysis to genuinely fire) plateaued LOWER than v6
+(a version confirmed to never fire at all) -- an outcome not explained
+by anything the existing per-cycle scalar logs capture: "Alright my
+visual cortex is still more advanced than probably any tech on this
+planet. Let's either get displayarray (my lib) or opencv working and
+display all of the networks side by side with labels next to each
+other in lock step and I'll just look at all of the synapses for the
+next run. The algorithms acting on them can be included as long as
+they're near the synapses they're affecting."
+
+**Built on** ``displayarray`` (the user's own PyPI library; installed
+into ``.venv_peridot``), with a raw-OpenCV fallback if it isn't
+available. New module ``scripts/live_synapse_display.py`` --
+deliberately split into pure, GUI-free composition functions
+(``normalize_to_uint8``, ``heatmap``, ``deviation_strip``,
+``label_panel``, ``compose_pool_panel``, ``compose_frame``, all unit
+tested in ``tests/test_live_synapse_display.py``) and a thin
+``LiveSynapseDisplay`` class that owns the actual window and pushes a
+freshly-composed frame every time any pool reports a completed
+amortized cycle.
+
+**Layout, per pool, top to bottom**: a label (pool name + the step it
+was last updated at) -- the weight heatmap (the literal synapse) --
+the deviation/reset strip (one cell per OUTPUT column: red intensity =
+that column's current deviation z-score, green flag = selected/reset
+THIS cycle -- "the algorithm acting on them," placed at the exact
+boundary between the two matrices it can touch) -- the importance
+heatmap (the accumulator the reset decision is drawn from). All 6
+pools (``input_proj``/``q_proj``/``k_proj``/``v_proj``/``o_proj``/
+``lm_head``, each ``scattered``+``block4``) tile left to right in one
+frame, "side by side ... in lock step": every panel always shows its
+own most-recently-seen state in the SAME frame -- not that every pool
+updates on the exact same step (they don't; each pool completes its
+own amortized cycle on a different step offset, same as the existing
+column-log npz snapshots already did).
+
+**cell_px defaults to 1** -- literal one pixel per synapse, no
+upsampling. First version defaulted to 2-3px/cell for "visibility";
+direct correction ("why so zoomed in... the pixels should just be able
+to be pixels") -- fixed, since the user's own stated reason for this
+feature is to look at the real data directly, not a smoothed/enlarged
+version of it. Raised only via ``plasticity_live_display_cell_px`` if
+someone deliberately wants fewer, larger pools on screen.
+
+**Data source, reused rather than duplicated**: the SAME per-pool
+``column_state``/``raw_importance`` data the existing
+``plasticity_column_log_dir`` npz snapshots already compute (see
+``plasticity_reset_design.plasticity_column_data_collection`` and
+``raw_ci_landscape_capture``) -- ``layer.importance``/``layer.weights``
+reshaped to ``(in_features, out_features)`` (verified safe against the
+real model class, same as the existing raw-importance capture), and
+deviation computed from ``col_grad_fast``/``col_grad_slow``/
+``col_grad_var`` with the identical formula the C++ engine itself uses.
+New ``plasticity_live_display`` flag (default ``False``, byte-identical
+no-op, no window opened) is independent of
+``plasticity_column_log_dir`` -- you can watch live without writing
+npz snapshots to disk, or do both.
+
+Full regression: 374 passed (362 baseline + 12 new), 11 skipped, 40
+deselected -- no regressions.
