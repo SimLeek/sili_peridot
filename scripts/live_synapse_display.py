@@ -108,9 +108,12 @@ def compose_pool_panel(
     width_px = imp_map.shape[1]
     parts = [label_panel(f"{pool_key}  step={step}", width_px)]
     if weight is not None:
+        parts.append(label_panel("weight", width_px, height_px=14))
         parts.append(heatmap(weight, cell_px))
     if deviation_by_col is not None and reset_active is not None:
+        parts.append(label_panel("deviation (red) / reset (green)", width_px, height_px=14))
         parts.append(deviation_strip(deviation_by_col, reset_active, width_px))
+    parts.append(label_panel("importance", width_px, height_px=14))
     parts.append(imp_map)
     return np.concatenate(parts, axis=0)
 
