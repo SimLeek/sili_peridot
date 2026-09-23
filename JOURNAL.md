@@ -10072,3 +10072,34 @@ This is a clean early signal that the EVT-derived threshold restores
 the mechanism's intended behavior, though the run is still in
 progress (100k steps total) and hasn't been compared against the
 other arms' own final outcomes yet.
+
+## 2026-09-22 -- v6 finished: full stage history and final numbers,
+## raw facts only
+
+v6 (`select_by_deviation=True`, EVT-derived gate k) ran the full
+100,000 steps (12243s, steps/sec=8.17). Raw numbers, no keep/prune
+verdict (see `feedback_present_before_keep_prune_decisions`):
+
+- FINAL: final_vocab=64, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=64, peak_k=3 (peak == final -- no regression from
+  a higher point reached earlier)
+- STAGE_HISTORY (5 level_ups total, all early):
+  - step 1800: vocab=16,k=2 -> vocab=16,k=3
+  - step 4912: vocab=16,k=3 -> vocab=32,k=2
+  - step 6425: vocab=32,k=2 -> vocab=32,k=3
+  - step 7037: vocab=32,k=3 -> vocab=64,k=2
+  - step 9468: vocab=64,k=2 -> vocab=64,k=3 (last level_up of the run)
+- No further level_ups occurred across the remaining ~90,500 steps.
+  loss_ema drifted from ~3.0 (step 16250) up to ~4.2-4.5 by the
+  step-90000+ region and stayed there; acc_ema drifted down from
+  ~0.2-0.3 (step 16250) to mostly 0.01-0.08 for the back half of the
+  run.
+
+Compared against v5 (old broken gate, same config): v6 clears vocab=
+16/k=3 -- the exact level v5 stayed stuck at for its full 37,750+
+observed steps -- confirming the EVT-derived gate fix does restore
+early progress that the old fixed-k=1.0 gate structurally prevented.
+v6 itself then plateaus at vocab=64/k=3 for the remaining ~90k steps
+of its own run. Whether that plateau is itself a further, separate
+problem (and if so whether it resembles any other observed
+stuck-signature) is not yet analyzed here -- raw facts only.
