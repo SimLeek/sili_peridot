@@ -1840,3 +1840,62 @@ passed (382 + 22 new), clean.
 Not yet compared visually by the user, not yet tried against
 additional candidates or literature, not yet validated with a real
 engine run -- raw findings only, no keep/prune verdict.
+
+**Update -- layer-wide rank-preserving candidate (direct instruction)
+plus two literature-grounded candidates, preferred over self-invented
+heuristics going forward**: after watching ceiling_decay's replay,
+direct correction on the CRITERION, not just wanting more to watch:
+"something that reached top importance is probably important, so
+while 90% [saturation avoidance] looks good... it's not [good
+enough]... the more the total layer reaches full saturation, the more
+the entire layer importance is lowered, that way there can still be
+outliers while the whole thing is lowered. Basically normalize the
+entire layer importance to a sane lower value." Also: "now I want you
+to prefer research papers" over guessing from the data alone.
+
+``layer_l2_decay_step``: a faithful port of this project's OWN
+existing engine mechanism (the L2-saturation-gated decay from
+``docs/research/delta_csr_types.rst:plasticity_reset.l2_saturation_decay``
+-- built earlier this session, never enabled in v8, never tested
+against real select_by_deviation data until now). Touches EVERY column
+uniformly at a strength driven by the WHOLE population's L2-norm
+saturation ratio through a soft sigmoid -- a uniform multiplicative
+shrink preserves rank order exactly (verified directly in
+``tests/test_plasticity_sim.py``), unlike ``ceiling_decay_step``'s
+per-column clipping. Against v8's real growth data: 0% final
+saturation in all 6 pools, but unlike ``ceiling_decay_step`` the MAX
+column still reaches a meaningful 54-65 rather than being pinned near
+max_ci OR crushed toward zero.
+
+Web-searched and grounded two published continual-learning techniques
+rather than guessing further: **Shrink-and-Perturb** (Ash & Adams
+2020 -- L2 toward zero plus noise, flagged in the literature as very
+hyperparameter-sensitive) and **L2 Init** (Kumar, Marklund & Van Roy,
+"Maintaining Plasticity in Continual Learning via Regenerative
+Regularization", CoLLAs 2025, arXiv:2308.11958 -- regularize toward
+each parameter's OWN INITIAL value rather than zero; the paper found
+this mitigates plasticity loss more consistently than either
+Shrink-and-Perturb or plain L2). ``simulate_l2_init`` adapts L2 Init's
+always-on (never saturation-gated) regularization to this project's
+importance-accumulator dynamics -- every column drifts `rate` of the
+way back toward its own first-recorded value, unconditionally, every
+cycle.
+
+Directly confirmed the literature's own stated hyperparameter
+sensitivity on real data, not just cited it: ``rate=0.01`` crushed
+importance to near-zero everywhere (max 0.04-0.4 across all pools) --
+over a 2955-cycle real trajectory, ``(1-0.01)^2955~=0``, strong enough
+to cripple the ci-based learning-rate mechanism entirely, not just
+prevent saturation. ``rate=0.0001`` (100x smaller) gives a much saner
+result: 0% final saturation, max importance retained at 77-78. Both
+exported so the rate sensitivity itself is directly watchable, not
+just a number.
+
+All candidates now exported for direct visual comparison under
+``logs/plasticity_column_snapshots/<v8_run>_sim_<candidate_name>/`` --
+``ceiling_decay``, ``layer_l2_decay``, ``l2_init`` (rate=0.01),
+``l2_init_rate0001``, and ``v8_algorithm_mirrored`` (the poor-fidelity
+own-sandbox baseline). 6 new tests in
+``tests/test_plasticity_sim.py`` (28 total for this module). Full
+regression: 410 passed (404 + 6 new), clean. No keep/prune verdict --
+raw findings and exports only.

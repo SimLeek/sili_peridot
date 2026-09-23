@@ -1,56 +1,21 @@
-"""Offline, pure-Python sandbox for rapidly testing candidate
-plasticity-reset algorithms against REAL recorded training data,
-without needing a new C++ engine run per candidate. Direct
-instruction, after watching v8's replay show importance saturating to
-max_ci=100 (solid yellow) for q/k/v_proj by step ~30k while o_proj
-collapsed into a few wide stripes: "I think we could try some
-algorithms to see if we can get the post 8000 or 30k step state to
-look more like the pre-8000 state by accumulating whatever the
-algorithm does to all the arrays over time and accumulating the
-deviation. The goal is to keep the network plastic enough to learn the
-new challenges, and I don't think all importance saturated to 100
-matches that."
+"""Offline, pure-Python sandbox for testing candidate plasticity-reset
+algorithms against REAL recorded training data, without a new C++
+engine run per candidate. See
+docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox
+for the full design rationale, the confound this approach has (a
+recorded natural delta bakes in the real run's own intervention effect
+at cycles it touched a column -- checked directly, not hidden;
+directional screening, not a quantitative forecast), and the JOURNAL.md
+history of each candidate.
 
-**Scope, stated explicitly**: this operates on col_importance/deviation
-dynamics -- the exact quantities the real engine's cycle-boundary
-selection/gating logic itself operates on (see
+A candidate decides which columns to touch each cycle and how
+strongly, from its OWN simulated trajectory-so-far only (never the
+real run's future or real deviation) -- mirroring
 delta_csr_types.hpp:plasticity_select_cycle_boundary, ported faithfully
-below). NOT a full per-synapse gradient re-simulation -- the per-cycle
-col_importance delta recorded in each run's .npz snapshots is used
-AS-IS as the "natural" (environment) signal for every candidate to
-react to. This is an approximation with one known confound: at cycles
-where the REAL run's own algorithm reset a column, that column's
-recorded delta includes the real algorithm's own decay effect, not
-just genuine gradient-driven growth -- there's no recorded way to
-exactly invert that (the real reset also mixes in a random `fresh`
-weight sample that was never recorded, and even for col_importance
-alone, its own EMA touch reads the PRE-decay raw value, so the decay's
-effect only shows up in the FOLLOWING cycle's delta, entangled with
-whatever real growth also happened by then). Only reset_fraction
-(1% by default) of columns are touched per cycle, so this confound
-affects a minority of cycles/columns -- flagged here, not hidden, and
-checked directly in test_plasticity_sim.py's replay-fidelity test
-(replaying real deltas with zero further intervention must exactly
-reproduce the real recorded col_importance trajectory -- the sandbox's
-one hard fidelity guarantee).
-
-**What a "candidate algorithm" controls**: given the simulated
-trajectory-so-far (its OWN col_importance, col_grad_fast/slow/var,
-col_age -- never peeking at the real run's future or its real
-deviation), decide which columns to touch this cycle and how strongly,
-mirroring exactly what plasticity_select_cycle_boundary decides in the
-real engine. Promising candidates still need a real engine run to
-validate -- a different algorithm changes real future gradients too,
-which this offline sandbox cannot replay -- per the user's own stated
-two-phase plan (screen fast in Python, validate for real).
-
-**Export back to the SAME .npz schema replay_synapse_display.py reads**
-so a candidate's simulated run can be watched exactly like a real one
--- see export_simulated_trajectory(). raw_importance/raw_weight are
-themselves approximated for visualization (rescaled from the real
-run's own per-synapse texture, or a freshly-drawn sample matching the
-real engine's own init distribution for newly-reset columns) -- not
-exact, same spirit as the col_importance-level approximation above."""
+below. Promising candidates still need a real engine run to validate.
+export_simulated_trajectory() writes results back to the same .npz
+schema replay_synapse_display.py reads, so a candidate's simulated run
+can be watched the same way a real one is."""
 
 from __future__ import annotations
 
@@ -512,6 +477,123 @@ def export_simulated_trajectory(
         )
         n_written += 1
     return n_written
+
+
+# ---------------------------------------------------------------------------
+# Layer-wide candidates: touch EVERY column uniformly (never per-column
+# thresholding), strength driven by a population-level signal -- direct
+# instruction, as a corrective to ceiling_decay_step's per-column
+# clipping: "something that reached top importance is probably
+# important, so while 90% [saturation avoided] looks good... it's not
+# [good enough on its own] ... the more the total layer reaches full
+# saturation, the more the entire layer importance is lowered, that
+# way there can still be outliers while the whole thing is lowered.
+# Basically normalize the entire layer importance to a sane lower
+# value." A uniform multiplicative rescale preserves RANK ORDER
+# exactly (unlike ceiling_decay_step, which only touches the columns
+# already above a fixed cutoff) -- a column that legitimately earned
+# the highest importance in the layer stays highest, just at a lower
+# absolute level once the population as a whole is too saturated.
+# ---------------------------------------------------------------------------
+
+
+def layer_l2_decay_step(
+    col_importance: np.ndarray,
+    max_ci: float = 100.0,
+    l2_decay_threshold: float = 0.9,
+    l2_decay_temperature: float = 0.05,
+    l2_decay_lambda: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Faithful port of this project's OWN existing engine mechanism
+    (delta_csr_types.hpp:plasticity_select_cycle_boundary's L2-saturation
+    -gated decay, built earlier this session but never enabled in v8 --
+    lambda was 0.0 there) -- never tested against v8's real recorded
+    growth pressure until now. sat_ratio = ||col_importance||_2 relative
+    to the fully-saturated ceiling max_ci*sqrt(n) -- 1.0 exactly when
+    EVERY column sits at the accumulator's own clamp. Passed through a
+    soft sigmoid (smooth, not a hard threshold) to get decay_strength in
+    [0,1). EVERY column is touched equally (`touched` is all-True) at
+    strength `l2_decay_lambda * decay_strength` -- a uniform shrink, not
+    a per-column selection, so it never disturbs relative ordering.
+    Returns (touched_mask [all True], strength [uniform scalar broadcast])."""
+    n = col_importance.shape[0]
+    l2_norm = float(np.sqrt(np.sum(col_importance.astype(np.float64) ** 2)))
+    ceiling_norm = max_ci * math.sqrt(n)
+    sat_ratio = l2_norm / ceiling_norm if ceiling_norm > 0 else 0.0
+    decay_strength = 1.0 / (1.0 + math.exp(-(sat_ratio - l2_decay_threshold) / l2_decay_temperature))
+    strength = np.full(n, l2_decay_lambda * decay_strength)
+    touched = np.ones(n, dtype=bool)
+    return touched, strength
+
+
+def simulate_l2_init(
+    traj: PoolTrajectory,
+    signal: str = "col_importance",
+    max_ci: float | None = None,
+    rate: float = 0.01,
+) -> SimResult:
+    """L2 Init (Kumar, Marklund & Van Roy, "Maintaining Plasticity in
+    Continual Learning via Regenerative Regularization", CoLLAs 2025,
+    arXiv:2308.11958) -- regularize toward each parameter's OWN INITIAL
+    value, not toward zero (plain L2) and not toward a population-
+    relative ceiling (layer_l2_decay_step). The paper's finding:
+    parameters insensitive to recent loss should drift back toward
+    init, keeping them ready to adapt quickly to new tasks -- found to
+    mitigate plasticity loss more consistently than Shrink-and-Perturb
+    (Ash & Adams 2020, L2-toward-zero + noise, also flagged in the same
+    literature search as very hyperparameter-sensitive) or plain L2.
+    The paper's own target is trainable weights, regularized
+    continuously inside the loss -- ALWAYS ON, never gated by any
+    saturation threshold, reproduced faithfully here: `initial` is the
+    run's own first recorded value for this signal, and every column
+    drifts `rate` of the way back toward it EVERY cycle, regardless of
+    how saturated the layer currently is: `current += rate * (initial -
+    current)`. L2 Init's own additive-pull-toward-a-fixed-reference
+    shape doesn't fit simulate_level_based's multiplicative-shrink
+    step_fn interface, so it gets its own small loop here instead of
+    being forced into that shape."""
+    if signal == "col_importance":
+        base = traj.col_importance
+    elif signal == "raw_mean_ci":
+        if traj.raw_mean_ci is None:
+            raise KeyError(
+                f"{traj.pool_key} has no raw_importance recorded -- re-run with "
+                "plasticity_raw_importance_log=True, or use signal='col_importance'"
+            )
+        base = traj.raw_mean_ci
+    else:
+        raise ValueError(f"unknown signal {signal!r}")
+    deltas = natural_deltas(base)
+    n_out = traj.n_out
+    T = traj.n_cycles
+    initial = base[0].copy()
+    current = initial.copy()
+
+    out_importance = np.zeros((T, n_out))
+    out_active = np.zeros((T, n_out), dtype=bool)
+    out_importance[0] = current
+
+    for t in range(T - 1):
+        current = current + deltas[t]
+        if max_ci is not None:
+            np.clip(current, None, max_ci, out=current)
+        pull = rate * (initial - current)
+        current = current + pull
+        out_importance[t + 1] = current
+        out_active[t + 1] = np.abs(pull) > 1e-9
+
+    zeros = np.zeros_like(out_importance)
+    return SimResult(
+        pool_key=traj.pool_key,
+        steps=traj.steps,
+        col_importance=out_importance,
+        col_grad_fast=zeros,
+        col_grad_slow=zeros,
+        col_grad_var=zeros,
+        col_age=np.zeros((T, n_out), dtype=np.int64),
+        col_reset_active=out_active,
+        deviation=zeros,
+    )
 
 
 # ---------------------------------------------------------------------------

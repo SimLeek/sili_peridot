@@ -18,12 +18,14 @@ from scripts.plasticity_sim import (
     cycle_boundary,
     evt_k,
     export_simulated_trajectory,
+    layer_l2_decay_step,
     load_pool_trajectory,
     natural_deltas,
     percentile_k,
     saturation_fraction,
     sim_export_dir,
     simulate,
+    simulate_l2_init,
     simulate_level_based,
     update_grad_tracking,
 )
@@ -336,3 +338,89 @@ class TestSimulateLevelBased:
         traj = load_pool_trajectory(pool_dir)
         result = simulate_level_based(traj, ceiling_decay_step, max_ci=100.0, ceiling_frac=0.9)
         assert not result.col_reset_active.any()
+
+
+class TestLayerL2DecayStep:
+    def test_far_below_threshold_near_zero_strength(self):
+        col_imp = np.full(10, 10.0)  # sat_ratio well under l2_decay_threshold
+        touched, strength = layer_l2_decay_step(
+            col_imp, max_ci=100.0, l2_decay_threshold=0.9, l2_decay_temperature=0.05
+        )
+        assert touched.all()  # EVERY column touched, not just outliers
+        assert np.allclose(strength, strength[0])  # uniform across the population
+        assert strength[0] < 1e-4
+
+    def test_fully_saturated_gives_most_of_lambda_strength(self):
+        # sat_ratio=1.0 -> sigmoid((1.0-0.9)/0.05) = sigmoid(2.0) ~= 0.8808
+        # (a smooth sigmoid never fully saturates to 1 at a finite ratio)
+        # -- strength should be lambda * that factor, not raw lambda.
+        col_imp = np.full(10, 100.0)  # sat_ratio == 1.0, fully saturated
+        touched, strength = layer_l2_decay_step(
+            col_imp, max_ci=100.0, l2_decay_threshold=0.9, l2_decay_temperature=0.05, l2_decay_lambda=0.05
+        )
+        assert touched.all()
+        assert strength[0] == pytest.approx(0.05 * 0.8808, rel=1e-3)
+
+    def test_preserves_rank_order_uniform_shrink(self):
+        # A column with more importance than another must STAY more
+        # important after a uniform layer-wide shrink -- the whole
+        # point of this candidate vs ceiling_decay_step's per-column
+        # clipping.
+        col_imp = np.array([100.0, 50.0, 10.0])
+        touched, strength = layer_l2_decay_step(col_imp, max_ci=100.0, l2_decay_lambda=0.1)
+        after = col_imp * (1.0 - strength)
+        assert after[0] > after[1] > after[2]
+
+
+class TestSimulateL2Init:
+    def _write_run(self, tmp_path, deltas):
+        pool_dir = tmp_path / "q_proj.block4"
+        pool_dir.mkdir()
+        col_importance = np.zeros(len(deltas[0]))
+        for t, d in enumerate([np.zeros(len(deltas[0])), *deltas]):
+            col_importance = col_importance + d
+            np.savez(
+                pool_dir / f"step{t * 50:08d}.npz",
+                step=t * 50,
+                loss_ema=1.0,
+                acc_ema=0.5,
+                n_reset_this_cycle=0,
+                l2_sat_ratio=0.0,
+                l2_decay_strength=0.0,
+                col_importance=col_importance.astype(np.float32),
+                col_grad_slow=np.zeros_like(col_importance, dtype=np.float32),
+                col_grad_fast=np.zeros_like(col_importance, dtype=np.float32),
+                col_grad_var=np.zeros_like(col_importance, dtype=np.float32),
+                col_age=np.full_like(col_importance, t, dtype=np.uint32),
+                col_reset_active=np.zeros_like(col_importance, dtype=np.uint8),
+            )
+        return str(pool_dir)
+
+    def test_drifts_back_toward_initial_value(self, tmp_path):
+        # Sustained growth every cycle -- L2 Init should hold it well
+        # below the unregularized runaway value, same spirit check as
+        # ceiling_decay's runaway test, but via additive pull-to-init
+        # instead of a multiplicative ceiling clip.
+        deltas = [np.array([5.0]) for _ in range(60)]
+        pool_dir = self._write_run(tmp_path, deltas)
+        traj = load_pool_trajectory(pool_dir)
+        result = simulate_l2_init(traj, rate=0.1)
+        assert result.col_importance[-1, 0] < 300.0  # unregularized would be exactly 300
+        assert result.col_reset_active[1:].any()
+
+    def test_zero_growth_column_stays_at_initial_no_pull_needed(self, tmp_path):
+        deltas = [np.array([0.0]) for _ in range(10)]
+        pool_dir = self._write_run(tmp_path, deltas)
+        traj = load_pool_trajectory(pool_dir)
+        result = simulate_l2_init(traj, rate=0.1)
+        assert np.allclose(result.col_importance, 0.0)
+
+    def test_always_on_not_gated_by_saturation(self, tmp_path):
+        # Even a column comfortably below any saturation ceiling still
+        # gets pulled toward its initial value every cycle -- unlike
+        # layer_l2_decay_step/ceiling_decay_step, which are both gated.
+        deltas = [np.array([1.0]) for _ in range(5)]  # well below any max_ci=100 ceiling
+        pool_dir = self._write_run(tmp_path, deltas)
+        traj = load_pool_trajectory(pool_dir)
+        result = simulate_l2_init(traj, rate=0.1, max_ci=100.0)
+        assert result.col_reset_active[1:].all()

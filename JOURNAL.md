@@ -10339,3 +10339,77 @@ a known limitation, not hidden. Full regression: 404 passed (382 + 22
 new), clean. Not yet compared visually by the user, not yet tried
 against additional candidates or literature, not yet validated with a
 real engine run -- raw findings only, no keep/prune verdict.
+
+## 2026-09-23 -- two more candidates: a layer-wide rank-preserving
+## decay (direct instruction) and a literature-grounded L2 Init;
+## user now wants research-paper-grounded candidates preferred
+
+After watching the ceiling_decay replay (visible resetting/plasticity
+after step 8k, mostly absent before it -- promising), direct
+correction on the APPROACH, not just wanting more runs to watch:
+"something that reached top importance is probably important, so
+while 90% [avoiding literal saturation] looks good... it's not [good
+enough]... the more the total layer reaches full saturation, the more
+the entire layer importance is lowered, that way there can still be
+outliers while the whole thing is lowered. Basically normalize the
+entire layer importance to a sane lower value." Also: "now I want you
+to prefer research papers" over self-invented heuristics.
+
+`layer_l2_decay_step`: a faithful port of this project's OWN existing
+engine mechanism (the L2-saturation-gated decay built earlier this
+session, never enabled in v8 -- lambda was 0.0 there, never tested
+against real select_by_deviation data until now). Touches EVERY column
+uniformly (not a per-column threshold) at a strength driven by the
+WHOLE population's L2-norm saturation ratio, passed through a soft
+sigmoid -- a uniform multiplicative shrink preserves rank order exactly
+(confirmed via direct test), unlike ceiling_decay_step's per-column
+clipping. Replayed against v8's real raw_mean_ci growth: 0% final
+saturation in all 6 pools, but unlike ceiling_decay, the MAX column
+still reaches a meaningful 54-65 (not pinned near max_ci, but not
+crushed to near-zero either) -- input_proj/o_proj show brief transient
+saturation touches (8.7%/32.6% of cycles at some point) that then
+recover, rather than never occurring at all.
+
+Web search confirmed and grounded two published techniques (direct
+instruction to prefer these over guessing): Shrink-and-Perturb (Ash &
+Adams 2020 -- L2 toward ZERO plus noise, flagged in the literature as
+very hyperparameter-sensitive) and L2 Init (Kumar, Marklund & Van Roy,
+"Maintaining Plasticity in Continual Learning via Regenerative
+Regularization", CoLLAs 2025, arXiv:2308.11958 -- regularize toward
+each parameter's OWN INITIAL value instead of zero, found in the paper
+to mitigate plasticity loss more consistently than Shrink-and-Perturb
+or plain L2). Implemented `simulate_l2_init`, adapting the paper's
+always-on (never saturation-gated) regularization to this project's
+importance-accumulator dynamics -- pulls every column `rate` of the
+way back toward its own first-recorded value, every cycle,
+unconditionally.
+
+**Confirmed the literature's own stated hyperparameter-sensitivity
+directly on real data**: `rate=0.01` (a naive first guess) crushed
+importance to near-zero everywhere (final max 0.04-0.4 across all
+pools) -- so strong it would cripple the ci-based learning-rate
+mechanism entirely (`feedback_importance_is_already_the_optimizer`),
+not just prevent saturation; over v8's real 2955-cycle trajectory,
+`(1-0.01)^2955 ~= 0`, fully explaining the collapse. `rate=0.0001`
+(100x smaller) gives a much saner result: 0% final saturation, max
+importance retained at a real 77-78, with only brief transient
+saturation touches in 2 of 6 pools. Both exported for direct visual
+comparison (rate sensitivity itself now watchable, not just numeric).
+
+All 3 new candidates (layer_l2_decay, l2_init at two rates) exported
+to the replay tool's schema alongside the existing ceiling_decay and
+v8_algorithm_mirrored exports --
+`logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture_sim_{layer_l2_decay,l2_init,l2_init_rate0001}/`.
+Tested in `tests/test_plasticity_sim.py` (6 new tests: layer_l2_decay's
+uniform-touch/rank-preservation/sigmoid-value correctness, l2_init's
+drift-toward-init/always-on/zero-growth behavior). Full regression:
+410 passed (404 + 6 new), clean.
+
+Five candidates now available to compare, none yet picked: v8's real
+algorithm, v8's algorithm replayed through the sandbox (poor fidelity,
+own-sandbox baseline only), ceiling_decay (per-column, 0% saturation
+throughout), layer_l2_decay (layer-wide, 0% final but transient
+touches, preserves rank, max importance 54-65), l2_init at two rates
+(0% saturation, max importance 0.4 vs 77 depending on rate). No
+keep/prune verdict -- raw findings and exports only, per this
+project's standing convention.
