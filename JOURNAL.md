@@ -10456,3 +10456,28 @@ sili_peridot regression: 418 passed (412 + 6 new), clean.
 
 Both v9 and v10 running now, full 100k-step runs, neither finished --
 raw progress only, no keep/prune verdict yet.
+
+## 2026-09-23 -- v10 (L2 Init) finished: full stage history and final
+## numbers, raw facts only
+
+v10 ran the full 100,000 steps (12045s, steps/sec=8.30). Raw numbers,
+no keep/prune verdict:
+
+- FINAL: final_vocab=64, final_k=2, final_phase=kcycle
+- PEAK: peak_vocab=64, peak_k=2 (peak == final)
+- STAGE_HISTORY (4 level_ups total):
+  - step 1883: vocab=16,k=2 -> vocab=16,k=3
+  - step 6076: vocab=16,k=3 -> vocab=32,k=2
+  - step 14844: vocab=32,k=2 -> vocab=32,k=3
+  - step 36662: vocab=32,k=3 -> vocab=64,k=2 (last level_up of the run)
+- No further level_ups across the remaining ~63,300 steps. loss_ema
+  ended around 4.0-4.4; acc_ema mostly 0.05-0.15 for the back half.
+
+Compared against the other real arms (raw facts, no verdict): v10's
+final vocab=64/k=2 is below v9's ceiling of vocab=16/k=3 observed so
+far (v9 still running), and below v7/v8's own final states (vocab=32/
+k=3 and vocab=64/k=3 respectively). Whether rate=0.0001 was still too
+aggressive, too weak, or something else entirely is not analyzed
+here -- v10's own column log is available for offline inspection
+(`logs/plasticity_column_snapshots/dense_lr_unscaled_v10_l2_init/`) if
+that investigation is wanted next.
