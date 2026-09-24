@@ -1919,3 +1919,187 @@ finished yet -- raw progress only.
 Also: watching two replay windows side by side surfaced a real UX gap
 (both titled "synapses," no way to tell them apart) -- ``replay()``
 now defaults ``window_name`` to the run directory's own basename.
+
+**v9/v10 final results (100k steps each, corrected comparison)**: v9
+(layer_l2_decay) reached only 1 level-up (step 1347, vocab=16/k=3),
+stalled the rest of the run (loss_ema noisy 2.2-2.4, acc_ema noisy
+0.05-0.16, importance pinned at l2sat=1.00/imp=99.9996 for v_proj the
+entire tail). v10 (l2_init, rate=0.0001) reached 4 level-ups (steps
+1883/6076/14844/36662, final vocab=64/k=2) -- using the curriculum's
+REAL stage ordering ``(16,2)<(16,3)<(32,2)<(32,3)<(64,2)<(64,3)``
+(corrected after an initial comparison error compared vocab and k
+independently instead of jointly -- caught directly: "don't bother
+analyzing if you're going to just say blatant self-contradictions like
+that. 4 level ups is greater than 1 level up and 3 level ups. Only v8
+is greater"), v10 (64,2) is ahead of v7 (32,3); only v8 (64,3, the
+select_by_deviation percentile-k run) is further along than v10.
+
+Watching v10's replay directly (per-pool, per-timestep npz inspection),
+user's read: "V and i_proj have high importance everywhere, but do show
+deviation... Q and K weights look mostly like random noise... the
+deviations of each layer stay changing throughout, except for q_proj
+and k_proj which fix after a while." Quantitatively confirmed (deviation
+std and raw_importance range, early/mid/late thirds of the real
+recorded trajectory):
+
+.. code-block:: text
+
+    q_proj: deviation std 0.529 / 0.265 / 0.004   raw_ci final range [97.19, 98.90]
+    k_proj: deviation std 0.596 / 0.264 / 0.004   raw_ci final range [97.09, 98.23]
+    v_proj: deviation std 0.640 / 0.482 / 0.441 (stays varied)
+    o_proj: deviation std 0.619 / 0.494 / 0.516 (stays varied), raw_ci highly heterogeneous [0.12, 99.71]
+    lm_head: deviation std 0.667 / 0.682 / 0.650 (stays varied)
+
+q_proj/k_proj uniquely collapse to near-zero deviation std (every
+column converges to a nearly identical deviation) while raw_importance
+converges into a narrow, saturated-high band -- a "homogenization"
+signature distinct from every other layer, which stay heterogeneous
+throughout. User's synthesis: "V10 looks the most promising so far, it
+seems we might just need transformer layer specific plasticity stuff,
+not just stuff for neural networks in general."
+
+.. _toy_tile_recurrence_rmt.qk_norm_design:
+
+QK-Norm -- RMSNorm on Q/K before the attention dot product
+------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qk_norm_design``
+
+Direct instruction, tying the Q/K homogenization finding above to the
+literature: "V10 and V9 are essentially the same thing if the init
+values are 0, so the paper just implemented it better... Even in the QK
+norm case we might still want to watch that spectral norm info and
+capture the std values again to make sure it fixes it."
+
+Web-researched the actual mechanism behind Q/K collapse rather than
+guessing: this project's ``gaussian_attention`` (``sili/tensor.py``,
+math in ``sili/lib/headers/attention.hpp``) computes
+``score[q,j] = (Q[q].K[j])*scale - (j-center[q])^2/(2*sigma[q]^2)``,
+``scale = 1/sqrt(d)`` fixed internally, then softmax -- i.e. genuinely
+standard scaled dot-product attention plus an additive Gaussian
+positional bias, NOT some non-standard mechanism the QK-Norm literature
+wouldn't apply to (this had to be confirmed by reading
+``attention.hpp:gaussian_attention_forward`` directly before designing
+anything -- the ``centers``/``sigmas`` args could plausibly have meant
+the whole thing worked differently). Zhai et al. ("Stabilizing
+Transformer Training by Preventing Attention Entropy Collapse", ICML
+2023, arXiv:2303.06296) show attention entropy's lower bound decays
+exponentially with the Q.K score's spectral norm -- exactly the
+"deviation std -> 0, softmax weight concentrates" pattern seen in v10's
+q_proj/k_proj. **QK-Norm** (Henry et al. 2020, arXiv:2010.04245;
+production precedent in Gemma2/Chameleon): normalize Q and K before the
+dot product so scores are bounded regardless of how large the raw
+projections grow.
+
+Implementation (``model/toy_tile_recurrence_rmt.py``): reuses the
+project's OWN existing ``rmsnorm_tensor`` helper (already used for
+``input_ln``/``memory_ln``/``state_ln``) rather than adding new
+normalization machinery -- two new learnable gain vectors
+``q_norm_ln``/``k_norm_ln`` (size ``state_width``, init ones), a new
+``_apply_qk_norm(t, ln)`` no-op-unless-``qk_norm_enable`` helper, and
+the FULL q/k tensors normalized ONCE right after their existing
+post-projection clip, before ANY of the downstream gathers (mem/content
+split, physical-position reorder, the refreshed pass-2 memory key) --
+every place that currently reads raw ``q``/``k`` for attention now
+reads ``q_attn``/``k_attn`` instead. RMSNorm is a per-row operation (each
+row normalized using only its own values), so this holds regardless of
+which gather/concat/cache order touches a given row -- confirmed
+directly by a dedicated test
+(``TestQKSparsityAndNorm::test_step_cached_matches_step_with_qk_norm_enabled``)
+asserting ``step()`` and ``step_cached()`` still agree bit-for-bit
+under ``qk_norm_enable=True``, mirroring the pre-existing
+``TestStepCached`` parity test's own claim. ``v`` is left untouched --
+only Q/K participate in the dot-product score being bounded.
+``qk_norm_enable=False`` (default): byte-identical to today's behavior,
+confirmed by
+``test_default_off_is_byte_identical_to_plain_model``.
+
+.. _toy_tile_recurrence_rmt.qk_l1_sparsity_design:
+
+qk_l1_sparsity_coef -- cheap spectral-norm proxy, scoped to Q/K only
+------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qk_l1_sparsity_design``
+
+Direct instruction: "spectral normalization takes a ton of calculation,
+but we used an L1 norm or something similar to give a similar effect,
+but that may or may not be good enough. If you can get a quick
+additional loss or other low-calculation method to move the layers
+towards the spectral-normalization, then I'd like that to be
+implemented and tested as well."
+
+Grepped project memory (``project_hybrid_precision_plan.md``) before
+building anything new, per this project's own
+``feedback_check_journal_before_new_mechanism`` convention, and found
+the exact prior precedent being recalled: real power-iteration spectral
+normalization (Miyato et al. 2018) was a decisive win for
+``ToyTileRecurrenceRealFP4``'s o_proj in earlier work, but does NOT
+stack with magnitude-based regularizers (L1/L2 combined with it dropped
+mean reward 65-80% relative). The actual cheap proxy already built and
+validated in that earlier work was an **L1 output-sparsity penalty**
+(``coef*mean(|layer_output|)``, delivered via a split-backward helper so
+the auxiliary loss's gradient bypasses the importance-damped effective
+learning rate) -- confirmed this IS already merged into the CURRENT
+``ToyTileRecurrenceRMT`` class as ``l1_sparsity_coef``/
+``_l1_sparsity_split`` (contradicting an older memory note that called
+it un-merged), applied uniformly to all 6 layers via one shared
+coefficient.
+
+``qk_l1_sparsity_coef`` is a second, INDEPENDENT coefficient reusing the
+exact same ``_l1_sparsity_split`` helper, applied ONLY to q_proj/k_proj
+(both ``step()`` and ``step_cached()``, same block placement as the
+existing layer-wide penalty) -- so Q/K's magnitude can be pushed down
+without also touching v_proj/o_proj/input_proj/lm_head, which stayed
+heterogeneous in v10 and don't show the collapse pattern this is aimed
+at. Independent of ``l1_sparsity_coef`` (own constructor param, own
+``self`` attr, own gated block) -- can run alone, together, or neither.
+0.0 (default): byte-identical, confirmed by
+``test_default_off_is_byte_identical_to_plain_model``.
+
+.. _toy_tile_recurrence_rmt.qk_spectral_norm_diagnostic:
+
+Diagnostic: cheap spectral-norm upper bound + deviation-std verification
+------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qk_spectral_norm_diagnostic``
+
+Direct instruction: "Even in the QK norm case we might still want to
+watch that spectral norm info and capture the std values again to make
+sure it fixes it" -- i.e. don't just infer these mechanisms work from
+downstream MQAR performance; watch the actual quantity they're supposed
+to bound.
+
+``spectral_norm_upper_bound(w)`` (module-level, ``model/toy_tile_recurrence_rmt.py``):
+Holder's-inequality bound ``sigma_max(W) <= sqrt(||W||_1 * ||W||_inf)``
+(max abs column-sum times max abs row-sum) -- O(rows*cols), no power
+iteration, loose in general but EXACT for a rank-1 matrix (verified by
+test against an all-ones matrix: true spectral norm N, bound gives
+exactly N). New ``qk_spectral_norm_diag_log`` flag on
+``train_curriculum`` (default False, zero extra cost when off): computes
+this for q_proj/k_proj's current dense weight (reusing the same safe
+``layer.weights.reshape(in_features, out_features)`` accessor the
+``plasticity_raw_importance_log`` capture already established) at the
+same cadence as the main summary line, printed as
+``qk_specnorm[q=... k=...]``.
+
+The deviation-std side of verification reuses EXISTING tooling rather
+than adding new capture code: ``plasticity_raw_importance_log=True``
+already records per-column ``raw_importance``/``raw_weight`` snapshots
+(see :ref:`toy_tile_recurrence_rmt.raw_ci_landscape_capture`) -- the
+same early/mid/late deviation-std analysis run against v10's real data
+above applies directly to any new run's q_proj/k_proj pools once it
+finishes, no new instrumentation needed to check whether
+``qk_l1_sparsity_coef``/``qk_norm_enable`` actually keep deviation std
+from collapsing to ~0.
+
+**v11/v12 real validation launched**: ``v11``
+(``launch_dense_lr_unscaled_plasticity_reset_v11_qk_l1_sparsity.py``,
+``qk_l1_sparsity_coef=0.05`` -- the Goldilocks-zone value from the
+original L1-sparsity finding, ``l1_sparsity_coef=0.0`` so it's the ONLY
+active penalty) and ``v12``
+(``launch_dense_lr_unscaled_plasticity_reset_v12_qk_norm.py``,
+``qk_norm_enable=True``), both with
+``plasticity_raw_importance_log=True``/``plasticity_column_log_dir``/
+``qk_spectral_norm_diag_log=True`` for post-run verification. Neither
+finished yet -- raw progress only, per
+``feedback_present_before_keep_prune_decisions``.

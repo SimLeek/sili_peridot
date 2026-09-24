@@ -9,14 +9,22 @@ from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
 from sili.tensor import Tensor
 
 from model.toy_recall_models import AdamOptimizer, cross_entropy_sum
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT, spectral_norm_upper_bound
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
 MAX_WEIGHTS = STATE_WIDTH * 16
 
 
-def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0, dense=False, rng=None):
+def _model(
+    disldo_cls=DISLDOLayer,
+    num_cpus=2,
+    l1_sparsity_coef=0.0,
+    qk_l1_sparsity_coef=0.0,
+    qk_norm_enable=False,
+    dense=False,
+    rng=None,
+):
     return ToyTileRecurrenceRMT(
         VOCAB,
         EMBED_WIDTH,
@@ -27,6 +35,8 @@ def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0, dense=False
         num_cpus=num_cpus,
         disldo_cls=disldo_cls,
         l1_sparsity_coef=l1_sparsity_coef,
+        qk_l1_sparsity_coef=qk_l1_sparsity_coef,
+        qk_norm_enable=qk_norm_enable,
         dense=dense,
         rng=rng,
     )
@@ -1690,3 +1700,153 @@ class TestL2Init:
         model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
         out = model.apply_l2_init(rate=0.5)
         assert out["input_proj"]["n_touched"] > 0
+
+
+class TestSpectralNormUpperBound:
+    """spectral_norm_upper_bound -- Holder's-inequality cheap proxy
+    (sqrt(||W||_1 * ||W||_inf)), diagnostic only. See
+    docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic."""
+
+    def test_identity_matrix_is_exact(self):
+        w = np.eye(5, dtype=np.float32)
+        assert spectral_norm_upper_bound(w) == pytest.approx(1.0)
+
+    def test_rank_one_all_ones_matrix_is_exact(self):
+        # True spectral norm of an NxN all-ones matrix is N (eigenvalues
+        # 0 and N) -- Holder's bound is TIGHT for rank-1 matrices.
+        w = np.ones((4, 4), dtype=np.float32)
+        assert spectral_norm_upper_bound(w) == pytest.approx(4.0)
+
+    def test_zero_matrix_is_zero(self):
+        assert spectral_norm_upper_bound(np.zeros((3, 3), dtype=np.float32)) == 0.0
+
+    def test_empty_matrix_is_zero(self):
+        assert spectral_norm_upper_bound(np.zeros((0, 0), dtype=np.float32)) == 0.0
+
+    def test_scales_linearly_with_magnitude(self):
+        rng = np.random.RandomState(0)
+        w = rng.randn(6, 8).astype(np.float32)
+        base = spectral_norm_upper_bound(w)
+        assert spectral_norm_upper_bound(w * 3.0) == pytest.approx(base * 3.0, rel=1e-5)
+
+
+class TestQKSparsityAndNorm:
+    """qk_l1_sparsity_coef (independent, Q/K-scoped extension of the
+    existing l1_sparsity_coef mechanism) and qk_norm_enable (QK-Norm,
+    Henry et al. 2020). Direct instruction, after v10's real recorded
+    data showed q_proj/k_proj deviation-std collapsing to ~0 while
+    raw_importance converged into a narrow 97-99 band (a homogenization
+    signature distinct from v_proj/o_proj/lm_head). See
+    docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design and
+    :qk_norm_design."""
+
+    def _window_and_memory(self, seed=1):
+        x_window = np.random.RandomState(seed).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        return x_window, memory_prev
+
+    def test_default_off_is_byte_identical_to_plain_model(self):
+        model_a = _model(rng=np.random.default_rng(7))
+        model_b = _model(qk_l1_sparsity_coef=0.0, qk_norm_enable=False, rng=np.random.default_rng(7))
+        x_window, memory_prev = self._window_and_memory()
+        mem_a, logits_a, aux_a = model_a.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        mem_b, logits_b, aux_b = model_b.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        assert np.array_equal(mem_a, mem_b)
+        assert np.array_equal(logits_a.data, logits_b.data)
+        assert aux_a is None and aux_b is None
+
+    def test_qk_l1_sparsity_coef_produces_finite_aux_loss(self):
+        model = _model(qk_l1_sparsity_coef=0.05)
+        x_window, memory_prev = self._window_and_memory()
+        _mem, _logits, aux_loss = model.step(x_window, memory_prev, learning_rate=0.01)
+        assert aux_loss is not None
+        assert np.isfinite(float(aux_loss.data))
+
+    def test_qk_l1_sparsity_coef_independent_of_l1_sparsity_coef(self):
+        # qk_l1_sparsity_coef must fire even when the pre-existing,
+        # layer-wide l1_sparsity_coef is off.
+        model = _model(l1_sparsity_coef=0.0, qk_l1_sparsity_coef=0.05)
+        x_window, memory_prev = self._window_and_memory()
+        _mem, _logits, aux_loss = model.step(x_window, memory_prev, learning_rate=0.01)
+        assert aux_loss is not None
+
+    def test_qk_norm_enable_produces_finite_shapes(self):
+        model = _model(qk_norm_enable=True)
+        x_window, memory_prev = self._window_and_memory()
+        memory_new, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.01)
+        assert memory_new.shape == (NUM_MEM, STATE_WIDTH)
+        assert logits.data.shape == (NUM_TILES, VOCAB)
+        assert np.all(np.isfinite(memory_new))
+        assert np.all(np.isfinite(logits.data))
+
+    def test_qk_norm_enable_changes_output_vs_disabled(self):
+        model_a = _model(qk_norm_enable=False, rng=np.random.default_rng(9))
+        model_b = _model(qk_norm_enable=True, rng=np.random.default_rng(9))
+        x_window, memory_prev = self._window_and_memory()
+        _mem_a, logits_a, _aux_a = model_a.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        _mem_b, logits_b, _aux_b = model_b.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        assert not np.allclose(logits_a.data, logits_b.data)
+
+    def test_qk_norm_ln_gains_are_in_parameters_for_optimizer(self):
+        model = _model(qk_norm_enable=True)
+        params = model.parameters_for_optimizer()
+        assert model.q_norm_ln in params
+        assert model.k_norm_ln in params
+
+    def test_qk_norm_gains_actually_update_via_backward(self):
+        model = _model(qk_norm_enable=True, rng=np.random.default_rng(11))
+        opt = AdamOptimizer()
+        x_window, memory_prev = self._window_and_memory()
+        before = np.asarray(model.q_norm_ln.data).copy()
+        _mem, logits, aux = model.step(x_window, memory_prev, learning_rate=0.05, requires_grad=True)
+        loss = cross_entropy_sum(logits, [(t, 0) for t in range(NUM_TILES)])
+        if aux is not None:
+            loss = loss + aux
+        loss.backward()
+        opt.step(model.parameters_for_optimizer(), lr=0.05)
+        assert not np.allclose(before, model.q_norm_ln.data)
+
+    def test_step_cached_matches_step_with_qk_norm_enabled(self):
+        # Same bit-exact-parity claim as TestStepCached's own test, now
+        # under qk_norm_enable=True -- confirms the "normalize once, then
+        # gather/cache" ordering in step_cached is equivalent to step()'s
+        # own normalize-then-gather ordering (RMSNorm is per-row, so this
+        # holds regardless of when the concat/cache round-trip happens).
+        model_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            qk_norm_enable=True,
+            rng=np.random.default_rng(42),
+        )
+        model_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            qk_norm_enable=True,
+            rng=np.random.default_rng(42),
+        )
+        embed_table = np.random.RandomState(1).randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.1
+        tokens = np.random.RandomState(2).randint(0, VOCAB, size=12)
+
+        memory_a = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        memory_b = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        tile_cache = None
+        for i in range(len(tokens)):
+            window = _build_window(embed_table, tokens, i, NUM_TILES)
+            memory_a, logits_a, _aux_a = model_a.step(window, memory_a, 0.0, requires_grad=False)
+            memory_b, logits_b, _aux_b, tile_cache = model_b.step_cached(
+                embed_table[tokens[i]], memory_b, 0.0, tile_cache, requires_grad=False
+            )
+            row_a = np.asarray(logits_a.data)[NUM_TILES - 1]
+            row_b = np.asarray(logits_b.data)[0]
+            assert np.allclose(row_a, row_b, atol=1e-5), f"step {i}: logits diverged under qk_norm_enable"
+            assert np.allclose(memory_a, memory_b, atol=1e-5), f"step {i}: memory_new diverged under qk_norm_enable"

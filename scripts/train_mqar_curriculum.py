@@ -34,7 +34,7 @@ from sili.tensor import combine_losses
 
 from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, predicted_token
 from model.toy_recall_task import generate_mqar_sequence
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT, spectral_norm_upper_bound
 from scripts.train_mqar_rmt_reference import (
     CLIP_RANGE,
     COLUMN_NEURONS,
@@ -488,6 +488,22 @@ def train_curriculum(
     l2_init_min_chunk: int = 4,
     l2_init_max_chunk: int = 2048,
     l2_init_rate: float = 0.0001,
+    # qk_l1_sparsity_coef/qk_norm_enable: EXPERIMENTAL Q/K-specific
+    # candidates for the attention-entropy-collapse pattern found in
+    # v10's real recorded data (deviation std -> ~0 in q_proj/k_proj
+    # only, while v_proj/o_proj/lm_head stayed heterogeneous). See
+    # docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design
+    # and :qk_norm_design. Both default off: byte-identical, no extra
+    # work.
+    qk_l1_sparsity_coef: float = 0.0,
+    qk_norm_enable: bool = False,
+    # Diagnostic only (no training-time cost unless True): logs
+    # spectral_norm_upper_bound(q_proj/k_proj weights) at the same
+    # cadence as the main summary line, to directly verify whether
+    # qk_l1_sparsity_coef/qk_norm_enable actually bound Q/K's spectral
+    # norm growth, not just infer it from downstream MQAR performance.
+    # See docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic.
+    qk_spectral_norm_diag_log: bool = False,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -582,6 +598,8 @@ def train_curriculum(
         dense=dense,
         clip_range=clip_range,
         l1_sparsity_coef=L1_SPARSITY_COEF,
+        qk_l1_sparsity_coef=qk_l1_sparsity_coef,
+        qk_norm_enable=qk_norm_enable,
         synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]),
         scale_rank=1,
         additive_rank=additive_rank,
@@ -1066,6 +1084,19 @@ def train_curriculum(
                 model.apply_amortized_dy_r_target_control(steps_per_sec, target_steps_per_sec)
                 model.apply_cross_layer_budget_allocator(steps_per_sec, target_steps_per_sec)
             model.reset_layer_timing()
+            # qk_spectral_norm_diag_log: cheap (O(elements), q_proj/k_proj
+            # only), computed only at this same summary cadence -- see
+            # docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic.
+            qk_spectral_norm = None
+            if qk_spectral_norm_diag_log:
+                _real_layers = dict(model._named_real_layers())
+                qk_spectral_norm = {
+                    _name: spectral_norm_upper_bound(
+                        np.array(_layer.weights).reshape(_layer.in_features, _layer.out_features)
+                    )
+                    for _name, _layer in _real_layers.items()
+                    if _name in ("q_proj", "k_proj")
+                }
             window_t0 = time.time()
             if log_fn is not None:
                 log_fn(
@@ -1084,6 +1115,7 @@ def train_curriculum(
                     layer_timing=layer_timing_snapshot,
                     window_wall_s=window_wall_s,
                     plasticity_totals=(plasticity_totals if plasticity_reset_enable else None),
+                    qk_spectral_norm=qk_spectral_norm,
                 )
             max_streak_seen = 0
 
@@ -1246,6 +1278,12 @@ def main():
             f",imp={worst['last_importance']:.4f})]"
         )
 
+    def _qk_spectral_norm_str(qk_spectral_norm):
+        if not qk_spectral_norm:
+            return ""
+        parts = [f"{_SHORT_NAME.get(n, n)}={v:.2f}" for n, v in qk_spectral_norm.items()]
+        return "  qk_specnorm[" + " ".join(parts) + "]"
+
     def log_fn(
         step,
         vocab_size,
@@ -1262,6 +1300,7 @@ def main():
         layer_timing=None,
         window_wall_s=None,
         plasticity_totals=None,
+        qk_spectral_norm=None,
     ):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
@@ -1272,6 +1311,7 @@ def main():
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
         timing_s = _layer_timing_str(layer_timing, window_wall_s)
         plasticity_s = _plasticity_totals_str(plasticity_totals)
+        qk_specnorm_s = _qk_spectral_norm_str(qk_spectral_norm)
 
         def _r_target_str(label, d):
             # Shared dy_r_target/x_r_target formatter; see cli_gradient_sparsity_args anchor.
@@ -1287,7 +1327,7 @@ def main():
         print(
             f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
             f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{timing_s}{sps_s}{streak_s}{dy_r_s}{x_r_s}"
-            f"{_ranks_str(ranks)}{plasticity_s}",
+            f"{_ranks_str(ranks)}{plasticity_s}{qk_specnorm_s}",
             flush=True,
         )
 
