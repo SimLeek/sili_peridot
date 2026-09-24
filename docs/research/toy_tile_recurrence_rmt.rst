@@ -2355,10 +2355,28 @@ slow (``beta2=0.999``) EMA. Confirmed via grep that no equivalent
 exists anywhere in the C++ per-synapse backward/update path
 (``sisldo_ops.hpp``, ``linear_disldo_backward.hpp``) -- searched for
 ``grad_clip``/``clip_grad``/``max_grad`` and found nothing but an
-unrelated AQRS rank-control threshold check. NOT YET IMPLEMENTED --
-recorded here as an open item, not built this session. Needs its own
-design pass (where in the per-synapse update path to clip, what the
-clip threshold/schedule should be, whether it's a global constant or
-per-layer/per-column, TDD both scattered+block4 per
-``feedback_block4_scattered_parity_required``) before touching
-``sili__new``.
+unrelated AQRS rank-control threshold check.
+
+**Update -- engine primitive built and tested (sili__new)**: direct
+correction, after a first attempt only confirmed a missing-parameter
+compile error was RED, not the actual failure mode -- "Wow that's not
+the failure I'm talking about. The stuff in all the research papers
+about unclipped grad causing issues, _that_ is what should be tested,
+_not_ a missing parameter." Fixed by writing a test that calls ONLY
+``update_ci``'s pre-existing 6-argument signature (no new API at all)
+and verifying it standalone against the UNMODIFIED header before any
+fix existed: a single ``g=50`` spike poisons ``ci`` by **2155x**
+relative to a no-spike baseline, 249 steps later -- a real, measured
+confirmation of the Zhang et al. 2020 (attention models produce
+heavy-tailed gradient noise) claim in this codebase's own formula, not
+an assumption. New ``max_abs_grad`` parameter added to ``update_ci``
+(Plain + Bounded, scalar + Block4Vec, default ``1e30`` = true no-op)
+clips it to 1.86x baseline for the same spike. Full details, exact
+numbers, and the TDD-process correction in sili__new's
+``docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip``.
+
+**Still not done**: threading ``max_abs_grad`` up through
+``cpu_backend.cpp``'s bindings, ``sili/sparse_rnn.py``, and this
+project's own ``train_mqar_curriculum.py`` ``synapse_kwargs`` so a
+real MQAR run can actually opt into it -- the engine primitive exists
+and is tested, but no real training run has used it yet.

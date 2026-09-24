@@ -10782,6 +10782,58 @@ needs its own design pass (clip placement, threshold/schedule, global
 vs per-layer/per-column, TDD scattered+block4 parity) before touching
 sili__new.
 
+## 2026-09-24 -- max_abs_grad built and TDD-tested in sili__new; a
+## real process correction on what "RED" should actually mean
+
+Direct instruction: "I think we should actually fix the clip grad norm
+thing first, and use a test in sili to demonstrate its importance...
+it seems like it could be a unit test that completes in a few
+milliseconds rather than an integration test."
+
+First attempt wrote a test for the new `max_abs_grad` parameter,
+confirmed it failed to compile without the header change, and treated
+that as RED. Direct correction: "Wow that's not the failure I'm
+talking about. The stuff in all the research papers about unclipped
+grad causing issues, _that_ is what should be tested, _not_ a missing
+parameter." Right call -- a missing-parameter compile error proves
+nothing about whether the actual bug (heavy-tailed gradient spikes
+poisoning `ci`) is real in this codebase.
+
+Fixed properly: rewrote the test file so the PROBLEM test calls ONLY
+`update_ci`'s pre-existing 6-argument signature, then verified it
+standalone (a throwaway `g++` compile against the header with the
+header fix `git stash`ed out) before touching anything else. Result
+against TODAY's completely unmodified formula:
+
+```
+ci_start=0.000453 ci_baseline=0.000905 ci_spiked=1.949572 ratio=2155.0
+predicted ci_spiked=1.949618 (analytic decay formula)
+PROBLEM TEST PASSED: unclipped g=50 spike poisons ci by 2155.0x after 249 steps
+```
+
+A single g=50 spike (matching Zhang et al. 2020's finding that
+attention architectures produce heavy-tailed gradient noise
+independent of input data) poisons `ci` by 2155x relative to a
+no-spike baseline, 249 steps later -- matching the analytic prediction
+(`2.5*0.999^249` decay of the injected excess) almost exactly. Then
+confirmed the fix resolves it, same standalone-probe discipline:
+clipping to `max_abs_grad=1.0` leaves `ci` at only 1.86x baseline for
+the identical spike.
+
+Implemented `max_abs_grad` on `update_ci` (`PlainRMSpropSynapsePolicy`
++ `BoundedRMSpropSynapsePolicy`, scalar + `Block4Vec`) in sili__new,
+default `1e30` (true no-op, every existing call site stays
+bit-identical) -- full 182-test sili__new regression passes clean.
+Committed and pushed to sili__new
+(`feature/dy-external-gate-hook`, commit a82a5d2). Full design writeup
+in sili__new's
+`docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip`.
+
+Not yet done: threading `max_abs_grad` up through `cpu_backend.cpp`'s
+bindings, `sili/sparse_rnn.py`, and this project's
+`train_mqar_curriculum.py` `synapse_kwargs` -- the engine primitive
+exists and is tested, but no real training run has used it yet.
+
 ## 2026-09-23 -- v12b (QK-Norm, seed=1001) finished: did NOT replicate
 ## v12's GRADUATED result -- stalled at vocab=64/k=2 for ~90k steps
 
