@@ -10564,3 +10564,48 @@ is the load-bearing confirmation and holds regardless.
 v11 (`qk_l1_sparsity_coef=0.05`) still running at time of writing --
 step ~17750/100000, vocab=64/k=2, progressing steadily but nowhere
 near v12's graduation speed so far. No verdict yet, raw progress only.
+
+## 2026-09-23 -- v11 (qk_l1_sparsity_coef) finished: 5 level-ups, stalled
+## 76k steps on the last one, never graduated
+
+v11 ran the full 100,000 steps (12773s, 7.83 steps/sec).
+
+- FINAL: final_vocab=64, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=64, peak_k=3 (peak == final)
+- STAGE_HISTORY: 5 level-ups -- steps 1990 / 4562 / 6213 / 8244 /
+  84256. The last one (64,2 -> 64,3) took ~76,000 steps by itself,
+  after the first 4 landed within the first 8244 steps.
+- Using the correct stage ordering: v11 (64,3) ties v8's own (64,3)
+  ceiling (the best of v5-v9), well below v12's GRADUATED (126,4).
+
+Deviation-std check, same analysis as v10/v12: q_proj/k_proj do NOT
+collapse to v10's ~0.004 here either -- std stays 0.38-0.58 across all
+three thirds, comparable magnitude to v_proj/o_proj/lm_head:
+
+```
+q_proj: std 0.470/0.424/0.383   col_importance final: mean=99.60 max=99.91 min=99.04
+k_proj: std 0.584/0.363/0.396   col_importance final: mean=99.42 max=99.49 min=98.95
+v_proj: std 0.677/0.494/0.410   col_importance final: mean=99.50 max=99.90 min=97.65
+input_proj: std 0.708/0.606/0.343   col_importance final: mean=100.00 max=100.00 min=99.99
+o_proj: std 0.635/0.526/0.433   col_importance final: mean=3.87  max=83.31 min=0.14
+lm_head: std 0.670/0.652/0.642   col_importance final: mean=0.49  max=0.71  min=0.43
+```
+
+Genuinely interesting, not yet explained: the qk_l1_sparsity_coef
+penalty ALSO avoids the deviation-std collapse (unlike v10), but still
+hit a real 76k-step stall before its last level-up -- avoiding the
+collapse signature did not, by itself, avoid stalling here the way it
+appeared to for v12. Note col_importance for q/k/v/input_proj DID
+reach the same ~99-100 saturated range v10 showed (unlike v12, which
+never got that high because it graduated in only 15k steps) -- so this
+arm still saturates importance, just without the deviation-std
+collapse that saturation alone was hypothesized to cause. Raw finding,
+no explanation asserted yet.
+
+**v12 replication launched**: direct instruction, "Launch V12 again to
+validate while V11 continues running please. Keep both the new and old
+recordings when running v12 again." `v12b`
+(`launch_dense_lr_unscaled_plasticity_reset_v12b_qk_norm_repeat.py`) --
+identical config to v12 except `seed=1001` (v12 used 1000), own
+separate `plasticity_column_log_dir`/log file so v12's original
+recordings stay untouched. Running now.

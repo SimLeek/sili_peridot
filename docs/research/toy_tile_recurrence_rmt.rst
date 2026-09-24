@@ -2112,6 +2112,25 @@ every other layer throughout, never collapsing to v10's ~0.004 --
 QK-Norm removes the homogenization signature. ``qk_specnorm`` stayed
 flat the whole run (q~=15.2-15.35, k~=15.03-15.11), consistent with it
 actually bounding Q/K's spectral norm. Full numbers in JOURNAL.md's
-2026-09-23 "v12 GRADUATED" entry. ``v11`` (qk_l1_sparsity_coef) still
-running -- raw progress only, per
+2026-09-23 "v12 GRADUATED" entry.
+
+**v11 result**: ran the full 100,000 steps, 5 level-ups (steps 1990 /
+4562 / 6213 / 8244 / 84256 -- the last one alone a ~76k-step stall),
+final ``vocab=64, k=3``, never graduated. Ties v8's own ceiling, well
+below v12. The deviation-std check shows q_proj/k_proj ALSO avoiding
+v10's ~0.004 collapse here (std stays 0.38-0.58, comparable to
+v_proj/o_proj/lm_head) -- but q/k/v/input_proj's ``col_importance``
+still saturated to ~99-100 (v12 never reached that range, having
+graduated in far fewer steps). So qk_l1_sparsity_coef also avoids the
+homogenization signature, yet still hit a real long stall -- avoiding
+that signature alone didn't guarantee fast progress here the way it
+appeared to for v12. Raw finding, not yet explained. Full numbers in
+JOURNAL.md's 2026-09-23 "v11 finished" entry.
+
+**v12 replication (v12b)**: direct instruction, "Launch V12 again to
+validate... Keep both the new and old recordings." ``v12b``
+(``launch_dense_lr_unscaled_plasticity_reset_v12b_qk_norm_repeat.py``)
+-- identical config, ``seed=1001`` instead of v12's 1000, own separate
+``plasticity_column_log_dir``/log file so v12's original recordings
+stay untouched. Running now, per
 ``feedback_present_before_keep_prune_decisions``.
