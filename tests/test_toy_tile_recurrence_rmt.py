@@ -21,7 +21,7 @@ def _model(
     num_cpus=2,
     l1_sparsity_coef=0.0,
     qk_l1_sparsity_coef=0.0,
-    qk_norm_enable=False,
+    qkvo_norm_enable=False,
     dense=False,
     rng=None,
 ):
@@ -36,7 +36,7 @@ def _model(
         disldo_cls=disldo_cls,
         l1_sparsity_coef=l1_sparsity_coef,
         qk_l1_sparsity_coef=qk_l1_sparsity_coef,
-        qk_norm_enable=qk_norm_enable,
+        qkvo_norm_enable=qkvo_norm_enable,
         dense=dense,
         rng=rng,
     )
@@ -1732,13 +1732,16 @@ class TestSpectralNormUpperBound:
 
 class TestQKSparsityAndNorm:
     """qk_l1_sparsity_coef (independent, Q/K-scoped extension of the
-    existing l1_sparsity_coef mechanism) and qk_norm_enable (QK-Norm,
-    Henry et al. 2020). Direct instruction, after v10's real recorded
-    data showed q_proj/k_proj deviation-std collapsing to ~0 while
-    raw_importance converged into a narrow 97-99 band (a homogenization
-    signature distinct from v_proj/o_proj/lm_head). See
+    existing l1_sparsity_coef mechanism) and qkvo_norm_enable (QKV-Norm
+    + O-Norm, Henry et al. 2020 / Zhai et al. 2023). Direct instruction,
+    after v10's real recorded data showed q_proj/k_proj deviation-std
+    collapsing to ~0 while raw_importance converged into a narrow 97-99
+    band (a homogenization signature distinct from v_proj/o_proj/
+    lm_head), and v12/v12b's real validation found Q/K-only
+    normalization just shifted the SAME saturation pattern onto
+    v_proj/o_proj/input_proj instead of removing it. See
     docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design and
-    :qk_norm_design."""
+    :qkvo_norm_design."""
 
     def _window_and_memory(self, seed=1):
         x_window = np.random.RandomState(seed).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
@@ -1747,7 +1750,7 @@ class TestQKSparsityAndNorm:
 
     def test_default_off_is_byte_identical_to_plain_model(self):
         model_a = _model(rng=np.random.default_rng(7))
-        model_b = _model(qk_l1_sparsity_coef=0.0, qk_norm_enable=False, rng=np.random.default_rng(7))
+        model_b = _model(qk_l1_sparsity_coef=0.0, qkvo_norm_enable=False, rng=np.random.default_rng(7))
         x_window, memory_prev = self._window_and_memory()
         mem_a, logits_a, aux_a = model_a.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
         mem_b, logits_b, aux_b = model_b.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
@@ -1770,8 +1773,8 @@ class TestQKSparsityAndNorm:
         _mem, _logits, aux_loss = model.step(x_window, memory_prev, learning_rate=0.01)
         assert aux_loss is not None
 
-    def test_qk_norm_enable_produces_finite_shapes(self):
-        model = _model(qk_norm_enable=True)
+    def test_qkvo_norm_enable_produces_finite_shapes(self):
+        model = _model(qkvo_norm_enable=True)
         x_window, memory_prev = self._window_and_memory()
         memory_new, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.01)
         assert memory_new.shape == (NUM_MEM, STATE_WIDTH)
@@ -1779,39 +1782,46 @@ class TestQKSparsityAndNorm:
         assert np.all(np.isfinite(memory_new))
         assert np.all(np.isfinite(logits.data))
 
-    def test_qk_norm_enable_changes_output_vs_disabled(self):
-        model_a = _model(qk_norm_enable=False, rng=np.random.default_rng(9))
-        model_b = _model(qk_norm_enable=True, rng=np.random.default_rng(9))
+    def test_qkvo_norm_enable_changes_output_vs_disabled(self):
+        model_a = _model(qkvo_norm_enable=False, rng=np.random.default_rng(9))
+        model_b = _model(qkvo_norm_enable=True, rng=np.random.default_rng(9))
         x_window, memory_prev = self._window_and_memory()
         _mem_a, logits_a, _aux_a = model_a.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
         _mem_b, logits_b, _aux_b = model_b.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
         assert not np.allclose(logits_a.data, logits_b.data)
 
-    def test_qk_norm_ln_gains_are_in_parameters_for_optimizer(self):
-        model = _model(qk_norm_enable=True)
+    def test_qkvo_norm_ln_gains_are_in_parameters_for_optimizer(self):
+        model = _model(qkvo_norm_enable=True)
         params = model.parameters_for_optimizer()
         assert model.q_norm_ln in params
         assert model.k_norm_ln in params
+        assert model.v_norm_ln in params
+        assert model.o_norm_ln in params
 
-    def test_qk_norm_gains_actually_update_via_backward(self):
-        model = _model(qk_norm_enable=True, rng=np.random.default_rng(11))
+    def test_qkvo_norm_gains_actually_update_via_backward(self):
+        model = _model(qkvo_norm_enable=True, rng=np.random.default_rng(11))
         opt = AdamOptimizer()
         x_window, memory_prev = self._window_and_memory()
-        before = np.asarray(model.q_norm_ln.data).copy()
+        before_q = np.asarray(model.q_norm_ln.data).copy()
+        before_v = np.asarray(model.v_norm_ln.data).copy()
+        before_o = np.asarray(model.o_norm_ln.data).copy()
         _mem, logits, aux = model.step(x_window, memory_prev, learning_rate=0.05, requires_grad=True)
         loss = cross_entropy_sum(logits, [(t, 0) for t in range(NUM_TILES)])
         if aux is not None:
             loss = loss + aux
         loss.backward()
         opt.step(model.parameters_for_optimizer(), lr=0.05)
-        assert not np.allclose(before, model.q_norm_ln.data)
+        assert not np.allclose(before_q, model.q_norm_ln.data)
+        assert not np.allclose(before_v, model.v_norm_ln.data)
+        assert not np.allclose(before_o, model.o_norm_ln.data)
 
-    def test_step_cached_matches_step_with_qk_norm_enabled(self):
+    def test_step_cached_matches_step_with_qkvo_norm_enabled(self):
         # Same bit-exact-parity claim as TestStepCached's own test, now
-        # under qk_norm_enable=True -- confirms the "normalize once, then
-        # gather/cache" ordering in step_cached is equivalent to step()'s
-        # own normalize-then-gather ordering (RMSNorm is per-row, so this
-        # holds regardless of when the concat/cache round-trip happens).
+        # under qkvo_norm_enable=True -- confirms the "normalize once,
+        # then gather/cache" ordering in step_cached is equivalent to
+        # step()'s own normalize-then-gather ordering (RMSNorm is
+        # per-row, so this holds regardless of when the concat/cache
+        # round-trip happens).
         model_a = ToyTileRecurrenceRMT(
             VOCAB,
             EMBED_WIDTH,
@@ -1820,7 +1830,7 @@ class TestQKSparsityAndNorm:
             NUM_MEM,
             MAX_WEIGHTS,
             num_cpus=2,
-            qk_norm_enable=True,
+            qkvo_norm_enable=True,
             rng=np.random.default_rng(42),
         )
         model_b = ToyTileRecurrenceRMT(
@@ -1831,7 +1841,7 @@ class TestQKSparsityAndNorm:
             NUM_MEM,
             MAX_WEIGHTS,
             num_cpus=2,
-            qk_norm_enable=True,
+            qkvo_norm_enable=True,
             rng=np.random.default_rng(42),
         )
         embed_table = np.random.RandomState(1).randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.1
@@ -1848,5 +1858,5 @@ class TestQKSparsityAndNorm:
             )
             row_a = np.asarray(logits_a.data)[NUM_TILES - 1]
             row_b = np.asarray(logits_b.data)[0]
-            assert np.allclose(row_a, row_b, atol=1e-5), f"step {i}: logits diverged under qk_norm_enable"
-            assert np.allclose(memory_a, memory_b, atol=1e-5), f"step {i}: memory_new diverged under qk_norm_enable"
+            assert np.allclose(row_a, row_b, atol=1e-5), f"step {i}: logits diverged under qkvo_norm_enable"
+            assert np.allclose(memory_a, memory_b, atol=1e-5), f"step {i}: memory_new diverged under qkvo_norm_enable"

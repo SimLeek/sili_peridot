@@ -2150,3 +2150,80 @@ entry. Net: two real data points for ``qk_norm_enable`` now exist --
 one excellent (v12), one stalled (v12b) -- not enough to call this
 mechanism reliable either way. No keep/prune verdict; more seeds
 needed, per ``feedback_present_before_keep_prune_decisions``.
+
+.. _toy_tile_recurrence_rmt.qkvo_norm_design:
+
+qkvo_norm_enable -- extending QK-Norm to V and o_proj's output
+------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qkvo_norm_design``
+
+Direct instruction, after asking whether v_proj/o_proj/input_proj
+saturating in v12b had any research precedent (answered by re-reading
+the σReparam paper already cited for :ref:`toy_tile_recurrence_rmt.qk_norm_design`
+and this project's own `project_hybrid_precision_plan.md` o_proj
+spectral-radius history -- see that conversation for the full sourced
+answer): "Please extend the current qk_norm_enable into a
+qkvo_norm_enable, using the same pattern that works for QK to fix the
+other layers, then launch that as V13 and we'll see if that can
+perform robustly."
+
+Zhai et al. (2023) themselves found applying σReparam to Q/K only vs.
+**all linear layers** (Q, K, V, output, feedforward) performs
+comparably, with all-layers being the simpler, more robust choice --
+QK-Norm was never meant to be Q/K-exclusive, this project just built
+the narrower version first. QKV-Norm (LayerNorm on Q, K, *and* V) is
+also now standard practice in production models (Gemma 3, OLMo 2,
+Qwen 3). Separately, this project's OWN prior work found o_proj
+specifically needed spectral-radius control in the older
+`ToyTileRecurrenceRealFP4` architecture, because it sits inside the
+recurrent loop (applied repeatedly to state across timesteps, so its
+eigenvalues compound) -- a mechanistically different reason than Q/K's
+dot-product-score collapse, but pointing at the same layer now showing
+up as saturated in v12b.
+
+``qkvo_norm_enable`` (renamed from ``qk_norm_enable``, same
+``_apply_qkvo_norm`` no-op-unless-enabled helper, generalized) adds two
+new learnable RMSNorm gains, ``v_norm_ln``/``o_norm_ln``, applied via
+the EXACT same pattern already validated for Q/K:
+
+- **V**: the FULL ``v`` tensor normalized once, right after its own
+  post-projection clip, before ANY downstream gather -- mirrors
+  ``q_attn``/``k_attn`` exactly. Every consumer that used to read raw
+  ``v`` (``v_phys``, ``v_content_only``, the pass-2 refreshed
+  ``v_mem_fresh``) now reads the normalized version.
+- **O**: o_proj's OUTPUT (``attn_mem``, ``attn_content``) normalized
+  right after its own post-projection clip, before being added into
+  the recurrent state (``memory_new_t``) or the content residual
+  (``pre_norm_content``). This is a new insertion point beyond the
+  Q/K/V pattern (Q/K/V normalize a projection's output before a
+  DOT-PRODUCT/weighted-sum use; O has no such downstream use -- it
+  normalizes before the RESIDUAL ADD instead, the closest analog for a
+  layer whose only consumer is a residual connection).
+- ``step_cached()`` gets the identical treatment (``v_step_attn``, the
+  same O-norm insertion at both its own attn_mem/attn_content sites) --
+  a new parity test
+  (``TestQKSparsityAndNorm::test_step_cached_matches_step_with_qkvo_norm_enabled``)
+  confirms bit-exact agreement with ``step()`` under
+  ``qkvo_norm_enable=True``, same as the original Q/K-only version.
+- ``last_debug`` keeps referencing the RAW (pre-norm) ``attn_mem``/
+  ``attn_content``/``v`` values, consistent with how raw ``q``/``k``
+  were already kept there -- debug capture is unaffected by this
+  mechanism.
+
+Not touched: the o_proj-output-L1-sparsity aux-loss recompute block
+(a separate, undamped-gradient forward pass feeding
+``qk_l1_sparsity_coef``/``l1_sparsity_coef``) -- its role is an
+auxiliary sparsity nudge, not part of the main attention-output
+consumption path, so O-norm doesn't apply there.
+
+**v13 real validation launched**: ``v13``
+(``launch_dense_lr_unscaled_plasticity_reset_v13_qkvo_norm.py``),
+``qkvo_norm_enable=True``, otherwise identical config to v12/v12b
+(``seed=1000``, same curriculum/embed_width/k_first_target), with
+``plasticity_raw_importance_log=True``/``plasticity_column_log_dir``/
+``qk_spectral_norm_diag_log=True`` for post-run verification against
+ALL SIX pools this time (not just q/k), to see whether normalizing
+V/O too removes the saturation v12b showed shifting there, and whether
+it reproduces v12's GRADUATED result more robustly than Q/K-only did.
+No result yet, per ``feedback_present_before_keep_prune_decisions``.

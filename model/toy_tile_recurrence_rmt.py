@@ -81,7 +81,7 @@ class ToyTileRecurrenceRMT:
         clip_range: float = 6.0,
         l1_sparsity_coef: float = 0.0,
         qk_l1_sparsity_coef: float = 0.0,
-        qk_norm_enable: bool = False,
+        qkvo_norm_enable: bool = False,
         magnitude_clip_penalty_coef: float = 0.0,
         min_sigma: float = 1e-3,
         synapse_kwargs: dict | None = None,
@@ -134,12 +134,10 @@ class ToyTileRecurrenceRMT:
             normalization achieves, at a fraction of the cost). 0.0
             (default): byte-identical, no extra work. See
             docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design.
-        qk_norm_enable: QK-Norm (Henry et al. 2020, arXiv:2010.04245) --
-            RMSNorm applied to Q and K right before the attention dot
-            product, bounding score growth without spectral norm's
-            power-iteration cost. False (default): byte-identical, no
-            extra work. See
-            docs/research/toy_tile_recurrence_rmt.rst:qk_norm_design.
+        qkvo_norm_enable: QKV-Norm + O-Norm, extends qk_norm_enable to
+            V and o_proj's output too. False (default): byte-identical,
+            no extra work. See
+            docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
         recurrent_only_output:
             See docs/research/toy_tile_recurrence_rmt.rst:recurrent_only_output_ablation.
         input_sparsity_p, dy_sparsity_p, wide_max_weights, output_dy_sparsity_p:
@@ -239,7 +237,7 @@ class ToyTileRecurrenceRMT:
         self.clip_range = clip_range
         self.l1_sparsity_coef = l1_sparsity_coef
         self.qk_l1_sparsity_coef = qk_l1_sparsity_coef
-        self.qk_norm_enable = qk_norm_enable
+        self.qkvo_norm_enable = qkvo_norm_enable
         self.magnitude_clip_penalty_coef = magnitude_clip_penalty_coef
         self.min_sigma = min_sigma
         self.recurrent_only_output = recurrent_only_output
@@ -384,10 +382,12 @@ class ToyTileRecurrenceRMT:
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.memory_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.state_ln = Tensor(np.ones(state_width, dtype=np.float32))
-        # QK-Norm gains -- unused (never touched by forward, no gradient)
-        # unless qk_norm_enable=True. See _apply_qk_norm.
+        # QKV-Norm gains -- unused (never touched by forward, no gradient)
+        # unless qkvo_norm_enable=True. See _apply_qkvo_norm.
         self.q_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.k_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.v_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.o_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
 
         # Interleaved position layout + widened cold-start sigma: real bug
         # fix. See docs/research/toy_tile_recurrence_rmt.rst:interleaved_position_layout_bug.
@@ -777,6 +777,8 @@ class ToyTileRecurrenceRMT:
             self.log_sigmas,
             self.q_norm_ln,
             self.k_norm_ln,
+            self.v_norm_ln,
+            self.o_norm_ln,
         ]
 
     def magnitude_rescale_output(self, target: float, correction_rate: float, scale_invariant: bool = False) -> None:
@@ -1510,10 +1512,10 @@ class ToyTileRecurrenceRMT:
         n = float(np.asarray(out_tensor.data).size)
         return reduce_sum(power(excess, 2)) * (self.magnitude_clip_penalty_coef / n)
 
-    def _apply_qk_norm(self, t: Tensor, ln: Tensor) -> Tensor:
-        """QK-Norm (Henry et al. 2020) -- no-op unless qk_norm_enable.
-        See docs/research/toy_tile_recurrence_rmt.rst:qk_norm_design."""
-        if not self.qk_norm_enable:
+    def _apply_qkvo_norm(self, t: Tensor, ln: Tensor) -> Tensor:
+        """QKV-Norm/O-Norm -- no-op unless qkvo_norm_enable. See
+        docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design."""
+        if not self.qkvo_norm_enable:
             return t
         return rmsnorm_tensor(t, ln, self.rms_eps)
 
@@ -1632,18 +1634,19 @@ class ToyTileRecurrenceRMT:
         # See docs/research/toy_tile_recurrence_rmt.rst:magnitude_clip_and_min_sigma_design.
         sigmas.data = np.maximum(sigmas.data, self.min_sigma)
 
-        # QK-Norm (no-op unless qk_norm_enable): normalize the FULL q/k
-        # tensors once, then every gather below draws from these instead
-        # of the raw post-clip q/k. See
-        # docs/research/toy_tile_recurrence_rmt.rst:qk_norm_design.
-        q_attn = self._apply_qk_norm(q, self.q_norm_ln)
-        k_attn = self._apply_qk_norm(k, self.k_norm_ln)
+        # QKV-Norm (no-op unless qkvo_norm_enable): normalize the FULL
+        # q/k/v tensors once, then every gather below draws from these
+        # instead of the raw post-clip q/k/v. See
+        # docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
+        q_attn = self._apply_qkvo_norm(q, self.q_norm_ln)
+        k_attn = self._apply_qkvo_norm(k, self.k_norm_ln)
+        v_attn = self._apply_qkvo_norm(v, self.v_norm_ln)
 
         # Reorder k/v into PHYSICAL position order for attention KEYS;
         # q stays LOGICAL (self.centers already holds the physical value).
         # See docs/research/toy_tile_recurrence_rmt.rst:interleaved_position_layout_bug.
         k_phys = gather(k_attn, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
-        v_phys = gather(v, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v_phys = gather(v_attn, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
 
         mem_idx = [m * sw + c for m in range(n_mem) for c in range(sw)]
         content_idx = [(n_mem + t) * sw + c for t in range(n_content) for c in range(sw)]
@@ -1675,7 +1678,8 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, against the FRESH memory_new_t, not stale
@@ -1705,15 +1709,16 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
-        k_mem_fresh_attn = self._apply_qk_norm(k_mem_fresh, self.k_norm_ln)
+        k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
+        v_mem_fresh_attn = self._apply_qkvo_norm(v_mem_fresh, self.v_norm_ln)
 
         # Content's own k/v (from pass 1) stay unchanged; only memory is
         # refreshed. Rebuilt via the SAME interleaved-physical gather.
         # See docs/research/toy_tile_recurrence_rmt.rst:interleaved_position_layout_bug.
         k_content_only = gather(k_attn, content_idx).reshape((n_content, sw))
-        v_content_only = gather(v, content_idx).reshape((n_content, sw))
+        v_content_only = gather(v_attn, content_idx).reshape((n_content, sw))
         k2 = concat([k_mem_fresh_attn, k_content_only], axis=0)
-        v2 = concat([v_mem_fresh, v_content_only], axis=0)
+        v2 = concat([v_mem_fresh_attn, v_content_only], axis=0)
         k2_phys = gather(k2, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
         v2_phys = gather(v2, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
 
@@ -1757,6 +1762,7 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
+        attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
         # Debug instrumentation: cheap reference-only capture for bisecting
         # NaN/Inf. See docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
@@ -1870,7 +1876,7 @@ class ToyTileRecurrenceRMT:
         # Residual against RAW content value, kept live regardless of
         # recurrent_only_output. See
         # docs/research/toy_tile_recurrence_rmt.rst:recurrent_only_output_ablation.
-        pre_norm_content = x_wide + attn_content
+        pre_norm_content = x_wide + attn_content_n
         content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
         _accumulate_penalty(content_out)  # pre-clip, same reasoning as above
         content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)
@@ -2001,20 +2007,22 @@ class ToyTileRecurrenceRMT:
         sigmas = exp(self.log_sigmas)
         sigmas.data = np.maximum(sigmas.data, self.min_sigma)
 
-        # QK-Norm (no-op unless qk_norm_enable), same "normalize once,
-        # then gather" order as step()'s own q_attn/k_attn -- RMSNorm is
-        # per-row, so normalizing before vs. after this gather/cache
-        # round-trip is equivalent, preserving byte-parity with step().
-        # See docs/research/toy_tile_recurrence_rmt.rst:qk_norm_design.
-        q_step_attn = self._apply_qk_norm(q_step, self.q_norm_ln)
-        k_step_attn = self._apply_qk_norm(k_step, self.k_norm_ln)
+        # QKV-Norm (no-op unless qkvo_norm_enable), same "normalize once,
+        # then gather" order as step()'s own q_attn/k_attn/v_attn --
+        # RMSNorm is per-row, so normalizing before vs. after this
+        # gather/cache round-trip is equivalent, preserving byte-parity
+        # with step(). See
+        # docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
+        q_step_attn = self._apply_qkvo_norm(q_step, self.q_norm_ln)
+        k_step_attn = self._apply_qkvo_norm(k_step, self.k_norm_ln)
+        v_step_attn = self._apply_qkvo_norm(v_step, self.v_norm_ln)
 
         q_mem = gather(q_step_attn, self._mem_idx_step).reshape((n_mem, sw))
         k_mem_from_prev = gather(k_step_attn, self._mem_idx_step).reshape((n_mem, sw))
-        v_mem_from_prev = gather(v_step, self._mem_idx_step).reshape((n_mem, sw))
+        v_mem_from_prev = gather(v_step_attn, self._mem_idx_step).reshape((n_mem, sw))
         q_new = gather(q_step_attn, self._new_content_idx_step).reshape((1, sw))
         k_new = gather(k_step_attn, self._new_content_idx_step).reshape((1, sw))
-        v_new = gather(v_step, self._new_content_idx_step).reshape((1, sw))
+        v_new = gather(v_step_attn, self._new_content_idx_step).reshape((1, sw))
 
         # Reassemble FULL [n_content, sw] content k/v: cache (oldest
         # first, zero-padded) plus this step's fresh row at the end.
@@ -2058,7 +2066,8 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, only the newest content row's own query ---
@@ -2085,10 +2094,11 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
-        k_mem_fresh_attn = self._apply_qk_norm(k_mem_fresh, self.k_norm_ln)
+        k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
+        v_mem_fresh_attn = self._apply_qkvo_norm(v_mem_fresh, self.v_norm_ln)
 
         k2_full = concat([k_mem_fresh_attn, k_content_full], axis=0)
-        v2_full = concat([v_mem_fresh, v_content_full], axis=0)
+        v2_full = concat([v_mem_fresh_attn, v_content_full], axis=0)
         k2_phys = gather(k2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
         v2_phys = gather(v2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
 
@@ -2130,8 +2140,9 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
+        attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
-        pre_norm_content = x_wide_new + attn_content
+        pre_norm_content = x_wide_new + attn_content_n
         content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
         _accumulate_penalty(content_out)
         content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)

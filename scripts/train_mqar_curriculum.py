@@ -488,20 +488,26 @@ def train_curriculum(
     l2_init_min_chunk: int = 4,
     l2_init_max_chunk: int = 2048,
     l2_init_rate: float = 0.0001,
-    # qk_l1_sparsity_coef/qk_norm_enable: EXPERIMENTAL Q/K-specific
-    # candidates for the attention-entropy-collapse pattern found in
-    # v10's real recorded data (deviation std -> ~0 in q_proj/k_proj
-    # only, while v_proj/o_proj/lm_head stayed heterogeneous). See
-    # docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design
-    # and :qk_norm_design. Both default off: byte-identical, no extra
-    # work.
+    # qk_l1_sparsity_coef: EXPERIMENTAL Q/K-specific candidate for the
+    # attention-entropy-collapse pattern found in v10's real recorded
+    # data (deviation std -> ~0 in q_proj/k_proj only). See
+    # docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design.
+    # Default off: byte-identical, no extra work.
     qk_l1_sparsity_coef: float = 0.0,
-    qk_norm_enable: bool = False,
+    # qkvo_norm_enable: supersedes the earlier qk_norm_enable (Q/K
+    # only) -- v12/v12b's real validation found Q/K-only normalization
+    # just shifted the same saturation pattern onto v_proj/o_proj/
+    # input_proj instead of removing it. Now covers Q, K, V, and
+    # o_proj's output. See
+    # docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
+    # Default off: byte-identical, no extra work.
+    qkvo_norm_enable: bool = False,
     # Diagnostic only (no training-time cost unless True): logs
     # spectral_norm_upper_bound(q_proj/k_proj weights) at the same
     # cadence as the main summary line, to directly verify whether
-    # qk_l1_sparsity_coef/qk_norm_enable actually bound Q/K's spectral
-    # norm growth, not just infer it from downstream MQAR performance.
+    # qk_l1_sparsity_coef/qkvo_norm_enable actually bound Q/K's
+    # spectral norm growth, not just infer it from downstream MQAR
+    # performance.
     # See docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic.
     qk_spectral_norm_diag_log: bool = False,
 ) -> dict:
@@ -599,7 +605,7 @@ def train_curriculum(
         clip_range=clip_range,
         l1_sparsity_coef=L1_SPARSITY_COEF,
         qk_l1_sparsity_coef=qk_l1_sparsity_coef,
-        qk_norm_enable=qk_norm_enable,
+        qkvo_norm_enable=qkvo_norm_enable,
         synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]),
         scale_rank=1,
         additive_rank=additive_rank,
