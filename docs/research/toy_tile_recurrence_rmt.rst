@@ -2100,6 +2100,18 @@ active penalty) and ``v12``
 (``launch_dense_lr_unscaled_plasticity_reset_v12_qk_norm.py``,
 ``qk_norm_enable=True``), both with
 ``plasticity_raw_importance_log=True``/``plasticity_column_log_dir``/
-``qk_spectral_norm_diag_log=True`` for post-run verification. Neither
-finished yet -- raw progress only, per
+``qk_spectral_norm_diag_log=True`` for post-run verification.
+
+**v12 result**: GRADUATED (the curriculum's max level) at step 15143 --
+``final_vocab=126, final_k=4``, 8 level-ups, 2480s, 6.11 steps/sec. No
+prior arm this session (v5-v11) reached GRADUATED at all. The
+deviation-std verification the diagnostic was built for: rerunning the
+same early/mid/late analysis against v12's real recorded data shows
+q_proj/k_proj's deviation std staying in the same 0.4-0.8 range as
+every other layer throughout, never collapsing to v10's ~0.004 --
+QK-Norm removes the homogenization signature. ``qk_specnorm`` stayed
+flat the whole run (q~=15.2-15.35, k~=15.03-15.11), consistent with it
+actually bounding Q/K's spectral norm. Full numbers in JOURNAL.md's
+2026-09-23 "v12 GRADUATED" entry. ``v11`` (qk_l1_sparsity_coef) still
+running -- raw progress only, per
 ``feedback_present_before_keep_prune_decisions``.

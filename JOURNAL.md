@@ -10510,3 +10510,57 @@ no keep/prune verdict:
 Using the correct stage ordering (see correction above): v9 (16,3) is
 the LOWEST of the four completed real arms so far -- below v7 (32,3),
 v10 (64,2), and v8 (64,3).
+
+## 2026-09-23 -- v12 (qk_norm_enable) GRADUATED at step 15143 -- best
+## real result of the whole session so far
+
+Direct instruction after v10's Q/K homogenization finding: implement
+QK-Norm (Henry et al. 2020) and a Q/K-scoped L1 sparsity penalty
+(`qk_l1_sparsity_coef`), plus a spectral-norm diagnostic, and launch
+both as real validation. Full design/citations in
+`docs/research/toy_tile_recurrence_rmt.rst:qk_norm_design`,
+`:qk_l1_sparsity_design`, `:qk_spectral_norm_diagnostic`.
+
+v12 (`qk_norm_enable=True`) reached `GRADUATED` (the curriculum's max
+level) at step 15143 -- `final_vocab=126, final_k=4`, 2480s wall-clock,
+6.11 steps/sec. Full stage history: 8 level-ups, steps 869 / 4581 /
+6256 / 7455 / 8419 / 9217 / 10563 / 15143. No prior arm this session
+(v5 through v11) reached GRADUATED at all -- every other arm was still
+climbing or stalled somewhere in the vocab=16-64 range by step
+100,000. Raw fact, no keep/prune verdict yet.
+
+The `qk_specnorm` diagnostic stayed essentially flat the entire run
+(q~=15.2-15.35, k~=15.03-15.11) -- did not grow unboundedly, consistent
+with QK-Norm bounding the Q/K weight matrices' spectral norm as
+intended.
+
+**Deviation-std verification, per direct instruction ("capture the std
+values again to make sure it fixes it")**: reran the same early/mid/late
+deviation-std analysis used on v10's real data, against v12's real
+recorded `plasticity_column_snapshots/dense_lr_unscaled_v12_qk_norm/`
+(405 q_proj snapshots, steps 50-15118):
+
+```
+q_proj: deviation std (early/mid/late): 0.768 / 0.532 / 0.436   col_importance final: mean=0.42 max=3.23  min=0.18
+k_proj: deviation std (early/mid/late): 0.683 / 0.610 / 0.614   col_importance final: mean=0.29 max=1.41  min=0.14
+v_proj: deviation std (early/mid/late): 0.669 / 0.599 / 0.612   col_importance final: mean=1.19 max=2.68  min=0.69
+input_proj: deviation std (early/mid/late): 0.809 / 0.792 / 0.296   col_importance final: mean=2.69 max=17.83 min=0.06
+o_proj: deviation std (early/mid/late): 0.730 / 0.663 / 0.509   col_importance final: mean=0.24 max=4.00  min=0.06
+lm_head: deviation std (early/mid/late): 0.846 / 0.701 / 0.438   col_importance final: mean=0.19 max=0.35  min=0.07
+```
+
+Directly confirms the fix: q_proj/k_proj's deviation std stays in the
+same 0.4-0.8 range as every other layer throughout, NEVER collapsing
+to the ~0.004 near-zero value v10 showed by its late third -- the
+"homogenization" signature is gone, and q_proj/k_proj are no longer
+distinguishable from v_proj/o_proj/lm_head on this metric. Caveat,
+stated honestly: this run graduated in 15,143 steps vs v10's full
+100,000, so col_importance also never approaches saturation here
+(max single digits to ~18, vs v10's 97-99) -- the absolute
+col_importance comparison isn't apples-to-apples across such
+different run lengths, but the deviation-std shape (never collapsing)
+is the load-bearing confirmation and holds regardless.
+
+v11 (`qk_l1_sparsity_coef=0.05`) still running at time of writing --
+step ~17750/100000, vocab=64/k=2, progressing steadily but nowhere
+near v12's graduation speed so far. No verdict yet, raw progress only.
