@@ -10658,6 +10658,66 @@ reliable; a seed-varied replication (the same check that caught v12's
 fragility) would be the natural next step before trusting this. No
 keep/prune verdict.
 
+## 2026-09-24 -- v13b (qkvo_norm_enable, seed=1001) finished: MUCH
+## better than v12b but still didn't fully graduate, and the
+## v/o/input_proj saturation came back anyway
+
+Direct instruction: "Yep. Let's try a replication run!" `v13b`
+(`launch_dense_lr_unscaled_plasticity_reset_v13b_qkvo_norm_repeat.py`)
+-- identical config to v13, `seed=1001` (same seed choice v12b used).
+Ran the full 100,000 steps (13004s, 7.69 steps/sec).
+
+- FINAL: final_vocab=126, final_k=3, final_phase=kcycle -- did NOT
+  reach GRADUATED (k=4), unlike v13's own seed=1000 run.
+- STAGE_HISTORY: 7 level-ups -- steps 1195 / 3158 / 3716 / 4966 / 7199
+  / 8660 / 18094, then flat for the remaining ~81,900 steps on the
+  last (126,2 -> 126,3) transition's aftermath.
+- Using the correct stage ordering: v13b (126,3) is FAR ahead of
+  v12b's (64,2) -- a real, substantial improvement in robustness over
+  Q/K-only normalization, even though it fell short of v13's own
+  GRADUATED result.
+
+Deviation-std check, same analysis:
+
+```
+q_proj: std 0.473/0.370/0.233   col_importance final: mean=8.07  max=16.46 min=3.57
+k_proj: std 0.580/0.276/0.231   col_importance final: mean=7.91  max=16.77 min=3.30
+v_proj: std 0.658/0.320/0.142   col_importance final: mean=100.00 max=100.00 min=100.00
+input_proj: std 0.726/0.269/0.289   col_importance final: mean=100.00 max=100.00 min=100.00
+o_proj: std 0.634/0.390/0.157   col_importance final: mean=100.00 max=100.00 min=100.00
+lm_head: std 0.663/0.649/0.649   col_importance final: mean=0.08  max=0.10  min=0.06
+```
+
+Genuinely important complication: q_proj/k_proj stay healthy and
+UNSATURATED under this second seed too (importance mean ~8, nowhere
+near the ceiling) -- Q/K-norm's fix is holding across both seeds now.
+But v_proj/o_proj/input_proj are back to being FULLY saturated
+(exactly `min=max=mean=100.00`), the SAME pattern v12b showed, DESPITE
+v_norm_ln/o_norm_ln being active this run. The V/O normalization did
+NOT prevent this recurrence under seed=1001, even though it looked
+clean under seed=1000 (v13's own result).
+
+Working hypothesis, not yet verified: Q/K normalization bounds the
+attention SCORE directly (the literal quantity `(Q.K)*scale` feeding
+softmax), giving a tight causal link to the gradient dynamics that
+drive `importance = EMA(g^2)`. V/O normalization only bounds the
+FORWARD activation magnitude (v_attn, attn_mem_n/attn_content_n) --
+it doesn't directly cap the BACKWARD per-synapse squared-gradient
+flowing into v_proj/o_proj's weights, which is what `col_importance`
+actually tracks. If the downstream loss keeps demanding larger
+weight updates from v_proj/o_proj regardless of their OUTPUT being
+normalized, the importance accumulator can still saturate. Not
+confirmed, just the most direct read of why this fix generalized for
+Q/K but not (reliably) for V/O.
+
+Net: `qkvo_norm_enable` is more robust across seeds than the
+Q/K-only version (126,3 vs 64,2 on the harder seed), but not
+demonstrated reliable -- the v/o/input_proj saturation this whole
+investigation started from is still present under at least one seed,
+just with less immediate curriculum-stalling consequence than v9/v11
+showed. No keep/prune verdict; the V/O piece specifically may need a
+different mechanism than the Q/K piece did.
+
 ## 2026-09-23 -- v12b (QK-Norm, seed=1001) finished: did NOT replicate
 ## v12's GRADUATED result -- stalled at vocab=64/k=2 for ~90k steps
 

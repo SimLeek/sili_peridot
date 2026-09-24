@@ -2237,5 +2237,31 @@ GRADUATED even faster" entry.
 Same caveat v12b itself proved the importance of: this is one data
 point (same seed as v12's best run) -- encouraging, but not yet enough
 to call ``qkvo_norm_enable`` reliable without a seed-varied replication,
-the same check that caught v12's fragility. No keep/prune verdict, per
+the same check that caught v12's fragility.
+
+**v13b replication (seed=1001) -- much better than v12b, but still
+short of GRADUATED, and v/o/input_proj saturation came back**: direct
+instruction, "Yep. Let's try a replication run!" ``v13b``
+(``launch_dense_lr_unscaled_plasticity_reset_v13b_qkvo_norm_repeat.py``)
+-- identical config, same seed choice as v12b. Result: ran the full
+100,000 steps, 7 level-ups, final ``vocab=126, k=3`` -- did NOT reach
+GRADUATED (k=4) like v13's own run, but FAR ahead of v12b's ``(64,2)``
+-- a real, substantial robustness improvement over Q/K-only
+normalization, even short of full success.
+
+Deviation-std check: q_proj/k_proj stay healthy and unsaturated under
+this seed too (Q/K-norm's fix holds). But v_proj/o_proj/input_proj are
+back to FULLY saturated (``min=max=mean=100.00`` exactly) -- the SAME
+pattern v12b showed, DESPITE ``v_norm_ln``/``o_norm_ln`` being active.
+Working hypothesis (not verified): Q/K-norm bounds the attention
+SCORE directly, tightly coupled to the gradient dynamics driving
+``col_importance``; V/O-norm only bounds the forward activation
+magnitude, not the backward per-synapse squared-gradient that
+``col_importance`` actually tracks -- normalizing a layer's OUTPUT
+doesn't necessarily cap how hard the loss can still push its WEIGHTS.
+Net: ``qkvo_norm_enable`` is more robust than Q/K-only across seeds,
+but not demonstrated reliable -- the V/O saturation this investigation
+started from is still present under at least one seed. Full numbers in
+JOURNAL.md's 2026-09-24 "v13b... saturation came back anyway" entry.
+No keep/prune verdict, per
 ``feedback_present_before_keep_prune_decisions``.
