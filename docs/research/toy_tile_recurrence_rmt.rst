@@ -2217,13 +2217,25 @@ Not touched: the o_proj-output-L1-sparsity aux-loss recompute block
 auxiliary sparsity nudge, not part of the main attention-output
 consumption path, so O-norm doesn't apply there.
 
-**v13 real validation launched**: ``v13``
+**v13 result: GRADUATED even faster than v12, saturation gone
+everywhere**: ``v13``
 (``launch_dense_lr_unscaled_plasticity_reset_v13_qkvo_norm.py``),
-``qkvo_norm_enable=True``, otherwise identical config to v12/v12b
-(``seed=1000``, same curriculum/embed_width/k_first_target), with
-``plasticity_raw_importance_log=True``/``plasticity_column_log_dir``/
-``qk_spectral_norm_diag_log=True`` for post-run verification against
-ALL SIX pools this time (not just q/k), to see whether normalizing
-V/O too removes the saturation v12b showed shifting there, and whether
-it reproduces v12's GRADUATED result more robustly than Q/K-only did.
-No result yet, per ``feedback_present_before_keep_prune_decisions``.
+``qkvo_norm_enable=True``, ``seed=1000`` (same as v12's own GRADUATED
+run, for direct comparison). Reached GRADUATED at step 13342 (1760s) --
+FASTER than v12's step 15143 -- 8 level-ups.
+
+Deviation-std check against ALL SIX pools this time (not just q/k):
+every pool stays in the healthy 0.3-0.88 std range throughout the
+whole run, no collapse anywhere, and no layer pinned at exactly
+``col_importance=100.00`` the way v12b's v_proj/o_proj/input_proj were
+(input_proj gets closest, max=99.74, but keeps real per-column spread,
+min=0.05). Directly consistent with the hypothesis: normalizing V and
+O too removes the saturation that Q/K-only normalization left free to
+surface elsewhere. Full numbers in JOURNAL.md's 2026-09-23 "v13...
+GRADUATED even faster" entry.
+
+Same caveat v12b itself proved the importance of: this is one data
+point (same seed as v12's best run) -- encouraging, but not yet enough
+to call ``qkvo_norm_enable`` reliable without a seed-varied replication,
+the same check that caught v12's fragility. No keep/prune verdict, per
+``feedback_present_before_keep_prune_decisions``.

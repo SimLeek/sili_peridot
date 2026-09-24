@@ -10610,6 +10610,54 @@ identical config to v12 except `seed=1001` (v12 used 1000), own
 separate `plasticity_column_log_dir`/log file so v12's original
 recordings stay untouched. Running now.
 
+## 2026-09-23 -- v13 (qkvo_norm_enable) finished: GRADUATED even faster
+## than v12, and the saturation seen everywhere in v12b is gone
+
+Direct instruction, after asking whether v12b's v_proj/o_proj/
+input_proj saturation had research precedent (answered: yes, Zhai et
+al. 2023's own all-linear-layers finding, QKV-Norm being standard in
+Gemma 3/OLMo 2/Qwen 3, and this project's own o_proj-spectral-radius
+history): "Please extend the current qk_norm_enable into a
+qkvo_norm_enable, using the same pattern that works for QK to fix the
+other layers, then launch that as V13 and we'll see if that can
+perform robustly." Renamed `qk_norm_enable` -> `qkvo_norm_enable`,
+added `v_norm_ln`/`o_norm_ln`, wired into both `step()`/`step_cached()`
+with parity confirmed by a dedicated bit-exact test. Full details in
+`docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design`.
+
+v13 ran with `seed=1000` (same as v12's own GRADUATED run, for a
+direct comparison) and GRADUATED at step 13342 (1760s, 7.58
+steps/sec) -- FASTER than v12's own step 15143. Full stage history: 8
+level-ups, steps 938 / 4036 / 4776 / 5158 / 5817 / 6349 / 8269 / 13342.
+
+Deviation-std check against ALL SIX pools (not just q/k this time),
+same early/mid/late analysis:
+
+```
+q_proj: std 0.811/0.497/0.399   col_importance final: mean=0.18  max=2.97  min=0.01
+k_proj: std 0.724/0.739/0.341   col_importance final: mean=0.12  max=3.22  min=0.02
+v_proj: std 0.718/0.634/0.643   col_importance final: mean=4.02  max=36.91 min=0.05
+input_proj: std 0.853/0.768/0.712   col_importance final: mean=13.59 max=99.74 min=0.05
+o_proj: std 0.851/0.638/0.589   col_importance final: mean=2.50  max=55.22 min=0.03
+lm_head: std 0.882/0.609/0.473   col_importance final: mean=0.10  max=0.19  min=0.04
+```
+
+Every pool stays in the healthy 0.3-0.88 range throughout -- no
+collapse anywhere (unlike v10's q/k) and no layer pinned at
+`col_importance=100.00` exactly (unlike v12b's v_proj/o_proj/
+input_proj, which hit `min=max=mean=100.00`). input_proj gets closest
+(max=99.74) but keeps real heterogeneity (min=0.05), not a hard
+ceiling. Directly consistent with the hypothesis: normalizing V and
+O too removes the saturation that Q/K-only normalization left free to
+show up elsewhere.
+
+One real data point so far (same seed as v12's own best run) -- given
+v12b showed exactly how much a single seed can mislead, this result on
+its own is encouraging but not yet enough to call `qkvo_norm_enable`
+reliable; a seed-varied replication (the same check that caught v12's
+fragility) would be the natural next step before trusting this. No
+keep/prune verdict.
+
 ## 2026-09-23 -- v12b (QK-Norm, seed=1001) finished: did NOT replicate
 ## v12's GRADUATED result -- stalled at vocab=64/k=2 for ~90k steps
 
