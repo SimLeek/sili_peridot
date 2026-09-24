@@ -10878,3 +10878,65 @@ Two real data points now exist for `qk_norm_enable` -- one excellent
 (v12), one mediocre and stalled (v12b) -- not yet enough to call this
 mechanism reliable or unreliable. No keep/prune verdict; more seeds
 would be needed to say anything stronger.
+
+## 2026-09-24 -- max_abs_grad threaded through to real training; v14
+## result: fixes the literal ci=100 saturation, but curriculum
+## progress got WORSE, not better
+
+Direct instruction: "Let's set a default, thread it through, and then
+run a real mqar run with it, v14. After that, we can get back to the
+adabelief-style work." Threaded `max_abs_grad` through
+`cpu_backend.cpp`'s `DISLDOLayerV` bindings (new
+`kSynapsePolicyMaxAbsGrad = 8.0f`, data-derived from v13's own
+recorded gradient-scale distribution, joining `max_ci`/`max_abs_delta`
+as a third always-on safety clamp), `sili/sparse_rnn.py`'s
+`DISLDOLayer32.forward`, and `NOCAPS_KWARGS_FP32` in
+`train_mqar_curriculum.py` (active by default for every fp32 run now,
+not a launcher-only flag). Caught two test-local mock SynapsePolicy
+stand-ins that needed the new param too (real compile failure, not
+missed) -- full 182-test C++ + 431-test Python regression clean. Full
+details in sili__new's
+`docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip`.
+
+`v14` ran the identical config to v13b (`qkvo_norm_enable=True`,
+`seed=1001`, the harder seed where v13b's v_proj/o_proj/input_proj
+saturation recurred), now with grad clipping active by default too.
+
+- FINAL: final_vocab=126, final_k=2 -- did NOT reach (126,3) like
+  v13b did, let alone GRADUATED. WORSE than v13b on the same seed.
+- STAGE_HISTORY: 6 level-ups, last at step 11154, then flat for the
+  remaining ~88,850 steps.
+
+Deviation-std + col_importance check, same analysis:
+
+```
+q_proj: std 0.543/0.459/0.352   col_importance final: mean=0.06  max=0.37  min=0.03
+k_proj: std 0.672/0.108/0.259   col_importance final: mean=0.10  max=0.45  min=0.06
+v_proj: std 0.675/0.599/0.539   col_importance final: mean=44.03 max=47.12 min=38.82
+input_proj: std 0.705/0.735/0.577   col_importance final: mean=64.00 max=64.01 min=63.98
+o_proj: std 0.663/0.577/0.535   col_importance final: mean=65.01 max=82.64 min=39.52
+lm_head: std 0.686/0.695/0.630   col_importance final: mean=0.11  max=0.15  min=0.08
+```
+
+Genuinely nuanced result, not a clean win or loss: grad clipping DID
+do what it was built to do -- v_proj/o_proj/input_proj are no longer
+pinned at the hard `min=max=mean=100.00` ceiling v13b showed (now
+38-83, real spread, especially o_proj). The literal saturation
+mechanism this whole investigation started from is gone. But the
+curriculum outcome got WORSE anyway -- fewer level-ups, stalled
+earlier than v13b did. Working hypothesis, not verified: `max_abs_grad
+=8.0` was calibrated from v13's POOLED gradient-scale distribution
+across all 6 pools, dominated by q/k's own (now much lower,
+mean~0.06-0.10) scale -- v/o/input_proj may have a genuinely higher
+natural gradient scale that a single global constant serves poorly,
+clipping USEFUL large updates for those layers along with the harmful
+outlier spikes. A per-layer or per-column threshold (rather than one
+global constant) may be needed -- directly motivates the per-column
+AdaBelief-style work already planned as the next step, rather than
+resolving the need for it.
+
+No keep/prune verdict on `max_abs_grad` as currently calibrated. The
+mechanism itself (proven in isolation via the unit test) works exactly
+as designed; whether a single global threshold is the right shape for
+a model with layers at very different natural gradient scales is now
+a real, evidenced open question, not a hypothetical one.

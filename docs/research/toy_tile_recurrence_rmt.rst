@@ -2375,8 +2375,36 @@ clips it to 1.86x baseline for the same spike. Full details, exact
 numbers, and the TDD-process correction in sili__new's
 ``docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip``.
 
-**Still not done**: threading ``max_abs_grad`` up through
-``cpu_backend.cpp``'s bindings, ``sili/sparse_rnn.py``, and this
-project's own ``train_mqar_curriculum.py`` ``synapse_kwargs`` so a
-real MQAR run can actually opt into it -- the engine primitive exists
-and is tested, but no real training run has used it yet.
+**Update -- threaded through and validated on v13b's harder seed;
+fixes the literal saturation, but curriculum progress got WORSE**:
+direct instruction, "Let's set a default, thread it through, and then
+run a real mqar run with it, v14." Threaded ``max_abs_grad`` through
+``cpu_backend.cpp``'s ``DISLDOLayerV`` bindings (new
+``kSynapsePolicyMaxAbsGrad = 8.0f``, data-derived from v13's own
+recorded gradient-scale distribution, joining ``max_ci``/
+``max_abs_delta`` as a third always-on-by-default safety clamp at this
+layer), ``sili/sparse_rnn.py``, and ``NOCAPS_KWARGS_FP32`` -- active
+by default for every fp32 run now, not a launcher-only opt-in. Full
+threading details in sili__new's own
+``docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip``.
+
+``v14`` ran v13b's identical config (``qkvo_norm_enable=True``,
+``seed=1001``) with grad clipping now also active. Result: final
+``vocab=126, k=2`` -- WORSE than v13b's ``(126,3)`` on the same seed,
+6 level-ups, stalled at step 11154.
+
+Deviation-std check: grad clipping DID do what it was built for --
+v_proj/o_proj/input_proj are no longer pinned at the hard
+``min=max=mean=100.00`` ceiling v13b showed (now real spread, 38-83).
+But the curriculum outcome got worse anyway. Working hypothesis:
+``max_abs_grad=8.0`` was calibrated from v13's POOLED gradient-scale
+distribution across all 6 pools, dominated by q/k's own scale (now
+crushed to mean~0.06-0.10) -- v/o/input_proj may have a genuinely
+higher natural gradient scale a single global constant serves poorly,
+clipping USEFUL large updates alongside harmful spikes. A per-layer or
+per-column threshold may be needed instead of one global constant --
+directly motivates the per-column AdaBelief-style work as the next
+step, rather than resolving the need for it. Full numbers in
+JOURNAL.md's 2026-09-24 "max_abs_grad threaded through... WORSE, not
+better" entry. No keep/prune verdict on ``max_abs_grad`` as currently
+calibrated.
