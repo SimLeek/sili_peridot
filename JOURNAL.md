@@ -10473,11 +10473,40 @@ no keep/prune verdict:
 - No further level_ups across the remaining ~63,300 steps. loss_ema
   ended around 4.0-4.4; acc_ema mostly 0.05-0.15 for the back half.
 
-Compared against the other real arms (raw facts, no verdict): v10's
-final vocab=64/k=2 is below v9's ceiling of vocab=16/k=3 observed so
-far (v9 still running), and below v7/v8's own final states (vocab=32/
-k=3 and vocab=64/k=3 respectively). Whether rate=0.0001 was still too
-aggressive, too weak, or something else entirely is not analyzed
-here -- v10's own column log is available for offline inspection
+Compared against the other real arms: v10's final vocab=64/k=2 is
+below v9's ceiling of vocab=16/k=3 observed so far (v9 still running),
+and below v7/v8's own final states (vocab=32/k=3 and vocab=64/k=3
+respectively). Whether rate=0.0001 was still too aggressive, too weak,
+or something else entirely is not analyzed here -- v10's own column
+log is available for offline inspection
 (`logs/plasticity_column_snapshots/dense_lr_unscaled_v10_l2_init/`) if
 that investigation is wanted next.
+
+**Correction, caught by direct user feedback**: the comparison above
+is WRONG -- vocab dominates k in the curriculum's actual stage
+ordering (`(16,2) < (16,3) < (32,2) < (32,3) < (64,2) < (64,3)`), so
+vocab=64/k=2 comes AFTER vocab=32/k=3 in that ordering, not before it.
+v10 (64,2) is actually ahead of v7 (32,3) and ahead of v9's
+still-running position (16,3) -- only v8 (64,3) is further along. Not
+"below" as stated above. Caught because comparing two different axes
+(vocab and k) informally, without checking the actual stage order,
+produces exactly this kind of self-contradiction -- flagged here
+rather than silently corrected, so the mistake stays visible.
+
+## 2026-09-23 -- v9 (layer_l2_decay) finished: full stage history and
+## final numbers, raw facts only
+
+v9 ran the full 100,000 steps (15191s, steps/sec=6.58). Raw numbers,
+no keep/prune verdict:
+
+- FINAL: final_vocab=16, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=16, peak_k=3 (peak == final)
+- STAGE_HISTORY: only ONE level_up, at step 1347 (vocab=16,k=2 ->
+  vocab=16,k=3) -- nothing else across the remaining ~98,650 steps.
+- Ended with `l2sat=1.00, l2decay=0.88` held steady for the whole
+  observed tail -- importance stayed pinned near max_ci despite the
+  decay mechanism being active the entire run.
+
+Using the correct stage ordering (see correction above): v9 (16,3) is
+the LOWEST of the four completed real arms so far -- below v7 (32,3),
+v10 (64,2), and v8 (64,3).
