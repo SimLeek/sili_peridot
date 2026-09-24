@@ -2265,3 +2265,100 @@ started from is still present under at least one seed. Full numbers in
 JOURNAL.md's 2026-09-24 "v13b... saturation came back anyway" entry.
 No keep/prune verdict, per
 ``feedback_present_before_keep_prune_decisions``.
+
+.. _toy_tile_recurrence_rmt.col_importance_is_rmsprop_v_t:
+
+``col_importance`` is literally RMSprop/Adam's second-moment state -- what the optimizer literature says about it saturating
+--------------------------------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.col_importance_is_rmsprop_v_t``
+
+Direct question, after v13b showed v/o/input_proj saturation
+recurring despite ``qkvo_norm_enable``: "It seems to be the importance
+saturating for those specifically, right? ... it would be the
+optimizer state for rmsprop and the second optimizer state for adam
+iirc." Confirmed directly against the engine code
+(``sili__new/sili/lib/headers/delta_csr_types.hpp``,
+``BoundedRMSpropSynapsePolicy::update_ci``) rather than just agreeing:
+``ci`` (per-synapse, aggregated into ``col_importance`` at the
+column level) is not just analogous to Adam/RMSprop's ``v_t`` -- it
+IS that state, same formula, same default ``beta2=0.999``:
+
+.. code-block:: text
+
+    ema = beta2*ci + (1-beta2)*(g*g + contrib*contrib)
+    ci  = clamp(ema, floor, max_ci)             # max_ci = 100.0, a HARD ceiling
+    delta = -eff_lr * g * S / (sqrt(ci) + eps)  # Adam/RMSprop's v_t-normalized update
+
+``max_ci=100`` exists specifically because this accumulator was
+measured climbing UNBOUNDED without a cap (0.0005 -> 163+ in an
+unsafe-pocket run, see ``synapse_policy.bounded_beats_plain`` in
+sili__new's own delta_csr_types.rst). "Saturating at exactly 100.00"
+is this project's circuit-breaker catching what would otherwise be
+unbounded ``v_t`` growth -- functionally identical consequence either
+way: ``sqrt(ci)`` maxes out, the per-synapse effective learning rate
+collapses toward zero, the synapse freezes regardless of whether it's
+still receiving real, useful error signal.
+
+Web-researched how the optimizer literature (not just the
+continual-learning literature already cited for L2 Init/Continual
+Backprop) handles this:
+
+- **AdaBelief** (Zhuang et al. 2020, NeurIPS) -- replaces
+  ``v_t = beta2*v_{t-1} + (1-beta2)*g_t^2`` with
+  ``s_t = beta2*s_{t-1} + (1-beta2)*(g_t - m_t)^2``, the squared
+  DEVIATION from the gradient's own recent EMA (``m_t``), not the raw
+  squared gradient. A gradient that's large but consistent/predictable
+  (``g_t ~= m_t``) keeps ``s_t`` small and the step size large; only a
+  gradient that's large AND surprising throttles the step. This maps
+  almost exactly onto this project's own "Critical flaw found"
+  reasoning from the (larger, not-yet-built) plasticity-reset plan: a
+  column receiving real, sustained, correctly-attributed error signal
+  has ``ci`` grow and stay high PRECISELY BECAUSE it's stuck -- a
+  self-sustaining bad equilibrium that a raw-``g^2`` accumulator can
+  never see past. AdaBelief targets that failure mode structurally,
+  not reactively (unlike layer_l2_decay/L2 Init/plasticity_reset,
+  which all decay/reset AFTER ``ci`` gets high, rather than measuring
+  a quantity that wouldn't get high in the first place for a
+  legitimately-useful-but-currently-large gradient).
+- AMSGrad (Reddi et al. 2018) -- keeps a running MAX of ``v_t``; fixes
+  the OPPOSITE problem (``v_t`` shrinking too fast late in training),
+  not applicable here.
+- Adafactor (Shazeer & Stern 2018) -- pairs its second-moment estimate
+  with explicit RMS-based update clipping and a beta2 schedule that
+  increases over training, rather than changing the moment formula.
+
+**Ruled out, direct instruction**: "we can't add any more optimizer
+bytes into the weights, so those would have to stay rmsprop." AdaBelief
+needs a THIRD per-synapse accumulator (``m_t``, the first-moment EMA of
+``g_t``) alongside the existing ``weight``/``ci`` pair -- an extra
+per-synapse float this project's own compute/bandwidth-bound scattered-
+CSR design (``project_sili_sparsity_deployment_target``,
+``project_sili_optimal_hardware_vision``) explicitly cannot absorb.
+The per-synapse ``ci`` mechanism stays exactly the current
+single-state ``BoundedRMSpropSynapsePolicy`` -- AdaBelief is not being
+built here, in this form, full stop.
+
+**TODO, direct instruction ("I also would like the clipping fixed, so
+maybe make that a todo item")**: a real, zero-extra-memory gap found
+while investigating this -- ``clip_grad_norm_`` in
+``train_mqar_curriculum.py`` is applied ONLY to
+``model.parameters_for_optimizer()`` (the small LayerNorm-gain/
+centers/log_sigmas params). The actual per-synapse gradients feeding
+``BoundedRMSpropSynapsePolicy::update_ci`` for q/k/v/o/input_proj/
+lm_head -- the ones actually driving the saturation under
+investigation -- are NEVER clipped before being squared into the ``ci``
+EMA. Standard Adam/RMSprop practice clips gradients BEFORE squaring
+them into the second-moment accumulator specifically to stop a
+transient outlier-gradient spike from getting permanently baked into a
+slow (``beta2=0.999``) EMA. Confirmed via grep that no equivalent
+exists anywhere in the C++ per-synapse backward/update path
+(``sisldo_ops.hpp``, ``linear_disldo_backward.hpp``) -- searched for
+``grad_clip``/``clip_grad``/``max_grad`` and found nothing but an
+unrelated AQRS rank-control threshold check. NOT YET IMPLEMENTED --
+recorded here as an open item, not built this session. Needs its own
+design pass (where in the per-synapse update path to clip, what the
+clip threshold/schedule should be, whether it's a global constant or
+per-layer/per-column, TDD both scattered+block4 per
+``feedback_block4_scattered_parity_required``) before touching
+``sili__new``.
