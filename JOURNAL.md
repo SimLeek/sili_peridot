@@ -10609,3 +10609,48 @@ recordings when running v12 again." `v12b`
 identical config to v12 except `seed=1001` (v12 used 1000), own
 separate `plasticity_column_log_dir`/log file so v12's original
 recordings stay untouched. Running now.
+
+## 2026-09-23 -- v12b (QK-Norm, seed=1001) finished: did NOT replicate
+## v12's GRADUATED result -- stalled at vocab=64/k=2 for ~90k steps
+
+Ran the full 100,000 steps (11694s, 8.55 steps/sec). Raw facts, no
+spin:
+
+- FINAL: final_vocab=64, final_k=2, final_phase=kcycle -- did NOT
+  graduate.
+- PEAK: peak_vocab=64, peak_k=2 (peak == final).
+- STAGE_HISTORY: 4 level-ups, all within the first 10,168 steps (868 /
+  5053 / 5635 / 10168), then flat for the remaining ~89,832 steps.
+- This is a real, direct contradiction of v12's own result under the
+  same config -- v12 (seed=1000) reached GRADUATED (vocab=126, k=4) by
+  step 15143; v12b (seed=1001) got stuck at (64,2) and never moved
+  again for the rest of the run. Exactly the scenario
+  `feedback_statistical_power_not_seeding` warns about: a single
+  striking seed is not evidence the mechanism reliably works.
+
+Deviation-std check, same analysis as v10/v12/v11:
+
+```
+q_proj: std 0.596/0.430/0.272   col_importance final: mean=7.69  max=71.87  min=0.25
+k_proj: std 0.606/0.244/0.244   col_importance final: mean=4.70  max=78.35  min=0.50
+v_proj: std 0.692/0.245/0.068   col_importance final: mean=100.00 max=100.00 min=100.00
+input_proj: std 0.731/0.437/0.347   col_importance final: mean=100.00 max=100.00 min=100.00
+o_proj: std 0.603/0.257/0.216   col_importance final: mean=100.00 max=100.00 min=100.00
+lm_head: std 0.695/0.645/0.572   col_importance final: mean=0.11  max=0.21  min=0.08
+```
+
+q_proj/k_proj again do NOT collapse to v10's ~0.004 (QK-Norm still
+avoids that specific signature under this seed too) -- but v_proj/
+o_proj/input_proj are now FULLY saturated (`min=max=mean=100.00`
+exactly), a DIFFERENT saturation pattern than v10 ever showed (v10's
+saturation was concentrated in q/k specifically). Raw, unexplained
+observation: QK-Norm removing q/k's own collapse does not appear to
+prevent saturation from showing up elsewhere -- whether that's the
+actual cause of this run's stall is not established, just noted
+honestly rather than assumed.
+
+Net: v12's GRADUATED result does NOT replicate under a different seed.
+Two real data points now exist for `qk_norm_enable` -- one excellent
+(v12), one mediocre and stalled (v12b) -- not yet enough to call this
+mechanism reliable or unreliable. No keep/prune verdict; more seeds
+would be needed to say anything stronger.

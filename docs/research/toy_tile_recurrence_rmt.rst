@@ -2127,10 +2127,26 @@ that signature alone didn't guarantee fast progress here the way it
 appeared to for v12. Raw finding, not yet explained. Full numbers in
 JOURNAL.md's 2026-09-23 "v11 finished" entry.
 
-**v12 replication (v12b)**: direct instruction, "Launch V12 again to
-validate... Keep both the new and old recordings." ``v12b``
+**v12 replication (v12b) -- did NOT reproduce GRADUATED**: direct
+instruction, "Launch V12 again to validate... Keep both the new and
+old recordings." ``v12b``
 (``launch_dense_lr_unscaled_plasticity_reset_v12b_qk_norm_repeat.py``)
 -- identical config, ``seed=1001`` instead of v12's 1000, own separate
-``plasticity_column_log_dir``/log file so v12's original recordings
-stay untouched. Running now, per
-``feedback_present_before_keep_prune_decisions``.
+recordings so v12's original stays untouched. Result: ran the full
+100,000 steps, 4 level-ups all within the first 10,168 steps, then
+FLAT at ``vocab=64, k=2`` for the remaining ~89,832 steps -- did NOT
+graduate, a direct contradiction of v12's own GRADUATED result under
+the identical config. Exactly the scenario
+``feedback_statistical_power_not_seeding`` warns about: a single
+striking seed is not evidence a mechanism reliably works.
+
+Deviation-std check still shows q_proj/k_proj avoiding v10's ~0.004
+collapse here too, but v_proj/o_proj/input_proj are now FULLY
+saturated (``col_importance`` exactly 100.00 min/max/mean) -- a
+DIFFERENT saturation pattern than v10 ever showed. Whether that's the
+actual cause of this run's stall is not established, only noted.
+Full numbers in JOURNAL.md's 2026-09-23 "v12b... did NOT replicate"
+entry. Net: two real data points for ``qk_norm_enable`` now exist --
+one excellent (v12), one stalled (v12b) -- not enough to call this
+mechanism reliable either way. No keep/prune verdict; more seeds
+needed, per ``feedback_present_before_keep_prune_decisions``.
