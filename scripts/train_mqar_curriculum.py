@@ -83,7 +83,12 @@ NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 # See docs/research/train_mqar_curriculum.rst:train_curriculum.fp8_max_abs_delta_scale_space_bug.
 NOCAPS_KWARGS_FP8 = {"max_abs_delta": 2.0, "max_ci": 1e30}
 # See docs/research/train_mqar_curriculum.rst:train_curriculum.fp32_unbounded_weight_blowup.
-NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0}
+# max_abs_grad=8.0: data-derived from v13's real recorded gradient-scale
+# distribution (sqrt(raw_importance) across all 6 pools, p99.9~=6.34,
+# p99.99~=9.85) -- see
+# docs/research/toy_tile_recurrence_rmt.rst:col_importance_is_rmsprop_v_t
+# and sili__new's docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0, "max_abs_grad": 8.0}
 PRECISION_SYNAPSE_KWARGS = {
     "fp4": NOCAPS_KWARGS,
     "fp8": NOCAPS_KWARGS_FP8,
