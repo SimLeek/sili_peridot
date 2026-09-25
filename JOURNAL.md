@@ -10940,3 +10940,59 @@ mechanism itself (proven in isolation via the unit test) works exactly
 as designed; whether a single global threshold is the right shape for
 a model with layers at very different natural gradient scales is now
 a real, evidenced open question, not a hypothetical one.
+
+## 2026-09-25 -- AdaBelief-style row/column centering built, threaded
+## through, v15 (column-only) + v16 (row+column) launched
+
+sili__new side (separate repo, `feature/dy-external-gate-hook`,
+commits `f8ef337`/`cb111ff`): built the per-column AdaBelief-style
+centering work v14's result motivated. `update_ci` gains a trailing
+`m` parameter (default 0, true no-op); centers via
+`residual = clip(g - m, ...)` instead of `clip(g, ...)`. New
+`FirstMomentTracker<VALUE_TYPE>` tracks an ADDITIVE row+column baseline
+`m[i,j] = m_row[i] + m_col[j]`, each axis an independent EMA of signed
+`g` -- chosen over Adafactor's multiplicative row/column
+reconstruction after catching, before implementing, that its
+I-divergence optimality only holds for a nonnegative target (`g^2`),
+not the signed `g` this project needs. Found and fixed a real
+double-counting bug via an end-to-end smoke test (not caught by unit
+tests alone): fitting each axis to raw `g` independently made
+`m_row+m_col` overshoot toward `2g` instead of `g` under confounded
+row/column effects (constant x/dy across a layer) -- fixed by having
+each axis fit the residual against the OTHER axis's OLD (pre-this-
+touch) value instead. Verified: row+column mean importance went from
+16.8844 (buggy, barely different from no-centering's 16.9364) to
+0.4407 (fixed, on par with column-only's 0.5327). 191/191 C++ tests +
+198 pytest pass. Full derivation in sili__new's
+`docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering`.
+
+Threaded through: `sili/sparse_rnn.py`'s `DISLDOLayer32.forward` gets
+`centering_row_enable`/`centering_col_enable`/`centering_beta1` kwargs
+(same `float | None = None` opt-in pattern as `max_abs_grad`). This
+repo's `train_mqar_curriculum.py` gets the same 3 params on
+`train_curriculum`, merged into `synapse_kwargs` (and thus reaching
+every layer via `self.synapse_kwargs`, same broadcast mechanism
+`NOCAPS_KWARGS_FP32` already uses) only when explicitly set -- default
+behavior byte-identical.
+
+`v15`/`v16`: same base config as v14 (`qkvo_norm_enable=True`,
+`seed=1001`, the harder seed), `max_abs_grad=8.0` still active by
+default (complementary to centering, not replaced by it -- clipping
+defends a one-off spike, centering defends a sustained one). Both
+smoke-tested at 150 steps before queuing (finite output, plausible
+steps/sec ~13, no exceptions).
+
+- **v15** (`launch_dense_lr_unscaled_plasticity_reset_v15_qkvo_norm_
+  centering_col.py`): `centering_col_enable=True` only.
+- **v16** (`launch_dense_lr_unscaled_plasticity_reset_v16_qkvo_norm_
+  centering_rowcol.py`): `centering_row_enable=True` AND
+  `centering_col_enable=True`.
+
+Both launched as real 100k-step background runs, logging to
+`logs/dense_lr_unscaled_plasticity_reset_v15_qkvo_norm_centering_col.log`
+and `logs/dense_lr_unscaled_plasticity_reset_v16_qkvo_norm_centering_
+rowcol.log` respectively, plus their own
+`plasticity_column_snapshots/` directories for post-hoc deviation-std
+verification. Direct instruction: "Yep. As usual, please thread it
+through and then launch v15 and v16." Results not yet in -- no
+keep/prune verdict yet, per usual discipline.

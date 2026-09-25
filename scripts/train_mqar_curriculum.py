@@ -515,6 +515,21 @@ def train_curriculum(
     # performance.
     # See docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic.
     qk_spectral_norm_diag_log: bool = False,
+    # AdaBelief-style row/column centering on the RMSprop-style ci
+    # accumulator itself (sili__new's update_ci m parameter -- distinct
+    # from every plasticity_reset_* mechanism above, which operates on
+    # col_importance/weight, not on ci's own gradient-EMA formula).
+    # Motivated by v14 (max_abs_grad clipping alone regressed curriculum
+    # progress vs v13b): clipping defends a one-off spike, centering
+    # defends a SUSTAINED large gradient that would otherwise keep ci
+    # pinned near max_abs_grad^2 forever. False/False (default):
+    # byte-identical, no extra work -- merged into synapse_kwargs (and
+    # thus reaches every DISLDOLayer32 layer's forward() call via
+    # self.synapse_kwargs) only when explicitly enabled. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+    centering_row_enable: bool = False,
+    centering_col_enable: bool = False,
+    centering_beta1: float | None = None,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -590,6 +605,14 @@ def train_curriculum(
         dynamic_rank_control = False
     state_width = embed_width * COLUMN_NEURONS
 
+    layer_synapse_kwargs = dict(PRECISION_SYNAPSE_KWARGS[precision])
+    if centering_row_enable:
+        layer_synapse_kwargs["centering_row_enable"] = True
+    if centering_col_enable:
+        layer_synapse_kwargs["centering_col_enable"] = True
+    if centering_beta1 is not None:
+        layer_synapse_kwargs["centering_beta1"] = centering_beta1
+
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
     if hasattr(_cpu, "seed_fp4_stochastic_rng"):
@@ -611,7 +634,7 @@ def train_curriculum(
         l1_sparsity_coef=L1_SPARSITY_COEF,
         qk_l1_sparsity_coef=qk_l1_sparsity_coef,
         qkvo_norm_enable=qkvo_norm_enable,
-        synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]),
+        synapse_kwargs=layer_synapse_kwargs,
         scale_rank=1,
         additive_rank=additive_rank,
         dynamic_rank_control=dynamic_rank_control,
