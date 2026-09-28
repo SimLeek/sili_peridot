@@ -530,6 +530,23 @@ def train_curriculum(
     centering_row_enable: bool = False,
     centering_col_enable: bool = False,
     centering_beta1: float | None = None,
+    # CiRenorm -- rescales a layer's real ci back toward a healthy
+    # region every call (never resets/prunes any synapse, unlike
+    # plasticity_reset_* above). Motivated directly by the v12-v16
+    # statistical analysis: "the average ci of a layer is literally
+    # inversely proportional to the average plasticity of that
+    # layer... importance was not a misnomer" -- rules out resetting
+    # high-ci synapses (genuinely important) in favor of rescaling.
+    # "off" (default): byte-identical, no extra work. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.ci_renorm.
+    ci_renorm_enable: str = "off",  # "off" | "trust_ratio" | "stable_region"
+    ci_renorm_touch_fraction: float = 0.01,
+    ci_renorm_min_chunk: int = 4,
+    ci_renorm_max_chunk: int = 2048,
+    ci_renorm_eff_lr: float = 0.01,
+    ci_renorm_max_ci_ref: float = 100.0,
+    ci_renorm_trust_ratio_min: float = 0.1,
+    ci_renorm_trust_ratio_max: float = 10.0,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -1058,6 +1075,17 @@ def train_curriculum(
                                 _live_display.update_pool(_key, step, _imp, _w, _dev, _col_state["col_reset_active"])
                                 if _live_display.closed():
                                     _live_display = None
+                if ci_renorm_enable != "off":
+                    model.apply_ci_renorm(
+                        touch_fraction=ci_renorm_touch_fraction,
+                        min_chunk=ci_renorm_min_chunk,
+                        max_chunk=ci_renorm_max_chunk,
+                        mode=ci_renorm_enable,
+                        eff_lr=ci_renorm_eff_lr,
+                        max_ci_ref=ci_renorm_max_ci_ref,
+                        trust_ratio_min=ci_renorm_trust_ratio_min,
+                        trust_ratio_max=ci_renorm_trust_ratio_max,
+                    )
                 if l2_init_enable:
                     model.apply_l2_init(
                         touch_fraction=l2_init_touch_fraction,

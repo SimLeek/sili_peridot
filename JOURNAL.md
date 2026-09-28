@@ -10996,3 +10996,89 @@ rowcol.log` respectively, plus their own
 verification. Direct instruction: "Yep. As usual, please thread it
 through and then launch v15 and v16." Results not yet in -- no
 keep/prune verdict yet, per usual discipline.
+
+## 2026-09-28 -- v15 GRADUATED, v15b/v15c/v16 all stalled; deep
+## statistical pass on all 7 runs; CiRenorm built and launched as v17/v18
+
+**v15 result**: GRADUATED at step 15063, `final_vocab=126 final_k=4`,
+8 level-ups -- clearly better than every other arm in this
+investigation (v14 stalled at (126,2), v16 at (126,3)).
+
+**Verification runs, direct instruction ("launch v15 again to
+verify" then "launch a new seed v15 too for v15c")**: `v15b` (identical
+config+seed=1001, checking this project's own documented multi-threaded
+backward nondeterminism) and `v15c` (seed=1000, checking generalization
+across seeds) both launched, smoke-tested, committed. Neither
+reproduced v15's graduation -- both stalled at `(126,3)`, matching v16.
+v15's graduation did not replicate on either axis tested.
+
+**Deep statistical pass** across all 7 same-family runs (v13/v13b/v14/
+v15/v15b/v15c/v16, 84,121 per-layer-per-cycle snapshots extracted from
+`plasticity_column_snapshots/`) plus targeted literature research (see
+sili__new's own `docs/research/delta_csr_types.rst:synapse_policy.
+ci_renorm` for the full writeup). Key findings, stated as descriptive
+patterns (n=3 graduated vs n=6 stalled is too small for a valid
+significance test -- permutation tests need ~10+/group to reach
+p<0.05 at all):
+
+- Graduated runs keep `v_proj`/`o_proj`/`input_proj`'s AVERAGE `ci` low
+  (medians ~0.1-1.5); every stalled run's average `ci` in those layers
+  climbs toward `max_ci=100` and NEVER recovers spontaneously within
+  100k steps (checked explicitly across all 5 stalled runs -- zero
+  "slingshot"-style plateau exits).
+- Direct instruction after this finding: "the average ci of a layer is
+  literally inversely proportional to the average plasticity of that
+  layer... importance was not a misnomer" -- this rules OUT the
+  per-neuron plasticity_reset mechanism's own reset-to-random-weights
+  action as a fix (the highest-ci columns are genuinely the most
+  important ones; resetting them is real information loss, not a
+  repair). Direct instruction: "Plasticity reset fraction should be
+  removed entirely" (not yet removed from the codebase this session --
+  `reset_fraction=0.0` was already a documented no-op in every v13-v16
+  launcher; actual removal is a separate follow-up).
+
+**CiRenorm built** (sili__new side, commits `6f05ed4`/`7b517b8`): a NEW
+mechanism that RESCALES a layer's real per-synapse `ci` back toward a
+healthy region (never resets/prunes any synapse, preserves relative
+ranking). Two arms tried per direct instruction ("try that, but also
+just try a method that regularly forces the column/layer importance
+average to be in the stable region... stable average and variance
+too... then run both"):
+
+- **TrustRatio**: LAMB-inspired (You et al. 2019) multiplicative
+  rescale toward a target ci implied by each column's own weight norm
+  -- self-calibrating, no manual targets needed.
+- **StableRegion**: affine (z-score) renormalize toward per-layer
+  `(mean, std)` targets pulled directly from v13/v15's own real
+  recorded data.
+
+Found and fixed 4 real bugs during the build (full details in
+sili__new's RST doc): a cursor-resume bug in the pre-existing amortized
+traversal pattern (unconditional `elem_pos` reset double-touches
+cells), a circularity bug in TrustRatio's first formula (estimating `g`
+from `ci` while dividing by `ci` cancels out), a stale-reference
+convergence bug (accumulating stats from the pre- instead of
+post-correction value made corrections collapse toward 0 instead of
+converging -- found via an end-to-end smoke test), and a missing-
+equilibrium bug in TrustRatio (a raw per-touch scale has no fixed
+point, causing geometric decay -- also found via the smoke test).
+211/211 C++ tests pass.
+
+**Threaded through** (this repo): `model/toy_tile_recurrence_rmt.py`
+gets `apply_ci_renorm(touch_fraction, mode, eff_lr, ...)`, iterating
+every real layer, using empirically-derived per-layer stable-region
+targets for `q_proj`/`k_proj`/`v_proj`/`input_proj`/`o_proj`/`lm_head`.
+`train_mqar_curriculum.py` gets `ci_renorm_enable: str = "off"` (|
+"trust_ratio" | "stable_region") plus the usual touch_fraction/chunk
+knobs, called once per real query step. Both modes smoke-tested at 150
+steps; full 431-test pytest regression clean.
+
+**v17/v18 launched**: v14's base config (`qkvo_norm_enable=True`,
+`seed=1001`, `max_abs_grad=8.0` default), deliberately WITHOUT
+centering -- isolates CiRenorm's own contribution against the same
+baseline v15/v16 were compared to, rather than confounding it with
+centering's already-inconclusive effect ("do science correctly":
+enumerate every difference before an A/B). v17 = `ci_renorm_enable=
+"trust_ratio"`, v18 = `ci_renorm_enable="stable_region"`. Both
+smoke-tested at 150 steps before queuing. Results not yet in -- no
+keep/prune verdict.

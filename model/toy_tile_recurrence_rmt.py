@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from typing import ClassVar
 
 import numpy as np
 from sili.energy import EnergyDynamics
@@ -1185,6 +1186,94 @@ class ToyTileRecurrenceRMT:
                     )
                 stats = dict(stats, block4=block4_stats)
             results[name] = {"importance": stats}
+        return results
+
+    # Empirically-derived per-layer (target_mean, target_std) for
+    # CiRenorm's StableRegion arm -- medians from real GRADUATED runs
+    # (v13/v15, step>=3000 window) of sili_peridot's own dense-vs-sparse
+    # MQAR investigation. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.ci_renorm.
+    _CI_RENORM_STABLE_TARGETS: ClassVar[dict[str, tuple[float, float]]] = {
+        "q_proj": (0.09, 0.18),
+        "k_proj": (0.10, 0.13),
+        "v_proj": (0.40, 0.35),
+        "input_proj": (1.05, 1.47),
+        "o_proj": (0.20, 0.67),
+        "lm_head": (0.09, 0.03),
+    }
+
+    def apply_ci_renorm(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        mode: str = "off",
+        eff_lr: float = 0.01,
+        max_ci_ref: float = 100.0,
+        trust_ratio_min: float = 0.1,
+        trust_ratio_max: float = 10.0,
+    ) -> dict:
+        """EXPERIMENTAL -- rescales each layer's real per-synapse ci back
+        toward a healthy region every call (never resets/prunes any
+        synapse). See
+        sili__new's docs/research/delta_csr_types.rst:synapse_policy.ci_renorm
+        for the full derivation, including the "importance was not a
+        misnomer" motivation for rescaling instead of the per-neuron
+        plasticity_reset mechanism's top-K reset action.
+
+        mode="off" (default): byte-identical no-op. "trust_ratio":
+        LAMB-inspired multiplicative rescale toward a weight-norm-implied
+        target, self-calibrating, no manual targets needed.
+        "stable_region": affine renormalize toward
+        _CI_RENORM_STABLE_TARGETS' empirically-derived per-layer
+        (mean, std) -- a layer not in that dict (e.g. critic_head) is
+        skipped. Same touch_fraction/chunk sizing as apply_plasticity_reset."""
+        if mode == "off":
+            return {}
+        mode_int = {"trust_ratio": 1, "stable_region": 2}[mode]
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            if not hasattr(layer, "apply_amortized_ci_renorm"):
+                continue
+            if mode == "stable_region":
+                if name not in self._CI_RENORM_STABLE_TARGETS:
+                    continue
+                target_mean_scalar, target_std_scalar = self._CI_RENORM_STABLE_TARGETS[name]
+                target_mean = np.full(layer.out_features, target_mean_scalar, dtype=np.float32)
+                target_std = np.full(layer.out_features, target_std_scalar, dtype=np.float32)
+            else:
+                target_mean = np.empty(0, dtype=np.float32)
+                target_std = np.empty(0, dtype=np.float32)
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            stats = layer.apply_amortized_ci_renorm(
+                chunk_size,
+                mode_int,
+                target_mean,
+                target_std,
+                eff_lr,
+                max_ci_ref,
+                trust_ratio_min,
+                trust_ratio_max,
+            )
+            if hasattr(layer, "apply_amortized_block4_ci_renorm"):
+                stats = dict(
+                    stats,
+                    block4=layer.apply_amortized_block4_ci_renorm(
+                        block4_chunk_size,
+                        mode_int,
+                        target_mean,
+                        target_std,
+                        eff_lr,
+                        max_ci_ref,
+                        trust_ratio_min,
+                        trust_ratio_max,
+                    ),
+                )
+            results[name] = stats
         return results
 
     def apply_l2_init(
