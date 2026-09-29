@@ -11247,9 +11247,24 @@ Only one level-up ever (step 6967, k2->k3), then flat for the remaining
 (loss 2.26->3.82 within ~33 steps at the step 6967->7000 boundary).
 
 **v22 (no wake_gate_steps) result**: final/peak vocab=32, k=3 -- a real
-stall, but matching v19b/v19c's stall level, meaningfully better than
-v21. Stage history: 16k2->16k3 (step 1278), 16k3->32k2 (step 4172),
-32k2->32k3 (step 7724), then flat for the remaining ~92000 steps.
+stall, meaningfully better than v21. Stage history: 16k2->16k3 (step
+1278), 16k3->32k2 (step 4172), 32k2->32k3 (step 7724), then flat for
+the remaining ~92000 steps.
+
+**CORRECTION (caught re-checking the raw STAGE_HISTORY, not from a new
+run)**: the "matching v19b/v19c's stall level" claim above was wrong --
+v19b/v19c's real stage histories show they cleared the ENTIRE
+vocab-doubling curriculum fast (16->32->64->126, all within ~9200
+steps) and only stalled on the FINAL k-increment at the vocab CEILING
+(v19b: stuck at vocab=126/k=3 from step 9201; v19c: stuck at
+vocab=126/k=2 from step 5097) -- a k-cycle stall at the top of the
+curriculum, not a vocab-doubling stall. v21 (stuck at vocab=16) and v22
+(stuck at vocab=32) never even reached vocab=64, let alone the 126
+ceiling -- this is an earlier and more severe stall than either
+pre-energy baseline failure, not a comparable one. The pure energy
+mechanism, even in its best (no-gate) form tested so far, is currently
+making curriculum progress WORSE than the CiRenorm+WeightRenorm+
+plasticity_reset baseline (v19), not neutral.
 
 **Why v21 underperformed v22 -- found via direct measurement, not
 inference**: an instrumented probe (mirroring v21's config exactly,
