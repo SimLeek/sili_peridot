@@ -920,3 +920,20 @@ backward-only-with-dense-forward setup tested so far) struggles to
 reach the full vocab=126/k=3 milestone -- the fix is more likely to be
 "amortize better" (time-division, coverage guarantees) than "select
 better" (a smarter magnitude/energy signal).
+
+**Disambiguation, 2026-09-29 (do not conflate the two "energy"s)**:
+the "energy" in "magnitude/energy-based ``dy_r_target``" above is
+SIGNAL-PROCESSING energy -- ``top_k_csr_nucleus``'s cumulative sum of
+squared ``|dy|``, a magnitude proxy. It's still fundamentally
+"chase the biggest gradient," which is exactly the class of selection
+signal this note found underperforms Arm C. ``EnergyDynamics`` (see
+``sili/energy.py``, ``apply_energy_dynamics.decay_mean_reversion``)
+tracks a DIFFERENT, per-neuron homeostatic quantity that is
+ANTI-correlated with recent activity by construction (quiet neurons
+accumulate it, active ones drain it) -- it shares Arm C's "guaranteed
+attention to underused elements" fairness property that WON here,
+while still being state-informed rather than blind time-division. A
+top-k-by-``EnergyDynamics``-state grad-selection arm is NOT a rerun of
+the already-rejected magnitude/signal-energy result above and is
+untested -- see the MQAR investigation's own scratch notes (2026-09-29)
+for the proposed design.
