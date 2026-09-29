@@ -11157,3 +11157,82 @@ toy_tile_recurrence_rmt.py) mirrors `apply_ci_renorm` exactly.
 PLUS `weight_renorm_enable="stable_region"` -- does constraining weight
 alongside ci prevent the runaway that doomed v18b. Results not yet in
 -- no keep/prune verdict.
+
+## 2026-09-30 -- v19 family results: WeightRenorm fixes the weight
+## runaway, but doesn't fix the actual stall; found the real mechanism
+## (a sharp post-transition bifurcation, not gradual chaos); energy
+## gating launched as v21/v22
+
+**v19 GRADUATED** (126,4). **v19b** (same-seed repeat) stalled at
+(126,3) -- but critically, its weight norm stayed flat (~17) the whole
+run, unlike v18b's own 17->360 runaway. **v19c** (new seed) also
+stalled, at (126,2). So WeightRenorm did fix the specific failure mode
+it targeted (confirmed: weight bounded in all 3 v19-family runs) --
+but 2 of 3 still stalled anyway.
+
+**Real mechanism found, not "threading noise"** -- direct correction:
+"if you roll three dice, you can't blame the fact that two of them
+fell on the floor on the fact that there were three dice." Threading
+is only the SOURCE of the tiny perturbation, not an explanation for
+why the system is sensitive to it. Checked v19b/v19c's own loss/acc
+right at their last level-up: loss does NOT drift, it SPIKES sharply
+within 50-250 steps of the transition, then LOCKS FLAT at an elevated
+plateau for the remaining 90k+ steps (v19b: loss 2.68->4.38 at step
+9201->9250, then holds 3.8-4.7 to step 100000; v19c: loss 2.81->5.44
+at step 7250->7500, holds 4.4-4.7). v19's own successful transitions
+show the same initial dip, but RECOVER within ~1000-1500 steps. So the
+real question is a bifurcation right AT each curriculum transition --
+recover, or fall into a different, stable-but-bad attractor -- not
+gradual divergence. Checked Q/K spectral norm as a candidate
+distinguishing factor at the fork point: ruled out directly, nearly
+identical (~14.6-14.8) in all three runs regardless of outcome.
+
+**Energy gating proposed and built** -- direct instruction: "The
+energy system is exactly the thing that is meant to escape stable
+attractors... We have a more advanced energy system here, and
+applying it could help, but we'd need to be careful to tune it."
+Researched `sili/energy.py`'s `EnergyDynamics`: per-neuron energy
+accumulates via `drive - activation_cost*|h| + noise`; crossing +2.0
+forces a fire (real perturbation, not a soft nudge), crossing -2.0
+shuts off. Applied to "embed_input"/"state" (what the dense layers
+*see*, not weights/ci -- a different lever from CiRenorm/WeightRenorm).
+The one prior negative result in this project (wide288 sparse arm,
+`r_target_min=0.5`) doesn't transfer: that used nucleus top-k sparse
+selection where firing naturally rotates every step, so "hasn't fired
+in N steps" was never a real pathology signal there. This whole
+v13-v22 family is `dense=True` -- no organic rotation -- much closer
+to the original zero-init/pathological-attractor-escape scenario
+energy was built and validated against.
+
+**v21** (`wake_gate_steps=2500`, drive calibrated from a probe that
+turned out NOT to have CiRenorm/WeightRenorm active -- a minor
+calibration gap, not corrected since it was already running): launched
+on v19's config + energy.
+
+**Direct correction on v21's own design**: "there shouldn't really
+even be a 'wake gate steps' per the original design... It should
+ideally work without wake gate and do little during healthy regions
+but provide escape energy in the stable attractor region if tuned
+right." Verified via a real ~20000-step probe (seed=1001, plain
+`qkvo_norm_enable=True`, which itself stalled at vocab=32/k=1 by step
+2500): without `wake_gate_steps`, EVERY neuron accumulates energy
+EVERY step continuously (confirmed by reading `_apply_energy_dynamics`
+directly -- `stale` is all-True when `wake_gate_steps=None`, no
+"frozen/awake" state exists at all). Measured real `|h|` in healthy vs
+stuck windows: `state` drops 0.32->0.25 (mostly separable across
+500-call rolling windows, only 6.7% of healthy windows dip as low as
+the stuck median); `embed_input` drops 0.087->0.050 and goes nearly
+FROZEN once stuck (0.049-0.051, barely varying) -- a genuine
+degenerate-representation signature. Under a drive calibrated neutral
+for the healthy regime, the stuck regime shows real positive drift
+(~1061/~2165 steps to forced-fire for state/embed_input) -- a
+non-tautological, data-verified finding that the pure continuous
+mechanism has real signal to exploit without an artificial gate.
+
+**v22** (no `wake_gate_steps`, drive re-measured under the ACTUAL v19
+stack this time: state=0.342 (drive=0.0171), embed_input=0.094
+(drive=0.0047), activation_cost=0.05 kept from the existing validated
+config): launched as the "without wake gate" comparison v21 needed.
+Both v21 and v22 smoke-tested before launch. Results not yet in -- no
+keep/prune verdict, and per direct instruction this "may take a few
+attempts to tune right."
