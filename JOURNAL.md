@@ -11236,3 +11236,85 @@ config): launched as the "without wake gate" comparison v21 needed.
 Both v21 and v22 smoke-tested before launch. Results not yet in -- no
 keep/prune verdict, and per direct instruction this "may take a few
 attempts to tune right."
+
+## 2026-09-29 -- v21/v22 results, and the real answer to "how much escape
+heat does the energy mechanism actually provide"
+
+**v21 (wake_gate_steps=2500) result**: final/peak vocab=16, k=3 --
+the WORST result in the entire investigation, never reaching vocab=32.
+Only one level-up ever (step 6967, k2->k3), then flat for the remaining
+~93000 steps. Same sharp-spike-then-lock signature as every other stall
+(loss 2.26->3.82 within ~33 steps at the step 6967->7000 boundary).
+
+**v22 (no wake_gate_steps) result**: final/peak vocab=32, k=3 -- a real
+stall, but matching v19b/v19c's stall level, meaningfully better than
+v21. Stage history: 16k2->16k3 (step 1278), 16k3->32k2 (step 4172),
+32k2->32k3 (step 7724), then flat for the remaining ~92000 steps.
+
+**Why v21 underperformed v22 -- found via direct measurement, not
+inference**: an instrumented probe (mirroring v21's config exactly,
+`wake_gate_steps=2500`, corrected drive) initially showed
+`frac_at_fire=0.000000` in every measured window, healthy or stuck --
+looked like the forced-fire mechanism never engages at all. This was a
+measurement artifact: a firing neuron's energy is drained by
+`2*activation_cost` (=0.1) *within the same call* that fires it, so a
+post-call read can never catch a neuron mid-fire (`energy_max` sitting
+at a suspicious, constant ~1.97-1.99 in every window, even "healthy",
+was the tell). Rebuilt the probe to recompute the PRE-drain energy
+directly from `h`/`drive`/`activation_cost` for every call (ignoring
+the exploration-noise term, std<=0.001, ~100x smaller than the 0.1
+drain gap being detected -- negligible for this purpose) and reran on a
+real ~16000-step trajectory (same seed=1001, full v19+v21-style stack).
+
+Real fire/shutoff rates, over 407222 calls:
+```
+state:        frac_would_fire  mean=0.000313  (any-fire in 68.2% of calls)
+              frac_would_shutoff mean=0.075677 (any-shutoff in 99.9% of calls)
+embed_input:  frac_would_fire  mean=0.000185  (any-fire in 10.0% of calls)
+              frac_would_shutoff mean=0.203848 (any-shutoff in 99.7% of calls)
+```
+Firing IS real (not zero), but it is a near-constant, minuscule trickle
+-- ~0.03% of state neurons and ~0.02% of embed_input neurons cross the
++2.0 threshold per call, essentially always a handful of neurons out of
+the whole layer, never a meaningful collective perturbation. Checked
+for a ramp-up/burst around each of the 3 level-up transitions and
+across early/mid/late thirds of the run: NO spike anywhere -- the fire
+rate is flat (~0.03%/0.02%) throughout, whether the model is smoothly
+progressing or approaching a curriculum transition. The mechanism does
+not "sense" difficulty and escalate; it's a constant, tiny, unconditional
+trickle by construction.
+
+Meanwhile SHUTOFF dominates completely: 7.6% of state neurons and 20.4%
+of embed_input neurons are in continuous shutoff (energy<=-2.0) at any
+given moment, present in essentially every single call. The realized
+dynamics are overwhelmingly silencing-biased, not escape-biased --
+this asymmetry falls directly out of calibrating `drive` to be
+"neutral" (zero average energy drift) in the healthy |h| regime: by
+construction only the extreme right tail of the |h| distribution ever
+pushes a neuron up to +2.0, while the much fatter low-|h| tail
+routinely pushes neurons down to -2.0.
+
+**This explains the v21-vs-v22 gap directly**: v21's `wake_gate_steps=2500`
+completely freezes "awake" (recently-fired) neurons out of ALL energy
+dynamics -- fire, shutoff, drive, noise, all of it -- until they go
+stale. Since real fire activity only ever touches ~0.03% of neurons per
+call to begin with, gating the awake majority out of that already-tiny
+trickle removes most of what little escape pressure exists, with no
+compensating benefit. v22 (no gate) lets the same tiny trickle reach
+every neuron continuously, and reached the same stall level as the
+ungated (no-energy) v19 baseline instead of regressing below it.
+
+**Direct answer to "how deep was the basin, and what temperature would
+be needed to escape it"**: at the current "neutral-on-average"
+calibration (`drive = activation_cost * E[|h|]`), the mechanism
+structurally cannot generate more than a trace amount of escape
+pressure -- neutral-by-construction means only the rarest tail events
+ever reach the fire threshold. Nothing observed (flat fire rate across
+transitions, no burst response to being near a curriculum boundary)
+suggests the current calibration is anywhere close to hot enough to
+reliably escape a stable-but-wrong basin. Raising the temperature would
+require a deliberate net-positive drive bias (not neutral) and/or a
+materially larger `exploration` (noise) term than the current 0.001 --
+both untested at this point. No keep/prune verdict offered; this is the
+diagnostic groundwork for deciding whether to try a hotter-calibrated
+v23, not a recommendation itself.
