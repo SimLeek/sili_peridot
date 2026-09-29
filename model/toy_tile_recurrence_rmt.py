@@ -1276,6 +1276,73 @@ class ToyTileRecurrenceRMT:
             results[name] = stats
         return results
 
+    # Empirically-derived per-layer (target_mean, target_std) for
+    # WeightRenorm -- medians from v18/v18c's own real recorded weight
+    # data (step<8000, before either run's own drift became meaningful).
+    # Weight mean is ~0 everywhere (fan-in-scaled, zero-mean by
+    # construction); only std varies by layer. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    _WEIGHT_RENORM_STABLE_TARGETS: ClassVar[dict[str, tuple[float, float]]] = {
+        "q_proj": (0.0, 0.059),
+        "k_proj": (0.0, 0.059),
+        "v_proj": (0.0, 0.059),
+        "input_proj": (0.0, 0.162),
+        "o_proj": (0.0, 0.060),
+        "lm_head": (0.0, 0.163),
+    }
+
+    def apply_weight_renorm(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        mode: str = "off",
+    ) -> dict:
+        """EXPERIMENTAL -- rescales each layer's real per-synapse WEIGHT
+        back toward a healthy region every call (never touches
+        importance). Companion to apply_ci_renorm, built after
+        CiRenorm's StableRegion arm was found to let weight itself run
+        away in a positive-feedback loop even while ci stayed correctly
+        bounded (real result: v18 GRADUATED, its same-seed repeat v18b
+        stalled at (64,3) with v_proj weight norm growing 17->360 over
+        95k steps while ci stayed near target the whole time). See
+        sili__new's
+        docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+
+        mode="off" (default): byte-identical no-op. "stable_region":
+        affine renormalize toward _WEIGHT_RENORM_STABLE_TARGETS'
+        empirically-derived per-layer (mean, std) -- the only meaningful
+        mode here (unlike CiRenorm, there's no TrustRatio arm: its own
+        formula is derived FROM weight norm, so applying it to
+        renormalize weight itself would be circular)."""
+        if mode == "off":
+            return {}
+        mode_int = {"stable_region": 2}[mode]
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            if not hasattr(layer, "apply_amortized_weight_renorm"):
+                continue
+            if name not in self._WEIGHT_RENORM_STABLE_TARGETS:
+                continue
+            target_mean_scalar, target_std_scalar = self._WEIGHT_RENORM_STABLE_TARGETS[name]
+            target_mean = np.full(layer.out_features, target_mean_scalar, dtype=np.float32)
+            target_std = np.full(layer.out_features, target_std_scalar, dtype=np.float32)
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            stats = layer.apply_amortized_weight_renorm(chunk_size, mode_int, target_mean, target_std)
+            if hasattr(layer, "apply_amortized_block4_weight_renorm"):
+                stats = dict(
+                    stats,
+                    block4=layer.apply_amortized_block4_weight_renorm(
+                        block4_chunk_size, mode_int, target_mean, target_std
+                    ),
+                )
+            results[name] = stats
+        return results
+
     def apply_l2_init(
         self,
         touch_fraction: float = 0.01,

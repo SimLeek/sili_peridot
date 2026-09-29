@@ -11082,3 +11082,78 @@ enumerate every difference before an A/B). v17 = `ci_renorm_enable=
 "trust_ratio"`, v18 = `ci_renorm_enable="stable_region"`. Both
 smoke-tested at 150 steps before queuing. Results not yet in -- no
 keep/prune verdict.
+
+## 2026-09-30 -- v17/v18 results: TrustRatio worse than baseline,
+## StableRegion graduates 2/3 -- but reveals a new weight-runaway
+## failure mode; WeightRenorm built and launched as v19
+
+**v17 (TrustRatio)**: did NOT graduate, worse than v14's own no-
+CiRenorm baseline -- `final_vocab=64 final_k=2`, peak (64,2), stalled
+at step 4537. **v18 (StableRegion)**: GRADUATED at step 14972,
+`final_vocab=126 final_k=4`, matching v15's own graduation almost
+exactly.
+
+Direct question after this split result: "I'm pretty sure it's
+specifically StableRegion that is mathematically enforcing plasticity,
+not TrustRatio... math can be cyclic or miss the point while looking
+smart." Confirmed by tracing the actual math: TrustRatio's "implied
+target ci" (`(w_norm/eff_lr)^2`) is derived from the column's OWN
+current weight norm -- for exactly the failure mode this was meant to
+fix (a column whose weight has been pushed far by sustained large
+gradient), that derivation gives the MOST-in-need-of-correction
+columns the LEAST correction, since their own already-large weight
+norm inflates their own "acceptable" target right along with it.
+StableRegion's target is externally anchored to real historical data,
+immune to this. LAMB's own math is sound for what LAMB does (bounding
+per-layer update instability); the mistake was treating "trust_ratio=1"
+as "this ci is healthy" when the paper's derivation never claimed
+that.
+
+**v18 replication, direct instruction ("Yep, launch the repeat
+runs.")**: `v18b` (seed=1001 repeat) stalled at `(64,3)`. `v18c`
+(seed=1000, new seed) GRADUATED at `(126,4)`, matching v18. 2 of 3
+StableRegion runs graduated (a better hit rate than centering's
+1-of-3), but v18b's failure needed explaining.
+
+**Deep dive into v18/v18b/v18c's own recorded `raw_importance`/
+`raw_weight` matrices** (not just the smoothed `col_importance` copy)
+found something new: CiRenorm was correctly holding `ci` near the
+StableRegion target in ALL THREE runs, including the stalled v18b --
+the mechanism itself worked as designed. But v18b's `v_proj`/
+`o_proj`/`input_proj` weight norm was left completely unconstrained
+and ran away: bucketed every 5000 steps, `v_proj`'s weight norm climbs
+smoothly from ~17 (matching v18/v18c's own healthy range) to 360 by
+step 95000 -- a genuine, continuously-compounding positive-feedback
+loop, not a step-change. v18c showed the SAME direction of drift, far
+more gently (17.0 -> 18.0 over 40000 steps). Mechanism: pinning `ci`
+to a fixed target while the layer's true gradient magnitude
+legitimately grows (this investigation's own recurring finding) keeps
+the effective step large, letting weight grow faster than warranted,
+which drives larger downstream gradients the fixed `ci` target still
+won't track. Matched-pair analysis (v18 vs v18b, same seed) found
+real `ci` divergence as early as step 5000-8000 -- well before the
+runaway was visible in absolute weight-norm terms -- consistent with
+the same early threading-order sensitivity flagged throughout this
+whole investigation, amplified by this newly-identified feedback loop.
+
+**WeightRenorm built** (sili__new commits `26875f3`/`7ef756a`), direct
+instruction: "I guess we have to do a weight renorm in addition to the
+ci renorm. Exact same method would probably be fine." Reuses
+CiRenorm's own tested arithmetic verbatim (not duplicated) -- only
+change needed was a `clamp_nonnegative` parameter (weight is signed,
+unlike ci). Only StableRegion is meaningful for weight (TrustRatio's
+formula is derived FROM weight norm, so applying it to weight would be
+circular). Targets: empirical per-column weight std from v18/v18c's
+own healthy early-training data (mean~=0 everywhere; std ~0.059 for
+q/k/v/o_proj, ~0.16 for input_proj/lm_head). 218/218 C++ tests pass.
+
+**Threaded through** (this repo): `apply_weight_renorm` (model/
+toy_tile_recurrence_rmt.py) mirrors `apply_ci_renorm` exactly.
+`train_mqar_curriculum.py` gets `weight_renorm_enable: str = "off" |
+"stable_region"`. Smoke-tested combined with `ci_renorm_enable=
+"stable_region"`; full 431-test pytest regression clean.
+
+**v19 launched**: v18's own config (`ci_renorm_enable="stable_region"`)
+PLUS `weight_renorm_enable="stable_region"` -- does constraining weight
+alongside ci prevent the runaway that doomed v18b. Results not yet in
+-- no keep/prune verdict.

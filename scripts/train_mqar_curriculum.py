@@ -547,6 +547,19 @@ def train_curriculum(
     ci_renorm_max_ci_ref: float = 100.0,
     ci_renorm_trust_ratio_min: float = 0.1,
     ci_renorm_trust_ratio_max: float = 10.0,
+    # WeightRenorm -- companion to CiRenorm above, built after CiRenorm's
+    # StableRegion arm was found to let weight itself run away in a
+    # positive-feedback loop even while ci stayed correctly bounded
+    # (v18 GRADUATED; its same-seed repeat v18b stalled with v_proj
+    # weight norm growing 17->360 over 95k steps while ci stayed near
+    # target throughout). Direct instruction: "I guess we have to do a
+    # weight renorm in addition to the ci renorm. Exact same method
+    # would probably be fine." "off" (default): byte-identical. See
+    # sili__new's docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    weight_renorm_enable: str = "off",  # "off" | "stable_region"
+    weight_renorm_touch_fraction: float = 0.01,
+    weight_renorm_min_chunk: int = 4,
+    weight_renorm_max_chunk: int = 2048,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -1085,6 +1098,13 @@ def train_curriculum(
                         max_ci_ref=ci_renorm_max_ci_ref,
                         trust_ratio_min=ci_renorm_trust_ratio_min,
                         trust_ratio_max=ci_renorm_trust_ratio_max,
+                    )
+                if weight_renorm_enable != "off":
+                    model.apply_weight_renorm(
+                        touch_fraction=weight_renorm_touch_fraction,
+                        min_chunk=weight_renorm_min_chunk,
+                        max_chunk=weight_renorm_max_chunk,
+                        mode=weight_renorm_enable,
                     )
                 if l2_init_enable:
                     model.apply_l2_init(
