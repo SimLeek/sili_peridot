@@ -325,6 +325,7 @@ def train_curriculum(
     embed_learning_rate: float | None = None,
     k_first_target: int | None = None,
     k_first_vocab: int | None = None,
+    continue_past_graduation: bool = False,
     l2_decay_chunk_size: int | None = None,
     l2_decay_adaptation_rate: float = 0.3,
     dy_r_target: float | None = None,
@@ -1146,7 +1147,13 @@ def train_curriculum(
                 ranks = model.report_ranks() if dynamic_rank_control else None
                 if log_fn is not None:
                     log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema, ranks=ranks)
-                break
+                # continue_past_graduation: log GRADUATED once (above) but
+                # keep training to max_steps instead of stopping -- the
+                # odometer's kcycle branch has no ceiling on k once vocab
+                # is maxed (_advance_stage), so it keeps attempting k+1
+                # naturally; no other curriculum change needed.
+                if not continue_past_graduation:
+                    break
         elif wrong_streak >= wrong_streak_threshold and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS:
             _regress_stage(step)
 
