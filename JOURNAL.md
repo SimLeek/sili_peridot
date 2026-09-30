@@ -11353,3 +11353,60 @@ or loss magnitude, similar in spirit to the two-timescale EMA idea
 explored for grad-selection fairness) could keep L1 in the regime
 where it actually competes with the task gradient instead of being
 permanently negligible. Not scoped or built -- flagging for later.
+
+## 2026-09-30 -- literature check: is rank collapse pathological, and are
+we near the research frontier on plasticity?
+
+Direct question after finding lm_head's raw_weight effective rank
+(participation ratio) collapsing over extended plateau training
+(Arm G/Arm G+H/v19c comparison, prior entry) -- is this generalization,
+or a recognized, actively-researched failure mode?
+
+**Rank collapse in transformers**: "From Condensation to Rank Collapse:
+A Two-Stage Analysis of Transformer Training Dynamics" (NeurIPS 2025,
+arXiv:2510.06954) -- training has a natural early "condensation" phase
+(V matrix converges row-wise toward target orientation, healthy) then a
+later phase where Q/K matrices "begin to actively participate...
+driving their collapse" once other params reach quasi-steady-state.
+
+**Spectral collapse IS a recognized causal driver of plasticity loss**,
+not just correlation, per a 2025 cluster:
+- "Learning Continually by Spectral Regularization" (Lewandowski et al.,
+  ICLR 2025) -- regularizes to preserve initialization's singular-value
+  structure throughout training; sustains trainability across
+  architectures in continual settings. Judged likely too EXPENSIVE for
+  practical use here (real singular-value tracking every step) --
+  informative reference, not a near-term implementation target.
+- "Spectral Collapse Drives Loss of Plasticity in Deep Continual
+  Learning" (arXiv:2509.22335)
+- "SingularClip: Preventing Spectral Collapse to Maintain Plasticity in
+  Continual and Reinforcement Learning" (arXiv:2608.18319)
+
+This independently corroborates our own empirical finding -- the
+lm_head rank collapse we measured is consistent with, not an artifact
+outside of, current research on this exact phenomenon.
+
+**Practical candidate: plain weight decay.** A 2025 paper found
+standard weight decay (not a custom mechanism) measurably improves
+language-model plasticity. The plasticity survey's own broader finding
+echoes this: general-purpose regularization from supervised learning
+tends to outperform domain-specific plasticity interventions -- a
+humbling data point given how much custom machinery (L1, energy-based
+selection/lr-scale) this investigation has built. Weight decay should
+be cheap to implement via the existing amortized-cursor infrastructure
+(same pattern as CiRenorm/WeightRenorm/L2 decay). Open question before
+implementing: does it compose with or fight CiRenorm/WeightRenorm's
+own mean/std-targeting (StableRegion pulls toward a nonzero target
+std, decay pulls magnitude toward zero) -- needs a mathematical check
+first, ablation/comparison second if the math doesn't resolve it
+cleanly. Not yet implemented.
+
+**Scale is not the answer.** "Can Scale Save Us From Plasticity Loss in
+Large Language Models?" (arXiv:2606.24752) tested 5M-314M-parameter
+GPT-style models: plasticity-loss onset follows a sublinear scaling
+law with model size -- larger models DELAY it, never eliminate it.
+This toy-scale investigation is studying a genuine, scale-independent
+open problem, not an artifact of under-scaling.
+
+Also referenced: "Plasticity Loss in Deep Reinforcement Learning: A
+Survey" (arXiv:2411.04832, ~50 methods taxonomized).
