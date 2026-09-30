@@ -5,7 +5,7 @@ import time
 from typing import ClassVar
 
 import numpy as np
-from sili.energy import EnergyDynamics
+from sili.energy import EnergyDynamics, GradSelectionEnergy
 from sili.sparse_rnn import CSR, DISLDOLayer, _nucleus_top_k_csr
 from sili.tensor import Tensor, concat, exp, gather, gaussian_attention, power, reduce_sum, relu, tensor_abs
 
@@ -113,6 +113,8 @@ class ToyTileRecurrenceRMT:
         dy_time_gate_phase_step: float = 0.02,
         dy_time_gate_period: float = 125.0,
         dy_time_gate_seed: int | None = None,
+        dy_energy_gate_density: float | None = None,
+        dy_energy_gate_kwargs: dict | None = None,
         r_target_min: float = 0.05,
         use_energy: bool = False,
         energy_kwargs: dict | None = None,
@@ -205,6 +207,20 @@ class ToyTileRecurrenceRMT:
             priority, see sili's DISLDOLayer32.forward dy_gate_mask).
             Requires disldo_cls to support dy_gate_mask (DISLDOLayer32
             only, currently).
+        dy_energy_gate_density, dy_energy_gate_kwargs: Arm G -- top-k
+            BACKWARD/dy grad-selection by GradSelectionEnergy state
+            (sili.energy.GradSelectionEnergy) instead of Arm C's blind
+            time-division. One tracker per wide layer, fed that layer's
+            own forward output every call (see _timed_layer_forward);
+            each call selects the density-fraction of neurons with the
+            HIGHEST (quietest) energy as dy_gate_mask. dy_energy_gate_kwargs
+            is keyed by layer name, e.g. {"q_proj": {"drive":...,
+            "activation_cost":..., "decay":...}, ...} (mirrors
+            energy_kwargs' own per-name convention) -- required per-layer
+            since each layer's own output-magnitude scale differs.
+            No-op unless dy_energy_gate_density is set; mutually exclusive
+            with dy_time_gate_cutoff (time-gate takes priority if both
+            set -- not intended to be combined this way, set only one).
         r_target_min: floor the amortized closed-loop controllers
             (apply_amortized_dy_r_target_control/apply_amortized_
             x_r_target_control/apply_cross_layer_budget_allocator) ratchet
@@ -271,6 +287,10 @@ class ToyTileRecurrenceRMT:
         self.dy_time_gate_period = dy_time_gate_period
         self._dy_time_gate_rng = np.random.default_rng(dy_time_gate_seed)
         self._dy_time_gate_angle: dict = {}  # layer_name -> np.float64[n_out]
+        # See __init__'s own dy_energy_gate_* docstring (Arm G).
+        self.dy_energy_gate_density = dy_energy_gate_density
+        self.dy_energy_gate_kwargs = dy_energy_gate_kwargs or {}
+        self._grad_select_energy: dict = {}  # layer_name -> GradSelectionEnergy
         # See docs/research/toy_tile_recurrence_rmt.rst:input_selection_stats_design.
         self.last_input_selection: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
@@ -531,7 +551,10 @@ class ToyTileRecurrenceRMT:
         wide-layers-only scope). See
         docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
         lr = self.layer_lr_override.get(layer_name, learning_rate) if self.layer_lr_override else learning_rate
-        return self._timed_call(layer_name, layer.forward, x, lr, *args, **kwargs)
+        out = self._timed_call(layer_name, layer.forward, x, lr, *args, **kwargs)
+        if layer_name in self._WIDE_LAYER_NAMES:
+            self._update_grad_select_energy(layer_name, out)
+        return out
 
     def reset_layer_timing(self) -> None:
         """Zero self._layer_timing -- call at the start of a measurement
@@ -596,6 +619,35 @@ class ToyTileRecurrenceRMT:
         self._dy_time_gate_angle[layer_name] = angle
         return np.sin(angle) > self.dy_time_gate_cutoff
 
+    def _dy_energy_gate(self, layer_name: str) -> np.ndarray | None:
+        """Arm G: top-k BACKWARD/dy grad-selection by GradSelectionEnergy
+        state, using that layer's own tracked energy (updated in
+        _timed_layer_forward from the layer's own forward output).
+        No-op (returns None) unless dy_energy_gate_density is set. See
+        __init__'s own docstring."""
+        if self.dy_energy_gate_density is None:
+            return None
+        ge = self._grad_select_energy.get(layer_name)
+        if ge is None:
+            return None
+        k = round(self.dy_energy_gate_density * len(ge.energy))
+        return ge.top_k_mask(k)
+
+    def _update_grad_select_energy(self, layer_name: str, output: Tensor) -> None:
+        """Feeds Arm G's per-layer GradSelectionEnergy tracker this
+        layer's own forward output. No-op unless dy_energy_gate_density
+        is set. Called from _timed_layer_forward, once per wide-layer
+        call -- see __init__'s own dy_energy_gate_* docstring."""
+        if self.dy_energy_gate_density is None:
+            return
+        ge = self._grad_select_energy.get(layer_name)
+        if ge is None:
+            kwargs = self.dy_energy_gate_kwargs.get(layer_name, {})
+            n_out = getattr(self, layer_name).out_features
+            ge = GradSelectionEnergy(n_out=n_out, **kwargs)
+            self._grad_select_energy[layer_name] = ge
+        ge.update(np.asarray(output.data))
+
     def _wide_extra_kwargs(self, layer_name: str) -> dict:
         """Extra kwargs for ONE of the 5 affected layers' forward() calls;
         layer_name must be one of _WIDE_LAYER_NAMES. Live (not cached) since
@@ -604,6 +656,9 @@ class ToyTileRecurrenceRMT:
         gate = self._dy_time_gate(layer_name)
         if gate is not None:
             return {"dy_gate_mask": gate}
+        energy_gate = self._dy_energy_gate(layer_name)
+        if energy_gate is not None:
+            return {"dy_gate_mask": energy_gate}
         r_target = self._effective_dy_r_target(layer_name)
         if r_target is not None:
             kw = {"dy_r_target": r_target}

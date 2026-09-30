@@ -11333,3 +11333,23 @@ materially larger `exploration` (noise) term than the current 0.001 --
 both untested at this point. No keep/prune verdict offered; this is the
 diagnostic groundwork for deciding whether to try a hotter-calibrated
 v23, not a recommendation itself.
+
+## 2026-09-29 -- deferred idea: loss-adaptive L1_SPARSITY_COEF
+
+Direct suggestion, deferred to a note rather than built now: could
+`L1_SPARSITY_COEF` (currently a fixed 0.05, silently active on all 5
+wide layers in every run since before this v13-v23/G series began)
+be tuned dynamically based on current loss, rather than fixed?
+
+Relevant given today's finding: L1's gradient contribution is a
+FIXED-magnitude nudge (coef*sign(w)), independent of task-gradient
+scale -- and real measured task gradients here run 0.79-3923 (healthy)
+to 32-204,300 (stuck), routinely 4-5 orders of magnitude past the
+0.05 threshold, making L1 structurally near-inert at this task's real
+gradient scale regardless of regime (see today's entry above; v11's
+qk_l1_sparsity_coef=0.05 still hit a real 76k-step stall). A
+loss-adaptive coefficient (e.g. scaling with a measured/EMA'd gradient
+or loss magnitude, similar in spirit to the two-timescale EMA idea
+explored for grad-selection fairness) could keep L1 in the regime
+where it actually competes with the task gradient instead of being
+permanently negligible. Not scoped or built -- flagging for later.
