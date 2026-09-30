@@ -115,6 +115,9 @@ class ToyTileRecurrenceRMT:
         dy_time_gate_seed: int | None = None,
         dy_energy_gate_density: float | None = None,
         dy_energy_gate_kwargs: dict | None = None,
+        dy_energy_lr_scale_enable: bool = False,
+        dy_energy_lr_scale_kappa: float = 0.5,
+        dy_energy_lr_scale_setpoint: float = 1.0,
         r_target_min: float = 0.05,
         use_energy: bool = False,
         energy_kwargs: dict | None = None,
@@ -221,6 +224,9 @@ class ToyTileRecurrenceRMT:
             No-op unless dy_energy_gate_density is set; mutually exclusive
             with dy_time_gate_cutoff (time-gate takes priority if both
             set -- not intended to be combined this way, set only one).
+        dy_energy_lr_scale_enable/kappa/setpoint: Arm H -- lr multiplier
+            M=exp(kappa*(energy-setpoint)), composes atop active
+            selection (_wide_extra_kwargs), shares Arm G's tracker.
         r_target_min: floor the amortized closed-loop controllers
             (apply_amortized_dy_r_target_control/apply_amortized_
             x_r_target_control/apply_cross_layer_budget_allocator) ratchet
@@ -291,6 +297,10 @@ class ToyTileRecurrenceRMT:
         self.dy_energy_gate_density = dy_energy_gate_density
         self.dy_energy_gate_kwargs = dy_energy_gate_kwargs or {}
         self._grad_select_energy: dict = {}  # layer_name -> GradSelectionEnergy
+        # See __init__'s own dy_energy_lr_scale_* docstring (Arm H).
+        self.dy_energy_lr_scale_enable = dy_energy_lr_scale_enable
+        self.dy_energy_lr_scale_kappa = dy_energy_lr_scale_kappa
+        self.dy_energy_lr_scale_setpoint = dy_energy_lr_scale_setpoint
         # See docs/research/toy_tile_recurrence_rmt.rst:input_selection_stats_design.
         self.last_input_selection: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
@@ -633,12 +643,21 @@ class ToyTileRecurrenceRMT:
         k = round(self.dy_energy_gate_density * len(ge.energy))
         return ge.top_k_mask(k)
 
+    def _dy_energy_lr_scale(self, layer_name: str) -> np.ndarray | None:
+        """Arm H multiplier from Arm G's shared tracker. See __init__'s
+        own dy_energy_lr_scale_* docstring."""
+        if not self.dy_energy_lr_scale_enable:
+            return None
+        ge = self._grad_select_energy.get(layer_name)
+        if ge is None:
+            return None
+        return np.exp(self.dy_energy_lr_scale_kappa * (ge.energy - self.dy_energy_lr_scale_setpoint)).astype(np.float32)
+
     def _update_grad_select_energy(self, layer_name: str, output: Tensor) -> None:
-        """Feeds Arm G's per-layer GradSelectionEnergy tracker this
-        layer's own forward output. No-op unless dy_energy_gate_density
-        is set. Called from _timed_layer_forward, once per wide-layer
-        call -- see __init__'s own dy_energy_gate_* docstring."""
-        if self.dy_energy_gate_density is None:
+        """Feeds the per-layer GradSelectionEnergy tracker, shared by
+        Arm G/H. No-op unless one is enabled. Called from
+        _timed_layer_forward per wide-layer call."""
+        if self.dy_energy_gate_density is None and not self.dy_energy_lr_scale_enable:
             return
         ge = self._grad_select_energy.get(layer_name)
         if ge is None:
@@ -652,7 +671,22 @@ class ToyTileRecurrenceRMT:
         """Extra kwargs for ONE of the 5 affected layers' forward() calls;
         layer_name must be one of _WIDE_LAYER_NAMES. Live (not cached) since
         self.dy_r_target[name] is mutable post-construction. See
-        docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design."""
+        docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
+        Arm H composes on top of whichever selection fires below (falls
+        back to dy_sparsity_p=1.0 standalone) -- see __init__'s own
+        dy_energy_lr_scale_* docstring."""
+        kw = self._wide_selection_kwargs(layer_name)
+        scale = self._dy_energy_lr_scale(layer_name)
+        if scale is not None:
+            kw["energy_lr_scale"] = scale
+            if not kw or (len(kw) == 1 and "energy_lr_scale" in kw):
+                kw["dy_sparsity_p"] = 1.0
+        return kw
+
+    def _wide_selection_kwargs(self, layer_name: str) -> dict:
+        """The dy_gate_mask/dy_r_target/dy_sparsity_p selection logic
+        alone, factored out of _wide_extra_kwargs so Arm H's
+        energy_lr_scale can compose on top without duplicating it."""
         gate = self._dy_time_gate(layer_name)
         if gate is not None:
             return {"dy_gate_mask": gate}
