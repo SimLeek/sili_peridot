@@ -121,6 +121,8 @@ class ToyTileRecurrenceRMT:
         r_target_min: float = 0.05,
         use_energy: bool = False,
         energy_kwargs: dict | None = None,
+        sleep_energy_enable: bool = False,
+        sleep_energy_kwargs: dict | None = None,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -249,7 +251,13 @@ class ToyTileRecurrenceRMT:
             per-region since the two regions' E[|h|] measure ~4x apart
             (state~=0.23, embed_input~=0.06 at width=288) and
             EnergyDynamics.drive must be calibrated against the region it
-            actually gates, not shared. No-op unless use_energy=True."""
+            actually gates, not shared. No-op unless use_energy=True.
+        sleep_energy_enable, sleep_energy_kwargs: 'sleep' annealing on
+            each wide layer's own output via fire_wake_gradient, no
+            wake_gate_steps -- see JOURNAL.md's 2026-10-03 "energy-driven
+            sleep annealing" entry. Keyed by layer name; caller picks
+            whether to backward on self._sleep_aux_loss. No-op unless
+            sleep_energy_enable=True."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -325,6 +333,11 @@ class ToyTileRecurrenceRMT:
         self.energy_kwargs = energy_kwargs or {}
         self._energy: dict = {}  # region name -> EnergyDynamics, lazily built
         self._energy_aux_loss: Tensor | None = None
+        # See __init__'s own sleep_energy_enable/sleep_energy_kwargs docstring above.
+        self.sleep_energy_enable = sleep_energy_enable
+        self.sleep_energy_kwargs = sleep_energy_kwargs or {}
+        self._sleep_energy: dict = {}  # call-site key -> EnergyDynamics, lazily built
+        self._sleep_aux_loss: Tensor | None = None
 
         state_width = self.state_width
         if rng is None:
@@ -1555,6 +1568,22 @@ class ToyTileRecurrenceRMT:
         self._energy_aux_loss = aux if self._energy_aux_loss is None else self._energy_aux_loss + aux
         return h_out
 
+    def _accumulate_sleep_energy(self, x: Tensor, layer_name: str, call_site: str | None = None) -> None:
+        """Sleep annealing (see __init__'s sleep_energy_enable docstring).
+        Unlike _apply_energy above, does NOT gate x -- the forced-fire
+        signal is the fire_wake_gradient it injects, applied via the
+        caller's choice of which loss to backward. call_site disambiguates
+        a layer's multiple per-step call sites at different shapes."""
+        if not self.sleep_energy_enable:
+            return
+        key = layer_name if call_site is None else f"{layer_name}:{call_site}"
+        ed = self._sleep_energy.get(key)
+        if ed is None:
+            ed = EnergyDynamics(**self.sleep_energy_kwargs[layer_name])
+            self._sleep_energy[key] = ed
+        _h_out, aux, _actual_p = ed(x)
+        self._sleep_aux_loss = aux if self._sleep_aux_loss is None else self._sleep_aux_loss + aux
+
     def _to_sparse(self, x: Tensor, layer_name: str) -> Tensor:
         """Sparsity plan Phase 6 helper; no-op unless x_r_target[layer_name]
         or input_sparsity_p is set. Real bug fix: wires _children/_backward
@@ -1777,6 +1806,7 @@ class ToyTileRecurrenceRMT:
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
         self._energy_aux_loss = None  # see _apply_energy's own docstring
+        self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
         self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
 
         if content_dy_sparsity_schedule is not None:
@@ -1816,6 +1846,7 @@ class ToyTileRecurrenceRMT:
             **self.synapse_kwargs,
             **_kw("input_proj", "content"),
         )  # [n_content, sw]
+        self._accumulate_sleep_energy(x_wide, "input_proj")
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -1868,6 +1899,9 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(q)
         _accumulate_penalty(k)
         _accumulate_penalty(v)
+        self._accumulate_sleep_energy(q, "q_proj")
+        self._accumulate_sleep_energy(k, "k_proj", "pass1")
+        self._accumulate_sleep_energy(v, "v_proj", "pass1")
 
         # Clip q/k/v BEFORE gaussian_attention -- real bug fix, see
         # docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
@@ -1922,6 +1956,7 @@ class ToyTileRecurrenceRMT:
             **_kw("o_proj", "mem"),
         )
         _accumulate_penalty(attn_mem)
+        self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
@@ -1952,6 +1987,8 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
+        self._accumulate_sleep_energy(k_mem_fresh, "k_proj", "mem")
+        self._accumulate_sleep_energy(v_mem_fresh, "v_proj", "mem")
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
         k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
@@ -2006,6 +2043,7 @@ class ToyTileRecurrenceRMT:
             **_kw("o_proj", "content"),
         )
         _accumulate_penalty(attn_content)
+        self._accumulate_sleep_energy(attn_content, "o_proj", "content")
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
         attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
@@ -2149,6 +2187,7 @@ class ToyTileRecurrenceRMT:
             **self.synapse_kwargs,
             **self._output_extra_kwargs,
         )
+        self._accumulate_sleep_energy(logits, "lm_head")
 
         # Advantage-actor-critic value head, exposed via attribute not
         # return value. See docs/research/toy_tile_recurrence_rmt.rst:critic_head_design.
@@ -2168,6 +2207,8 @@ class ToyTileRecurrenceRMT:
 
         if self._energy_aux_loss is not None:
             aux_loss = self._energy_aux_loss if aux_loss is None else aux_loss + self._energy_aux_loss
+        if self._sleep_aux_loss is not None:
+            aux_loss = self._sleep_aux_loss if aux_loss is None else aux_loss + self._sleep_aux_loss
         if self._balance_aux_loss is not None:
             aux_loss = self._balance_aux_loss if aux_loss is None else aux_loss + self._balance_aux_loss
 

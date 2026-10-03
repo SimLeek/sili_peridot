@@ -359,6 +359,18 @@ def train_curriculum(
     r_target_min: float = 0.05,
     use_energy: bool = False,
     energy_kwargs: dict | None = None,
+    # Sleep annealing (see docs/research/toy_tile_recurrence_rmt.rst:
+    # sleep_energy_design, JOURNAL.md's 2026-10-03 "energy-driven sleep
+    # annealing" entry) -- periodic windows where the task loss is
+    # replaced entirely by model.step()'s own sleep-energy aux_loss
+    # (fire_wake_gradient-driven, no wake_gate, decay-stabilized),
+    # toggled via model.sleep_energy_enable, every sleep_every_steps
+    # steps for sleep_duration_steps steps. False (default):
+    # byte-identical to today's exact behavior.
+    sleep_enable: bool = False,
+    sleep_every_steps: int | None = None,
+    sleep_duration_steps: int | None = None,
+    sleep_energy_kwargs: dict | None = None,
     # See docs/research/train_mqar_curriculum.rst:train_curriculum.lr_override_fn_range_test
     # -- bypasses the warmup/accuracy-decay schedule below entirely when set: lr = lr_override_fn(step).
     lr_override_fn=None,
@@ -706,6 +718,7 @@ def train_curriculum(
         r_target_min=r_target_min,
         use_energy=use_energy,
         energy_kwargs=energy_kwargs,
+        sleep_energy_kwargs=sleep_energy_kwargs,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -826,6 +839,14 @@ def train_curriculum(
             v, k, ph = _current()
             log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
+    if sleep_enable:
+        if use_tile_cache:
+            raise ValueError("sleep_enable is not supported together with use_tile_cache")
+        if sleep_every_steps is None or sleep_duration_steps is None or sleep_energy_kwargs is None:
+            raise ValueError("sleep_enable requires sleep_every_steps, sleep_duration_steps, and sleep_energy_kwargs")
+    in_sleep = False
+    sleep_steps_remaining = 0
+
     t0 = time.time()
     window_t0 = t0
     model.reset_layer_timing()
@@ -833,6 +854,16 @@ def train_curriculum(
     while step < max_steps:
         step += 1
         stage_step += 1
+        if sleep_enable:
+            if not in_sleep and step % sleep_every_steps == 0:
+                in_sleep = True
+                sleep_steps_remaining = sleep_duration_steps
+                model.sleep_energy_enable = True
+            if in_sleep:
+                sleep_steps_remaining -= 1
+                if sleep_steps_remaining <= 0:
+                    in_sleep = False
+                    model.sleep_energy_enable = False
         if lr_override_fn is not None:
             lr = lr_override_fn(step)
         elif step <= WARMUP_STEPS:
@@ -915,11 +946,53 @@ def train_curriculum(
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
-                memory, logits, aux = model.step(window, memory, lr, requires_grad=(i in targets))
+                memory, logits, aux = model.step(window, memory, lr, requires_grad=((i in targets) or in_sleep))
                 logit_row = num_tiles - 1
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
-            if i in targets:
+            if in_sleep:
+                # Sleep: no task loss at all, backward only on
+                # model.step()'s own sleep-energy aux_loss (populated at
+                # every token position, not just targets, since
+                # requires_grad was forced True above). loss_ema/acc_ema/
+                # streak tracking are untouched -- sleep steps are
+                # invisible to curriculum progression. Only the general
+                # -purpose magnitude regularizers run here, not the full
+                # target-gated block below (plasticity_reset/
+                # dynamic_rank_control/loss_adjusted_decay are a known,
+                # accepted scope gap -- see sleep_energy_design).
+                if aux is not None:
+                    aux.backward()
+                clip_grad_norm_(model.parameters_for_optimizer(), effective_max_grad_norm)
+                opt.step(model.parameters_for_optimizer(), lr=lr)
+                if l2_decay_chunk_size is not None:
+                    model.apply_amortized_l2_decay(l2_decay_chunk_size, l2_decay_adaptation_rate)
+                if ci_renorm_enable != "off":
+                    model.apply_ci_renorm(
+                        touch_fraction=ci_renorm_touch_fraction,
+                        min_chunk=ci_renorm_min_chunk,
+                        max_chunk=ci_renorm_max_chunk,
+                        mode=ci_renorm_enable,
+                        eff_lr=ci_renorm_eff_lr,
+                        max_ci_ref=ci_renorm_max_ci_ref,
+                        trust_ratio_min=ci_renorm_trust_ratio_min,
+                        trust_ratio_max=ci_renorm_trust_ratio_max,
+                    )
+                if weight_renorm_enable != "off":
+                    model.apply_weight_renorm(
+                        touch_fraction=weight_renorm_touch_fraction,
+                        min_chunk=weight_renorm_min_chunk,
+                        max_chunk=weight_renorm_max_chunk,
+                        mode=weight_renorm_enable,
+                    )
+                if l2_init_enable:
+                    model.apply_l2_init(
+                        touch_fraction=l2_init_touch_fraction,
+                        min_chunk=l2_init_min_chunk,
+                        max_chunk=l2_init_max_chunk,
+                        rate=l2_init_rate,
+                    )
+            elif i in targets:
                 loss = cross_entropy_sum(logits, [(logit_row, targets[i])])
                 loss_ema = (
                     float(loss.data)
