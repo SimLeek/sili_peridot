@@ -11410,3 +11410,114 @@ open problem, not an artifact of under-scaling.
 
 Also referenced: "Plasticity Loss in Deep Reinforcement Learning: A
 Survey" (arXiv:2411.04832, ~50 methods taxonomized).
+
+## 2026-10-03 -- energy-driven "sleep" annealing: rank collapse here is
+purely directional, not magnitude-based, and a cheap existing mechanism
+(no new code) demonstrably reverses it, once pointed at the right axis
+
+**Starting question**: does EnergyDynamics' forced-firing/LRU mechanism
+(built for dead-neuron escape, see
+[[project_wide288_energy_rl_negative_result]]) already function as a
+plasticity-restoring "annealing" system for the lm_head rank collapse
+found in the v18-v24 series, either as currently deployed or in some
+other mode (e.g. a dedicated "sleep" phase, training on `aux_loss`
+alone)?
+
+**First-pass answer was wrong in both directions, corrected twice by
+direct user pushback (see 2026-10-03 session) before landing on the real
+answer:**
+
+1. Initial claim ("EnergyDynamics can't matter for rank, it only sees
+   magnitude, never correlation") was too absolute -- it conflated "is
+   the selector surgically correct" with "can noise injection help at
+   all." A forced, LRU-rotating activation pattern + real backward is
+   mechanistically closer to a stochastic noise regularizer (dropout-
+   family) than a precise correlation-targeting penalty -- it doesn't
+   need to identify which neurons are redundant to still decorrelate
+   them as a side effect of injected activity diversity.
+2. Correction of the correction: don't reach for the expensive, "correct
+   -looking" fix (a periodic pairwise-correlation-computing orthogonality
+   penalty) before checking whether the cheap hack already works. Direct
+   instruction: "Stop seeking out the most direct yet computationally
+   expensive solutions possible instead of the 'hacks' that could work
+   100x faster."
+
+**Real geometry of the collapse, measured directly from v24's own
+saved snapshots (step 48 vs step 99987, every wide layer)**: column norm
+coefficient-of-variation collapses to ~0 everywhere by mid-run (WeightRenorm
+enforces near-perfectly uniform column magnitude), zero near-zero columns
+at any point in any layer -- but mean pairwise |cosine similarity| between
+columns rises in lockstep with participation-ratio decline (lm_head:
+PR 33->6.4, cos 0.13->0.84; v_proj: PR 207->41, cos 0.047->0.41; o_proj:
+PR 207->28, cos 0.047->0.46; q/k_proj stay flat on both). **Rank collapse
+here is 100% directional (columns rotating into alignment), with zero
+shrinkage component** -- confirms there is nothing for a magnitude
+-triggered mechanism to select on by construction (WeightRenorm has
+already erased the one signal it depends on).
+
+**Cheap burst test, real data, zero new mechanism** (isolated
+`DISLDOLayer32`, v24's actual collapsed lm_head weight matrix loaded via
+`load_dense_values`, random input, task loss off, `EnergyDynamics.
+aux_loss` as the only backward signal):
+- First attempt used the mechanism's gentle `energy_loss`/`reactivity`
+  homeostatic term -- wrong lever. That term is tuned to coexist gently
+  alongside a real competing task gradient; with none present it just
+  chased its own setpoint mismatch and inflated magnitude (col norm
+  0.98->1.26) without touching correlation at all.
+- Correct lever: `fire_wake_gradient` (the mechanism's purpose-built
+  "guaranteed-magnitude gradient at forced-fire positions" knob,
+  per-neuron fixed random sign), `wake_gate_steps` OMITTED (continuous,
+  not staleness-gated), `decay`-stabilized, `WeightRenorm` running
+  CONCURRENTLY (per direct instruction -- cleanly separates the
+  magnitude axis, which WeightRenorm owns, from the directional axis,
+  which the forced-firing owns). With this combination: PR rises and
+  mean|cos| falls monotonically, column norm stays flat throughout --
+  clean, controlled, no runaway.
+- **The lever that actually matters is rotation rate (the `decay`
+  parameter, i.e. how fast a neuron's energy climbs back to the +2.0
+  fire threshold), not push magnitude** -- `fire_wake_gradient` swept
+  0.5/1.0/2.0 made almost no difference to the trajectory. Sweeping the
+  decay/rotation rate found a real sweet spot: faster rotation helps up
+  to a point (decay reaching ~95% of its target within ~2% of the
+  window length), but pushing faster still (0.5%, 1% of window) makes
+  the trajectory NOISY and NON-MONOTONIC and ends up WORSE, not better
+  -- a genuine ceiling on how hot this can run, not a monotonic
+  "more is better" knob.
+- At the sweet spot: lm_head's real PR went 6.36->27.16 over 60,000
+  steps, 6.36->29.18 over 130,000 steps (still rising, approaching but
+  not fully reaching the original healthy level of PR=33.45/cos=0.13
+  seen at step 48 of the real run) -- clean the whole way, zero
+  instability, magnitude held flat by WeightRenorm throughout. Full
+  recovery, at this rotation rate, costs on the order of 100k+ steps --
+  comparable to, not dramatically cheaper than, this project's own
+  measured real stall durations (>=53,882 steps) -- so this is a real,
+  substantial sleep phase, not a quick 500-step fix, though it costs
+  zero new engineering (100% already-built `EnergyDynamics`).
+
+**Direct caution from the user, not yet resolved, important for any
+write-up or relaunch**: some of the measured rank decline is plausibly
+real, USEFUL specialization from genuine training, not purely
+pathological redundancy -- the isolated burst test has no task loss at
+all, so it cannot distinguish "undoing harmful collapse" from "erasing
+specialization the task actually needed." This means "push decorrelation
+as far/fast as possible" is NOT established as correct; the right DOSE
+(how much sleep, how often, how hot) is an open calibration question,
+not something this isolated test can answer on its own -- only a real
+in-model test, measuring actual task performance before/after, can.
+
+**How to apply**: this closes the "do we have an annealing system for
+plasticity" question with a real, complete, three-part picture for any
+future summary: (1) magnitude regularization (WeightRenorm/CiRenorm,
+now l2_decay) is solved and validated; (2) directional/rank regularization
+has a working, cheap, zero-new-code candidate (energy-driven sleep,
+calibrated by rotation rate not push magnitude, run concurrently with
+WeightRenorm); (3) the correct DOSE of (2) is unresolved and may trade
+off against genuine specialization -- don't claim this is "solved" until
+a real in-model test (not an isolated single-layer burst) shows it
+helps actual task performance without hurting an already-healthy run.
+Next: wire an actual scheduled sleep phase into the real training loop
+and test it BOTH on a currently-stuck run (does it help escape) AND on
+a top performer like v24/armH (does "raises rank in isolation" actually
+translate to help, or does it hurt a run that's already working by
+disturbing useful, non-pathological correlation structure) -- explicit
+instruction that these may not generalize the same direction.
