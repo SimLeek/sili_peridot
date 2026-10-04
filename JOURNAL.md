@@ -11521,3 +11521,73 @@ a top performer like v24/armH (does "raises rank in isolation" actually
 translate to help, or does it hurt a run that's already working by
 disturbing useful, non-pathological correlation structure) -- explicit
 instruction that these may not generalize the same direction.
+
+## 2026-10-04 -- v25/v26 results: blind periodic sleep helps one, hurts
+the other; the real discriminator is intrinsic (q/k freeze), not rank
+
+**v25** (v19c's exact known-stuck config, seed=1000, + sleep every 5000
+steps for 500 steps): reached vocab=126/k=3 at step 17893 -- one level
+PAST where v19c itself ever got (permanently stuck at 126/k=2) -- then
+stuck at k=3 for the remaining ~82k steps.
+
+**v26** (v24's exact top-performer config, seed=1001, + same sleep
+schedule): reached vocab=126/k=2 at step 11021 -- nearly 2x SLOWER than
+v24's own 6230 -- and never progressed past k=2 for the remaining ~89k
+steps, far short of v24's own k=5. v26's trajectory is BYTE-IDENTICAL to
+v24's through step ~4717 (before sleep ever triggers), then diverges
+right around step 5000-5500 -- exactly where the first sleep window
+lands, and exactly where v24's own unmodified run was in its fastest
+stretch of progress (64/k3->126/k2 in ~1500 steps).
+
+So: sleep's cost (slower climb) is paid in both cases; its benefit
+(escaping a plateau) only showed up where the baseline was already
+going to get stuck anyway. Direct correction from the user after this
+was reported: don't gate on curriculum/task bookkeeping (stall
+duration, level-ups, streak) -- "we have to go by intrinsic info...
+assume the model wouldn't have access to" that. Rank/participation
+ratio was checked next (intrinsic, weight-only) as a candidate
+"tiredness" signal and found NOT to discriminate: PR trajectories and
+their slopes are statistically indistinguishable between v19c (stuck)
+and v24 (succeeds) across every window from step 0-8000, in every
+layer -- confirming/extending this project's own earlier finding that
+rank decline happens in every long-running config regardless of
+outcome, not an early differentiator.
+
+**The real discriminator found: q_proj/k_proj's own col_importance
+going completely static (zero delta between successive amortized
+cycles) -- purely intrinsic, already-tracked by plasticity_reset,
+needs no new C++.** Checked when this freeze first happens in each run:
+
+| run | q/k freeze (zero-delta) starts | outcome |
+|---|---|---|
+| v19c (no sleep) | step 13,273 | permanently stuck at 126/k2 |
+| v24 (no sleep) | step 35,848 -- AFTER already reaching k5 at 19,850 | reaches k5, then plateaus |
+| v25 (+ periodic sleep) | step 96,986 | escaped to 126/k3 |
+| v26 (+ periodic sleep) | step 97,752 | stuck at 126/k2 the whole time |
+
+Confirmed real (not a logging artifact): o_proj/v_proj/lm_head keep
+changing at the exact same timestamps in every run -- it's specifically
+q/k going dead, not a global freeze. The timing correlates with outcome
+in the two UNMODIFIED baselines (early freeze = bad fixed point, late
+freeze = good one already banked). But periodic sleep delays this
+freeze almost identically in BOTH v25 and v26 (~97k either way) --
+necessary-but-not-sufficient: v26's q/k kept moving the entire ~89k-step
+stall without that movement ever being productive, a different failure
+mode (churning-without-consolidating) than v19c's original frozen-dead
+one, plausibly caused by sleep's own periodic forcing never letting the
+network settle into v24's good fixed point in the first place.
+
+**Hypothesis, now built and testing**: gate sleep on the freeze itself
+(sleep_gate_layers=("q_proj","k_proj"), new param on train_curriculum)
+instead of a blind schedule -- reactive, purely intrinsic, self-limiting
+(turns off the moment col_importance starts moving again, no separate
+wake-up logic). Reuses plasticity_reset's own col_importance/
+cycle_complete tracking verbatim, zero new C++. This should leave v24's
+own fast, uninterrupted k2->k5 climb completely undisturbed (its
+natural freeze doesn't happen until step 35848, long after k5 is
+reached) while still rescuing a genuinely-dead run the moment it
+freezes. v27 (freeze-gated + v19c's config) and v28 (freeze-gated +
+v24's config) launched to test this directly against v25/v26's own
+results. Unit-verified the freeze-detection logic in isolation
+(5 synthetic cases: first-ever call, moved value, unmoved value,
+incomplete cycle, resumed movement) before launching -- all correct.

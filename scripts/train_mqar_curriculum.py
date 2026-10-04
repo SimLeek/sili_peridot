@@ -371,6 +371,15 @@ def train_curriculum(
     sleep_every_steps: int | None = None,
     sleep_duration_steps: int | None = None,
     sleep_energy_kwargs: dict | None = None,
+    # Reactive alternative to the periodic sleep_every_steps/sleep_duration_steps
+    # schedule above -- intrinsic only (col_importance deltas from the already
+    # -running plasticity_reset mechanism, no task/curriculum info): sleep stays
+    # on exactly as long as ANY named layer's col_importance is frozen (zero
+    # delta between successive amortized cycles), off otherwise. When set,
+    # sleep_every_steps/sleep_duration_steps are ignored. See JOURNAL.md's
+    # 2026-10-04 "freeze-gated sleep" entry.
+    sleep_gate_layers: tuple[str, ...] | None = None,
+    sleep_gate_epsilon: float = 1e-7,
     # See docs/research/train_mqar_curriculum.rst:train_curriculum.lr_override_fn_range_test
     # -- bypasses the warmup/accuracy-decay schedule below entirely when set: lr = lr_override_fn(step).
     lr_override_fn=None,
@@ -842,10 +851,34 @@ def train_curriculum(
     if sleep_enable:
         if use_tile_cache:
             raise ValueError("sleep_enable is not supported together with use_tile_cache")
-        if sleep_every_steps is None or sleep_duration_steps is None or sleep_energy_kwargs is None:
-            raise ValueError("sleep_enable requires sleep_every_steps, sleep_duration_steps, and sleep_energy_kwargs")
+        if sleep_energy_kwargs is None:
+            raise ValueError("sleep_enable requires sleep_energy_kwargs")
+        if sleep_gate_layers:
+            if not plasticity_reset_enable:
+                raise ValueError("sleep_gate_layers requires plasticity_reset_enable (it reads col_importance)")
+        elif sleep_every_steps is None or sleep_duration_steps is None:
+            raise ValueError("sleep_enable without sleep_gate_layers requires sleep_every_steps/sleep_duration_steps")
     in_sleep = False
     sleep_steps_remaining = 0
+    _freeze_last_ci: dict = {}
+    _freeze_is_frozen: dict = {}
+
+    def _update_freeze_tracker(plasticity_stats: dict) -> None:
+        """Intrinsic-only freeze check (see sleep_gate_layers docstring):
+        a named layer is 'frozen' once col_importance stops moving at all
+        between successive amortized-cycle completions."""
+        for _name in sleep_gate_layers or ():
+            _leaf = (plasticity_stats.get(_name) or {}).get("importance")
+            _leaf = (_leaf or {}).get("block4")
+            if _leaf is None or not _leaf.get("cycle_complete"):
+                continue
+            _col_state = _leaf.get("column_state")
+            if _col_state is None:
+                continue
+            new_ci = float(np.mean(_col_state["col_importance"]))
+            prev_ci = _freeze_last_ci.get(_name)
+            _freeze_is_frozen[_name] = prev_ci is not None and abs(new_ci - prev_ci) < sleep_gate_epsilon
+            _freeze_last_ci[_name] = new_ci
 
     t0 = time.time()
     window_t0 = t0
@@ -855,15 +888,19 @@ def train_curriculum(
         step += 1
         stage_step += 1
         if sleep_enable:
-            if not in_sleep and step % sleep_every_steps == 0:
-                in_sleep = True
-                sleep_steps_remaining = sleep_duration_steps
-                model.sleep_energy_enable = True
-            if in_sleep:
-                sleep_steps_remaining -= 1
-                if sleep_steps_remaining <= 0:
-                    in_sleep = False
-                    model.sleep_energy_enable = False
+            if sleep_gate_layers:
+                in_sleep = any(_freeze_is_frozen.get(name, False) for name in sleep_gate_layers)
+                model.sleep_energy_enable = in_sleep
+            else:
+                if not in_sleep and step % sleep_every_steps == 0:
+                    in_sleep = True
+                    sleep_steps_remaining = sleep_duration_steps
+                    model.sleep_energy_enable = True
+                if in_sleep:
+                    sleep_steps_remaining -= 1
+                    if sleep_steps_remaining <= 0:
+                        in_sleep = False
+                        model.sleep_energy_enable = False
         if lr_override_fn is not None:
             lr = lr_override_fn(step)
         elif step <= WARMUP_STEPS:
@@ -992,6 +1029,30 @@ def train_curriculum(
                         max_chunk=l2_init_max_chunk,
                         rate=l2_init_rate,
                     )
+                if sleep_gate_layers:
+                    # Keep col_importance moving (or not) during sleep too,
+                    # so the freeze gate can detect waking up on its own.
+                    _update_freeze_tracker(
+                        model.apply_plasticity_reset(
+                            touch_fraction=plasticity_reset_touch_fraction,
+                            min_chunk=plasticity_reset_min_chunk,
+                            max_chunk=plasticity_reset_max_chunk,
+                            eta=plasticity_reset_eta,
+                            eta_slow=plasticity_reset_eta_slow,
+                            eta_slow_catchup=plasticity_reset_eta_slow_catchup,
+                            eta_fast=plasticity_reset_eta_fast,
+                            blend=plasticity_reset_blend,
+                            reset_fraction=plasticity_reset_reset_fraction,
+                            k=plasticity_reset_k,
+                            eta_var=plasticity_reset_eta_var,
+                            l2_decay_lambda=plasticity_reset_l2_decay_lambda,
+                            l2_decay_threshold=plasticity_reset_l2_decay_threshold,
+                            l2_decay_temperature=plasticity_reset_l2_decay_temperature,
+                            max_ci=plasticity_reset_max_ci,
+                            select_by_deviation=plasticity_reset_select_by_deviation,
+                            include_column_state=True,
+                        )
+                    )
             elif i in targets:
                 loss = cross_entropy_sum(logits, [(logit_row, targets[i])])
                 loss_ema = (
@@ -1092,8 +1153,12 @@ def train_curriculum(
                         l2_decay_temperature=plasticity_reset_l2_decay_temperature,
                         max_ci=plasticity_reset_max_ci,
                         select_by_deviation=plasticity_reset_select_by_deviation,
-                        include_column_state=(plasticity_column_log_dir is not None or plasticity_live_display),
+                        include_column_state=(
+                            plasticity_column_log_dir is not None or plasticity_live_display or bool(sleep_gate_layers)
+                        ),
                     )
+                    if sleep_gate_layers:
+                        _update_freeze_tracker(_plasticity_stats)
                     for _layer_name, _layer_stats in _plasticity_stats.items():
                         _scattered = _layer_stats.get("importance")
                         if _scattered is None:
