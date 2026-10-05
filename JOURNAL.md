@@ -11591,3 +11591,97 @@ v24's config) launched to test this directly against v25/v26's own
 results. Unit-verified the freeze-detection logic in isolation
 (5 synthetic cases: first-ever call, moved value, unmoved value,
 incomplete cycle, resumed movement) before launching -- all correct.
+
+## k=4/k=5 in-context ceiling, exact derivation (answering a direct
+question: does solving k=4 also require out-of-context work, and is
+there any "next up" token or other signal besides the raw key/value
+pairs?)
+
+Verified directly from `generate_mqar_sequence` (`model/toy_recall_task.py`).
+`seq_len_for_k(k) = 4k` exactly (the helper's `%2` rounding is
+vestigial -- `4k` is always even). Keys sit at `kvs[0::2]`, positions
+`0, 2, ..., 2k-2`. Queries are placed via `queries[gaps*2] = keys`,
+`gaps` a random permutation of `range(space)`, `space = k`, so:
+
+- max possible query position = `context_size + (k-1)*2 = 4k-2`
+- min possible key position = `0`
+- **worst-case key-to-query gap = `4k-2`** (a real, reachable case --
+  `gaps` is a random assignment, so key-index 0 landing on the largest
+  gap value happens with nonzero probability on real training examples)
+
+Window reach is `num_tiles-1 = 15`. So: k=3 gap=10 (margin +5), **k=4
+gap=14 (margin +1 -- in-context, but by only one token, not an exact
+boundary)**, **k=5 gap=18 (margin -3 -- genuinely exceeds the window)**.
+The `level_prefix` offset shifts both the key's and its query's
+absolute position by the same amount, so it cancels out of the gap and
+doesn't change any of this.
+
+**No "next up" token or other side signal exists.** `queries[gaps*2] =
+keys` -- a query position literally contains the SAME key token
+repeated, with no separate marker. The model must recognize "I've seen
+this exact token before as a key" from pure token-identity recurrence,
+then recall its paired value -- it really is "just all the pairs."
+
+So k=5 is the first level that structurally requires recurrence beyond
+the attention window, by a clean margin of 3 (not an exact boundary).
+This is the baseline this section's k=6/k=7 results (next entry) are
+measured against.
+
+## 2026-10-04 (cont'd) -- v27/v28 results: freeze-gated sleep beats
+EVERY prior result in this investigation, including both unmodified
+baselines
+
+| run | mechanism | reached 126/k2 at | final k |
+|---|---|---|---|
+| v19c (no sleep) | -- | step 7,375 | stuck at k2 forever |
+| v25 (blind periodic sleep) | -- | step 11,936 | k3, then stuck |
+| **v27 (freeze-gated sleep, v19c's config)** | -- | step 10,312 | **k6** |
+| v24 (no sleep) | -- | step 6,230 | k5, then stuck |
+| v26 (blind periodic sleep) | -- | step 11,021 | stuck at k2 forever |
+| **v28 (freeze-gated sleep, v24's config)** | -- | step 7,711 | **k7** |
+
+Both v27 and v28 beat every prior result in the whole v13-v28 series,
+including the completely unmodified baselines -- not just a fix for
+the periodic-schedule disruption, a genuinely new ceiling. Both show
+the same qualitative shape: fast climb through early k-levels, a long
+stall (v27: steps 14,125-49,164; v28: steps 16,893-40,939), then a
+sleep-triggered rescue past it, repeating once more before the run
+ends. Neither fully escaped -- both re-plateaued at their final k by
+step 100,000 -- so this is real, repeated rescue work, not an unlimited
+escape valve.
+
+**k=6/k=7 significance, computed the same way as the k=4/k=5 entry
+above**: worst-case gap = `4k-2` = 22 (k=6) / 26 (k=7), exceeding the
+15-token window reach by 7 and 11 positions respectively -- a
+substantially harder recurrent-memory requirement than k=5's own
+3-token excess. With `NUM_MEMORY_SLOTS=2`, reaching k=6/k=7 at all
+means the model is genuinely using real superposition (multiple
+key-value associations packed into just 2 memory slots), not mastering
+k=5 and getting lucky at the ceiling.
+
+**Known bug, NOT fixed in this PR, tracked for a follow-up**: v27's log
+shows `RuntimeWarning: overflow encountered in multiply` at
+`sili/cpu.py:69` (`Backend.mul`, the generic elementwise Tensor
+multiply used throughout the whole autograd system) around step
+98,250, late in its own k6 plateau. Did not visibly corrupt the run
+(no NaN, loss stayed in its normal 4.4-4.7 range afterward) and did not
+crash (numpy warns rather than raising on fp32 overflow) -- but some
+Tensor value grew large enough to overflow fp32 during an extended
+run, silently, which is a real correctness gap worth closing (root
+cause not yet identified) before pushing these recipes further or
+scaling up.
+
+**Decision (direct instruction)**: this closes out the
+plasticity/sleep-annealing investigation for this PR. Sparsity (DISLDO)
+and plasticity (magnitude regularization + freeze-gated sleep) are both
+demonstrated working together on a real 100k+ step run. `scripts/
+train_peridot_main.py` is now the project's canonical main entry point
+(README.md added, pointing to it). Deferred to a follow-up PR, recorded
+but not started here: the `Backend.mul` overflow fix; scaling this
+recipe with FP4 precision and harder MQAR tasks on a rented RTX
+5090-class GPU, re-running the same small-model-first ablation
+discipline before trusting anything at that scale; and revisiting the
+sleep mechanism's cadence for real-time/wall-clock deployment (e.g. a
+robot sleeping on an hours schedule, not a training-step schedule) --
+likely needs steps/lr/gradient-sparsity re-tuned together, not just the
+gate itself.

@@ -20,6 +20,20 @@ reproducible.
 commit [`30ca81a`](https://github.com/SimLeek/sili_peridot/commit/30ca81a),
 `launch_dense_lr_scaled.py`, branch `research/dense-vs-sparse-mqar-300k`.
 
+**Capability ceiling superseded (2026-10-04), different axis than the
+table below tracks.** The v13-v28 plasticity/sleep-annealing series
+(JOURNAL.md has the full narrative) wasn't optimizing fastest-to-k3 --
+it was asking how far past k3 a run can get before stalling for good.
+`scripts/train_peridot_main.py` (seed=1001, the full magnitude +
+freeze-gated-sleep recipe) reached `vocab=126, k=7` -- well past `k=5`,
+the highest level solvable from pure in-context lookup (see
+JOURNAL.md's "k=4/k=5 in-context ceiling" entry), meaning real,
+superposed recurrent-memory use. It reaches `vocab=126, k=3` itself at
+step 16,111 -- slower than this table's own fastest-to-k3 record above,
+so it doesn't overwrite that specific entry, but it is now the
+project's reference result for MQAR capability. See JOURNAL.md's
+2026-10-04 entries for the full v27/v28 comparison.
+
 First run in this project's history (as far as this log's coverage
 goes) to reach the full `vocab=126, k=3` milestone at all -- the
 previous best (`arm_nolevel_down`, state_width=128, 2026-09-07) reached
