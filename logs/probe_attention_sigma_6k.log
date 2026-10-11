@@ -1,0 +1,11 @@
+=== base-16: embed_width=16 steps=6000 ===
+  base-16: 6000 queries, 1908 correct (31.8%), peak_vocab=16 final_vocab=8
+  sigma (all):       mean=3.8427 std=0.6468 median=3.6094 p10=3.2505 p90=4.6589
+  sigma (correct):   mean=3.8266 std=0.6600 median=3.5605
+  sigma (incorrect): mean=3.8502 std=0.6404 median=3.6705
+
+=== embed-32: embed_width=32 steps=6000 ===
+  embed-32: 6000 queries, 2658 correct (44.3%), peak_vocab=8 final_vocab=8
+  sigma (all):       mean=4.5000 std=0.0000 median=4.5000 p10=4.5000 p90=4.5000
+  sigma (correct):   mean=4.5000 std=0.0000 median=4.5000
+  sigma (incorrect): mean=4.5000 std=0.0000 median=4.5000

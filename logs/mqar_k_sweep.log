@@ -1,0 +1,60 @@
+# train_steps=3000 seed=1000 k_values=[1, 2, 4, 8] embed_width=16 column_neurons=8 state_width=128 vocab=128 l1_sparsity_coef=0.05 peak_lr=0.01
+
+=== K=1 (seq_len=4) ===
+  [K=1] step=   300/3000  (16s elapsed, 0.0519s/step)
+  [K=1] step=   600/3000  (31s elapsed, 0.0513s/step)
+  [K=1] step=   900/3000  (45s elapsed, 0.0499s/step)
+  [K=1] step=  1200/3000  (59s elapsed, 0.0489s/step)
+  [K=1] step=  1500/3000  (74s elapsed, 0.0490s/step)
+  [K=1] step=  1800/3000  (89s elapsed, 0.0494s/step)
+  [K=1] step=  2100/3000  (104s elapsed, 0.0495s/step)
+  [K=1] step=  2400/3000  (117s elapsed, 0.0489s/step)
+  [K=1] step=  2700/3000  (132s elapsed, 0.0490s/step)
+  [K=1] step=  3000/3000  (146s elapsed, 0.0486s/step)
+K=  1  seq_len=   4  acc=0.0833  (147s)
+
+=== K=2 (seq_len=8) ===
+  [K=2] step=   300/3000  (41s elapsed, 0.1352s/step)
+  [K=2] step=   600/3000  (81s elapsed, 0.1354s/step)
+  [K=2] step=   900/3000  (122s elapsed, 0.1354s/step)
+  [K=2] step=  1200/3000  (163s elapsed, 0.1360s/step)
+  [K=2] step=  1500/3000  (203s elapsed, 0.1355s/step)
+  [K=2] step=  1800/3000  (244s elapsed, 0.1356s/step)
+  [K=2] step=  2100/3000  (285s elapsed, 0.1358s/step)
+  [K=2] step=  2400/3000  (326s elapsed, 0.1359s/step)
+  [K=2] step=  2700/3000  (366s elapsed, 0.1357s/step)
+  [K=2] step=  3000/3000  (407s elapsed, 0.1356s/step)
+K=  2  seq_len=   8  acc=0.0000  (409s)
+
+=== K=4 (seq_len=16) ===
+  [K=4] step=   300/3000  (114s elapsed, 0.3788s/step)
+  [K=4] step=   600/3000  (227s elapsed, 0.3790s/step)
+  [K=4] step=   900/3000  (338s elapsed, 0.3758s/step)
+  [K=4] step=  1200/3000  (451s elapsed, 0.3756s/step)
+  [K=4] step=  1500/3000  (562s elapsed, 0.3746s/step)
+  [K=4] step=  1800/3000  (663s elapsed, 0.3682s/step)
+  [K=4] step=  2100/3000  (761s elapsed, 0.3626s/step)
+  [K=4] step=  2400/3000  (859s elapsed, 0.3581s/step)
+  [K=4] step=  2700/3000  (957s elapsed, 0.3543s/step)
+  [K=4] step=  3000/3000  (1061s elapsed, 0.3535s/step)
+K=  4  seq_len=  16  acc=0.0000  (1065s)
+
+=== K=8 (seq_len=32) ===
+  [K=8] step=   300/3000  (310s elapsed, 1.0345s/step)
+  [K=8] step=   600/3000  (616s elapsed, 1.0262s/step)
+  [K=8] step=   900/3000  (921s elapsed, 1.0238s/step)
+  [K=8] step=  1200/3000  (1227s elapsed, 1.0221s/step)
+  [K=8] step=  1500/3000  (1531s elapsed, 1.0208s/step)
+  [K=8] step=  1800/3000  (1836s elapsed, 1.0202s/step)
+  [K=8] step=  2100/3000  (2153s elapsed, 1.0253s/step)
+  [K=8] step=  2400/3000  (2458s elapsed, 1.0243s/step)
+  [K=8] step=  2700/3000  (2768s elapsed, 1.0251s/step)
+  [K=8] step=  3000/3000  (3074s elapsed, 1.0247s/step)
+K=  8  seq_len=  32  acc=0.0063  (3087s)
+
+# SUMMARY
+   K   seq_len       acc
+   1         4    0.0833
+   2         8    0.0000
+   4        16    0.0000
+   8        32    0.0063

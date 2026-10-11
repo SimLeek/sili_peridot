@@ -1,0 +1,9 @@
+=== base-16: embed_width=16 steps=300 ===
+  base-16: 600 backward calls captured, 0 with EXACTLY zero log_sigmas.grad (0.0%)
+  grad norm: mean=2.155e-02 max=1.081e+00 median=4.127e-03
+  grad norm (nonzero only): mean=2.155e-02 min=2.208e-04
+
+=== embed-32: embed_width=32 steps=300 ===
+  embed-32: 600 backward calls captured, 0 with EXACTLY zero log_sigmas.grad (0.0%)
+  grad norm: mean=9.599e+09 max=5.412e+10 median=6.649e+09
+  grad norm (nonzero only): mean=9.599e+09 min=4.303e-03

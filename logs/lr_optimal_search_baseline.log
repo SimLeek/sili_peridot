@@ -1,0 +1,19 @@
+
+FINAL: best_lr=0.04832 (mult=24.16x) best_score=0.6100 n_trials=15 elapsed=692s reason=converged
+
+History (log_lr, score), sorted by log_lr:
+  lr=0.00200 (mult=  1.00x) score=0.2400
+  lr=0.00324 (mult=  1.62x) score=0.3400
+  lr=0.00705 (mult=  3.52x) score=0.5000
+  lr=0.02485 (mult= 12.42x) score=0.5100
+  lr=0.04021 (mult= 20.10x) score=0.4600
+  lr=0.04504 (mult= 22.52x) score=0.5000
+  lr=0.04704 (mult= 23.52x) score=0.3000
+  lr=0.04783 (mult= 23.91x) score=0.4300
+  lr=0.04832 (mult= 24.16x) score=0.6100
+  lr=0.04913 (mult= 24.56x) score=0.4900
+  lr=0.05046 (mult= 25.23x) score=0.4900
+  lr=0.05413 (mult= 27.07x) score=0.5300
+  lr=0.06505 (mult= 32.53x) score=0.4500
+  lr=0.08759 (mult= 43.79x) score=0.1500
+  lr=0.19080 (mult= 95.40x) score=0.0800

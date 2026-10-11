@@ -1,0 +1,18 @@
+baseline config, 1500 steps, seeds=[1000, 1001], coef=0.05
+
+  [mult=10.000 peak_lr=0.02000] seed=1000 old_style=0.6667 eval_acc(50)=0.6000 skips=0/1500
+  [mult=10.000 peak_lr=0.02000] seed=1001 old_style=0.3333 eval_acc(50)=0.5200 skips=0/1500
+[mult=10.000 peak_lr=0.02000] MEAN old_style=0.5000 eval_acc=0.5600
+
+  [mult=20.000 peak_lr=0.04000] seed=1000 old_style=0.3333 eval_acc(50)=0.5200 skips=0/1500
+  [mult=20.000 peak_lr=0.04000] seed=1001 old_style=0.6667 eval_acc(50)=0.5200 skips=0/1500
+[mult=20.000 peak_lr=0.04000] MEAN old_style=0.5000 eval_acc=0.5200
+
+  [mult=50.000 peak_lr=0.10000] seed=1000 old_style=0.3333 eval_acc(50)=0.5200 skips=0/1500
+  [mult=50.000 peak_lr=0.10000] seed=1001 old_style=0.6667 eval_acc(50)=0.2200 skips=0/1500
+[mult=50.000 peak_lr=0.10000] MEAN old_style=0.5000 eval_acc=0.3700
+
+  [mult=100.000 peak_lr=0.20000] seed=1000 old_style=0.3333 eval_acc(50)=0.1200 skips=0/1500
+  [mult=100.000 peak_lr=0.20000] seed=1001 old_style=0.0000 eval_acc(50)=0.1800 skips=0/1500
+[mult=100.000 peak_lr=0.20000] MEAN old_style=0.1667 eval_acc=0.1500
+

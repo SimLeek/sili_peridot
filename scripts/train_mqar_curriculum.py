@@ -19,6 +19,7 @@ trajectory_log_every semantics. See each CLI arg's own comment in main() below f
 from __future__ import annotations
 
 import json
+import os
 import resource
 import sys
 import time
@@ -28,12 +29,12 @@ import numpy as np
 sys.path.insert(0, ".")
 
 from sili import _cpu
-from sili.sparse_rnn import DISLDOLayer, DISLDOLayer8, DISLDOLayer32
+from sili.sparse_rnn import DIDLDOLayer32, DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili.tensor import combine_losses
 
 from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, predicted_token
 from model.toy_recall_task import generate_mqar_sequence
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT, spectral_norm_upper_bound
 from scripts.train_mqar_rmt_reference import (
     CLIP_RANGE,
     COLUMN_NEURONS,
@@ -50,7 +51,17 @@ from scripts.train_mqar_rmt_reference import (
 )
 from scripts.train_tile_curriculum import _build_tile_window
 
-PRECISION_CLS = {"fp4": DISLDOLayer, "fp8": DISLDOLayer8, "fp32": DISLDOLayer32}
+PRECISION_CLS = {
+    "fp4": DISLDOLayer,
+    "fp8": DISLDOLayer8,
+    "fp32": DISLDOLayer32,
+    # Group B (DIDLDO/SIDLDO, dense weight storage) -- the real dense
+    # control arm for the dense-vs-sparse MQAR comparison, not
+    # DISLDOLayer32(dense=True) (still Group A/sparse-capable storage,
+    # just densely initialized). See sparse_rnn.rst:
+    # sparse_rnn.engine_select_two_groups for the group distinction.
+    "fp32_dense": DIDLDOLayer32,
+}
 
 
 def _default_graded_dy_schedule(num_tiles: int, floor: float = 0.02) -> list:
@@ -72,9 +83,21 @@ NOCAPS_KWARGS = {"max_abs_delta": 1e30, "max_ci": 1e30}
 # See docs/research/train_mqar_curriculum.rst:train_curriculum.fp8_max_abs_delta_scale_space_bug.
 NOCAPS_KWARGS_FP8 = {"max_abs_delta": 2.0, "max_ci": 1e30}
 # See docs/research/train_mqar_curriculum.rst:train_curriculum.fp32_unbounded_weight_blowup.
-NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0}
-PRECISION_SYNAPSE_KWARGS = {"fp4": NOCAPS_KWARGS, "fp8": NOCAPS_KWARGS_FP8, "fp32": NOCAPS_KWARGS_FP32}
+# max_abs_grad=8.0: data-derived from v13's real recorded gradient-scale
+# distribution (sqrt(raw_importance) across all 6 pools, p99.9~=6.34,
+# p99.99~=9.85) -- see
+# docs/research/toy_tile_recurrence_rmt.rst:col_importance_is_rmsprop_v_t
+# and sili__new's docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+NOCAPS_KWARGS_FP32 = {"max_abs_delta": 2.0, "max_ci": 100.0, "max_abs_grad": 8.0}
+PRECISION_SYNAPSE_KWARGS = {
+    "fp4": NOCAPS_KWARGS,
+    "fp8": NOCAPS_KWARGS_FP8,
+    "fp32": NOCAPS_KWARGS_FP32,
+    "fp32_dense": NOCAPS_KWARGS_FP32,
+}
 
+# See docs/research/train_mqar_curriculum.rst:train_curriculum.width_scaling_lr_fanin_hypothesis
+# -- UNCONFIRMED: tuned near state_width=128, wider dense state_width may need this lowered.
 DEFAULT_PEAK_LR = 0.015
 DEFAULT_NUM_TILES = 16  # fixed local-attention window (model param, not a task param)
 LEVEL_UP_TOKEN = VOCAB - 2  # 126 -- reserved, never chosen as an MQAR key/value
@@ -278,6 +301,14 @@ def train_curriculum(
     embed_width: int = EMBED_WIDTH,
     input_sparsity_p: float | None = None,
     wide_max_weights: int | None = None,
+    # See docs/research/train_mqar_curriculum.rst:train_curriculum.dense_was_hardcoded_true
+    # -- was unconditionally True (not a real param) until 2026-09-18. Leave True at this
+    # model scale: dense=False + a pre-chosen wide_max_weights has repeatedly degenerated
+    # (project_sili_wide_model_mqar_baseline, project_sili_synaptogenesis_pruning_testing
+    # memories) -- not validated as safe until state_width is large enough for a real
+    # fan-in budget (biological target 1000-10000/neuron) to fit without forcing near-full
+    # density anyway.
+    dense: bool = True,
     dy_sparsity_p: float | None = None,
     use_tile_cache: bool = False,
     output_dy_sparsity_p: float | None = None,
@@ -294,6 +325,7 @@ def train_curriculum(
     embed_learning_rate: float | None = None,
     k_first_target: int | None = None,
     k_first_vocab: int | None = None,
+    continue_past_graduation: bool = False,
     l2_decay_chunk_size: int | None = None,
     l2_decay_adaptation_rate: float = 0.3,
     dy_r_target: float | None = None,
@@ -304,11 +336,257 @@ def train_curriculum(
     x_r_target: float | None = None,
     x_k_min: int = 0,
     x_k_max: int | None = None,
+    x_balance_bias_step: float | None = None,
+    x_balance_loss_coef: float = 0.0,
+    x_r_target_auto: bool = False,
+    x_r_target_auto_beta: float = 0.98,
+    x_r_target_auto_margin: float = 0.0,
+    dy_time_gate_cutoff: float | None = None,
+    dy_time_gate_phase_step: float = 0.02,
+    dy_time_gate_period: float = 125.0,
+    dy_time_gate_seed: int | None = None,
+    dy_energy_gate_density: float | None = None,
+    dy_energy_gate_kwargs: dict | None = None,
+    dy_energy_lr_scale_enable: bool = False,
+    dy_energy_lr_scale_kappa: float = 0.5,
+    dy_energy_lr_scale_setpoint: float = 1.0,
+    write_time_aux_targets: bool = False,
+    max_grad_norm: float | None = None,
     target_steps_per_sec: float | None = None,
     trajectory_log_every: int | None = None,
     trajectory_log_steps: tuple[int, int] | None = None,
     trajectory_log_fn=None,
     r_target_min: float = 0.05,
+    use_energy: bool = False,
+    energy_kwargs: dict | None = None,
+    # Sleep annealing (see docs/research/toy_tile_recurrence_rmt.rst:
+    # sleep_energy_design, JOURNAL.md's 2026-10-03 "energy-driven sleep
+    # annealing" entry) -- periodic windows where the task loss is
+    # replaced entirely by model.step()'s own sleep-energy aux_loss
+    # (fire_wake_gradient-driven, no wake_gate, decay-stabilized),
+    # toggled via model.sleep_energy_enable, every sleep_every_steps
+    # steps for sleep_duration_steps steps. False (default):
+    # byte-identical to today's exact behavior.
+    sleep_enable: bool = False,
+    sleep_every_steps: int | None = None,
+    sleep_duration_steps: int | None = None,
+    sleep_energy_kwargs: dict | None = None,
+    # Reactive alternative to the periodic sleep_every_steps/sleep_duration_steps
+    # schedule above -- intrinsic only (col_importance deltas from the already
+    # -running plasticity_reset mechanism, no task/curriculum info): sleep stays
+    # on exactly as long as ANY named layer's col_importance is frozen (zero
+    # delta between successive amortized cycles), off otherwise. When set,
+    # sleep_every_steps/sleep_duration_steps are ignored. See JOURNAL.md's
+    # 2026-10-04 "freeze-gated sleep" entry.
+    sleep_gate_layers: tuple[str, ...] | None = None,
+    sleep_gate_epsilon: float = 1e-7,
+    # See docs/research/train_mqar_curriculum.rst:train_curriculum.lr_override_fn_range_test
+    # -- bypasses the warmup/accuracy-decay schedule below entirely when set: lr = lr_override_fn(step).
+    lr_override_fn=None,
+    # See docs/research/train_mqar_curriculum.rst:polyak_lr_f_star_assumption -- per-layer
+    # Stochastic-Polyak-Step-size, replacing lr for the 5 wide layers only (lm_head/embed
+    # unaffected). False (default): byte-identical to today's exact behavior.
+    polyak_lr: bool = False,
+    polyak_f_star: float = 0.0,
+    # c=0.5 (a typical literature SPS damping factor) was wildly miscalibrated
+    # for this setup's actual per-layer Lbar scale -- see apply_polyak_lr's
+    # own docstring for the recalibration story (first validation run failed
+    # to learn at all under the old c=0.5/lr_max=0.1 defaults).
+    polyak_c: float = 0.0005,
+    polyak_lr_max: float = 0.05,
+    # See docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design --
+    # EXPERIMENTAL critical-learning-periods/loss-of-plasticity forgetting.
+    # False (default): byte-identical to today's exact behavior, matching
+    # l2_decay_chunk_size's own off-by-default convention.
+    loss_adjusted_decay_enable: bool = False,
+    # touch_fraction, not a raw chunk_size -- real bug caught before ever
+    # launching a real run: see apply_loss_adjusted_decay's own
+    # touch_fraction docstring section (a single shared absolute
+    # chunk_size either barely touches big layers or, for small ones,
+    # over-touches past their own nnz -- compounding toward an
+    # accidental full-layer wipe rather than gradual, testable decay).
+    loss_adjusted_decay_touch_fraction: float = 0.01,
+    loss_adjusted_decay_min_chunk: int = 4,
+    loss_adjusted_decay_max_chunk: int = 2048,
+    # Half-life in TOUCHES (~1 per amortized cycle), not an abstract
+    # severity knob -- real miscalibration caught before ever launching a
+    # real run: see apply_loss_adjusted_decay's own SEVERITY docstring
+    # section (an earlier strength/floor design crushed a real layer's
+    # weights to float-zero within ~1400 calls under full stall, a small
+    # fraction of one historical stall's real 74k-99k-step length).
+    # 500 touches (~50,000 calls at the default touch_fraction, the same
+    # order of magnitude as those historical stalls) to halve at worst.
+    loss_adjusted_decay_importance_half_life_touches: float | None = 500.0,
+    # weight arm default OFF -- see apply_loss_adjusted_decay's own
+    # docstring: it shares l2_decay_chunk_size's C++ weight-decay cursor,
+    # do not set this nonzero in the same run that also sets
+    # l2_decay_chunk_size.
+    loss_adjusted_decay_weight_half_life_touches: float | None = None,
+    # Real baseline/grace period -- see apply_loss_adjusted_decay's own
+    # min_stall_steps docstring section (direct question: "I feel like it
+    # would need to establish a baseline and shouldn't necessarily decay
+    # all the time"). Decay is an EXACT no-op for this many consecutive
+    # non-improving calls before it starts ramping in at all.
+    loss_adjusted_decay_min_stall_steps: int = 200,
+    loss_adjusted_decay_ramp_steps: int = 200,
+    loss_adjusted_decay_beta_fast: float = 0.9,
+    loss_adjusted_decay_beta_floor: float = 0.999,
+    loss_adjusted_decay_improve_tol: float = 1e-3,
+    # See docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design --
+    # EXPERIMENTAL per-neuron utility-based plasticity reset
+    # (Continual-Backprop-inspired), SUPERSEDES loss_adjusted_decay above
+    # as the primary mechanism under test. False (default): byte-identical
+    # to today's exact behavior. NO loss argument needed -- purely local
+    # per-column signals, unlike loss_adjusted_decay.
+    plasticity_reset_enable: bool = False,
+    plasticity_reset_touch_fraction: float = 0.01,
+    plasticity_reset_min_chunk: int = 4,
+    plasticity_reset_max_chunk: int = 2048,
+    plasticity_reset_eta: float = 0.99,
+    plasticity_reset_eta_slow: float = 0.99,
+    plasticity_reset_eta_slow_catchup: float = 0.95,
+    plasticity_reset_eta_fast: float = 0.5,
+    plasticity_reset_blend: float = 0.10,
+    plasticity_reset_reset_fraction: float = 0.01,
+    plasticity_reset_k: float = 1.0,
+    plasticity_reset_eta_var: float = 0.9,
+    # L2-saturation-gated decay on col_importance (direct instruction,
+    # after offline replay of a real 100k-step run's column logs showed
+    # importance saturating at the ci accumulator's max_ci clamp for
+    # most of a pool's population by late training). 0.0 (default):
+    # byte-identical no-op. See
+    # docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay.
+    plasticity_reset_l2_decay_lambda: float = 0.0,
+    plasticity_reset_l2_decay_threshold: float = 0.9,
+    plasticity_reset_l2_decay_temperature: float = 0.05,
+    plasticity_reset_max_ci: float = 100.0,
+    # False (default): byte-identical top-K-by-importance selection.
+    # True: rank candidates by deviation (growth RATE) instead of
+    # col_importance (absolute LEVEL) -- direct instruction, after
+    # comparing a graduated real run against a stuck real run's
+    # collected data. See
+    # docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection.
+    plasticity_reset_select_by_deviation: bool = False,
+    # Offline data collection toward fitting a reset-selection equation
+    # from real training data (direct instruction: per-column, not
+    # per-synapse -- the mechanism only ever selects at column
+    # granularity). None (default): no extra work, byte-identical to
+    # today. When set, one small .npz per completed cycle per
+    # layer/pool is written under this directory -- see
+    # docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+    # plasticity_column_data_collection section.
+    plasticity_column_log_dir: str | None = None,
+    # Diagnostic (direct instruction, after finding col_importance is a
+    # SECOND EMA on top of the real per-synapse ci accumulator, making it
+    # impossible to see the real accumulator's own recovery dynamics
+    # between plasticity touches): when True, each plasticity_column_log_dir
+    # snapshot ALSO includes the raw, unsmoothed per-synapse importance
+    # matrix (layer.importance reshaped to (in_features, out_features)),
+    # not just the column aggregate. False (default): byte-identical,
+    # no extra work. See
+    # docs/research/toy_tile_recurrence_rmt.rst:raw_ci_landscape_capture.
+    plasticity_raw_importance_log: bool = False,
+    # Diagnostic: called once per REAL weight update (right after
+    # opt.step()), as raw_ci_sample_fn(step, model) -- lets a caller
+    # track individual synapse values at the TRUE update cadence (every
+    # real step), unlike the once-per-cycle snapshots above. None
+    # (default): no extra work.
+    raw_ci_sample_fn=None,
+    # Direct instruction ("let's ... get displayarray ... working and
+    # display all of the networks side by side ... I'll just look at
+    # all of the synapses for the next run"): when True, pushes a
+    # live, tiled visualization (every pool's weight + importance
+    # heatmaps plus the plasticity_reset algorithm's own live
+    # selection/deviation state) to an on-screen window every time any
+    # pool completes an amortized cycle -- see
+    # scripts/live_synapse_display.py and
+    # docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display.
+    # False (default): byte-identical, no extra work, no window opened.
+    plasticity_live_display: bool = False,
+    # Pixels per synapse cell in the live display. Default 1: literal
+    # one pixel per synapse, no artificial zoom (direct correction --
+    # upsampling by default was solving a problem that didn't exist).
+    # Raise only if you deliberately want fewer, larger pools on
+    # screen. Only used when plasticity_live_display.
+    plasticity_live_display_cell_px: int = 1,
+    # L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025, arXiv:2308.11958)
+    # -- EXPERIMENTAL, see
+    # docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    # False (default): byte-identical, no extra work. Independent of
+    # plasticity_reset_enable -- separate mechanism, separate cursor,
+    # can run alongside it or alone.
+    l2_init_enable: bool = False,
+    l2_init_touch_fraction: float = 0.01,
+    l2_init_min_chunk: int = 4,
+    l2_init_max_chunk: int = 2048,
+    l2_init_rate: float = 0.0001,
+    # qk_l1_sparsity_coef: EXPERIMENTAL Q/K-specific candidate for the
+    # attention-entropy-collapse pattern found in v10's real recorded
+    # data (deviation std -> ~0 in q_proj/k_proj only). See
+    # docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design.
+    # Default off: byte-identical, no extra work.
+    qk_l1_sparsity_coef: float = 0.0,
+    # qkvo_norm_enable: supersedes the earlier qk_norm_enable (Q/K
+    # only) -- v12/v12b's real validation found Q/K-only normalization
+    # just shifted the same saturation pattern onto v_proj/o_proj/
+    # input_proj instead of removing it. Now covers Q, K, V, and
+    # o_proj's output. See
+    # docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
+    # Default off: byte-identical, no extra work.
+    qkvo_norm_enable: bool = False,
+    # Diagnostic only (no training-time cost unless True): logs
+    # spectral_norm_upper_bound(q_proj/k_proj weights) at the same
+    # cadence as the main summary line, to directly verify whether
+    # qk_l1_sparsity_coef/qkvo_norm_enable actually bound Q/K's
+    # spectral norm growth, not just infer it from downstream MQAR
+    # performance.
+    # See docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic.
+    qk_spectral_norm_diag_log: bool = False,
+    # AdaBelief-style row/column centering on the RMSprop-style ci
+    # accumulator itself (sili__new's update_ci m parameter -- distinct
+    # from every plasticity_reset_* mechanism above, which operates on
+    # col_importance/weight, not on ci's own gradient-EMA formula).
+    # Motivated by v14 (max_abs_grad clipping alone regressed curriculum
+    # progress vs v13b): clipping defends a one-off spike, centering
+    # defends a SUSTAINED large gradient that would otherwise keep ci
+    # pinned near max_abs_grad^2 forever. False/False (default):
+    # byte-identical, no extra work -- merged into synapse_kwargs (and
+    # thus reaches every DISLDOLayer32 layer's forward() call via
+    # self.synapse_kwargs) only when explicitly enabled. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+    centering_row_enable: bool = False,
+    centering_col_enable: bool = False,
+    centering_beta1: float | None = None,
+    # CiRenorm -- rescales a layer's real ci back toward a healthy
+    # region every call (never resets/prunes any synapse, unlike
+    # plasticity_reset_* above). Motivated directly by the v12-v16
+    # statistical analysis: "the average ci of a layer is literally
+    # inversely proportional to the average plasticity of that
+    # layer... importance was not a misnomer" -- rules out resetting
+    # high-ci synapses (genuinely important) in favor of rescaling.
+    # "off" (default): byte-identical, no extra work. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.ci_renorm.
+    ci_renorm_enable: str = "off",  # "off" | "trust_ratio" | "stable_region"
+    ci_renorm_touch_fraction: float = 0.01,
+    ci_renorm_min_chunk: int = 4,
+    ci_renorm_max_chunk: int = 2048,
+    ci_renorm_eff_lr: float = 0.01,
+    ci_renorm_max_ci_ref: float = 100.0,
+    ci_renorm_trust_ratio_min: float = 0.1,
+    ci_renorm_trust_ratio_max: float = 10.0,
+    # WeightRenorm -- companion to CiRenorm above, built after CiRenorm's
+    # StableRegion arm was found to let weight itself run away in a
+    # positive-feedback loop even while ci stayed correctly bounded
+    # (v18 GRADUATED; its same-seed repeat v18b stalled with v_proj
+    # weight norm growing 17->360 over 95k steps while ci stayed near
+    # target throughout). Direct instruction: "I guess we have to do a
+    # weight renorm in addition to the ci renorm. Exact same method
+    # would probably be fine." "off" (default): byte-identical. See
+    # sili__new's docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    weight_renorm_enable: str = "off",  # "off" | "stable_region"
+    weight_renorm_touch_fraction: float = 0.01,
+    weight_renorm_min_chunk: int = 4,
+    weight_renorm_max_chunk: int = 2048,
 ) -> dict:
     # query_debug_fn: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.query_debug_fn_explainable_ai_hook.
@@ -321,22 +599,76 @@ def train_curriculum(
     # train_curriculum.use_tile_cache_query_step_fallback.
     # k_first_target/k_first_vocab: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.k_first_target_odometer_reordering.
+    #
+    # WARNING (2026-09-11): leaving k_first_target unset (the default) runs
+    # the vocab-first curriculum -- k=1 for the ENTIRE vocab ramp, tens of
+    # thousands of steps, before k ever grows. This risks training the model
+    # to solve MQAR via a positional/relative shortcut (there's only ever
+    # ONE query-key pair per sequence at k=1) rather than genuine key-value
+    # binding, and per this file's own k_first_target_odometer_reordering
+    # design note, entrenches synapse importance against the k>1 feature
+    # before the model is ever asked to use it. Callers should set
+    # k_first_target (the "kcycle" odometer -- v16k1,v16k2,v16k3,v18k1,...)
+    # by default; only leave it unset when the test SPECIFICALLY calls for
+    # isolating vocab growth from k growth (e.g. reproducing an older
+    # vocab-first result, or a deliberate ablation of curriculum order
+    # itself). Kept opt-in rather than flipping the default, per this
+    # param's own backward-compatibility policy above -- existing callers
+    # that already pass k_first_target explicitly are unaffected either way.
     if k_first_target is not None and k_first_vocab is None:
         k_first_vocab = seq_len_for_k(k_first_target) + 4
+
+    # write_time_aux_targets: OFF by default, per direct instruction --
+    # predict-next-token only makes sense as a training signal if the
+    # next token is actually predictable, and in MQAR's random key/value
+    # layout it structurally isn't (every write position's "next token"
+    # is an unrelated random draw). _build_targets's own fallback
+    # (targets.setdefault(i, tokens[i+1]) for every non-query write
+    # position) mixes that unpredictable signal into every step
+    # alongside the real associative-recall objective. The 2026-09-07
+    # arm_nolevel_down investigation (JOURNAL.md) already found removing
+    # it helped, not hurt (bounded, if anything lower loss) -- this was
+    # previously only ever done via an ad-hoc module-level monkeypatch
+    # (scripts/sandbox_arm_launchers/run_sandbox_dense_probe.py's `_q`),
+    # never kept as a reusable, real parameter until now.
+    build_targets_fn = _build_targets if write_time_aux_targets else (lambda _tok, pairs, _k: dict(pairs))
+
+    # max_grad_norm: None -> MAX_GRAD_NORM (the module default, 1.0),
+    # matching every existing caller's behavior unchanged. clip_grad_norm_
+    # is a GLOBAL L2 norm across every parameter tensor combined, never
+    # scaled by parameter count -- as width grows, q/k/v/o_proj's own
+    # parameter count grows with state_width^2, so the natural (pre-clip)
+    # norm grows roughly with sqrt(param count) even at unchanged
+    # per-parameter gradient magnitudes. A fixed max_norm tuned at one
+    # width clips increasingly aggressively at a wider one, silently
+    # shrinking the effective step size below what was calibrated for the
+    # narrower model. Exposed here (real parameter, not a monkeypatch --
+    # see write_time_aux_targets's own history) to test that hypothesis
+    # directly, per direct instruction.
+    effective_max_grad_norm = MAX_GRAD_NORM if max_grad_norm is None else max_grad_norm
 
     disldo_cls = PRECISION_CLS[precision]
     # AQRS (additive_rank/dynamic_rank_control) exists to give LOW-BIT
     # storage (FP4/FP8) extra precision where it's sparse -- fp32 is
     # already full precision everywhere, so AQRS has nothing to correct
-    # for. Force it off here rather than support it on DISLDOLayer32: the
-    # caller's own additive_rank=1/dynamic_rank_control=True defaults
-    # would otherwise reach ToyTileRecurrenceRMT's non-zero-value guard
-    # (rank_kwargs/additive_kwargs, model/toy_tile_recurrence_rmt.py) and
-    # get forwarded into a constructor that was never meant to have it.
-    if precision == "fp32":
+    # for. Force it off here rather than support it on DISLDOLayer32/
+    # DIDLDOLayer32: the caller's own additive_rank=1/dynamic_rank_
+    # control=True defaults would otherwise reach ToyTileRecurrenceRMT's
+    # non-zero-value guard (rank_kwargs/additive_kwargs, model/
+    # toy_tile_recurrence_rmt.py) and get forwarded into a constructor
+    # that was never meant to have it.
+    if precision in ("fp32", "fp32_dense"):
         additive_rank = 0
         dynamic_rank_control = False
     state_width = embed_width * COLUMN_NEURONS
+
+    layer_synapse_kwargs = dict(PRECISION_SYNAPSE_KWARGS[precision])
+    if centering_row_enable:
+        layer_synapse_kwargs["centering_row_enable"] = True
+    if centering_col_enable:
+        layer_synapse_kwargs["centering_col_enable"] = True
+    if centering_beta1 is not None:
+        layer_synapse_kwargs["centering_beta1"] = centering_beta1
 
     rng = np.random.RandomState(seed)
     np.random.seed(seed)
@@ -354,10 +686,12 @@ def train_curriculum(
         MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS,
         disldo_cls=disldo_cls,
-        dense=True,
+        dense=dense,
         clip_range=clip_range,
         l1_sparsity_coef=L1_SPARSITY_COEF,
-        synapse_kwargs=dict(PRECISION_SYNAPSE_KWARGS[precision]),
+        qk_l1_sparsity_coef=qk_l1_sparsity_coef,
+        qkvo_norm_enable=qkvo_norm_enable,
+        synapse_kwargs=layer_synapse_kwargs,
         scale_rank=1,
         additive_rank=additive_rank,
         dynamic_rank_control=dynamic_rank_control,
@@ -376,7 +710,24 @@ def train_curriculum(
         x_r_target=x_r_target,
         x_k_min=x_k_min,
         x_k_max=x_k_max,
+        x_balance_bias_step=x_balance_bias_step,
+        x_balance_loss_coef=x_balance_loss_coef,
+        x_r_target_auto=x_r_target_auto,
+        x_r_target_auto_beta=x_r_target_auto_beta,
+        x_r_target_auto_margin=x_r_target_auto_margin,
+        dy_time_gate_cutoff=dy_time_gate_cutoff,
+        dy_time_gate_phase_step=dy_time_gate_phase_step,
+        dy_time_gate_period=dy_time_gate_period,
+        dy_time_gate_seed=dy_time_gate_seed,
+        dy_energy_gate_density=dy_energy_gate_density,
+        dy_energy_gate_kwargs=dy_energy_gate_kwargs,
+        dy_energy_lr_scale_enable=dy_energy_lr_scale_enable,
+        dy_energy_lr_scale_kappa=dy_energy_lr_scale_kappa,
+        dy_energy_lr_scale_setpoint=dy_energy_lr_scale_setpoint,
         r_target_min=r_target_min,
+        use_energy=use_energy,
+        energy_kwargs=energy_kwargs,
+        sleep_energy_kwargs=sleep_energy_kwargs,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -397,6 +748,18 @@ def train_curriculum(
     new_key_ids: list = []
     streak_has_new_vocab = False
     max_streak_seen = 0  # best streak between log points; see wrong_streak_threshold_reward_hacking anchor
+    # Per-layer/pool cumulative counts + latest deviation, so log_fn can
+    # attribute a loss spike to plasticity_reset actually firing (vs some
+    # other cause) instead of only seeing the downstream loss effect.
+    plasticity_totals: dict = {}
+    _live_display = None
+    if plasticity_live_display:
+        from scripts.live_synapse_display import LiveSynapseDisplay
+
+        _live_display = LiveSynapseDisplay(
+            pool_order=[f"{n}.{p}" for n, _ in model._named_real_layers() for p in ("scattered", "block4")],
+            cell_px=plasticity_live_display_cell_px,
+        )
     stage_step = 0
     queries_since_level_change = 0
     pending_level_token = None
@@ -485,6 +848,38 @@ def train_curriculum(
             v, k, ph = _current()
             log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
+    if sleep_enable:
+        if use_tile_cache:
+            raise ValueError("sleep_enable is not supported together with use_tile_cache")
+        if sleep_energy_kwargs is None:
+            raise ValueError("sleep_enable requires sleep_energy_kwargs")
+        if sleep_gate_layers:
+            if not plasticity_reset_enable:
+                raise ValueError("sleep_gate_layers requires plasticity_reset_enable (it reads col_importance)")
+        elif sleep_every_steps is None or sleep_duration_steps is None:
+            raise ValueError("sleep_enable without sleep_gate_layers requires sleep_every_steps/sleep_duration_steps")
+    in_sleep = False
+    sleep_steps_remaining = 0
+    _freeze_last_ci: dict = {}
+    _freeze_is_frozen: dict = {}
+
+    def _update_freeze_tracker(plasticity_stats: dict) -> None:
+        """Intrinsic-only freeze check (see sleep_gate_layers docstring):
+        a named layer is 'frozen' once col_importance stops moving at all
+        between successive amortized-cycle completions."""
+        for _name in sleep_gate_layers or ():
+            _leaf = (plasticity_stats.get(_name) or {}).get("importance")
+            _leaf = (_leaf or {}).get("block4")
+            if _leaf is None or not _leaf.get("cycle_complete"):
+                continue
+            _col_state = _leaf.get("column_state")
+            if _col_state is None:
+                continue
+            new_ci = float(np.mean(_col_state["col_importance"]))
+            prev_ci = _freeze_last_ci.get(_name)
+            _freeze_is_frozen[_name] = prev_ci is not None and abs(new_ci - prev_ci) < sleep_gate_epsilon
+            _freeze_last_ci[_name] = new_ci
+
     t0 = time.time()
     window_t0 = t0
     model.reset_layer_timing()
@@ -492,13 +887,41 @@ def train_curriculum(
     while step < max_steps:
         step += 1
         stage_step += 1
-        if step <= WARMUP_STEPS:
+        if sleep_enable:
+            if sleep_gate_layers:
+                in_sleep = any(_freeze_is_frozen.get(name, False) for name in sleep_gate_layers)
+                model.sleep_energy_enable = in_sleep
+            else:
+                if not in_sleep and step % sleep_every_steps == 0:
+                    in_sleep = True
+                    sleep_steps_remaining = sleep_duration_steps
+                    model.sleep_energy_enable = True
+                if in_sleep:
+                    sleep_steps_remaining -= 1
+                    if sleep_steps_remaining <= 0:
+                        in_sleep = False
+                        model.sleep_energy_enable = False
+        if lr_override_fn is not None:
+            lr = lr_override_fn(step)
+        elif step <= WARMUP_STEPS:
             lr = peak_lr * step / WARMUP_STEPS
         elif acc_ema is None:
             lr = peak_lr
         else:
             frac = max(MIN_LR_FRAC, min(1.0, 1.0 - acc_ema))
             lr = peak_lr * frac
+
+        if polyak_lr:
+            # See docs/research/train_mqar_curriculum.rst:polyak_lr_f_star_assumption
+            # -- lagged one step (uses last outer step's loss_ema + each wide layer's
+            # E_t from its own last backward call), same granularity as lr itself.
+            model.apply_polyak_lr(
+                loss_ema if loss_ema is not None else 0.0,
+                f_star=polyak_f_star,
+                c=polyak_c,
+                lr_max=polyak_lr_max,
+                bootstrap_lr=lr,
+            )
 
         vocab_size, k, phase = _current()
         seq_len = seq_len_for_k(k)
@@ -518,7 +941,7 @@ def train_curriculum(
         new_vocab_query_positions = (
             {pos for pos, _ in mqar_pairs if int(tokens[pos]) in new_key_ids} if new_key_ids else set()
         )
-        targets = _build_targets(tokens, mqar_pairs, k)
+        targets = build_targets_fn(tokens, mqar_pairs, k)
         query_positions = {pos for pos, _ in mqar_pairs}
 
         # [vocab indicator, k indicator]; see docs/research/train_mqar_curriculum.rst:
@@ -560,11 +983,77 @@ def train_curriculum(
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
-                memory, logits, aux = model.step(window, memory, lr, requires_grad=(i in targets))
+                memory, logits, aux = model.step(window, memory, lr, requires_grad=((i in targets) or in_sleep))
                 logit_row = num_tiles - 1
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
-            if i in targets:
+            if in_sleep:
+                # Sleep: no task loss at all, backward only on
+                # model.step()'s own sleep-energy aux_loss (populated at
+                # every token position, not just targets, since
+                # requires_grad was forced True above). loss_ema/acc_ema/
+                # streak tracking are untouched -- sleep steps are
+                # invisible to curriculum progression. Only the general
+                # -purpose magnitude regularizers run here, not the full
+                # target-gated block below (plasticity_reset/
+                # dynamic_rank_control/loss_adjusted_decay are a known,
+                # accepted scope gap -- see sleep_energy_design).
+                if aux is not None:
+                    aux.backward()
+                clip_grad_norm_(model.parameters_for_optimizer(), effective_max_grad_norm)
+                opt.step(model.parameters_for_optimizer(), lr=lr)
+                if l2_decay_chunk_size is not None:
+                    model.apply_amortized_l2_decay(l2_decay_chunk_size, l2_decay_adaptation_rate)
+                if ci_renorm_enable != "off":
+                    model.apply_ci_renorm(
+                        touch_fraction=ci_renorm_touch_fraction,
+                        min_chunk=ci_renorm_min_chunk,
+                        max_chunk=ci_renorm_max_chunk,
+                        mode=ci_renorm_enable,
+                        eff_lr=ci_renorm_eff_lr,
+                        max_ci_ref=ci_renorm_max_ci_ref,
+                        trust_ratio_min=ci_renorm_trust_ratio_min,
+                        trust_ratio_max=ci_renorm_trust_ratio_max,
+                    )
+                if weight_renorm_enable != "off":
+                    model.apply_weight_renorm(
+                        touch_fraction=weight_renorm_touch_fraction,
+                        min_chunk=weight_renorm_min_chunk,
+                        max_chunk=weight_renorm_max_chunk,
+                        mode=weight_renorm_enable,
+                    )
+                if l2_init_enable:
+                    model.apply_l2_init(
+                        touch_fraction=l2_init_touch_fraction,
+                        min_chunk=l2_init_min_chunk,
+                        max_chunk=l2_init_max_chunk,
+                        rate=l2_init_rate,
+                    )
+                if sleep_gate_layers:
+                    # Keep col_importance moving (or not) during sleep too,
+                    # so the freeze gate can detect waking up on its own.
+                    _update_freeze_tracker(
+                        model.apply_plasticity_reset(
+                            touch_fraction=plasticity_reset_touch_fraction,
+                            min_chunk=plasticity_reset_min_chunk,
+                            max_chunk=plasticity_reset_max_chunk,
+                            eta=plasticity_reset_eta,
+                            eta_slow=plasticity_reset_eta_slow,
+                            eta_slow_catchup=plasticity_reset_eta_slow_catchup,
+                            eta_fast=plasticity_reset_eta_fast,
+                            blend=plasticity_reset_blend,
+                            reset_fraction=plasticity_reset_reset_fraction,
+                            k=plasticity_reset_k,
+                            eta_var=plasticity_reset_eta_var,
+                            l2_decay_lambda=plasticity_reset_l2_decay_lambda,
+                            l2_decay_threshold=plasticity_reset_l2_decay_threshold,
+                            l2_decay_temperature=plasticity_reset_l2_decay_temperature,
+                            max_ci=plasticity_reset_max_ci,
+                            select_by_deviation=plasticity_reset_select_by_deviation,
+                            include_column_state=True,
+                        )
+                    )
+            elif i in targets:
                 loss = cross_entropy_sum(logits, [(logit_row, targets[i])])
                 loss_ema = (
                     float(loss.data)
@@ -618,12 +1107,161 @@ def train_curriculum(
                 if sigma_grad_debug_fn is not None:
                     # Fired before clip_grad_norm_; see ema_grad_scale_per_tensor anchor.
                     sigma_grad_debug_fn(step, model.log_sigmas.grad, model.centers.grad)
-                clip_grad_norm_(model.parameters_for_optimizer(), MAX_GRAD_NORM)
+                clip_grad_norm_(model.parameters_for_optimizer(), effective_max_grad_norm)
                 opt.step(model.parameters_for_optimizer(), lr=lr)
+                if raw_ci_sample_fn is not None:
+                    raw_ci_sample_fn(step, model)
                 # See docs/research/train_mqar_curriculum.rst:
                 # train_curriculum.l2_decay_and_rank_control_ordering.
                 if l2_decay_chunk_size is not None:
                     model.apply_amortized_l2_decay(l2_decay_chunk_size, l2_decay_adaptation_rate)
+                if loss_adjusted_decay_enable:
+                    # Uses loss_ema (not the raw per-token loss), same
+                    # smoothing convention apply_polyak_lr already uses for
+                    # its own residual -- see loss_adjusted_decay_design.
+                    model.apply_loss_adjusted_decay(
+                        loss_ema if loss_ema is not None else float(loss.data),
+                        touch_fraction=loss_adjusted_decay_touch_fraction,
+                        min_chunk=loss_adjusted_decay_min_chunk,
+                        max_chunk=loss_adjusted_decay_max_chunk,
+                        importance_half_life_touches=loss_adjusted_decay_importance_half_life_touches,
+                        weight_half_life_touches=loss_adjusted_decay_weight_half_life_touches,
+                        min_stall_steps=loss_adjusted_decay_min_stall_steps,
+                        ramp_steps=loss_adjusted_decay_ramp_steps,
+                        beta_fast=loss_adjusted_decay_beta_fast,
+                        beta_floor=loss_adjusted_decay_beta_floor,
+                        improve_tol=loss_adjusted_decay_improve_tol,
+                    )
+                if plasticity_reset_enable:
+                    if plasticity_raw_importance_log or plasticity_live_display:
+                        _layers_by_name = dict(model._named_real_layers())
+                    # No loss argument -- purely local per-column signals.
+                    _plasticity_stats = model.apply_plasticity_reset(
+                        touch_fraction=plasticity_reset_touch_fraction,
+                        min_chunk=plasticity_reset_min_chunk,
+                        max_chunk=plasticity_reset_max_chunk,
+                        eta=plasticity_reset_eta,
+                        eta_slow=plasticity_reset_eta_slow,
+                        eta_slow_catchup=plasticity_reset_eta_slow_catchup,
+                        eta_fast=plasticity_reset_eta_fast,
+                        blend=plasticity_reset_blend,
+                        reset_fraction=plasticity_reset_reset_fraction,
+                        k=plasticity_reset_k,
+                        eta_var=plasticity_reset_eta_var,
+                        l2_decay_lambda=plasticity_reset_l2_decay_lambda,
+                        l2_decay_threshold=plasticity_reset_l2_decay_threshold,
+                        l2_decay_temperature=plasticity_reset_l2_decay_temperature,
+                        max_ci=plasticity_reset_max_ci,
+                        select_by_deviation=plasticity_reset_select_by_deviation,
+                        include_column_state=(
+                            plasticity_column_log_dir is not None or plasticity_live_display or bool(sleep_gate_layers)
+                        ),
+                    )
+                    if sleep_gate_layers:
+                        _update_freeze_tracker(_plasticity_stats)
+                    for _layer_name, _layer_stats in _plasticity_stats.items():
+                        _scattered = _layer_stats.get("importance")
+                        if _scattered is None:
+                            continue
+                        for _pool_name, _leaf in (
+                            ("scattered", _scattered),
+                            ("block4", _scattered.get("block4")),
+                        ):
+                            if _leaf is None or not _leaf.get("cycle_complete"):
+                                continue
+                            _key = f"{_layer_name}.{_pool_name}"
+                            _tot = plasticity_totals.setdefault(
+                                _key,
+                                {
+                                    "n_reset": 0,
+                                    "last_deviation": 0.0,
+                                    "last_min_deviation": 0.0,
+                                    "last_max_deviation": 0.0,
+                                    "last_importance": 0.0,
+                                    "last_l2_sat_ratio": 0.0,
+                                    "last_l2_decay_strength": 0.0,
+                                },
+                            )
+                            _tot["n_reset"] += _leaf.get("n_reset_this_cycle", 0)
+                            _tot["last_deviation"] = _leaf.get("mean_deviation", 0.0)
+                            _tot["last_min_deviation"] = _leaf.get("min_deviation", 0.0)
+                            _tot["last_max_deviation"] = _leaf.get("max_deviation", 0.0)
+                            _tot["last_importance"] = _leaf.get("mean_col_importance", 0.0)
+                            _tot["last_l2_sat_ratio"] = _leaf.get("l2_sat_ratio", 0.0)
+                            _tot["last_l2_decay_strength"] = _leaf.get("l2_decay_strength", 0.0)
+                            _col_state = _leaf.get("column_state")
+                            if plasticity_column_log_dir is not None and _col_state is not None:
+                                _snap_dir = os.path.join(plasticity_column_log_dir, f"{_layer_name}.{_pool_name}")
+                                os.makedirs(_snap_dir, exist_ok=True)
+                                _extra = {}
+                                if plasticity_raw_importance_log:
+                                    # Raw, unsmoothed per-synapse importance --
+                                    # NOT col_importance (a second EMA on top of
+                                    # this). Safe reshape: scattered_nnz==0 for
+                                    # every dense-loaded real layer throughout
+                                    # training (verified), so layer.importance
+                                    # is exactly in_features*out_features long,
+                                    # in row-major order. See
+                                    # raw_ci_landscape_capture anchor. Also
+                                    # captures the raw weight matrix (same
+                                    # reshape, same safety guarantee) so a
+                                    # later replay can show the actual synapse
+                                    # values alongside importance, matching
+                                    # live_synapse_display's own two panels.
+                                    _layer = _layers_by_name[_layer_name]
+                                    _extra["raw_importance"] = np.array(_layer.importance).reshape(
+                                        _layer.in_features, _layer.out_features
+                                    )
+                                    _extra["raw_weight"] = np.array(_layer.weights).reshape(
+                                        _layer.in_features, _layer.out_features
+                                    )
+                                np.savez(
+                                    os.path.join(_snap_dir, f"step{step:08d}.npz"),
+                                    step=step,
+                                    loss_ema=(loss_ema if loss_ema is not None else float("nan")),
+                                    acc_ema=(acc_ema if acc_ema is not None else float("nan")),
+                                    n_reset_this_cycle=_leaf.get("n_reset_this_cycle", 0),
+                                    l2_sat_ratio=_leaf.get("l2_sat_ratio", 0.0),
+                                    l2_decay_strength=_leaf.get("l2_decay_strength", 0.0),
+                                    **_col_state,
+                                    **_extra,
+                                )
+                            if _live_display is not None and _col_state is not None:
+                                _layer = _layers_by_name[_layer_name]
+                                _imp = np.array(_layer.importance).reshape(_layer.in_features, _layer.out_features)
+                                _w = np.array(_layer.weights).reshape(_layer.in_features, _layer.out_features)
+                                _fast = _col_state["col_grad_fast"]
+                                _slow = _col_state["col_grad_slow"]
+                                _var = _col_state["col_grad_var"]
+                                _dev = (_fast - _slow) / (np.sqrt(np.maximum(_var, 0.0)) + 1e-8)
+                                _live_display.update_pool(_key, step, _imp, _w, _dev, _col_state["col_reset_active"])
+                                if _live_display.closed():
+                                    _live_display = None
+                if ci_renorm_enable != "off":
+                    model.apply_ci_renorm(
+                        touch_fraction=ci_renorm_touch_fraction,
+                        min_chunk=ci_renorm_min_chunk,
+                        max_chunk=ci_renorm_max_chunk,
+                        mode=ci_renorm_enable,
+                        eff_lr=ci_renorm_eff_lr,
+                        max_ci_ref=ci_renorm_max_ci_ref,
+                        trust_ratio_min=ci_renorm_trust_ratio_min,
+                        trust_ratio_max=ci_renorm_trust_ratio_max,
+                    )
+                if weight_renorm_enable != "off":
+                    model.apply_weight_renorm(
+                        touch_fraction=weight_renorm_touch_fraction,
+                        min_chunk=weight_renorm_min_chunk,
+                        max_chunk=weight_renorm_max_chunk,
+                        mode=weight_renorm_enable,
+                    )
+                if l2_init_enable:
+                    model.apply_l2_init(
+                        touch_fraction=l2_init_touch_fraction,
+                        min_chunk=l2_init_min_chunk,
+                        max_chunk=l2_init_max_chunk,
+                        rate=l2_init_rate,
+                    )
                 if dynamic_rank_control:
                     mutated = model.apply_dynamic_rank_control(
                         scale_grace_period_steps=rank_grace_period_steps,
@@ -647,7 +1285,13 @@ def train_curriculum(
                 ranks = model.report_ranks() if dynamic_rank_control else None
                 if log_fn is not None:
                     log_fn(step, *_current()[:2], phase_now, "GRADUATED", loss_ema, acc_ema, ranks=ranks)
-                break
+                # continue_past_graduation: log GRADUATED once (above) but
+                # keep training to max_steps instead of stopping -- the
+                # odometer's kcycle branch has no ceiling on k once vocab
+                # is maxed (_advance_stage), so it keeps attempting k+1
+                # naturally; no other curriculum change needed.
+                if not continue_past_graduation:
+                    break
         elif wrong_streak >= wrong_streak_threshold and queries_since_level_change >= MIN_QUERIES_BEFORE_REGRESS:
             _regress_stage(step)
 
@@ -677,6 +1321,19 @@ def train_curriculum(
                 model.apply_amortized_dy_r_target_control(steps_per_sec, target_steps_per_sec)
                 model.apply_cross_layer_budget_allocator(steps_per_sec, target_steps_per_sec)
             model.reset_layer_timing()
+            # qk_spectral_norm_diag_log: cheap (O(elements), q_proj/k_proj
+            # only), computed only at this same summary cadence -- see
+            # docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic.
+            qk_spectral_norm = None
+            if qk_spectral_norm_diag_log:
+                _real_layers = dict(model._named_real_layers())
+                qk_spectral_norm = {
+                    _name: spectral_norm_upper_bound(
+                        np.array(_layer.weights).reshape(_layer.in_features, _layer.out_features)
+                    )
+                    for _name, _layer in _real_layers.items()
+                    if _name in ("q_proj", "k_proj")
+                }
             window_t0 = time.time()
             if log_fn is not None:
                 log_fn(
@@ -694,6 +1351,8 @@ def train_curriculum(
                     x_r_target=model.x_r_target,
                     layer_timing=layer_timing_snapshot,
                     window_wall_s=window_wall_s,
+                    plasticity_totals=(plasticity_totals if plasticity_reset_enable else None),
+                    qk_spectral_norm=qk_spectral_norm,
                 )
             max_streak_seen = 0
 
@@ -840,6 +1499,28 @@ def main():
         parts.append(f"other={other_s:.2f}s({other_pct:.0f}%)")
         return "  t[" + " ".join(parts) + f" / {window_wall_s:.2f}s]"
 
+    def _plasticity_totals_str(totals):
+        # Attributes a loss spike to plasticity_reset actually firing (and
+        # on which layer/pool, at what deviation) instead of only showing
+        # the downstream loss effect -- see feedback_present_before_keep_prune_decisions
+        # (needed to untangle results DURING the run, not just at the end).
+        if not totals:
+            return ""
+        n_reset = sum(t["n_reset"] for t in totals.values())
+        worst_key, worst = max(totals.items(), key=lambda kv: kv[1]["last_deviation"])
+        return (
+            f"  plasticity[reset={n_reset} "
+            f"worst={worst_key}(dev={worst['last_deviation']:.2f}"
+            f"[{worst['last_min_deviation']:.2f},{worst['last_max_deviation']:.2f}]"
+            f",imp={worst['last_importance']:.4f})]"
+        )
+
+    def _qk_spectral_norm_str(qk_spectral_norm):
+        if not qk_spectral_norm:
+            return ""
+        parts = [f"{_SHORT_NAME.get(n, n)}={v:.2f}" for n, v in qk_spectral_norm.items()]
+        return "  qk_specnorm[" + " ".join(parts) + "]"
+
     def log_fn(
         step,
         vocab_size,
@@ -855,6 +1536,8 @@ def main():
         x_r_target=None,
         layer_timing=None,
         window_wall_s=None,
+        plasticity_totals=None,
+        qk_spectral_norm=None,
     ):
         loss_s = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
         acc_s = f"{acc_ema:.4f}" if acc_ema is not None else "n/a"
@@ -864,6 +1547,8 @@ def main():
         sps_s = f"  steps/sec={steps_per_sec:.1f}" if steps_per_sec is not None else ""
         streak_s = f"  max_streak={max_streak:>2}/{STREAK_THRESHOLD}" if max_streak is not None else ""
         timing_s = _layer_timing_str(layer_timing, window_wall_s)
+        plasticity_s = _plasticity_totals_str(plasticity_totals)
+        qk_specnorm_s = _qk_spectral_norm_str(qk_spectral_norm)
 
         def _r_target_str(label, d):
             # Shared dy_r_target/x_r_target formatter; see cli_gradient_sparsity_args anchor.
@@ -878,7 +1563,8 @@ def main():
         x_r_s = _r_target_str("x_r_target", x_r_target)
         print(
             f"  step={step:>7}  phase={phase:<5}  vocab={vocab_size:>4}  k={k:>3}  "
-            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{timing_s}{sps_s}{streak_s}{dy_r_s}{x_r_s}{_ranks_str(ranks)}",
+            f"loss_ema={loss_s}  acc_ema={acc_s}{tag}{timing_s}{sps_s}{streak_s}{dy_r_s}{x_r_s}"
+            f"{_ranks_str(ranks)}{plasticity_s}{qk_specnorm_s}",
             flush=True,
         )
 
@@ -890,12 +1576,15 @@ def main():
             if r_bar is None:
                 continue
             surprise = model._layer_surprise.get(name)
+            sel = model.last_grad_selection.get(name)
+            bits = [f"r{r_bar:.3f}"]
+            if sel is not None:
+                bits.append(f"R{sel['R_mean']:.3f}")
+                bits.append(f"k{sel['k_mean']:.1f}")
             if surprise is not None:
-                dy_parts.append(
-                    f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f},E{surprise['E_t']:.2g},L{surprise['Lbar']:.2g}"
-                )
-            else:
-                dy_parts.append(f"{_SHORT_NAME.get(name, name)}=r{r_bar:.3f}")
+                bits.append(f"E{surprise['E_t']:.2g}")
+                bits.append(f"L{surprise['Lbar']:.2g}")
+            dy_parts.append(f"{_SHORT_NAME.get(name, name)}=" + ",".join(bits))
         x_parts = []
         for name, x_target in model.x_r_target.items():
             if x_target is None:

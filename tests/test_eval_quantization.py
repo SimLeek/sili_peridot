@@ -42,6 +42,7 @@ REAL_CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "MiniC
 # own to OOM-kill this machine even after the two fixes above.
 
 
+@pytest.mark.integration  # loads a real 1B checkpoint, seconds not milliseconds
 @pytest.mark.skipif(
     not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
 )
@@ -138,6 +139,7 @@ class TestRealCheckpointQuantizationQuality:
             assert torch.equal(v, after[k]), f"{k} not restored after comparison"
 
 
+@pytest.mark.integration  # loads a real 1B checkpoint, seconds not milliseconds
 @pytest.mark.skipif(
     not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
 )

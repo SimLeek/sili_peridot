@@ -1,0 +1,176 @@
+
+=== superposition_stoch_extension_check.py run started 2026-08-18T18:21:36.821907 ===
+HIDDEN_WIDTH=5 baseline=0.0782 fp4_stoch_n_steps=40000 multi_digit_stoch_n_steps=60000
+  fp4_stoch          step=      0/40000 current=0.1555 best=0.1555 elapsed=0.0s
+  fp4_stoch          step=    500/40000 current=0.1331 best=0.1331 elapsed=0.5s
+  fp4_stoch          step=   1000/40000 current=0.1223 best=0.1223 elapsed=1.1s
+  fp4_stoch          step=   1500/40000 current=0.1173 best=0.1173 elapsed=1.6s
+  fp4_stoch          step=   2000/40000 current=0.1137 best=0.1137 elapsed=2.1s
+  fp4_stoch          step=   2500/40000 current=0.1109 best=0.1109 elapsed=2.6s
+  fp4_stoch          step=   3000/40000 current=0.1082 best=0.1081 elapsed=3.2s
+  fp4_stoch          step=   3500/40000 current=0.1075 best=0.1070 elapsed=3.7s
+  fp4_stoch          step=   4000/40000 current=0.1063 best=0.1063 elapsed=4.3s
+  fp4_stoch          step=   4500/40000 current=0.1043 best=0.1042 elapsed=4.8s
+  fp4_stoch          step=   5000/40000 current=0.1016 best=0.1016 elapsed=5.3s
+  fp4_stoch          step=   5500/40000 current=0.1004 best=0.1003 elapsed=5.9s
+  fp4_stoch          step=   6000/40000 current=0.0985 best=0.0985 elapsed=6.4s
+  fp4_stoch          step=   6500/40000 current=0.0974 best=0.0969 elapsed=6.9s
+  fp4_stoch          step=   7000/40000 current=0.0975 best=0.0969 elapsed=7.5s
+  fp4_stoch          step=   7500/40000 current=0.0957 best=0.0957 elapsed=8.0s
+  fp4_stoch          step=   8000/40000 current=0.0948 best=0.0945 elapsed=8.5s
+  fp4_stoch          step=   8500/40000 current=0.0935 best=0.0935 elapsed=9.0s
+  fp4_stoch          step=   9000/40000 current=0.0937 best=0.0932 elapsed=9.6s
+  fp4_stoch          step=   9500/40000 current=0.0921 best=0.0918 elapsed=10.1s
+  fp4_stoch          step=  10000/40000 current=0.0914 best=0.0914 elapsed=10.6s
+  fp4_stoch          step=  10500/40000 current=0.0923 best=0.0911 elapsed=11.1s
+  fp4_stoch          step=  11000/40000 current=0.0950 best=0.0911 elapsed=11.6s
+  fp4_stoch          step=  11500/40000 current=0.0930 best=0.0911 elapsed=12.1s
+  fp4_stoch          step=  12000/40000 current=0.0919 best=0.0911 elapsed=12.6s
+  fp4_stoch          step=  12500/40000 current=0.0907 best=0.0907 elapsed=13.2s
+  fp4_stoch          step=  13000/40000 current=0.0943 best=0.0907 elapsed=14.0s
+  fp4_stoch          step=  13500/40000 current=0.0887 best=0.0887 elapsed=14.7s
+  fp4_stoch          step=  14000/40000 current=0.0889 best=0.0885 elapsed=15.5s
+  fp4_stoch          step=  14500/40000 current=0.0893 best=0.0885 elapsed=16.3s
+  fp4_stoch          step=  15000/40000 current=0.0886 best=0.0872 elapsed=16.8s
+  fp4_stoch          step=  15500/40000 current=0.0859 best=0.0855 elapsed=17.3s
+  fp4_stoch          step=  16000/40000 current=0.0848 best=0.0844 elapsed=17.8s
+  fp4_stoch          step=  16500/40000 current=0.0825 best=0.0823 elapsed=18.4s
+  fp4_stoch          step=  17000/40000 current=0.0817 best=0.0817 elapsed=18.9s
+  fp4_stoch          step=  17500/40000 current=0.0823 best=0.0817 elapsed=19.4s
+  fp4_stoch          step=  18000/40000 current=0.0834 best=0.0817 elapsed=19.9s
+  fp4_stoch          step=  18500/40000 current=0.0821 best=0.0817 elapsed=20.4s
+  fp4_stoch          step=  19000/40000 current=0.0825 best=0.0817 elapsed=20.9s
+  fp4_stoch          step=  19500/40000 current=0.0825 best=0.0817 elapsed=21.4s
+  fp4_stoch          step=  20000/40000 current=0.0802 best=0.0795 elapsed=21.9s
+  fp4_stoch          step=  20500/40000 current=0.0803 best=0.0795 elapsed=22.4s
+  fp4_stoch          step=  21000/40000 current=0.0816 best=0.0795 elapsed=22.9s
+  fp4_stoch          step=  21500/40000 current=0.0832 best=0.0795 elapsed=23.4s
+  fp4_stoch          step=  22000/40000 current=0.0815 best=0.0795 elapsed=23.8s
+  fp4_stoch          step=  22500/40000 current=0.0824 best=0.0795 elapsed=24.3s
+  fp4_stoch          step=  23000/40000 current=0.0819 best=0.0795 elapsed=24.8s
+  fp4_stoch          step=  23500/40000 current=0.0830 best=0.0795 elapsed=25.3s
+  fp4_stoch          step=  24000/40000 current=0.0820 best=0.0795 elapsed=25.8s
+  fp4_stoch          step=  24500/40000 current=0.0810 best=0.0795 elapsed=26.4s
+  fp4_stoch          step=  25000/40000 current=0.0807 best=0.0795 elapsed=27.1s
+  fp4_stoch          step=  25500/40000 current=0.0805 best=0.0795 elapsed=27.7s
+  fp4_stoch          step=  26000/40000 current=0.0813 best=0.0795 elapsed=28.2s
+  fp4_stoch          step=  26500/40000 current=0.0820 best=0.0795 elapsed=28.7s
+  fp4_stoch          step=  27000/40000 current=0.0793 best=0.0793 elapsed=29.2s
+  fp4_stoch          step=  27500/40000 current=0.0789 best=0.0788 elapsed=29.7s
+  fp4_stoch          step=  28000/40000 current=0.0785 best=0.0785 elapsed=30.2s
+  fp4_stoch          *** CROSSED BASELINE at step=28220 current=0.0781 < baseline=0.0782 ***
+  fp4_stoch          step=  28500/40000 current=0.0782 best=0.0781 elapsed=30.7s
+  fp4_stoch          step=  29000/40000 current=0.0804 best=0.0781 elapsed=31.2s
+  fp4_stoch          step=  29500/40000 current=0.0791 best=0.0781 elapsed=31.7s
+  fp4_stoch          step=  30000/40000 current=0.0780 best=0.0780 elapsed=32.2s [BELOW BASELINE]
+  fp4_stoch          step=  30500/40000 current=0.0783 best=0.0772 elapsed=32.8s
+  fp4_stoch          step=  31000/40000 current=0.0787 best=0.0772 elapsed=33.3s
+  fp4_stoch          step=  31500/40000 current=0.0802 best=0.0772 elapsed=33.8s
+  fp4_stoch          step=  32000/40000 current=0.0799 best=0.0772 elapsed=34.3s
+  fp4_stoch          step=  32500/40000 current=0.0780 best=0.0772 elapsed=34.7s [BELOW BASELINE]
+  fp4_stoch          step=  33000/40000 current=0.0771 best=0.0766 elapsed=35.2s [BELOW BASELINE]
+  fp4_stoch          step=  33500/40000 current=0.0770 best=0.0763 elapsed=35.7s [BELOW BASELINE]
+  fp4_stoch          step=  34000/40000 current=0.0784 best=0.0763 elapsed=36.2s
+  fp4_stoch          step=  34500/40000 current=0.0765 best=0.0763 elapsed=36.8s [BELOW BASELINE]
+  fp4_stoch          step=  35000/40000 current=0.0752 best=0.0748 elapsed=37.4s [BELOW BASELINE]
+  fp4_stoch          step=  35500/40000 current=0.0755 best=0.0746 elapsed=37.9s [BELOW BASELINE]
+  fp4_stoch          step=  36000/40000 current=0.0752 best=0.0734 elapsed=38.4s [BELOW BASELINE]
+  fp4_stoch          step=  36500/40000 current=0.0756 best=0.0734 elapsed=38.9s [BELOW BASELINE]
+  fp4_stoch          step=  37000/40000 current=0.0755 best=0.0734 elapsed=39.5s [BELOW BASELINE]
+  fp4_stoch          step=  37500/40000 current=0.0732 best=0.0732 elapsed=40.0s [BELOW BASELINE]
+  fp4_stoch          step=  38000/40000 current=0.0733 best=0.0731 elapsed=40.5s [BELOW BASELINE]
+  fp4_stoch          step=  38500/40000 current=0.0751 best=0.0731 elapsed=41.1s [BELOW BASELINE]
+  fp4_stoch          step=  39000/40000 current=0.0777 best=0.0731 elapsed=41.6s [BELOW BASELINE]
+  fp4_stoch          step=  39500/40000 current=0.0784 best=0.0731 elapsed=42.1s
+  fp4_stoch          step=  40000/40000 current=0.0790 best=0.0731 elapsed=42.7s
+--- fp4_stoch DONE: best=0.0731 baseline=0.0782 crossed_at=28220 ---
+  multi_digit_stoch  step=      0/60000 current=0.1919 best=0.1919 elapsed=0.0s
+  multi_digit_stoch  step=    740/60000 current=0.1502 best=0.1502 elapsed=1.8s
+  multi_digit_stoch  step=   1480/60000 current=0.1417 best=0.1392 elapsed=3.6s
+  multi_digit_stoch  step=   2220/60000 current=0.1408 best=0.1377 elapsed=5.4s
+  multi_digit_stoch  step=   2960/60000 current=0.1405 best=0.1341 elapsed=7.2s
+  multi_digit_stoch  step=   3700/60000 current=0.1299 best=0.1290 elapsed=8.9s
+  multi_digit_stoch  step=   4440/60000 current=0.1252 best=0.1251 elapsed=10.7s
+  multi_digit_stoch  step=   5180/60000 current=0.1216 best=0.1214 elapsed=12.4s
+  multi_digit_stoch  step=   5920/60000 current=0.1227 best=0.1214 elapsed=14.1s
+  multi_digit_stoch  step=   6660/60000 current=0.1204 best=0.1194 elapsed=15.8s
+  multi_digit_stoch  step=   7400/60000 current=0.1155 best=0.1153 elapsed=17.4s
+  multi_digit_stoch  step=   8140/60000 current=0.1119 best=0.1118 elapsed=19.1s
+  multi_digit_stoch  step=   8880/60000 current=0.1070 best=0.1070 elapsed=20.8s
+  multi_digit_stoch  step=   9620/60000 current=0.1035 best=0.1032 elapsed=22.5s
+  multi_digit_stoch  step=  10360/60000 current=0.1055 best=0.1032 elapsed=24.2s
+  multi_digit_stoch  step=  11100/60000 current=0.1025 best=0.1024 elapsed=25.9s
+  multi_digit_stoch  step=  11840/60000 current=0.1021 best=0.1005 elapsed=27.6s
+  multi_digit_stoch  step=  12580/60000 current=0.1023 best=0.1005 elapsed=29.6s
+  multi_digit_stoch  step=  13320/60000 current=0.1044 best=0.1005 elapsed=31.8s
+  multi_digit_stoch  step=  14060/60000 current=0.1020 best=0.1005 elapsed=33.5s
+  multi_digit_stoch  step=  14800/60000 current=0.0995 best=0.0991 elapsed=35.7s
+  multi_digit_stoch  step=  15540/60000 current=0.1000 best=0.0986 elapsed=37.8s
+  multi_digit_stoch  step=  16280/60000 current=0.1020 best=0.0986 elapsed=39.7s
+  multi_digit_stoch  step=  17020/60000 current=0.1017 best=0.0986 elapsed=41.5s
+  multi_digit_stoch  step=  17760/60000 current=0.0989 best=0.0986 elapsed=43.1s
+  multi_digit_stoch  step=  18500/60000 current=0.0967 best=0.0963 elapsed=44.8s
+  multi_digit_stoch  step=  19240/60000 current=0.0963 best=0.0962 elapsed=46.5s
+  multi_digit_stoch  step=  19980/60000 current=0.0908 best=0.0907 elapsed=48.2s
+  multi_digit_stoch  step=  20720/60000 current=0.0914 best=0.0898 elapsed=50.0s
+  multi_digit_stoch  step=  21460/60000 current=0.0912 best=0.0898 elapsed=51.7s
+  multi_digit_stoch  step=  22200/60000 current=0.0906 best=0.0898 elapsed=53.4s
+  multi_digit_stoch  step=  22940/60000 current=0.0904 best=0.0893 elapsed=55.0s
+  multi_digit_stoch  step=  23680/60000 current=0.0885 best=0.0885 elapsed=56.7s
+  multi_digit_stoch  step=  24420/60000 current=0.0901 best=0.0882 elapsed=58.5s
+  multi_digit_stoch  step=  25160/60000 current=0.0894 best=0.0882 elapsed=60.1s
+  multi_digit_stoch  step=  25900/60000 current=0.0865 best=0.0864 elapsed=61.9s
+  multi_digit_stoch  step=  26640/60000 current=0.0858 best=0.0858 elapsed=63.7s
+  multi_digit_stoch  step=  27380/60000 current=0.0862 best=0.0852 elapsed=65.5s
+  multi_digit_stoch  step=  28120/60000 current=0.0854 best=0.0846 elapsed=67.3s
+  multi_digit_stoch  step=  28860/60000 current=0.0873 best=0.0844 elapsed=69.0s
+  multi_digit_stoch  step=  29600/60000 current=0.0880 best=0.0844 elapsed=70.8s
+  multi_digit_stoch  step=  30340/60000 current=0.0886 best=0.0844 elapsed=72.5s
+  multi_digit_stoch  step=  31080/60000 current=0.0872 best=0.0844 elapsed=74.4s
+  multi_digit_stoch  step=  31820/60000 current=0.0867 best=0.0844 elapsed=76.1s
+  multi_digit_stoch  step=  32560/60000 current=0.0851 best=0.0844 elapsed=77.9s
+  multi_digit_stoch  step=  33300/60000 current=0.0820 best=0.0820 elapsed=79.7s
+  multi_digit_stoch  step=  34040/60000 current=0.0815 best=0.0806 elapsed=81.4s
+  multi_digit_stoch  step=  34780/60000 current=0.0810 best=0.0806 elapsed=83.1s
+  multi_digit_stoch  step=  35520/60000 current=0.0813 best=0.0806 elapsed=84.9s
+  multi_digit_stoch  step=  36260/60000 current=0.0815 best=0.0806 elapsed=86.6s
+  multi_digit_stoch  step=  37000/60000 current=0.0809 best=0.0802 elapsed=88.3s
+  multi_digit_stoch  step=  37740/60000 current=0.0823 best=0.0802 elapsed=90.0s
+  multi_digit_stoch  step=  38480/60000 current=0.0806 best=0.0802 elapsed=91.7s
+  multi_digit_stoch  step=  39220/60000 current=0.0812 best=0.0802 elapsed=93.4s
+  multi_digit_stoch  step=  39960/60000 current=0.0815 best=0.0802 elapsed=95.1s
+  multi_digit_stoch  step=  40700/60000 current=0.0805 best=0.0802 elapsed=97.4s
+  multi_digit_stoch  step=  41440/60000 current=0.0811 best=0.0802 elapsed=99.9s
+  multi_digit_stoch  step=  42180/60000 current=0.0806 best=0.0802 elapsed=102.0s
+  multi_digit_stoch  step=  42920/60000 current=0.0806 best=0.0800 elapsed=103.6s
+  multi_digit_stoch  step=  43660/60000 current=0.0826 best=0.0800 elapsed=105.1s
+  multi_digit_stoch  step=  44400/60000 current=0.0825 best=0.0800 elapsed=106.6s
+  multi_digit_stoch  step=  45140/60000 current=0.0804 best=0.0800 elapsed=108.1s
+  multi_digit_stoch  step=  45880/60000 current=0.0798 best=0.0797 elapsed=109.6s
+  multi_digit_stoch  step=  46620/60000 current=0.0823 best=0.0789 elapsed=111.2s
+  multi_digit_stoch  *** CROSSED BASELINE at step=47300 current=0.0780 < baseline=0.0782 ***
+  multi_digit_stoch  step=  47360/60000 current=0.0780 best=0.0780 elapsed=112.7s [BELOW BASELINE]
+  multi_digit_stoch  step=  48100/60000 current=0.0782 best=0.0777 elapsed=114.3s
+  multi_digit_stoch  step=  48840/60000 current=0.0781 best=0.0771 elapsed=115.9s [BELOW BASELINE]
+  multi_digit_stoch  step=  49580/60000 current=0.0780 best=0.0770 elapsed=117.4s [BELOW BASELINE]
+  multi_digit_stoch  step=  50320/60000 current=0.0779 best=0.0768 elapsed=118.9s [BELOW BASELINE]
+  multi_digit_stoch  step=  51060/60000 current=0.0775 best=0.0768 elapsed=120.5s [BELOW BASELINE]
+  multi_digit_stoch  step=  51800/60000 current=0.0786 best=0.0768 elapsed=122.0s
+  multi_digit_stoch  step=  52540/60000 current=0.0791 best=0.0768 elapsed=123.5s
+  multi_digit_stoch  step=  53280/60000 current=0.0797 best=0.0768 elapsed=125.1s
+  multi_digit_stoch  step=  54020/60000 current=0.0799 best=0.0768 elapsed=126.7s
+  multi_digit_stoch  step=  54760/60000 current=0.0801 best=0.0768 elapsed=128.3s
+  multi_digit_stoch  step=  55500/60000 current=0.0774 best=0.0768 elapsed=129.8s [BELOW BASELINE]
+  multi_digit_stoch  step=  56240/60000 current=0.0764 best=0.0764 elapsed=131.3s [BELOW BASELINE]
+  multi_digit_stoch  step=  56980/60000 current=0.0772 best=0.0763 elapsed=132.8s [BELOW BASELINE]
+  multi_digit_stoch  step=  57720/60000 current=0.0808 best=0.0763 elapsed=134.4s
+  multi_digit_stoch  step=  58460/60000 current=0.0809 best=0.0763 elapsed=136.0s
+  multi_digit_stoch  step=  59200/60000 current=0.0793 best=0.0763 elapsed=137.6s
+  multi_digit_stoch  step=  59940/60000 current=0.0804 best=0.0763 elapsed=139.1s
+  multi_digit_stoch  step=  60000/60000 current=0.0804 best=0.0763 elapsed=139.2s
+--- multi_digit_stoch DONE: best=0.0763 baseline=0.0782 crossed_at=47300 ---
+
+=== SUMMARY (hidden_width=5, baseline=0.0782) ===
+fp4_stoch: best=0.0731 crossed_at=28220 (predicted ~24596)
+multi_digit_stoch: best=0.0763 crossed_at=47300 (predicted ~41964)
+total elapsed 181.9s

@@ -1,0 +1,51 @@
+[2026-07-27 19:04:53] Loading real-tier training corpus (WikiText-2)...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-07-27 19:04:57] Loaded 3555 training texts
+[2026-07-27 19:04:58] half_bandwidth=106
+[2026-07-27 19:04:58] === starting variant: no_energy (use_energy=False) ===
+/home/simleek/claude_code/sili_peridot/scripts/../model/prune.py:148: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at /build/python-pytorch/src/pytorch-opt-cuda/aten/src/ATen/SparseCsrTensorImpl.cpp:53.)
+  csr = pruned.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+  [load shard]  model-00000-of-00001.safetensors
+[2026-07-27 19:06:25] [no_energy] model built
+[2026-07-27 19:07:48] [no_energy] baseline accuracy=0.2443 perplexity=242.69
+[2026-07-27 19:09:16] [no_energy] 0 steps, 88s elapsed, accuracy=0.2443, perplexity=242.69
+[2026-07-27 19:23:59] [no_energy] 644 steps, 971s elapsed, accuracy=0.1676, perplexity=557.86
+[2026-07-27 19:39:00] [no_energy] 1320 steps, 1872s elapsed, accuracy=0.1439, perplexity=1266.27
+[2026-07-27 19:54:39] [no_energy] 2023 steps, 2810s elapsed, accuracy=0.1285, perplexity=1219.82
+[2026-07-27 20:10:18] [no_energy] 2697 steps, 3750s elapsed, accuracy=0.1857, perplexity=726.05
+[2026-07-27 20:25:42] [no_energy] 3345 steps, 4674s elapsed, accuracy=0.1522, perplexity=636.15
+[2026-07-27 20:40:43] [no_energy] 3992 steps, 5575s elapsed, accuracy=0.1704, perplexity=525.57
+[2026-07-27 20:56:13] [no_energy] 4657 steps, 6505s elapsed, accuracy=0.1195, perplexity=536.84
+[2026-07-27 21:12:26] [no_energy] 5340 steps, 7477s elapsed, accuracy=0.1111, perplexity=604.64
+[2026-07-27 21:27:50] [no_energy] 5991 steps, 8402s elapsed, accuracy=0.1619, perplexity=605.15
+[2026-07-27 21:43:46] [no_energy] 6673 steps, 9358s elapsed, accuracy=0.1354, perplexity=604.42
+[2026-07-27 21:59:26] [no_energy] 7332 steps, 10297s elapsed, accuracy=0.1460, perplexity=595.88
+[2026-07-27 22:14:42] [no_energy] 8007 steps, 11214s elapsed, accuracy=0.1544, perplexity=611.25
+[2026-07-27 22:30:40] [no_energy] 8688 steps, 12172s elapsed, accuracy=0.1621, perplexity=675.70
+[2026-07-27 22:46:22] [no_energy] 9349 steps, 13114s elapsed, accuracy=0.1334, perplexity=828.58
+[2026-07-27 23:01:40] [no_energy] 10000 steps, 14032s elapsed, accuracy=0.1188, perplexity=860.32
+[2026-07-27 23:08:23] [no_energy] 10256 steps, 14435s elapsed, accuracy=0.1619, perplexity=710.71
+[2026-07-27 23:08:23] === finished variant: no_energy: 10256 steps, 14435s ===
+[2026-07-27 23:08:25] === starting variant: with_energy (use_energy=True) ===
+  [load shard]  model-00000-of-00001.safetensors
+[2026-07-27 23:09:48] [with_energy] model built
+[2026-07-27 23:11:13] [with_energy] baseline accuracy=0.2443 perplexity=242.69
+[2026-07-27 23:12:41] [with_energy] 0 steps, 88s elapsed, accuracy=0.2443, perplexity=242.69
+[2026-07-27 23:27:03] [with_energy] 577 steps, 950s elapsed, accuracy=0.2346, perplexity=164.04
+[2026-07-27 23:42:06] [with_energy] 1186 steps, 1853s elapsed, accuracy=0.2026, perplexity=163.25
+[2026-07-27 23:57:46] [with_energy] 1832 steps, 2793s elapsed, accuracy=0.2103, perplexity=158.23
+[2026-07-28 00:13:46] [with_energy] 2474 steps, 3753s elapsed, accuracy=0.2103, perplexity=158.74
+[2026-07-28 00:30:15] [with_energy] 3123 steps, 4742s elapsed, accuracy=0.2445, perplexity=168.93
+[2026-07-28 00:45:16] [with_energy] 3713 steps, 5643s elapsed, accuracy=0.2451, perplexity=170.00
+[2026-07-28 01:01:49] [with_energy] 4366 steps, 6636s elapsed, accuracy=0.2277, perplexity=173.33
+[2026-07-28 01:17:37] [with_energy] 4990 steps, 7584s elapsed, accuracy=0.2277, perplexity=177.76
+[2026-07-28 01:32:56] [with_energy] 5596 steps, 8503s elapsed, accuracy=0.2445, perplexity=178.97
+[2026-07-28 01:48:56] [with_energy] 6234 steps, 9463s elapsed, accuracy=0.2374, perplexity=180.19
+[2026-07-28 02:04:03] [with_energy] 6827 steps, 10370s elapsed, accuracy=0.1969, perplexity=184.46
+[2026-07-28 02:19:29] [with_energy] 7425 steps, 11295s elapsed, accuracy=0.2206, perplexity=185.05
+[2026-07-28 02:35:32] [with_energy] 8073 steps, 12259s elapsed, accuracy=0.2038, perplexity=193.06
+[2026-07-28 02:51:15] [with_energy] 8688 steps, 13202s elapsed, accuracy=0.2046, perplexity=195.58
+[2026-07-28 03:08:26] [with_energy] 9349 steps, 14232s elapsed, accuracy=0.1983, perplexity=198.91
+[2026-07-28 03:11:47] [with_energy] 9459 steps, 14434s elapsed, accuracy=0.2143, perplexity=200.07
+[2026-07-28 03:11:47] === finished variant: with_energy: 9459 steps, 14434s ===
+[2026-07-28 03:11:48] === overnight run complete ===

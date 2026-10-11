@@ -1,0 +1,12 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.13.2, pytest-8.3.4, pluggy-1.5.0 -- /home/simleek/claude_code/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/simleek/claude_code/sili_peridot
+plugins: anyio-4.14.2, typeguard-4.4.1
+[1mcollecting ... [0mcollected 1 item
+
+tests/test_eval_lr.py::TestFindOptimalLRRealModel::test_baseline_config_peak_matches_manual_sweep 
+find_optimal_lr on baseline: best_lr=0.04832 (mult=24.16x) best_score=0.6500 n_trials=11 elapsed=510s reason=time_budget
+[32mPASSED[0m
+
+[32m======================== [32m[1m1 passed[0m[32m in 509.95s (0:08:29)[0m[32m =========================[0m

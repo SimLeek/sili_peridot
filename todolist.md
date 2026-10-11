@@ -13,6 +13,20 @@ turning the folded stack into a sparse next-input predictor while the
 energy system still manages sparsity/activity budget. Expect materially
 lower quality than the dense original; the bar is "usable," not parity.
 
+**NEXT TASK (2026-10, elevated, direct instruction -- not yet started):**
+GPU port of the block4/plasticity kernel-level work in `sili__new`, so
+MQAR-scale training/ablation runs iterate faster than CPU currently
+allows (hours per 100k-step config has been the actual bottleneck on
+how many configs/seeds could be tried in the plasticity investigation
+that just landed -- PR #26, `research/dense-vs-sparse-mqar-300k`,
+reaching MQAR vocab=126/k=7, see `JOURNAL.md`/`README.md`). Full scope
+recorded in `sili__new/TODO.md`'s own "GPU port of the block4/
+plasticity kernel-level work" section -- covers the real
+`linear_disldo_forward.hpp`/`linear_disldo_backward.hpp` kernels, the 4
+`block4_*_TODO_DELETE.hpp` traversal files (still live, still the only
+block4 implementation of CiRenorm/WeightRenorm/decay/plasticity_reset),
+and `EnergyDynamics`. Recorded as a todo only, not sized/designed yet.
+
 This file is the living plan. Update statuses as work lands. Keep
 individual source files under ~1k lines where practical; tests/examples
 are exempt from that budget. Discovery narrative (why something was

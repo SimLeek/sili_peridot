@@ -1,0 +1,2 @@
+[toy (current)] state_width=32 n_synapses=2660 n_high_importance=2660 stuck_fraction=1.0000 excess_stuck_ratio=4.000 mean_delta_w_high_imp=0.000000 mean_delta_w_overall=0.000000
+[8x wider] state_width=256 n_synapses=170516 n_high_importance=170516 stuck_fraction=1.0000 excess_stuck_ratio=4.000 mean_delta_w_high_imp=0.000000 mean_delta_w_overall=0.000000

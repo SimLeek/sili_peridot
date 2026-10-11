@@ -1,0 +1,3 @@
+FINAL 16 3 kcycle steps/sec 4.92 elapsed_s 610
+PEAK {'vocab': 16, 'k': 3, 'phase': 'kcycle'}
+STAGE_HISTORY [{'step': 291, 'event': 'level_up', 'from': {'vocab': 16, 'k': 1, 'phase': 'kcycle'}, 'to': {'vocab': 16, 'k': 2, 'phase': 'kcycle'}}, {'step': 1687, 'event': 'level_up', 'from': {'vocab': 16, 'k': 2, 'phase': 'kcycle'}, 'to': {'vocab': 16, 'k': 3, 'phase': 'kcycle'}}]

@@ -1,0 +1,10 @@
+step=   500 vocab= 16 k=2 phase=kcycle loss=2.153 acc=0.356 sps=2.22
+step=  1000 vocab= 16 k=2 phase=kcycle loss=1.574 acc=0.505 sps=2.20
+step=  1500 vocab= 16 k=2 phase=kcycle loss=1.395 acc=0.523 sps=2.18
+step=  1648 vocab= 16 k=3 phase=kcycle loss=1.336 acc=0.575  [LEVEL_UP] 
+step=  2000 vocab= 16 k=3 phase=kcycle loss=1.656 acc=0.359 sps=2.00
+step=  2500 vocab= 16 k=3 phase=kcycle loss=1.862 acc=0.405 sps=1.85
+step=  2980 vocab= 32 k=2 phase=kcycle loss=1.375 acc=0.562  [LEVEL_UP] 
+step=  3000 vocab= 32 k=2 phase=kcycle loss=3.358 acc=0.251 sps=1.77
+
+FINAL steps_per_sec=1.77 elapsed_s=1691

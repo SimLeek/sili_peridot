@@ -36,6 +36,7 @@ class TestEvalResult:
         assert r.accuracy == pytest.approx(0.5)
 
 
+@pytest.mark.integration  # loads a real 1B checkpoint, seconds not milliseconds
 @pytest.mark.skipif(
     not os.path.isdir(REAL_CHECKPOINT_DIR), reason="MiniCPM5-1B-Base checkpoint not present on this machine"
 )

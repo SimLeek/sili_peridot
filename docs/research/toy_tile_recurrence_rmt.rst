@@ -567,6 +567,628 @@ still converges to the same correct fixed point, just slower/faster,
 unlike a 2x-off half-life which directly sets the wrong equilibrium
 magnitude.
 
+.. _toy_tile_recurrence_rmt.loss_adjusted_decay_design:
+
+``apply_loss_adjusted_decay``: sustained-loss-triggered forgetting (critical-learning-periods hypothesis)
+------------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.loss_adjusted_decay_design``
+
+Direct instruction, following a rejected "variance in useful updates"
+explanation for stalled/failed training runs ("no, there is no 'luck'.
+This is pure math. If you're just getting lucky in math you're doing it
+wrong."): the alternative hypothesis is that the network structurally
+CAN'T UN-LEARN early bad adaptations -- matching the real
+critical-learning-periods / loss-of-plasticity literature (Achille et al.
+2019; Dohare et al., *Nature* 2024), which finds adaptive optimizers'
+accumulated second-moment state specifically contributes to "frozen
+units" that resist further updates, and that decaying that state (or, in
+one study, full unit resets) is a documented mitigation. This fit the
+observed crash-then-permanent-plateau shape of several stalled runs
+(dense-unscaled, Polyak, Arm C+knee variants) far better than a gradual
+variance story would.
+
+Direct instruction: "implement the decays, implement them both while
+making sure to note that we're actively testing them and may delete one
+or more of the forms of decay if it doesn't work well in testing" --
+``apply_loss_adjusted_decay`` implements BOTH arms as independently
+toggleable half-lives (``importance_half_life_touches``,
+``weight_half_life_touches``):
+
+- **Importance decay** -- this project's per-synapse ``importance`` field
+  plays the exact role of an Adam/RMSprop second-moment accumulator (see
+  ``feedback_importance_is_already_the_optimizer``), so this is the
+  direct, mechanism-specific fix: shrink the accumulator that's doing the
+  freezing. Default-enabled (``importance_half_life_touches=500``) -- has
+  its own dedicated C++ cursor (``_importance_decay_cursor``, see
+  ``sili__new``'s ``docs/research/delta_csr_types.rst:
+  amortized_decay.chunked_cursor``), no conflict with any other
+  mechanism.
+- **Weight/value decay** -- the more classic forgetting mechanism
+  (biologically: synaptic decay, not optimizer-state decay). Default-OFF
+  (``weight_half_life_touches=None``): it shares the SAME per-layer C++
+  weight-decay cursor as the existing, already-in-production
+  ``apply_amortized_l2_decay`` (RMS-closed-loop regularization, a
+  different, unrelated mechanism -- see
+  ``amortized_l2_decay_design`` above) -- there is only one
+  ``_decay_cursor`` per layer in C++, so running both in the same
+  training loop drives it out of sync with either mechanism's own intent.
+  Enable this arm only in a loop that does NOT also call
+  ``apply_amortized_l2_decay`` every step.
+
+Direct instruction on granularity: "we need to limit the bits per synapse
+to what they currently are" (no new per-synapse storage) and prefer
+per-neuron over per-layer where possible. Loss is a single global scalar
+with no natural per-neuron decomposition here, so this lands at
+PER-LAYER granularity, uniformly applied via each real layer's own
+``apply_amortized_importance_decay``/``apply_amortized_l2_decay`` call --
+the same limitation ``per_layer_learning_rate_polyak`` already documents
+for its own per-layer (not per-neuron) Polyak LR. Direct correction,
+2026-09-20: a fully dense layer's uniform fan-in does NOT make per-layer
+and per-neuron equivalent even there -- different neurons still receive
+different gradient signal / contribute differently to the loss with
+identical fan-in. Per-layer is accepted for now on granularity parity
+with the source literature (Achille/Dohare test unit-/layer-level
+interventions, not a loss-attributed per-neuron scheme either), not
+because this method's dense case happens to erase the distinction. KNOWN
+GAP, HIGH PRIORITY, tracked not fixed: a real per-neuron version needs
+either a per-row-aware cursor or a per-row decay_factor scaled by that
+row's own realized fan-in/gradient signal -- required before trusting
+this on genuinely sparse layers with heterogeneous per-row nnz.
+
+**Stall signal, purely LOSS-based, not instantaneous loss, never
+accuracy/correctness**: a fast EMA of loss (``beta_fast=0.9``) is
+compared against a slow-relaxing floor (``beta_floor=0.999``) tracking
+the EMA's own best-ever value. Direct correction, 2026-09-20: the
+``loss`` argument is whatever loss signal a caller has (prediction,
+curiosity, external-input, ...) -- never correctness/accuracy/streak
+(this project's curriculum advancement separately tracks its own
+``acc_ema``/``streak`` for THEIR purposes, but neither feeds this
+mechanism), since a deployed system may not have ground truth to check
+predictions against. ``self._decay_stall_steps`` counts consecutive
+steps since the EMA last beat the floor by a real margin
+(``improve_tol``, relative) -- a TIE does NOT reset stall (real bug
+caught by manual testing before ever launching a run: a plain ``<=``
+comparison let the EMA's own filter-transient settling from its initial
+value read as continuous "improvement" on a genuinely flat/oscillating
+loss, permanently masking a real stall). Reset to 0 the instant a
+genuine improvement occurs; the floor itself still relaxes slowly upward
+on non-improving steps so a genuine curriculum-driven loss increase (a
+harder level starting) doesn't read as a permanent stall forever.
+``stall_frac = min(1, stall_steps/ramp_steps)`` is the actual 0..1 signal
+driving decay severity -- deliberately insensitive to a single noisy
+step (matching the "pure math, not luck" correction: a single loss spike
+is noise, ``ramp_steps`` consecutive non-improving steps is a real
+stall), saturating only after sustained elevation.
+
+**Severity: half-life in touches, not an ad hoc strength/floor pair --
+real miscalibration caught and fixed before ever launching a real run.**
+The first version used ``decay_factor = max(min_decay_factor, 1 -
+stall_frac*strength)`` with NO principled connection to how many times a
+synapse actually gets touched over a real stall's duration -- and the
+known historical stalls this hypothesis targets ran FLAT for
+74,000-99,000+ training steps once stalled. At ``strength=0.3``, full
+stall settled at ``decay_factor=0.7`` per touch (``min_decay_factor=0.5``
+was never even reached -- ``max(0.5, 1-0.3)=0.7``); compounded over the
+~100-call amortized cycle (see the touch_fraction paragraph below), an
+empirical width=288 test crushed a real layer's weights to float-ZERO
+within ~1400 calls -- a small fraction of one historical stall's real
+length. That would have made the very thing under test ("does BOUNDED,
+recoverable forgetting restore plasticity") into an accidental full
+deletion well before the stall it's meant to help with even finishes.
+
+Fixed by deriving ``decay_factor`` from a HALF-LIFE IN TOUCHES, the same
+style this project's own ``apply_amortized_l2_decay`` docs already
+establish for decay_factor derivation (``2^(-cycle_length/H)`` for a
+chosen half-life ``H``): ``decay_factor_at_full_stall =
+2**(-1/half_life_touches)``, interpolated toward 1.0 (no decay) as
+``stall_frac`` falls: ``decay_factor = 1 - stall_frac*(1 -
+decay_factor_at_full_stall)``. A synapse touched
+``half_life_touches`` times in a row under FULLY saturated stall is
+reduced to exactly half, never to numerical zero. Default 500 touches
+(~50,000 calls at the default ``touch_fraction=0.01``, the SAME order of
+magnitude as the historical stalls' own real length) to halve at worst.
+Re-verified empirically at real width=288 scale over a 60,000-call
+simulated full stall: ``lm_head``'s mean |weight| shrank from 0.137 to
+0.0136 (~10x, the smallest/fastest-cycling layer), ``q_proj``'s from
+0.047 to 0.0205 (~2.3x) -- bounded, gradual, real, and nowhere near
+float-zero. ``None`` disables an arm entirely (an exact no-op, not
+merely a large half-life).
+
+**touch_fraction, not a raw chunk_size -- second real bug caught before
+ever launching a run.** This project's layers span a ~150x nnz range at
+width=288 (``lm_head`` early in the vocab curriculum: 576; q/k/v/o_proj
+fully dense: 82944). One shared absolute chunk_size either barely
+touches the big layers (a practical no-op) or, for the small layers,
+exceeds their own nnz entirely -- the amortized cursor then wraps and
+touches every synapse in that layer more than once per call, compounding
+much faster than the half-life above assumes (each "touch" the half-life
+counts is meant to be ~one per amortized cycle, not several per call).
+``touch_fraction`` (default 0.01) sizes each layer's own chunk_size as
+``clip(round(nnz*touch_fraction), min_chunk, max_chunk)``, making every
+layer's own full amortized cycle take roughly ``1/touch_fraction`` calls
+(~100 at the default) regardless of its absolute size.
+
+Both arms also call each layer's block4 counterpart when present
+(``apply_amortized_block4_importance_decay``/
+``apply_amortized_block4_l2_decay``, ``sili__new`` task added
+2026-09-20), since ``dense=True`` -- this investigation's actually-used
+config throughout -- routes ``DISLDOLayerV`` weights into block4 storage,
+not the scattered CSR path either arm's base call alone would cover; see
+``feedback_block4_scattered_parity_required``. block4's own chunk_size
+counts TILES (``_BLOCK4_TILE_SLOTS=16`` cells each), not individual
+synapses -- reusing the scattered chunk_size directly there would
+over-touch a block4-resident layer by roughly 16x relative to
+touch_fraction's intent, so the block4 call gets its own chunk_size
+divided by ``_BLOCK4_TILE_SLOTS`` (exact, not just an upper bound, for a
+layer whose tiles are all still dense-format -- true for every
+``dense=True`` config tested so far, since 16 live cells/tile at init
+exceeds ``switch_point``'s 14-cell sparse threshold).
+
+**Status: SUPERSEDED** by ``apply_plasticity_reset`` (below) as the
+primary mechanism under test -- kept available, still fully tested, may
+still be worth combining (Ablation D in the plasticity design) but is no
+longer the first thing queued against the known-stalled configs. Built,
+unit-tested at the engine level (``sili__new``'s
+``test_block4_amortized_decay.cpp``/``test_amortized_decay_stats.cpp``)
+and the model level (``TestLossAdjustedDecay`` in
+``tests/test_toy_tile_recurrence_rmt.py``, 11 cases including the
+tie/filter-transient regression, the ``min_stall_steps`` real-baseline
+regression, and a direct half-life-halves-in-N-touches check), parameters
+recalibrated against real width=288 nnz numbers.
+
+.. _toy_tile_recurrence_rmt.plasticity_reset_design:
+
+``apply_plasticity_reset``: per-neuron utility-based plasticity reset (Continual Backprop-style)
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.plasticity_reset_design``
+
+Replaces ``apply_loss_adjusted_decay`` as the primary mechanism under
+test for the critical-learning-periods/loss-of-plasticity hypothesis,
+after web-verifying the actual mechanism the source paper (Dohare et
+al. 2024, *Nature*, "Loss of plasticity in deep continual learning")
+uses -- **Continual Backprop**: continuously resets the LOWEST-utility
+MATURE hidden units at a tiny constant rate
+(``u[i] = η·u[i] + (1-η)·|activation_i|·Σ|outgoing_weight_i|``), never
+gated on loss at all. This is architecturally different from the
+loss-stall-triggered design above in two ways that matter: (1) it
+naturally never touches a genuinely-useful unit regardless of whether
+global loss is flat -- an optimal, converged, flat-loss network is full
+of high-utility units, protected by construction, no "is loss still
+bad" threshold hack needed; (2) it's inherently per-NEURON, the
+granularity gap the loss-based design could only flag as tracked debt.
+
+**Direct refinements to the literal paper mechanism** (from
+conversation, before implementation even started):
+
+- Utility uses ``importance`` (this project's own per-synapse
+  RMSprop-style accumulator, see ``feedback_importance_is_already_the_optimizer``)
+  times ``|weight|``, not raw activation -- "in our current importance,
+  an 'annoying' or noisy synapse will likely have high 'importance' but
+  low value since it's mostly important to ignore, which means low
+  actual utility." Sidesteps needing brand-new activation-tracking
+  infrastructure.
+- Amortized on TWO axes, not one -- not "reset one whole unit rarely"
+  (the paper's literal shape) but "touch ~1% of a layer's own cell-grid
+  every call" (reusing the SAME ``touch_fraction`` convention
+  ``apply_loss_adjusted_decay`` already proved correct) AND make each
+  touch a small BLEND toward the reset target, never an instant swap --
+  "I don't like things that could add up and cause blips or stalls, but
+  doing any compute that involves individual synapses will be expensive
+  so we don't want to do all of it at once."
+
+**A real, worked-through flaw, found and fixed before ever launching a
+run**: direct question -- "calculate when, hopefully before the end of
+the universe, a historically high utility column that was important for
+5000 steps, that is now giving the wrong answer thanks to a new
+curriculum, will take to become low enough utility again for this
+algorithm to actually affect it." Worked the math: `col_util` (an EMA of
+``importance*|weight|``) can only chase whatever that product CURRENTLY
+is -- it can't fall below a value that isn't itself falling. The
+literature's actual "frozen unit" failure mode is that a LARGE
+accumulated ``importance`` suppresses the effective learning rate (the
+update divides by ~√importance), so weight barely moves EVEN THOUGH the
+column is now wrong and receiving real error signal -- and real error
+signal means the gradient feeding ``importance`` stays large too, so
+``importance`` stays high or keeps growing PRECISELY BECAUSE the column
+is stuck. Self-sustaining bad equilibrium: **worst case, the answer is
+never, not "a long time."** A mechanism built to fix loss-of-plasticity
+that structurally cannot see the frozen-unit pathology wasn't testing
+the hypothesis it claimed to test.
+
+**Fixed design** (sili__new engine primitives:
+``apply_amortized_plasticity_reset``/``apply_amortized_block4_plasticity_reset``,
+``docs/research/delta_csr_types.rst:plasticity_reset.per_neuron_utility``
+has the full engine-level derivation) -- two independent selection
+pools sharing one amortized traversal:
+
+- **FROZEN pool**: TOP-K by ``col_importance`` (high accumulated
+  importance = frozen-risk, matching this project's own original
+  hypothesis and the already-built ``apply_loss_adjusted_decay``
+  importance arm, now per-neuron). Gated by a LOCAL per-column
+  gradient-ACTIVITY deviation, not global loss -- "we're
+  backpropagating through the whole model. 'Loss' is as local as we
+  need it to be... a much, much, much better signal than 'global
+  loss'." Two EMAs at different timescales
+  (``col_grad_slow``/``col_grad_fast``) of a per-column
+  gradient-activity signal; ``deviation = fast/slow``,
+  ``plasticity_boost = max(0, deviation-(1+k))`` -- a column whose
+  recent activity has spiked well above its own established baseline is
+  frozen-and-now-demonstrably-wrong, attributed to THAT column, not a
+  whole-network scalar. **Engine-safety correction, found DURING
+  implementation**: the real backward kernel has 6+ SIMD-vectorized
+  per-synapse update sites, too risky to hook correctly (this project's
+  own documented fragility history around these exact kernels) -- so
+  ``col_grad_slow``/``col_grad_fast`` are derived from
+  ``col_importance``'s own per-CYCLE delta instead (``importance`` is
+  already ``EMA(g²)``, only grows from real gradient activity, so its
+  own trajectory is a safe, already-available proxy at this
+  traversal's own cadence), never a real-kernel hook. Asymmetric EMA
+  rate on ``col_grad_slow``: fast catchup on a genuine drop
+  (improvement -- "the distribution can update its distribution"
+  quickly), slow on a rise (so a real spike isn't instantly absorbed,
+  which would defeat detecting it).
+- **DEAD pool**: a SEPARATE, independent bottom-K by
+  ``col_util_dead`` (``importance*|weight|``, the ORIGINAL formula --
+  found, by the worst-case-timing math above, to be structurally unable
+  to detect FROZEN columns, but honestly rescoped as exactly what it's
+  good at: genuinely idle columns, a DIFFERENT pathology gradient-
+  magnitude deviation alone can't tell apart from "optimal, low
+  activity." Direct follow-up question confirmed this gap: "do those
+  equations actually distinguish whether loss is above or below the
+  usual in all cases" -- no, low gradient activity is ambiguous between
+  "converged" and "dead/saturated," so this pool exists precisely to
+  catch what the frozen-pool's gate structurally cannot). Full ``blend``
+  rate, ungated -- lower risk of disturbing something still legitimately
+  useful than the frozen pool, so the extra caution isn't needed.
+  Mutually exclusive with the frozen pool by construction.
+
+Both pools reset gradually (``blend``/``blend*plasticity_boost`` per
+touch) toward a fan-in-scaled fresh sample
+(``fp4_stochastic_normal01()``), never a sudden full swap -- and since
+selection re-runs every cycle, a column that recovers (leaves the top/
+bottom fraction, or whose deviation settles back down) simply stops
+being touched. No fixed schedule fights against genuine continual
+learning.
+
+**Scale-invariance** (direct instruction: parameters "may be related to
+... the average number of steps in [the model's] lifetime ... but if we
+can get some non-infinite number as steps approaches infinite that could
+give us an infinite time horizon setup too"): every quantity here is a
+fixed-memory EMA, never a cumulative/growing running average -- an EMA's
+responsiveness to new data is CONSTANT regardless of total elapsed
+steps, so none of this mechanism's hyperparameters need retuning as a
+deployment's total lifetime grows, unlike ``apply_loss_adjusted_decay``'s
+own ``half_life_touches``, which WAS explicitly anchored to "the
+historical stalls' observed 74k-99k-step length" (a finite-horizon
+calibration this mechanism has no equivalent of).
+
+**No ``loss`` argument anywhere** in ``apply_plasticity_reset`` -- purely
+local per-column signals, cleanly distinct from
+``apply_loss_adjusted_decay``, which is global-scalar-loss-gated.
+Always structurally active when called (mirrors
+``apply_amortized_l2_decay``'s own always-on shape).
+
+Fp32-first, by direct instruction ("we're testing this for fp32 first
+and then applying to everything if it works right") -- only wired on
+``DISLDOLayerV``/``DISLDOLayer32`` (matching this whole investigation's
+actually-used config, ``dense=True`` routing through block4) so far;
+FP4/FP8 scattered classes NOT extended yet, a real, tracked follow-up
+gap, not silently dropped -- ``TestPlasticityReset::test_non_fp32_backend_reports_nothing_yet``
+pins down the current (intentional) behavior: an FP4-backed model
+reports an empty dict from ``apply_plasticity_reset``, no error.
+
+TDD throughout on the sili__new side (every primitive's test written
+and confirmed red before its implementation existed) -- see
+``docs/research/delta_csr_types.rst:plasticity_reset.per_neuron_utility``
+for the full engine-level test inventory (21 C++ unit tests across 3
+files, including a scattered-vs-block4 bit-equivalence check and a
+dedicated worst-case-timing regression test). Model level:
+``TestPlasticityReset`` in ``tests/test_toy_tile_recurrence_rmt.py`` (6
+cases: touch_fraction sizing across this test file's real nnz range,
+fp32-only backend dispatch, block4 substats present/absent as expected,
+many-cycle smoke test with sane internally-consistent stats, no ``loss``
+argument required, custom knobs threaded through correctly).
+
+**Status: not yet empirically tested** against the stalled runs this
+hypothesis was built to explain. Next: relaunch the same 3 known-stalled
+configs already identified for ``apply_loss_adjusted_decay``
+(``launch_width288_nolevel_down_control.py`` dense-unscaled,
+``launch_polyak_lr_width288.py`` Polyak, and
+``launch_arm_c_plus_knee_margin15.py`` Arm C+knee) with
+``plasticity_reset_enable=True`` instead, compare against their original
+stalled trajectory.
+
+.. _toy_tile_recurrence_rmt.plasticity_column_state:
+
+Per-column state logging for offline reset-equation fitting
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.plasticity_column_state``
+
+Direct instruction, after reviewing the log files this investigation
+already produces (importance, loss, accuracy): could a real
+reset-selection equation be FIT from actual training data instead of
+hand-derived heuristically? Scoped to per-COLUMN state, not
+per-synapse -- the mechanism only ever selects at column granularity
+(``col_importance``/deviation/age are per-column aggregates already),
+so per-synapse snapshots (the original, much larger storage estimate)
+would add cost without adding signal for this specific goal.
+
+``apply_plasticity_reset(..., include_column_state=True)`` fetches a
+copy of ``PlasticityState``'s own arrays (see
+``docs/research/delta_csr_types.rst:plasticity_reset.plasticity_column_state``
+for the engine-level accessor) for any pool whose cycle just
+completed -- off by default (extra work most callers don't need).
+``train_mqar_curriculum.py``'s ``plasticity_column_log_dir`` writes one
+small ``.npz`` per completed cycle per layer/pool, including
+``step``/``loss_ema``/``acc_ema`` alongside the column arrays -- the
+~1% of columns reset each cycle serve as a natural "treatment" group
+against the ~99% left alone, without needing any separate intervention.
+
+**Real bug found via smoke-testing the actual wiring** (not caught in
+planning): a dense-loaded real layer's content lives entirely in
+block4 (``load_dense_values`` routes through ``block4_load_dense_fp32``
+only) -- its scattered arm has 0 nnz for the whole run, so its own
+``cycle_complete`` trivially fires on literally every call via the
+engine's empty-nnz early-return path, with all-zero column state. A
+naive 500-step smoke run wrote 3036 files, almost entirely that noise.
+Fixed with ``scattered_nnz`` (sili__new), gating column-state
+attachment to arms with real content -- re-verified: 36 files, all
+holding genuine non-zero values.
+
+Storage cost is small at this granularity: the same 500-step smoke run
+produced 408KB total (block4 arms only). A full 100k-step run
+extrapolates to roughly 80MB per arm -- negligible against the 180GB
+free on this machine, and far cheaper than a full per-synapse weight
+snapshot (which would have run into the tens-of-GB range for the same
+horizon).
+
+.. _toy_tile_recurrence_rmt.l2_saturation_decay:
+
+L2-saturation-gated decay: from offline replay to a real engine change
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.l2_saturation_decay``
+
+Direct instruction: once real per-column data existed (see
+``plasticity_column_state`` above), "we should be able to run various
+functions on it much, much more quickly and see what python or other
+functions would've allowed the model to learn better or not." An
+offline analysis script (``scripts/analyze_column_log.py``, disposable)
+loaded the collected ``.npz`` snapshots and found ``col_importance``
+saturating at the ci accumulator's ``max_ci=100`` clamp by late
+training in several pools (``v_proj`` 288/288 columns tied at the
+ceiling by the run's end, ``k_proj`` 285/288, ``input_proj`` 280/288),
+with population std collapsing from real spread to the fp32 noise
+floor -- top-K-by-importance selection stops discriminating once most
+of a pool is tied.
+
+Two candidate fixes were replayed against the SAME real run, split at
+its own success/stall boundary (level-ups stopped at step 18837; the
+run held vocab=126/k=2 flat for the remaining ~81k steps):
+
+- ``rank(importance) + rank(deviation)`` (combined-rank selection):
+  rejected -- it was already far more exploratory DURING the success
+  period too (repeat rate collapsed from raw's 34-91% to 3-13%, touched
+  2-4x more distinct columns), not a surgical fix targeted at the
+  stall.
+- Age-decayed effective importance (``col_importance *
+  (1-lambda)^col_age``): showed the right asymmetric property in replay
+  (near no-op during success, 0% repeat rate during stall in every
+  saturated pool) but was explicitly rejected on a different ground,
+  direct instruction: "If col_age is steps, time, or some other
+  counter, that counter will eventually hit an overflow error or have
+  other numerical instability, so we want to avoid it since we're
+  targeting long term learning." This project's plasticity mechanisms
+  are held to an infinite-horizon-safe standard throughout (every knob
+  a fixed-memory EMA, nothing anchored to total elapsed steps) --
+  ``col_age`` as a decay EXPONENT breaks that even though it's already
+  tracked elsewhere in the state for the maturity gate.
+
+**Accepted design, direct instruction** ("I feel like an L2 norm would
+be an easy way to check if all the importances were close to 100...
+soft threshold if we can not hard"): ``sat_ratio =
+||col_importance||_2 / (max_ci*sqrt(n_out))``, a pure function of
+CURRENT state, passed through a soft sigmoid (not the earlier
+clipped-linear ramp) so there's no discontinuity at the threshold. A
+first version applied this as a UNIFORM per-cycle scalar re-score of
+the ALREADY-LOGGED historical trajectory and was mathematically
+guaranteed to be a no-op for selection -- multiplying an entire
+population by the same positive scalar can never change which columns
+rank highest (confirmed empirically: identical selection in every
+single replayed row). Real decay had to move into the actual engine
+(see ``docs/research/delta_csr_types.rst:plasticity_reset.l2_saturation_decay``
+for the full engine-side design) so it opposes ``col_importance``'s
+real growth during training, not a fixed log.
+
+``apply_plasticity_reset``'s new ``l2_decay_lambda``/
+``l2_decay_threshold``/``l2_decay_temperature``/``max_ci`` thread
+straight through to the engine primitive. Default ``l2_decay_lambda=0.0``
+is an exact no-op. Launched as v3
+(``launch_dense_lr_unscaled_plasticity_reset_v3_l2decay_column_log.py``,
+``lambda=0.05``, ``threshold=0.9``, ``temperature=0.05``) alongside the
+3 already-running v2 arms, with column logging enabled (direct
+instruction: "once we have it we can launch it with the column logging
+enabled too so we can see how it really did in detail") -- at
+``NUM_CPUS=4`` (matching dense v2 exactly, NOT the earlier data-
+collection run's ``NUM_CPUS=2``), a direct consequence of this
+session's own thread-ID-seeded-RNG finding: a different ``NUM_CPUS`` is
+an uncontrolled extra random seed, and this arm is meant as an actual
+controlled comparison against v2, not another data-collection-only
+pass.
+
+.. _toy_tile_recurrence_rmt.raw_ci_landscape_capture:
+
+v3 result: decay never won, and why the fix needs new diagnostics first
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.raw_ci_landscape_capture``
+
+v3 finished (100k steps): final/peak vocab=126/k=2, held flat from step
+11573, ``l2sat``/``l2decay`` sustained at ~1.00/0.88 from ~step 21500
+onward, never backing off. Offline replay of the collected per-column
+data confirmed the mechanism did NOT do its job: fine-grained,
+cycle-by-cycle deltas in ``v_proj``'s population-mean ``col_importance``
+average +0.00087/cycle once decay is fully active (std 0.029) --
+statistically indistinguishable from zero. Decay isn't losing to
+growth, it's in an almost exact tie. Separately, comparing v3's loss/
+acc plateau (loss=4.62, acc=0.046) against the UNDECAYED column_log
+run's own plateau at the same vocab=126/k=2 level (loss=4.73,
+acc=0.031) showed they're statistically indistinguishable -- the
+earlier-flagged "loss crash coincides with decay onset" correlation
+was confounded by both events following the same curriculum level-up,
+not decay causing harm.
+
+**Why a naive "increase lambda" fix isn't trustworthy without new
+data**: direct instruction, after being asked "sustained decrease to
+what number exactly, because importance 100 is around the ceiling...
+[decay] is potentially fighting more than just this decay" --
+``col_importance`` (the only per-column signal actually logged) is a
+SECOND EMA (``eta=0.99``) applied once per touch on top of the REAL
+per-synapse accumulator, whose own update rule
+(``ci_new = beta2*ci_old + (1-beta2)*(g^2+contrib^2)``, default
+``beta2=0.999``, found in ``delta_csr_types.hpp``'s ``update_ci``) is
+a SEPARATE, faster-reacting EMA. Two stacked smoothing processes at
+different rates, both compressed into one logged number, means the
+observed "+4.4 units/cycle growth-vs-decay tie" can't be trusted as a
+measurement of the real accumulator's own recovery dynamics between
+touches -- it might reflect a genuinely gradual real recovery (more
+lambda or touch frequency would help, roughly linearly), or it might
+be almost entirely ``col_importance``'s own lag catching up to a raw
+value that ALREADY re-saturated within 1-2 real steps (in which case
+no amount of once-per-cycle decay, however strong, can win -- only a
+much higher touch frequency or a direct per-step hook would).
+
+**Fix, built as new diagnostics rather than guessing** (direct
+instruction: "let's do 1 [better diagnostics]... even if there's some
+completely different mechanism at play we can still find it"):
+
+1. ``layer.importance`` (``DISLDOLayerV::get_importance()``, already
+   bound, no new engine code) returns the REAL raw per-synapse ``ci``,
+   with no ``col_importance``-style secondary smoothing. Verified safe
+   to reshape to ``(in_features, out_features)`` directly against the
+   real model class (not a hand-built layer, which can carry stray
+   default scattered content that contaminates the merge) --
+   ``scattered_nnz==0`` and ``len(layer.importance) ==
+   in_features*out_features`` exactly for every real dense-loaded
+   layer throughout training.
+2. ``train_curriculum``'s ``plasticity_column_log_dir`` snapshots gain
+   an opt-in ``plasticity_raw_importance_log=False`` flag: when set,
+   each once-per-cycle snapshot ALSO includes the raw
+   ``(in_features, out_features)`` importance matrix (a "landscape
+   frame"), not just the column aggregate -- cheap enough (~6ms/layer)
+   to run for a whole production run, giving a full-run visual/
+   spatial "video" of saturation if rendered from the stacked frames
+   later (raw float32 ``.npz`` is the stored source of truth; a
+   lossless video is an optional follow-up render, not the primary
+   artifact, to avoid 8-bit quantization losing the ~4-unit-scale
+   detail the earlier finding turned on).
+3. A new ``raw_ci_sample_fn(step, model)`` hook fires once per REAL
+   weight update (right after ``opt.step()``), at the true update
+   cadence -- unlike the once-per-~50-step cycle snapshots, this can
+   resolve whether an individual synapse's raw ``ci`` recovers in 1-2
+   steps or over many, directly answering the open question above.
+
+.. _toy_tile_recurrence_rmt.select_by_deviation_early_detection:
+
+select_by_deviation: growth-RATE selection, found by comparing runs
+-------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.select_by_deviation_early_detection``
+
+Direct instruction, after the raw-ci diagnostic run (above) graduated
+early (step 18366) instead of getting stuck like the original v3
+comparison run: "let's see if we can get a run that doesn't graduate
+in 100k steps with a full recording, and investigate the difference
+between runs with what we have in the meantime." Comparing the two
+runs' collected column-log data at MATCHED step counts found the
+stuck run's `col_importance` was already growing 17-147x faster than
+the graduated run's across every q/k/v/o_proj pool, visible from as
+early as step 5000-8000 -- well before either run's `l2_sat_ratio`/
+`l2_decay_strength` had done anything, and long before the absolute
+importance LEVEL itself became distinguishable.
+
+Direct instruction on what to do with that finding: "if we can
+determine some mathematical difference that would push the
+non-graduated run's columns... to be more like the graduated run's...
+but only when it's showing the same signs... so it doesn't affect the
+graduating run... we might have a good plasticity function from that."
+The existing frozen-pool selection (top-K by `col_importance`, an
+absolute LEVEL) structurally cannot use this signal -- a column
+accelerating fast while its level is still low never enters the
+candidate pool. `col_grad_fast`/`slow`/`var` (and the deviation z-score
+they feed) are already tracked for every mature column each cycle, not
+just the selected ones -- the gap was in what SELECTS, not what's
+tracked.
+
+``apply_plasticity_reset``'s new ``select_by_deviation=False`` (default,
+exact no-op preserving today's behavior) flips the ranking key to
+deviation (growth RATE) when ``True`` -- see
+``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection``
+for the full engine-side derivation and test coverage. The reset/blend
+action on a selected column is unchanged; only what gets selected.
+
+**Update -- the first deployed version of this (v5 launcher) harmed the
+base model, root cause found and fixed** (direct instruction after
+the finding: "How ... did you think that would not harm the base
+model? Try to do the second option unless you can actually find a k
+value based on an equation and not a guess. I vastly prefer not to add
+guessed hyperparameters."). v5 (``select_by_deviation=True``, L2 decay
+off) stayed stuck at vocab=16/k=3 for 37,750+ steps, far worse than
+every other comparison arm. Root cause: since selection under this
+mode always returns the population's own MAXIMUM deviation each cycle,
+gating it against a fixed ``k=1.0`` (calibrated for the unrelated
+top-importance mode's own, non-maximal deviation distribution) opened
+the gate almost every cycle -- confirmed via direct log analysis, 97.25%
+open-rate vs 22.25% under top-importance selection -- so near-full-
+strength resets fired continuously instead of only on genuine
+anomalies. Fixed with an EQUATION-derived threshold rather than a new
+guessed constant: since ``deviation`` is a z-score, the expected
+maximum of ``N`` approximately-standard-normal draws is the classical
+Gaussian extreme-value asymptotic ``sqrt(2*ln(N))`` (Fisher-Tippett-
+Gnedenko) -- closed-form in the candidate population size alone, no
+data calibration needed, and it scales up automatically for wider
+layers (more candidates -> larger expected maximum by pure chance, a
+Bonferroni-style correction for the implicit multiple comparisons).
+Full derivation, log-analysis numbers, and test coverage:
+``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation``.
+
+**Second update -- the EVT-derived k was ALSO wrong, found by checking
+the real data before trusting it, not by assuming the theory held**
+(direct instruction: "Better, but it didn't graduate. We have the log
+though now, right? So we should be able to check what happened with
+v6 when it stalled and what updates to the equation would fix it, and
+test those on the log a bit if we can before trying another run.").
+v6 (same config, running the EVT-derived-k fix) ran the full 100k
+steps but plateaued at vocab=64/k=3 for the last ~90k of them.
+Analyzing v6's own per-cycle column snapshots (recorded for all 6
+pools across the whole run) found the gate's open-rate was EXACTLY
+0.000 in every pool, across the ENTIRE run, not just the plateau --
+real deviation never approached the theoretical
+:math:`\\sqrt{2\\ln N}\\approx 3.1\\text{-}3.4` threshold (observed
+max ~1.0-1.8 throughout), meaning the mechanism's own EMA-lag
+structure doesn't actually produce the iid-standard-normal statistics
+the EVT derivation assumed. The fix that stopped v5's over-triggering
+had over-corrected into a permanent no-op -- v6's early progress owed
+nothing to the mechanism, which never fired a single real reset the
+whole run.
+
+Fixed again, still equation-derived but now calibrated against the
+population's own OBSERVED distribution instead of a theoretical
+asymptotic: ``k = percentile(mature population's deviation values this
+cycle, 100*(1-reset_fraction))`` -- a genuine order statistic of real
+data (no new guessed constant), reusing the existing ``reset_fraction``
+knob instead of introducing a new one. Validated against the SAME v6
+log data before implementing: recomputed on the exact recorded
+late-plateau deviations, this rule would have opened the gate 47-100%
+of the time across all 6 pools, vs 0% for the EVT rule and 97.25% for
+the original fixed ``k=1.0``. Full derivation, log-analysis numbers,
+and test coverage:
+``docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation``
+(same anchor, updated in place with both rounds). Launched as v7.
+
 .. _toy_tile_recurrence_rmt.to_sparse_gradient_detach_bug:
 
 ``_to_sparse``: real bug -- ``CSR.as_tensor()`` silently detached the graph
@@ -667,6 +1289,39 @@ range" gating policy lives in the CALLER (e.g.
 tracks its own step counter -- the model itself stays stateless about step
 numbers, same existing design choice as every other per-step model
 attribute here (``last_debug``, ``last_critic_pred``, etc.).
+
+.. _toy_tile_recurrence_rmt.last_grad_selection_design:
+
+``last_grad_selection``: the grad-axis counterpart, now instrumented (2026-09)
+------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.last_grad_selection_design``
+
+The "unlike the grad axis" caveat above is no longer true -- sili's own
+``_nucleus_top_k_csr`` call sites for ``dy_r_target`` (``DISLDOLayer.forward``
+and ``DISLDOLayer32.forward``, see sili__new's
+``record_grad_selection_stats.design``) now capture the same R/k stats onto
+each layer's own ``last_grad_selection``, right where the CSR is actually
+produced (this model's own Python has no visibility into that call, so it
+couldn't be computed here the way the x-axis stat is). This model's
+``last_grad_selection`` PROPERTY (not a plain dict -- computed on read, not
+maintained incrementally) pulls it back together across
+``_named_real_layers()``, mirroring ``last_input_selection``'s shape so
+``train_mqar_curriculum.py``'s trajectory printer can treat both axes the
+same way. A layer with no entry (no ``dy_r_target`` backward call yet, or a
+disldo_cls with no ``dy_r_target`` support at all, e.g. ``DISLDOLayer8``) is
+simply omitted, not a missing-key error.
+
+Real measurement (wide288 scale, ``r_target=0.9``, before the closed loop
+ratchets down): the grad axis kept roughly 2x MORE of its tensor than the
+x axis did at the same nominal setpoint (q/k/v: dy ``k~=128-133/288``
+vs. x ``k~=58/288``) -- gradients are measurably less concentrated than
+forward activations at this stage of training, so the two axes' densities
+do not simply multiply together the way a naive combined-density estimate
+would assume. Whether this gap narrows (or the grad axis becomes sparser
+than x, as hypothesized) later in training is an open question this
+instrumentation now lets a real run answer directly, rather than by
+extrapolating from a single early-training snapshot.
 
 .. _toy_tile_recurrence_rmt.l1_sparsity_split_design:
 
@@ -847,3 +1502,909 @@ yet before sequence start" behavior (``input_proj``/``k_proj``/``v_proj``
 have no bias term, so a zero raw embedding really does propagate to an
 exact zero k/v row, not an approximation). Reset to None/[] at the start of
 each new training sequence, same as ``memory_prev`` gets reset to zeros.
+
+.. _per_layer_learning_rate_polyak:
+
+``layer_lr_override``/``apply_polyak_lr``: per-layer dynamic LR
+-------------------------------------------------------------------------------
+
+*ID:* ``per_layer_learning_rate_polyak``
+
+2026-09-18. Direct motivation: several full 100k-step runs were needed
+just to bracket a good ``peak_lr`` by hand for the width-scaling
+degeneracy investigation (see ``train_mqar_curriculum.rst:
+train_curriculum.width_scaling_lr_fanin_hypothesis``). Researched
+task-agnostic dynamic-LR methods (D-Adaptation/Prodigy need a distance-
+to-solution estimate that's ungrounded for a real task we don't know
+the answer to ahead of time; hypergradient descent needs consecutive-
+step gradient VECTORS, which would mean exposing per-synapse detail --
+too much; the Stochastic Polyak Step-size only needs the loss and a
+gradient-energy scalar, both cheap and already close to hand) -- direct
+instruction: Polyak, applied per-layer directly (not layered under a
+separate per-layer mechanism like trust ratio, which needs a weight
+norm -- "still kind of ridiculous" as a step-size signal, and is its
+own extra cost).
+
+``_timed_call`` (this file) already captures ``_out.grad`` -- the exact
+``dy`` a layer's own backward consumes -- for every wide-layer call,
+previously only used to update ``self._layer_surprise[name]`` (E_t/Lbar)
+when ``dy_surprise_alpha`` was set. Now UNCONDITIONAL (cheap,
+``sum(dy**2)`` over an already-realized array -- same "always track the
+diagnostic" precedent as the knee-elbow tracker in ``_to_sparse``), so
+``apply_polyak_lr`` has a real per-layer gradient-energy signal for
+free, no new engine hook needed on this side (a parallel, independent
+hook was ALSO added on ``sili__new``'s ``DISLDOLayer32`` --
+``disldo_layer_forward.last_grad_norm_sq_polyak_hook`` -- for callers
+that don't go through ``_timed_call``; this file's own training loop
+uses the simpler already-existing ``_layer_surprise`` path instead).
+
+``self.layer_lr_override: dict`` (empty by default) is checked FIRST in
+``_timed_layer_forward``, ahead of whatever scalar ``learning_rate`` was
+passed in -- only the 5 wide layers go through that method (lm_head/
+critic_head never see a per-layer override, matches ``dy_r_target``'s
+own scope exactly). ``apply_polyak_lr(loss, f_star, c, lr_max,
+bootstrap_lr)`` computes ``lr_layer = min(lr_max, c * max(loss-f_star,
+0) / E_t_layer)`` per wide layer and populates this dict -- one step
+LAGGED (uses last step's loss and last backward's E_t, same convention
+as ``_effective_dy_r_target``, unavoidable since a layer's own
+``learning_rate`` has to be fixed before its forward+backward call
+that WOULD produce this step's own E_t).
+
+TODO, not yet built (direct instruction, deferred as real extra work):
+a PER-NEURON version (one Polyak lr per row of a layer's weight
+matrix, not one per whole layer) -- structural sparsity
+(``max_weights``) and gradient sparsity (nucleus top-k,
+``dy_gate_mask``) both act ROW-WISE, so a layer-wide scalar smears
+together neurons with very different realized fan-in/update frequency
+this step in a way per-neuron wouldn't. Revisit if per-layer doesn't
+adapt well, or as its own later test -- per-layer is the first thing
+to try.
+
+**Recalibration, 2026-09-19: first validation run failed to learn at
+all under the initial defaults.** ``launch_polyak_lr_width288.py``'s
+first run reached only ``vocab=16, k=3`` at step 713, then flat/noisy
+for the remaining 99,287 steps of its 100k budget -- far worse than
+the hand-tuned ``peak_lr=0.01`` record (``vocab=126, k=3`` at step
+13,601). Diagnosed directly (patched ``apply_polyak_lr`` to log its
+own inputs/outputs, a first attempt with a shallow-copied snapshot
+gave misleadingly frozen-looking values -- fixed with a proper deep
+copy): the raw per-call ``E_t`` for q/k/v/o_proj swings across orders
+of magnitude call to call (observed range ~0 to ~2000 for a single
+layer), so ``c * residual / E_t`` constantly saturated against
+``lr_max`` regardless of its value -- and ``lr_max=0.1`` (the original
+default) is already well into the instability regime the LR range test
+found (~0.1-0.32). Training 4 of 5 wide layers at ~0.1 nearly every
+step for 100k steps is a very plausible explanation for the observed
+flat/noisy failure.
+
+Fixed: switched the denominator to ``Lbar`` (the EMA-smoothed running
+gradient energy, already computed by the same ``_update_layer_surprise``
+call, just unused before) instead of the noisy raw ``E_t`` -- and
+recalibrated ``c`` from a literature-typical SPS damping factor (0.5)
+down to ``0.0005``, ``lr_max`` from ``0.1`` down to ``0.05``, both
+empirically, to land the computed values in the same ~0.01-0.06 range
+the LR range test and grid search already found safe rather than
+trusting an off-the-shelf constant that turned out not to transfer to
+this setup's actual per-layer gradient-energy scale. A short (1500-
+step) smoke test with the new defaults shows sane, decreasing lr
+values (mostly 0.0006-0.05 for q/k/v/o_proj, falling as loss falls --
+real annealing behavior) and genuine progress (reached k=3, loss
+3.8->1.8) instead of the frozen pattern. One residual imperfection,
+not yet addressed: ``input_proj``'s computed lr is driven near-zero
+(its ``Lbar`` runs on a different scale than q/k/v/o_proj's, likely
+from its different input/output dimensions -- ``embed_width x
+state_width`` vs ``state_width x state_width``) -- a single shared
+``c`` doesn't calibrate all 5 layers equally well. Worth watching if a
+longer validation run underperforms.
+
+.. _arm_c_single_state_angle_fix:
+
+Arm C gate: corrected from a 3-state design to 1-state, 2026-09-19/20
+-------------------------------------------------------------------------------
+
+*ID:* ``arm_c_single_state_angle_fix``
+
+Direct correction, caught in conversation, not by review of the running
+code: the implementation built earlier this session
+(``gate_j(t) = sin(2*pi*t/period_j + phase_j(t)) > cutoff``) used THREE
+stateful pieces per neuron -- a shared global step counter ``t``, a
+per-neuron period drawn once from ``Uniform(dy_time_gate_period_range)``
+and held fixed, and a separately-accumulated additive phase random walk
+``phase_j(t) = phase_j(t-1) + N(0, phase_step)`` -- none of which matches
+the original spec ("small infinitesimals added to vars on each neuron
+before sin is computed"). ``t`` was never supposed to be an absolute
+training-step counter; ``period_j`` varying per neuron was unnecessary
+complexity; the separate phase-noise term on top of a deterministic
+``t/period`` term was two mechanisms doing one job.
+
+**Fixed**: ``angle_j(t) = angle_j(t-1) + N(2*pi/period, phase_step)`` --
+ONE accumulating per-neuron state (``self._dy_time_gate_angle``),
+started uniform in ``[0, 2*pi)``, advanced each call by a single normal
+draw whose MEAN is a fixed shared constant (``2*pi/dy_time_gate_period``,
+same for every neuron -- no more per-neuron period draw) and whose
+spread (``dy_time_gate_phase_step``, unchanged default 0.02) supplies
+the "infinitesimal" wobble directly, with no separate phase term needed.
+``gate_j(t) = sin(angle_j(t)) > cutoff``, same formula shape, same
+density-vs-cutoff relationship (verified empirically:
+``density(cutoff=0.3)`` measured 0.4030 over 20,000 steps/2,000 neurons
+vs the theoretical ``0.5 - arcsin(0.3)/pi = 0.40301`` -- matches to 4
+decimal places). No global step counter needed at all --
+``self._dy_time_gate_t`` and its increment in ``step()`` were removed.
+
+**Scope caveat**: every Arm C result recorded in this investigation so
+far (the original confusion-matrix win, test 3's full grid, the
+gate-density LR compensation tests, the 12-run seed sweep) used the OLD
+three-state mechanism, not this corrected one. The qualitative
+conclusions (Arm C beating signal-guided selection, the density-driven
+reliability finding from the seed sweep, the LR-tolerance findings) are
+not expected to flip from this fix -- the underlying behavior (each
+neuron gets periodic, non-repeating trainable windows, density set by
+cutoff) is the same in spirit -- but the EXACT numbers (which specific
+neurons were on when, on any specific run) are not reproducible against
+the old code anymore. Not rerun yet.
+
+.. _toy_tile_recurrence_rmt.live_synapse_display:
+
+Live, side-by-side synapse visualization for direct visual inspection during training
+---------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.live_synapse_display``
+
+Direct instruction, after v7 (percentile-gated ``select_by_deviation``,
+confirmed via log analysis to genuinely fire) plateaued LOWER than v6
+(a version confirmed to never fire at all) -- an outcome not explained
+by anything the existing per-cycle scalar logs capture: "Alright my
+visual cortex is still more advanced than probably any tech on this
+planet. Let's either get displayarray (my lib) or opencv working and
+display all of the networks side by side with labels next to each
+other in lock step and I'll just look at all of the synapses for the
+next run. The algorithms acting on them can be included as long as
+they're near the synapses they're affecting."
+
+**Built on** ``displayarray`` (the user's own PyPI library; installed
+into ``.venv_peridot``), with a raw-OpenCV fallback if it isn't
+available. New module ``scripts/live_synapse_display.py`` --
+deliberately split into pure, GUI-free composition functions
+(``normalize_to_uint8``, ``heatmap``, ``deviation_strip``,
+``label_panel``, ``compose_pool_panel``, ``compose_frame``, all unit
+tested in ``tests/test_live_synapse_display.py``) and a thin
+``LiveSynapseDisplay`` class that owns the actual window and pushes a
+freshly-composed frame every time any pool reports a completed
+amortized cycle.
+
+**Layout, per pool, top to bottom**: a label (pool name + the step it
+was last updated at) -- the weight heatmap (the literal synapse) --
+the deviation/reset strip (one cell per OUTPUT column: red intensity =
+that column's current deviation z-score, green flag = selected/reset
+THIS cycle -- "the algorithm acting on them," placed at the exact
+boundary between the two matrices it can touch) -- the importance
+heatmap (the accumulator the reset decision is drawn from). All 6
+pools (``input_proj``/``q_proj``/``k_proj``/``v_proj``/``o_proj``/
+``lm_head``, each ``scattered``+``block4``) tile left to right in one
+frame, "side by side ... in lock step": every panel always shows its
+own most-recently-seen state in the SAME frame -- not that every pool
+updates on the exact same step (they don't; each pool completes its
+own amortized cycle on a different step offset, same as the existing
+column-log npz snapshots already did).
+
+**cell_px defaults to 1** -- literal one pixel per synapse, no
+upsampling. First version defaulted to 2-3px/cell for "visibility";
+direct correction ("why so zoomed in... the pixels should just be able
+to be pixels") -- fixed, since the user's own stated reason for this
+feature is to look at the real data directly, not a smoothed/enlarged
+version of it. Raised only via ``plasticity_live_display_cell_px`` if
+someone deliberately wants fewer, larger pools on screen.
+
+**Data source, reused rather than duplicated**: the SAME per-pool
+``column_state``/``raw_importance`` data the existing
+``plasticity_column_log_dir`` npz snapshots already compute (see
+``plasticity_reset_design.plasticity_column_data_collection`` and
+``raw_ci_landscape_capture``) -- ``layer.importance``/``layer.weights``
+reshaped to ``(in_features, out_features)`` (verified safe against the
+real model class, same as the existing raw-importance capture), and
+deviation computed from ``col_grad_fast``/``col_grad_slow``/
+``col_grad_var`` with the identical formula the C++ engine itself uses.
+New ``plasticity_live_display`` flag (default ``False``, byte-identical
+no-op, no window opened) is independent of
+``plasticity_column_log_dir`` -- you can watch live without writing
+npz snapshots to disk, or do both.
+
+**Superseded by a replay tool, same session**: a live-attached view is
+bound to the real training cadence -- one frame per completed
+amortized cycle, roughly once every several seconds per pool, nowhere
+close to smooth. Direct instruction after watching a real replay of
+already-recorded data and seeing what smooth playback actually looks
+like: "Tbh I'd prefer to see the replay unless it's running from
+30-60fps." New module ``scripts/replay_synapse_display.py`` reuses the
+exact same composition functions from ``live_synapse_display.py`` (no
+duplicated rendering logic) -- only the data source (recorded
+``.npz`` snapshots instead of a live training loop) and pacing model
+(a fixed frame rate, decoupled from real wall-clock training time)
+differ. ``discover_pools``/``build_event_timeline`` merge every pool's
+recorded snapshots into one step-sorted timeline (preserving the real
+chronological order events were recorded in, even though playback
+itself runs at a constant fps); ``replay()`` steps through it, pushing
+one frame per snapshot at the target rate. Unit tested (pure
+filesystem-reading logic against a real ``tmp_path`` tree, plus a
+dependency-injected fake display for the pacing/early-exit paths --
+``tests/test_replay_synapse_display.py``).
+
+Requires ``plasticity_raw_importance_log=True`` on the run that
+produced the snapshots (now captures ``raw_weight`` alongside
+``raw_importance`` in the same npz, same safe reshape guarantee, so
+replay can show both panels exactly like the live version) --
+``replay()`` raises clearly if a snapshot is missing it rather than
+silently rendering a blank panel. v8's launcher
+(``launch_dense_lr_unscaled_plasticity_reset_v8_select_by_deviation_replay_capture.py``)
+runs v7's exact config with full capture enabled, meant to run
+normally (background is fine, nothing to watch live) -- then replay it
+afterward: ``python scripts/replay_synapse_display.py
+logs/plasticity_column_snapshots/<run> --fps 30``.
+
+Smoke-tested against real, already-recorded data from an earlier run
+(the original v3 L2-decay diagnostic, the only prior run with
+``raw_importance`` captured) -- multiple pools rendered correctly side
+by side, playing smoothly through hundreds of real recorded steps.
+Direct observation from that replay, about the DATA rather than the
+tool: "pretty, but synapses weren't doing much through that process"
+-- consistent with what was already known about that particular run
+(confirmed saturated/stuck for most of its length), not a finding
+about a new mechanism.
+
+Full regression: 382 passed (374 + 8 new), 11 skipped, 40 deselected
+-- no regressions.
+
+.. _toy_tile_recurrence_rmt.plasticity_algorithm_sandbox:
+
+Offline Python sandbox for screening candidate plasticity algorithms against real recorded data
+----------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.plasticity_algorithm_sandbox``
+
+Direct instruction, after replaying v8 and observing q/k/v_proj's
+importance saturate to max_ci=100 by step ~30k while weight matrices
+lost per-synapse individuality (v_proj: dense plaid grid; o_proj:
+collapsed into a few wide uniform stripes): "I think we could try some
+algorithms to see if we can get the post 8000 or 30k step state to
+look more like the pre-8000 state by accumulating whatever the
+algorithm does to all the arrays over time and accumulating the
+deviation. The goal is to keep the network plastic enough to learn the
+new challenges."
+
+New ``scripts/plasticity_sim.py``: a faithful Python port of
+``delta_csr_types.hpp:plasticity_select_cycle_boundary``'s grad-tracking
++ deviation + percentile/EVT-k math (``update_grad_tracking``,
+``compute_deviation``, ``percentile_k``, ``evt_k``, ``cycle_boundary``),
+validated with a PRECISION cross-check against sili__new's own C++
+unit test's exact numbers (4-column fixture: deviation~=1.2392/-1.4837,
+k~=-0.803, boost~=2.042 -- exact match, not just plausible). Loads a
+run's recorded ``.npz`` snapshots (``load_pool_trajectory``), replays
+its per-cycle "natural delta" (``natural_deltas``) against a candidate
+algorithm's own selection/gating decisions (``simulate`` for the
+real engine's select-then-deviation-gate shape;
+``simulate_level_based`` for candidates with a genuinely different,
+non-history-based criterion), entirely offline -- no new C++ engine
+run needed per candidate.
+
+**Stated approximation, not hidden**: the "natural delta" is the real
+run's OWN recorded per-cycle change, which at cycles/columns the real
+run's own algorithm reset, bakes in that real intervention's effect,
+not pure gradient growth -- there's no recorded way to exactly invert
+it (the real reset's random ``fresh`` weight sample was never saved,
+and even col_importance's own EMA read happens BEFORE its per-cell
+decay is applied). Checked directly, honestly, before trusting
+anything: replaying a run with ZERO further intervention exactly
+reproduces its real recorded trajectory (0.0 max abs diff on real v8
+data -- confirms the loader/replay mechanics); replaying v8's OWN
+exact algorithm does NOT reproduce v8's real outcome (21-62%
+reset-event overlap, 0-26% simulated final saturation vs 100% real) --
+switching from the recorded ``col_importance`` EMA aggregate to
+``raw_mean_ci`` (mean of the recorded ``raw_importance`` matrix, closer
+to ground truth) did not improve this, confirming the dominant cause
+is confound-compounding over the ~30 average resets/column across a
+full run, not a signal-choice artifact. Direct confirmation this is
+expected and acceptable: "this is of course going to be an
+approximation... This just allows us to see if the algorithm is
+continually at least pushing the model towards a good state and not
+away from a good state" -- a directional screening signal, not a
+quantitative forecast; promising candidates still need a real engine
+run to validate.
+
+First candidate tested beyond replaying v8's own algorithm:
+``ceiling_decay_step`` -- decay any column above 90% of max_ci,
+strength ramping to 5%/cycle at max_ci itself, a purely LEVEL-based
+rule (no growth-rate history at all), deliberately a different
+criterion shape than select_by_deviation's RATE-based one. Replayed
+against v8's real ``raw_mean_ci`` growth pressure: 0% saturation
+throughout the ENTIRE run in all 6 pools (vs real 50-100%, vs the
+replayed v8-algorithm baseline's own fluctuating 0-77%).
+
+**Export back to the SAME .npz schema the replay tool reads**
+(``export_simulated_trajectory``, naming convention ``sim_export_dir``
+-- ``<real_run>_sim_<candidate_name>/<pool>/``, so multiple candidates'
+exports against the same real run never collide) -- direct instruction:
+"to make sure, I could also watch the npz vids with the algorithmic
+accumulation applied to double check." ``raw_importance`` in the
+export is approximated (the real run's own per-synapse texture,
+rescaled per column to match the simulated aggregate level) --
+``raw_weight`` reset events can't be exactly reconstructed (same
+unrecorded-``fresh``-sample limitation), documented, not hidden.
+
+Tested in ``tests/test_plasticity_sim.py`` (22 tests): the C++-engine
+precision cross-check above, cold-start/asymmetric-catchup grad
+tracking, percentile/EVT-k formulas, the zero-intervention replay
+fidelity guarantee (both signals), the ceiling-decay candidate's
+level-based behavior, and the npz export schema. Full regression: 404
+passed (382 + 22 new), clean.
+
+Not yet compared visually by the user, not yet tried against
+additional candidates or literature, not yet validated with a real
+engine run -- raw findings only, no keep/prune verdict.
+
+**Update -- layer-wide rank-preserving candidate (direct instruction)
+plus two literature-grounded candidates, preferred over self-invented
+heuristics going forward**: after watching ceiling_decay's replay,
+direct correction on the CRITERION, not just wanting more to watch:
+"something that reached top importance is probably important, so
+while 90% [saturation avoidance] looks good... it's not [good
+enough]... the more the total layer reaches full saturation, the more
+the entire layer importance is lowered, that way there can still be
+outliers while the whole thing is lowered. Basically normalize the
+entire layer importance to a sane lower value." Also: "now I want you
+to prefer research papers" over guessing from the data alone.
+
+``layer_l2_decay_step``: a faithful port of this project's OWN
+existing engine mechanism (the L2-saturation-gated decay from
+``docs/research/delta_csr_types.rst:plasticity_reset.l2_saturation_decay``
+-- built earlier this session, never enabled in v8, never tested
+against real select_by_deviation data until now). Touches EVERY column
+uniformly at a strength driven by the WHOLE population's L2-norm
+saturation ratio through a soft sigmoid -- a uniform multiplicative
+shrink preserves rank order exactly (verified directly in
+``tests/test_plasticity_sim.py``), unlike ``ceiling_decay_step``'s
+per-column clipping. Against v8's real growth data: 0% final
+saturation in all 6 pools, but unlike ``ceiling_decay_step`` the MAX
+column still reaches a meaningful 54-65 rather than being pinned near
+max_ci OR crushed toward zero.
+
+Web-searched and grounded two published continual-learning techniques
+rather than guessing further: **Shrink-and-Perturb** (Ash & Adams
+2020 -- L2 toward zero plus noise, flagged in the literature as very
+hyperparameter-sensitive) and **L2 Init** (Kumar, Marklund & Van Roy,
+"Maintaining Plasticity in Continual Learning via Regenerative
+Regularization", CoLLAs 2025, arXiv:2308.11958 -- regularize toward
+each parameter's OWN INITIAL value rather than zero; the paper found
+this mitigates plasticity loss more consistently than either
+Shrink-and-Perturb or plain L2). ``simulate_l2_init`` adapts L2 Init's
+always-on (never saturation-gated) regularization to this project's
+importance-accumulator dynamics -- every column drifts `rate` of the
+way back toward its own first-recorded value, unconditionally, every
+cycle.
+
+Directly confirmed the literature's own stated hyperparameter
+sensitivity on real data, not just cited it: ``rate=0.01`` crushed
+importance to near-zero everywhere (max 0.04-0.4 across all pools) --
+over a 2955-cycle real trajectory, ``(1-0.01)^2955~=0``, strong enough
+to cripple the ci-based learning-rate mechanism entirely, not just
+prevent saturation. ``rate=0.0001`` (100x smaller) gives a much saner
+result: 0% final saturation, max importance retained at 77-78. Both
+exported so the rate sensitivity itself is directly watchable, not
+just a number.
+
+All candidates now exported for direct visual comparison under
+``logs/plasticity_column_snapshots/<v8_run>_sim_<candidate_name>/`` --
+``ceiling_decay``, ``layer_l2_decay``, ``l2_init`` (rate=0.01),
+``l2_init_rate0001``, and ``v8_algorithm_mirrored`` (the poor-fidelity
+own-sandbox baseline). 6 new tests in
+``tests/test_plasticity_sim.py`` (28 total for this module). Full
+regression: 410 passed (404 + 6 new), clean. No keep/prune verdict --
+raw findings and exports only.
+
+**Update -- real-engine validation launched for both**: direct
+instruction, after watching ``layer_l2_decay`` and ``l2_init_rate0001``
+side by side: "let's try both of them and record while seeing if it
+helps reliably beat mqar rather than randomly stalling." ``v9``
+enables ``layer_l2_decay`` (already existed in the real engine, never
+turned on before -- ``reset_fraction=0.0`` isolates it as the only
+active mechanism, matching the sandbox test exactly). ``v10`` required
+building L2 Init as a genuinely new real mechanism first (it only
+existed in the offline sandbox) --
+``model.apply_l2_init(rate=0.0001, ...)``, new
+``l2_init_enable``/``l2_init_rate`` flags on ``train_curriculum``, see
+sili__new's ``docs/research/delta_csr_types.rst:plasticity_reset.l2_init``
+for the engine-side implementation (TDD, scattered+block4, full
+regression clean). Both launched as full 100k-step runs; neither
+finished yet -- raw progress only.
+
+Also: watching two replay windows side by side surfaced a real UX gap
+(both titled "synapses," no way to tell them apart) -- ``replay()``
+now defaults ``window_name`` to the run directory's own basename.
+
+**v9/v10 final results (100k steps each, corrected comparison)**: v9
+(layer_l2_decay) reached only 1 level-up (step 1347, vocab=16/k=3),
+stalled the rest of the run (loss_ema noisy 2.2-2.4, acc_ema noisy
+0.05-0.16, importance pinned at l2sat=1.00/imp=99.9996 for v_proj the
+entire tail). v10 (l2_init, rate=0.0001) reached 4 level-ups (steps
+1883/6076/14844/36662, final vocab=64/k=2) -- using the curriculum's
+REAL stage ordering ``(16,2)<(16,3)<(32,2)<(32,3)<(64,2)<(64,3)``
+(corrected after an initial comparison error compared vocab and k
+independently instead of jointly -- caught directly: "don't bother
+analyzing if you're going to just say blatant self-contradictions like
+that. 4 level ups is greater than 1 level up and 3 level ups. Only v8
+is greater"), v10 (64,2) is ahead of v7 (32,3); only v8 (64,3, the
+select_by_deviation percentile-k run) is further along than v10.
+
+Watching v10's replay directly (per-pool, per-timestep npz inspection),
+user's read: "V and i_proj have high importance everywhere, but do show
+deviation... Q and K weights look mostly like random noise... the
+deviations of each layer stay changing throughout, except for q_proj
+and k_proj which fix after a while." Quantitatively confirmed (deviation
+std and raw_importance range, early/mid/late thirds of the real
+recorded trajectory):
+
+.. code-block:: text
+
+    q_proj: deviation std 0.529 / 0.265 / 0.004   raw_ci final range [97.19, 98.90]
+    k_proj: deviation std 0.596 / 0.264 / 0.004   raw_ci final range [97.09, 98.23]
+    v_proj: deviation std 0.640 / 0.482 / 0.441 (stays varied)
+    o_proj: deviation std 0.619 / 0.494 / 0.516 (stays varied), raw_ci highly heterogeneous [0.12, 99.71]
+    lm_head: deviation std 0.667 / 0.682 / 0.650 (stays varied)
+
+q_proj/k_proj uniquely collapse to near-zero deviation std (every
+column converges to a nearly identical deviation) while raw_importance
+converges into a narrow, saturated-high band -- a "homogenization"
+signature distinct from every other layer, which stay heterogeneous
+throughout. User's synthesis: "V10 looks the most promising so far, it
+seems we might just need transformer layer specific plasticity stuff,
+not just stuff for neural networks in general."
+
+.. _toy_tile_recurrence_rmt.qk_norm_design:
+
+QK-Norm -- RMSNorm on Q/K before the attention dot product
+------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qk_norm_design``
+
+Direct instruction, tying the Q/K homogenization finding above to the
+literature: "V10 and V9 are essentially the same thing if the init
+values are 0, so the paper just implemented it better... Even in the QK
+norm case we might still want to watch that spectral norm info and
+capture the std values again to make sure it fixes it."
+
+Web-researched the actual mechanism behind Q/K collapse rather than
+guessing: this project's ``gaussian_attention`` (``sili/tensor.py``,
+math in ``sili/lib/headers/attention.hpp``) computes
+``score[q,j] = (Q[q].K[j])*scale - (j-center[q])^2/(2*sigma[q]^2)``,
+``scale = 1/sqrt(d)`` fixed internally, then softmax -- i.e. genuinely
+standard scaled dot-product attention plus an additive Gaussian
+positional bias, NOT some non-standard mechanism the QK-Norm literature
+wouldn't apply to (this had to be confirmed by reading
+``attention.hpp:gaussian_attention_forward`` directly before designing
+anything -- the ``centers``/``sigmas`` args could plausibly have meant
+the whole thing worked differently). Zhai et al. ("Stabilizing
+Transformer Training by Preventing Attention Entropy Collapse", ICML
+2023, arXiv:2303.06296) show attention entropy's lower bound decays
+exponentially with the Q.K score's spectral norm -- exactly the
+"deviation std -> 0, softmax weight concentrates" pattern seen in v10's
+q_proj/k_proj. **QK-Norm** (Henry et al. 2020, arXiv:2010.04245;
+production precedent in Gemma2/Chameleon): normalize Q and K before the
+dot product so scores are bounded regardless of how large the raw
+projections grow.
+
+Implementation (``model/toy_tile_recurrence_rmt.py``): reuses the
+project's OWN existing ``rmsnorm_tensor`` helper (already used for
+``input_ln``/``memory_ln``/``state_ln``) rather than adding new
+normalization machinery -- two new learnable gain vectors
+``q_norm_ln``/``k_norm_ln`` (size ``state_width``, init ones), a new
+``_apply_qk_norm(t, ln)`` no-op-unless-``qk_norm_enable`` helper, and
+the FULL q/k tensors normalized ONCE right after their existing
+post-projection clip, before ANY of the downstream gathers (mem/content
+split, physical-position reorder, the refreshed pass-2 memory key) --
+every place that currently reads raw ``q``/``k`` for attention now
+reads ``q_attn``/``k_attn`` instead. RMSNorm is a per-row operation (each
+row normalized using only its own values), so this holds regardless of
+which gather/concat/cache order touches a given row -- confirmed
+directly by a dedicated test
+(``TestQKSparsityAndNorm::test_step_cached_matches_step_with_qk_norm_enabled``)
+asserting ``step()`` and ``step_cached()`` still agree bit-for-bit
+under ``qk_norm_enable=True``, mirroring the pre-existing
+``TestStepCached`` parity test's own claim. ``v`` is left untouched --
+only Q/K participate in the dot-product score being bounded.
+``qk_norm_enable=False`` (default): byte-identical to today's behavior,
+confirmed by
+``test_default_off_is_byte_identical_to_plain_model``.
+
+.. _toy_tile_recurrence_rmt.qk_l1_sparsity_design:
+
+qk_l1_sparsity_coef -- cheap spectral-norm proxy, scoped to Q/K only
+------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qk_l1_sparsity_design``
+
+Direct instruction: "spectral normalization takes a ton of calculation,
+but we used an L1 norm or something similar to give a similar effect,
+but that may or may not be good enough. If you can get a quick
+additional loss or other low-calculation method to move the layers
+towards the spectral-normalization, then I'd like that to be
+implemented and tested as well."
+
+Grepped project memory (``project_hybrid_precision_plan.md``) before
+building anything new, per this project's own
+``feedback_check_journal_before_new_mechanism`` convention, and found
+the exact prior precedent being recalled: real power-iteration spectral
+normalization (Miyato et al. 2018) was a decisive win for
+``ToyTileRecurrenceRealFP4``'s o_proj in earlier work, but does NOT
+stack with magnitude-based regularizers (L1/L2 combined with it dropped
+mean reward 65-80% relative). The actual cheap proxy already built and
+validated in that earlier work was an **L1 output-sparsity penalty**
+(``coef*mean(|layer_output|)``, delivered via a split-backward helper so
+the auxiliary loss's gradient bypasses the importance-damped effective
+learning rate) -- confirmed this IS already merged into the CURRENT
+``ToyTileRecurrenceRMT`` class as ``l1_sparsity_coef``/
+``_l1_sparsity_split`` (contradicting an older memory note that called
+it un-merged), applied uniformly to all 6 layers via one shared
+coefficient.
+
+``qk_l1_sparsity_coef`` is a second, INDEPENDENT coefficient reusing the
+exact same ``_l1_sparsity_split`` helper, applied ONLY to q_proj/k_proj
+(both ``step()`` and ``step_cached()``, same block placement as the
+existing layer-wide penalty) -- so Q/K's magnitude can be pushed down
+without also touching v_proj/o_proj/input_proj/lm_head, which stayed
+heterogeneous in v10 and don't show the collapse pattern this is aimed
+at. Independent of ``l1_sparsity_coef`` (own constructor param, own
+``self`` attr, own gated block) -- can run alone, together, or neither.
+0.0 (default): byte-identical, confirmed by
+``test_default_off_is_byte_identical_to_plain_model``.
+
+.. _toy_tile_recurrence_rmt.qk_spectral_norm_diagnostic:
+
+Diagnostic: cheap spectral-norm upper bound + deviation-std verification
+------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qk_spectral_norm_diagnostic``
+
+Direct instruction: "Even in the QK norm case we might still want to
+watch that spectral norm info and capture the std values again to make
+sure it fixes it" -- i.e. don't just infer these mechanisms work from
+downstream MQAR performance; watch the actual quantity they're supposed
+to bound.
+
+``spectral_norm_upper_bound(w)`` (module-level, ``model/toy_tile_recurrence_rmt.py``):
+Holder's-inequality bound ``sigma_max(W) <= sqrt(||W||_1 * ||W||_inf)``
+(max abs column-sum times max abs row-sum) -- O(rows*cols), no power
+iteration, loose in general but EXACT for a rank-1 matrix (verified by
+test against an all-ones matrix: true spectral norm N, bound gives
+exactly N). New ``qk_spectral_norm_diag_log`` flag on
+``train_curriculum`` (default False, zero extra cost when off): computes
+this for q_proj/k_proj's current dense weight (reusing the same safe
+``layer.weights.reshape(in_features, out_features)`` accessor the
+``plasticity_raw_importance_log`` capture already established) at the
+same cadence as the main summary line, printed as
+``qk_specnorm[q=... k=...]``.
+
+The deviation-std side of verification reuses EXISTING tooling rather
+than adding new capture code: ``plasticity_raw_importance_log=True``
+already records per-column ``raw_importance``/``raw_weight`` snapshots
+(see :ref:`toy_tile_recurrence_rmt.raw_ci_landscape_capture`) -- the
+same early/mid/late deviation-std analysis run against v10's real data
+above applies directly to any new run's q_proj/k_proj pools once it
+finishes, no new instrumentation needed to check whether
+``qk_l1_sparsity_coef``/``qk_norm_enable`` actually keep deviation std
+from collapsing to ~0.
+
+**v11/v12 real validation launched**: ``v11``
+(``launch_dense_lr_unscaled_plasticity_reset_v11_qk_l1_sparsity.py``,
+``qk_l1_sparsity_coef=0.05`` -- the Goldilocks-zone value from the
+original L1-sparsity finding, ``l1_sparsity_coef=0.0`` so it's the ONLY
+active penalty) and ``v12``
+(``launch_dense_lr_unscaled_plasticity_reset_v12_qk_norm.py``,
+``qk_norm_enable=True``), both with
+``plasticity_raw_importance_log=True``/``plasticity_column_log_dir``/
+``qk_spectral_norm_diag_log=True`` for post-run verification.
+
+**v12 result**: GRADUATED (the curriculum's max level) at step 15143 --
+``final_vocab=126, final_k=4``, 8 level-ups, 2480s, 6.11 steps/sec. No
+prior arm this session (v5-v11) reached GRADUATED at all. The
+deviation-std verification the diagnostic was built for: rerunning the
+same early/mid/late analysis against v12's real recorded data shows
+q_proj/k_proj's deviation std staying in the same 0.4-0.8 range as
+every other layer throughout, never collapsing to v10's ~0.004 --
+QK-Norm removes the homogenization signature. ``qk_specnorm`` stayed
+flat the whole run (q~=15.2-15.35, k~=15.03-15.11), consistent with it
+actually bounding Q/K's spectral norm. Full numbers in JOURNAL.md's
+2026-09-23 "v12 GRADUATED" entry.
+
+**v11 result**: ran the full 100,000 steps, 5 level-ups (steps 1990 /
+4562 / 6213 / 8244 / 84256 -- the last one alone a ~76k-step stall),
+final ``vocab=64, k=3``, never graduated. Ties v8's own ceiling, well
+below v12. The deviation-std check shows q_proj/k_proj ALSO avoiding
+v10's ~0.004 collapse here (std stays 0.38-0.58, comparable to
+v_proj/o_proj/lm_head) -- but q/k/v/input_proj's ``col_importance``
+still saturated to ~99-100 (v12 never reached that range, having
+graduated in far fewer steps). So qk_l1_sparsity_coef also avoids the
+homogenization signature, yet still hit a real long stall -- avoiding
+that signature alone didn't guarantee fast progress here the way it
+appeared to for v12. Raw finding, not yet explained. Full numbers in
+JOURNAL.md's 2026-09-23 "v11 finished" entry.
+
+**v12 replication (v12b) -- did NOT reproduce GRADUATED**: direct
+instruction, "Launch V12 again to validate... Keep both the new and
+old recordings." ``v12b``
+(``launch_dense_lr_unscaled_plasticity_reset_v12b_qk_norm_repeat.py``)
+-- identical config, ``seed=1001`` instead of v12's 1000, own separate
+recordings so v12's original stays untouched. Result: ran the full
+100,000 steps, 4 level-ups all within the first 10,168 steps, then
+FLAT at ``vocab=64, k=2`` for the remaining ~89,832 steps -- did NOT
+graduate, a direct contradiction of v12's own GRADUATED result under
+the identical config. Exactly the scenario
+``feedback_statistical_power_not_seeding`` warns about: a single
+striking seed is not evidence a mechanism reliably works.
+
+Deviation-std check still shows q_proj/k_proj avoiding v10's ~0.004
+collapse here too, but v_proj/o_proj/input_proj are now FULLY
+saturated (``col_importance`` exactly 100.00 min/max/mean) -- a
+DIFFERENT saturation pattern than v10 ever showed. Whether that's the
+actual cause of this run's stall is not established, only noted.
+Full numbers in JOURNAL.md's 2026-09-23 "v12b... did NOT replicate"
+entry. Net: two real data points for ``qk_norm_enable`` now exist --
+one excellent (v12), one stalled (v12b) -- not enough to call this
+mechanism reliable either way. No keep/prune verdict; more seeds
+needed, per ``feedback_present_before_keep_prune_decisions``.
+
+.. _toy_tile_recurrence_rmt.qkvo_norm_design:
+
+qkvo_norm_enable -- extending QK-Norm to V and o_proj's output
+------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.qkvo_norm_design``
+
+Direct instruction, after asking whether v_proj/o_proj/input_proj
+saturating in v12b had any research precedent (answered by re-reading
+the σReparam paper already cited for :ref:`toy_tile_recurrence_rmt.qk_norm_design`
+and this project's own `project_hybrid_precision_plan.md` o_proj
+spectral-radius history -- see that conversation for the full sourced
+answer): "Please extend the current qk_norm_enable into a
+qkvo_norm_enable, using the same pattern that works for QK to fix the
+other layers, then launch that as V13 and we'll see if that can
+perform robustly."
+
+Zhai et al. (2023) themselves found applying σReparam to Q/K only vs.
+**all linear layers** (Q, K, V, output, feedforward) performs
+comparably, with all-layers being the simpler, more robust choice --
+QK-Norm was never meant to be Q/K-exclusive, this project just built
+the narrower version first. QKV-Norm (LayerNorm on Q, K, *and* V) is
+also now standard practice in production models (Gemma 3, OLMo 2,
+Qwen 3). Separately, this project's OWN prior work found o_proj
+specifically needed spectral-radius control in the older
+`ToyTileRecurrenceRealFP4` architecture, because it sits inside the
+recurrent loop (applied repeatedly to state across timesteps, so its
+eigenvalues compound) -- a mechanistically different reason than Q/K's
+dot-product-score collapse, but pointing at the same layer now showing
+up as saturated in v12b.
+
+``qkvo_norm_enable`` (renamed from ``qk_norm_enable``, same
+``_apply_qkvo_norm`` no-op-unless-enabled helper, generalized) adds two
+new learnable RMSNorm gains, ``v_norm_ln``/``o_norm_ln``, applied via
+the EXACT same pattern already validated for Q/K:
+
+- **V**: the FULL ``v`` tensor normalized once, right after its own
+  post-projection clip, before ANY downstream gather -- mirrors
+  ``q_attn``/``k_attn`` exactly. Every consumer that used to read raw
+  ``v`` (``v_phys``, ``v_content_only``, the pass-2 refreshed
+  ``v_mem_fresh``) now reads the normalized version.
+- **O**: o_proj's OUTPUT (``attn_mem``, ``attn_content``) normalized
+  right after its own post-projection clip, before being added into
+  the recurrent state (``memory_new_t``) or the content residual
+  (``pre_norm_content``). This is a new insertion point beyond the
+  Q/K/V pattern (Q/K/V normalize a projection's output before a
+  DOT-PRODUCT/weighted-sum use; O has no such downstream use -- it
+  normalizes before the RESIDUAL ADD instead, the closest analog for a
+  layer whose only consumer is a residual connection).
+- ``step_cached()`` gets the identical treatment (``v_step_attn``, the
+  same O-norm insertion at both its own attn_mem/attn_content sites) --
+  a new parity test
+  (``TestQKSparsityAndNorm::test_step_cached_matches_step_with_qkvo_norm_enabled``)
+  confirms bit-exact agreement with ``step()`` under
+  ``qkvo_norm_enable=True``, same as the original Q/K-only version.
+- ``last_debug`` keeps referencing the RAW (pre-norm) ``attn_mem``/
+  ``attn_content``/``v`` values, consistent with how raw ``q``/``k``
+  were already kept there -- debug capture is unaffected by this
+  mechanism.
+
+Not touched: the o_proj-output-L1-sparsity aux-loss recompute block
+(a separate, undamped-gradient forward pass feeding
+``qk_l1_sparsity_coef``/``l1_sparsity_coef``) -- its role is an
+auxiliary sparsity nudge, not part of the main attention-output
+consumption path, so O-norm doesn't apply there.
+
+**v13 result: GRADUATED even faster than v12, saturation gone
+everywhere**: ``v13``
+(``launch_dense_lr_unscaled_plasticity_reset_v13_qkvo_norm.py``),
+``qkvo_norm_enable=True``, ``seed=1000`` (same as v12's own GRADUATED
+run, for direct comparison). Reached GRADUATED at step 13342 (1760s) --
+FASTER than v12's step 15143 -- 8 level-ups.
+
+Deviation-std check against ALL SIX pools this time (not just q/k):
+every pool stays in the healthy 0.3-0.88 std range throughout the
+whole run, no collapse anywhere, and no layer pinned at exactly
+``col_importance=100.00`` the way v12b's v_proj/o_proj/input_proj were
+(input_proj gets closest, max=99.74, but keeps real per-column spread,
+min=0.05). Directly consistent with the hypothesis: normalizing V and
+O too removes the saturation that Q/K-only normalization left free to
+surface elsewhere. Full numbers in JOURNAL.md's 2026-09-23 "v13...
+GRADUATED even faster" entry.
+
+Same caveat v12b itself proved the importance of: this is one data
+point (same seed as v12's best run) -- encouraging, but not yet enough
+to call ``qkvo_norm_enable`` reliable without a seed-varied replication,
+the same check that caught v12's fragility.
+
+**v13b replication (seed=1001) -- much better than v12b, but still
+short of GRADUATED, and v/o/input_proj saturation came back**: direct
+instruction, "Yep. Let's try a replication run!" ``v13b``
+(``launch_dense_lr_unscaled_plasticity_reset_v13b_qkvo_norm_repeat.py``)
+-- identical config, same seed choice as v12b. Result: ran the full
+100,000 steps, 7 level-ups, final ``vocab=126, k=3`` -- did NOT reach
+GRADUATED (k=4) like v13's own run, but FAR ahead of v12b's ``(64,2)``
+-- a real, substantial robustness improvement over Q/K-only
+normalization, even short of full success.
+
+Deviation-std check: q_proj/k_proj stay healthy and unsaturated under
+this seed too (Q/K-norm's fix holds). But v_proj/o_proj/input_proj are
+back to FULLY saturated (``min=max=mean=100.00`` exactly) -- the SAME
+pattern v12b showed, DESPITE ``v_norm_ln``/``o_norm_ln`` being active.
+Working hypothesis (not verified): Q/K-norm bounds the attention
+SCORE directly, tightly coupled to the gradient dynamics driving
+``col_importance``; V/O-norm only bounds the forward activation
+magnitude, not the backward per-synapse squared-gradient that
+``col_importance`` actually tracks -- normalizing a layer's OUTPUT
+doesn't necessarily cap how hard the loss can still push its WEIGHTS.
+Net: ``qkvo_norm_enable`` is more robust than Q/K-only across seeds,
+but not demonstrated reliable -- the V/O saturation this investigation
+started from is still present under at least one seed. Full numbers in
+JOURNAL.md's 2026-09-24 "v13b... saturation came back anyway" entry.
+No keep/prune verdict, per
+``feedback_present_before_keep_prune_decisions``.
+
+.. _toy_tile_recurrence_rmt.col_importance_is_rmsprop_v_t:
+
+``col_importance`` is literally RMSprop/Adam's second-moment state -- what the optimizer literature says about it saturating
+--------------------------------------------------------------------------------------------------------------------------------
+
+*ID:* ``toy_tile_recurrence_rmt.col_importance_is_rmsprop_v_t``
+
+Direct question, after v13b showed v/o/input_proj saturation
+recurring despite ``qkvo_norm_enable``: "It seems to be the importance
+saturating for those specifically, right? ... it would be the
+optimizer state for rmsprop and the second optimizer state for adam
+iirc." Confirmed directly against the engine code
+(``sili__new/sili/lib/headers/delta_csr_types.hpp``,
+``BoundedRMSpropSynapsePolicy::update_ci``) rather than just agreeing:
+``ci`` (per-synapse, aggregated into ``col_importance`` at the
+column level) is not just analogous to Adam/RMSprop's ``v_t`` -- it
+IS that state, same formula, same default ``beta2=0.999``:
+
+.. code-block:: text
+
+    ema = beta2*ci + (1-beta2)*(g*g + contrib*contrib)
+    ci  = clamp(ema, floor, max_ci)             # max_ci = 100.0, a HARD ceiling
+    delta = -eff_lr * g * S / (sqrt(ci) + eps)  # Adam/RMSprop's v_t-normalized update
+
+``max_ci=100`` exists specifically because this accumulator was
+measured climbing UNBOUNDED without a cap (0.0005 -> 163+ in an
+unsafe-pocket run, see ``synapse_policy.bounded_beats_plain`` in
+sili__new's own delta_csr_types.rst). "Saturating at exactly 100.00"
+is this project's circuit-breaker catching what would otherwise be
+unbounded ``v_t`` growth -- functionally identical consequence either
+way: ``sqrt(ci)`` maxes out, the per-synapse effective learning rate
+collapses toward zero, the synapse freezes regardless of whether it's
+still receiving real, useful error signal.
+
+Web-researched how the optimizer literature (not just the
+continual-learning literature already cited for L2 Init/Continual
+Backprop) handles this:
+
+- **AdaBelief** (Zhuang et al. 2020, NeurIPS) -- replaces
+  ``v_t = beta2*v_{t-1} + (1-beta2)*g_t^2`` with
+  ``s_t = beta2*s_{t-1} + (1-beta2)*(g_t - m_t)^2``, the squared
+  DEVIATION from the gradient's own recent EMA (``m_t``), not the raw
+  squared gradient. A gradient that's large but consistent/predictable
+  (``g_t ~= m_t``) keeps ``s_t`` small and the step size large; only a
+  gradient that's large AND surprising throttles the step. This maps
+  almost exactly onto this project's own "Critical flaw found"
+  reasoning from the (larger, not-yet-built) plasticity-reset plan: a
+  column receiving real, sustained, correctly-attributed error signal
+  has ``ci`` grow and stay high PRECISELY BECAUSE it's stuck -- a
+  self-sustaining bad equilibrium that a raw-``g^2`` accumulator can
+  never see past. AdaBelief targets that failure mode structurally,
+  not reactively (unlike layer_l2_decay/L2 Init/plasticity_reset,
+  which all decay/reset AFTER ``ci`` gets high, rather than measuring
+  a quantity that wouldn't get high in the first place for a
+  legitimately-useful-but-currently-large gradient).
+- AMSGrad (Reddi et al. 2018) -- keeps a running MAX of ``v_t``; fixes
+  the OPPOSITE problem (``v_t`` shrinking too fast late in training),
+  not applicable here.
+- Adafactor (Shazeer & Stern 2018) -- pairs its second-moment estimate
+  with explicit RMS-based update clipping and a beta2 schedule that
+  increases over training, rather than changing the moment formula.
+
+**Ruled out, direct instruction**: "we can't add any more optimizer
+bytes into the weights, so those would have to stay rmsprop." AdaBelief
+needs a THIRD per-synapse accumulator (``m_t``, the first-moment EMA of
+``g_t``) alongside the existing ``weight``/``ci`` pair -- an extra
+per-synapse float this project's own compute/bandwidth-bound scattered-
+CSR design (``project_sili_sparsity_deployment_target``,
+``project_sili_optimal_hardware_vision``) explicitly cannot absorb.
+The per-synapse ``ci`` mechanism stays exactly the current
+single-state ``BoundedRMSpropSynapsePolicy`` -- AdaBelief is not being
+built here, in this form, full stop.
+
+**TODO, direct instruction ("I also would like the clipping fixed, so
+maybe make that a todo item")**: a real, zero-extra-memory gap found
+while investigating this -- ``clip_grad_norm_`` in
+``train_mqar_curriculum.py`` is applied ONLY to
+``model.parameters_for_optimizer()`` (the small LayerNorm-gain/
+centers/log_sigmas params). The actual per-synapse gradients feeding
+``BoundedRMSpropSynapsePolicy::update_ci`` for q/k/v/o/input_proj/
+lm_head -- the ones actually driving the saturation under
+investigation -- are NEVER clipped before being squared into the ``ci``
+EMA. Standard Adam/RMSprop practice clips gradients BEFORE squaring
+them into the second-moment accumulator specifically to stop a
+transient outlier-gradient spike from getting permanently baked into a
+slow (``beta2=0.999``) EMA. Confirmed via grep that no equivalent
+exists anywhere in the C++ per-synapse backward/update path
+(``sisldo_ops.hpp``, ``linear_disldo_backward.hpp``) -- searched for
+``grad_clip``/``clip_grad``/``max_grad`` and found nothing but an
+unrelated AQRS rank-control threshold check.
+
+**Update -- engine primitive built and tested (sili__new)**: direct
+correction, after a first attempt only confirmed a missing-parameter
+compile error was RED, not the actual failure mode -- "Wow that's not
+the failure I'm talking about. The stuff in all the research papers
+about unclipped grad causing issues, _that_ is what should be tested,
+_not_ a missing parameter." Fixed by writing a test that calls ONLY
+``update_ci``'s pre-existing 6-argument signature (no new API at all)
+and verifying it standalone against the UNMODIFIED header before any
+fix existed: a single ``g=50`` spike poisons ``ci`` by **2155x**
+relative to a no-spike baseline, 249 steps later -- a real, measured
+confirmation of the Zhang et al. 2020 (attention models produce
+heavy-tailed gradient noise) claim in this codebase's own formula, not
+an assumption. New ``max_abs_grad`` parameter added to ``update_ci``
+(Plain + Bounded, scalar + Block4Vec, default ``1e30`` = true no-op)
+clips it to 1.86x baseline for the same spike. Full details, exact
+numbers, and the TDD-process correction in sili__new's
+``docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip``.
+
+**Update -- threaded through and validated on v13b's harder seed;
+fixes the literal saturation, but curriculum progress got WORSE**:
+direct instruction, "Let's set a default, thread it through, and then
+run a real mqar run with it, v14." Threaded ``max_abs_grad`` through
+``cpu_backend.cpp``'s ``DISLDOLayerV`` bindings (new
+``kSynapsePolicyMaxAbsGrad = 8.0f``, data-derived from v13's own
+recorded gradient-scale distribution, joining ``max_ci``/
+``max_abs_delta`` as a third always-on-by-default safety clamp at this
+layer), ``sili/sparse_rnn.py``, and ``NOCAPS_KWARGS_FP32`` -- active
+by default for every fp32 run now, not a launcher-only opt-in. Full
+threading details in sili__new's own
+``docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip``.
+
+``v14`` ran v13b's identical config (``qkvo_norm_enable=True``,
+``seed=1001``) with grad clipping now also active. Result: final
+``vocab=126, k=2`` -- WORSE than v13b's ``(126,3)`` on the same seed,
+6 level-ups, stalled at step 11154.
+
+Deviation-std check: grad clipping DID do what it was built for --
+v_proj/o_proj/input_proj are no longer pinned at the hard
+``min=max=mean=100.00`` ceiling v13b showed (now real spread, 38-83).
+But the curriculum outcome got worse anyway. Working hypothesis:
+``max_abs_grad=8.0`` was calibrated from v13's POOLED gradient-scale
+distribution across all 6 pools, dominated by q/k's own scale (now
+crushed to mean~0.06-0.10) -- v/o/input_proj may have a genuinely
+higher natural gradient scale a single global constant serves poorly,
+clipping USEFUL large updates alongside harmful spikes. A per-layer or
+per-column threshold may be needed instead of one global constant --
+directly motivates the per-column AdaBelief-style work as the next
+step, rather than resolving the need for it. Full numbers in
+JOURNAL.md's 2026-09-24 "max_abs_grad threaded through... WORSE, not
+better" entry. No keep/prune verdict on ``max_abs_grad`` as currently
+calibrated.

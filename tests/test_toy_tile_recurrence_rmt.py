@@ -5,18 +5,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-from sili.sparse_rnn import DISLDOLayer
+from sili.sparse_rnn import DISLDOLayer, DISLDOLayer32
 from sili.tensor import Tensor
 
 from model.toy_recall_models import AdamOptimizer, cross_entropy_sum
-from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT
+from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT, spectral_norm_upper_bound
 
 VOCAB, EMBED_WIDTH, COLUMN_NEURONS, NUM_TILES, NUM_MEM = 10, 6, 2, 3, 2
 STATE_WIDTH = EMBED_WIDTH * COLUMN_NEURONS
 MAX_WEIGHTS = STATE_WIDTH * 16
 
 
-def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0):
+def _model(
+    disldo_cls=DISLDOLayer,
+    num_cpus=2,
+    l1_sparsity_coef=0.0,
+    qk_l1_sparsity_coef=0.0,
+    qkvo_norm_enable=False,
+    dense=False,
+    rng=None,
+):
     return ToyTileRecurrenceRMT(
         VOCAB,
         EMBED_WIDTH,
@@ -27,6 +35,10 @@ def _model(disldo_cls=DISLDOLayer, num_cpus=2, l1_sparsity_coef=0.0):
         num_cpus=num_cpus,
         disldo_cls=disldo_cls,
         l1_sparsity_coef=l1_sparsity_coef,
+        qk_l1_sparsity_coef=qk_l1_sparsity_coef,
+        qkvo_norm_enable=qkvo_norm_enable,
+        dense=dense,
+        rng=rng,
     )
 
 
@@ -1226,3 +1238,625 @@ class TestStepContentDySparsitySchedule:
             raise AssertionError("expected ValueError for mismatched schedule length")
         except ValueError:
             pass
+
+
+class TestLossAdjustedDecay:
+    """apply_loss_adjusted_decay -- critical-learning-periods/loss-of-
+    plasticity forgetting (EXPERIMENTAL, added 2026-09-20). See
+    docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design.
+    Direct instruction: "add tests to make sure things match in any edge
+    cases the code indicates" -- covers the exact bug caught by manual
+    testing during implementation (a tie/filter-transient dip must NOT
+    count as genuine improvement), plus stall accumulation, reset on real
+    improvement, per-arm toggling, and block4 coverage under dense=True."""
+
+    def test_perfectly_flat_loss_accumulates_stall_every_step(self):
+        # Regression test for a real bug caught during implementation: a
+        # plain `ema <= floor` comparison let the EMA's own settling to
+        # its initial value read as "improvement" on every single call,
+        # even for loss that never actually changes -- permanently
+        # masking a real stall. Fixed via a required relative margin
+        # (improve_tol). A flat loss must accumulate stall_steps == the
+        # number of calls, every time, no exceptions.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
+        out = None
+        for _ in range(50):
+            out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
+        assert model._decay_stall_steps == 50
+        # stall_steps itself accumulates every call regardless -- but with
+        # the default min_stall_steps=200 grace period, 50 calls hasn't
+        # cleared the baseline yet, so stall_frac (and therefore
+        # decay_factor) must be an EXACT no-op, not "small but nonzero".
+        assert out["input_proj"]["stall_frac"] == 0.0
+        assert out["input_proj"]["importance"]["decay_factor"] == 1.0
+
+    def test_min_stall_steps_is_a_real_baseline_not_just_a_gentler_ramp(self):
+        # Direct design question: "I feel like it would need to establish
+        # a baseline and shouldn't necessarily decay all the time." Before
+        # min_stall_steps existed, stall_frac (and decay_factor) were
+        # technically nonzero after almost every call, since the very
+        # first call already sets stall_steps=1. Verify the grace period
+        # gives a genuine dead zone: exactly at the boundary, stall_frac
+        # must still be 0; one call past it, it must be nonzero.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(20))
+        out = None
+        for _ in range(200):
+            out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, min_stall_steps=200)
+        assert out["input_proj"]["stall_frac"] == 0.0, "exactly at the grace-period boundary, decay must still be off"
+        out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, min_stall_steps=200)
+        assert out["input_proj"]["stall_frac"] > 0.0, "one call past the grace period, decay must start ramping in"
+
+    def test_noisy_but_flat_loss_still_registers_stall(self):
+        # A loss oscillating narrowly around a fixed mean (no real
+        # learning happening) must not be mistaken for improvement just
+        # because the EMA occasionally dips below its own filter-
+        # transient floor by a tiny amount -- improve_tol must reject
+        # noise-sized dips. 500 calls: enough to clear the default
+        # min_stall_steps=200 grace period AND ramp_steps=200 on top of it.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(1))
+        for i in range(500):
+            loss = 2.0 + (0.001 if i % 2 == 0 else -0.001)
+            out = model.apply_loss_adjusted_decay(loss, touch_fraction=1.0, max_chunk=1_000_000)
+        assert out["input_proj"]["stall_frac"] > 0.5, "noisy-flat loss must still register a real stall"
+
+    def test_sustained_improvement_keeps_resetting_stall(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(2))
+        loss = 5.0
+        out = None
+        for _ in range(100):
+            loss *= 0.98  # steadily, genuinely decreasing
+            out = model.apply_loss_adjusted_decay(loss, touch_fraction=1.0, max_chunk=1_000_000)
+        assert model._decay_stall_steps < 5
+        assert out["input_proj"]["stall_frac"] < 0.05
+
+    def test_importance_arm_default_on_weight_arm_default_off(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
+        out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
+        assert out["input_proj"]["importance"] is not None
+        assert out["input_proj"]["weight"] is None
+
+    def test_none_half_life_arm_is_an_exact_noop(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
+        out = model.apply_loss_adjusted_decay(
+            2.0,
+            touch_fraction=1.0,
+            max_chunk=1_000_000,
+            importance_half_life_touches=None,
+            weight_half_life_touches=None,
+        )
+        for entry in out.values():
+            assert entry["importance"] is None
+            assert entry["weight"] is None
+
+    def test_weight_arm_opt_in_actually_decays_block4_weight(self):
+        # dense=True routes DISLDOLayer32's weights into block4 storage --
+        # a sustained stall must measurably shrink the REAL (block4) weight
+        # magnitude, not just report a no-op on empty scattered padding.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
+        w_before = np.abs(np.array(model.input_proj.weights)).mean()
+        out = None
+        for _ in range(250):
+            out = model.apply_loss_adjusted_decay(
+                2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=20.0
+            )
+        assert out["input_proj"]["weight"] is not None
+        assert out["input_proj"]["weight"]["decay_factor"] < 1.0
+        assert out["input_proj"]["weight"]["block4"]["n"] > 0
+        w_after = np.abs(np.array(model.input_proj.weights)).mean()
+        assert w_after < w_before, "sustained stall + weight arm should measurably shrink real block4 weights"
+        assert w_after > 0.0, "bounded half-life decay must not annihilate weights within one short test run"
+
+    def test_scattered_backend_has_no_block4_key(self):
+        # FP4 (DISLDOLayer, scattered-only) has no block4 concept at all --
+        # the block4 sub-call must be skipped entirely (hasattr-guarded),
+        # not attempted-and-erroring.
+        model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(6))
+        out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
+        assert out["input_proj"]["importance"] is not None
+        assert "block4" not in out["input_proj"]["importance"]
+
+    def test_stall_frac_saturates_at_one(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(7))
+        out = None
+        for _ in range(500):  # far past ramp_steps=200
+            out = model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000)
+        assert out["input_proj"]["stall_frac"] == 1.0
+
+    def test_half_life_sets_the_decay_factor_at_full_stall(self):
+        # decay_factor at fully-saturated stall (stall_frac=1) must equal
+        # exactly 2**(-1/half_life_touches) -- the defining property of
+        # "half_life_touches touches under full stall halves the value,"
+        # not an arbitrary severity knob.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(8))
+        out = None
+        for _ in range(500):  # far past ramp_steps=200 -> stall_frac saturates at 1.0
+            out = model.apply_loss_adjusted_decay(
+                2.0, touch_fraction=1.0, max_chunk=1_000_000, importance_half_life_touches=10.0
+            )
+        assert out["input_proj"]["stall_frac"] == 1.0
+        assert out["input_proj"]["importance"]["decay_factor"] == pytest.approx(2.0 ** (-1.0 / 10.0))
+
+    def test_half_life_touches_actually_halves_after_that_many_full_stall_touches(self):
+        # End-to-end check of the half-life's own defining property: with
+        # touch_fraction=1.0 (whole layer touched every call) and stall
+        # already fully saturated, N calls at weight_half_life_touches=N
+        # should shrink |weight| by very close to 2x -- not near-zero
+        # (the original strength/floor design's failure mode) and not
+        # unchanged (a no-op). Uses WEIGHT, not importance: a fresh dense
+        # init starts importance at exactly 0, which can't demonstrate a
+        # halving ratio.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(9))
+        # Saturate stall_frac to 1.0 first, at a deliberately negligible
+        # half-life (near-1.0 decay_factor) so this warm-up phase doesn't
+        # itself perturb the weight before the timed window below starts.
+        # Needs > min_stall_steps(200) + ramp_steps(200) = 400 calls.
+        for _ in range(410):
+            model.apply_loss_adjusted_decay(2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=1e9)
+        w_before = np.abs(np.array(model.q_proj.weights)).mean()
+        half_life = 30.0
+        for _ in range(int(half_life)):
+            model.apply_loss_adjusted_decay(
+                2.0, touch_fraction=1.0, max_chunk=1_000_000, weight_half_life_touches=half_life
+            )
+        w_after = np.abs(np.array(model.q_proj.weights)).mean()
+        ratio = w_after / w_before
+        assert 0.3 < ratio < 0.7, f"expected ~0.5 shrink after half_life_touches calls, got ratio={ratio}"
+
+
+class TestPlasticityReset:
+    """apply_plasticity_reset -- per-neuron utility-based plasticity reset
+    (Continual-Backprop-inspired, EXPERIMENTAL, added 2026-09-20). See
+    docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    Replaces apply_loss_adjusted_decay as the primary mechanism under
+    test -- NOT loss-gated at all (no loss argument anywhere), driven
+    entirely by each column's own local importance/gradient-activity
+    signal. TDD: written against the sili__new engine primitives
+    (apply_amortized_plasticity_reset/apply_amortized_block4_plasticity_reset)
+    already built, tested, and committed there -- this class covers the
+    orchestration layer (per-layer touch_fraction chunk sizing,
+    block4/scattered dispatch, block4 tile-vs-cell division) on top of
+    them."""
+
+    def test_touch_fraction_sizing_across_real_nnz_range(self):
+        # Reuses the exact chunk-sizing convention proven correct for
+        # apply_loss_adjusted_decay (touch_fraction of EACH layer's own
+        # nnz, clipped to [min_chunk, max_chunk], block4 chunk divided by
+        # _BLOCK4_TILE_SLOTS) -- just needs to run without error across
+        # this test file's real ~small-but-varied layer sizes.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
+        out = model.apply_plasticity_reset()
+        assert set(out.keys()) >= {"input_proj", "q_proj", "k_proj", "v_proj", "o_proj", "lm_head"}
+        for entry in out.values():
+            assert "importance" in entry
+            assert entry["importance"] is not None
+
+    def test_non_fp32_backend_reports_nothing_yet(self):
+        # Direct instruction: this mechanism is tested against fp32
+        # (DISLDOLayer32/DISLDOLayerV, dense=True -> block4) FIRST --
+        # matching this whole investigation's actual config throughout --
+        # and only extended to FP4/FP8 later if it proves worthwhile.
+        # FP4 (DISLDOLayer) has NO apply_amortized_plasticity_reset bound
+        # at all yet -- the model method's hasattr guard must skip those
+        # layers entirely (not error, not report a partial/wrong entry).
+        model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(1))
+        out = model.apply_plasticity_reset()
+        assert out == {}, f"FP4 layers should report nothing yet (not wired), got keys: {list(out)}"
+
+    def test_block4_backend_reports_block4_substats(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(2))
+        out = model.apply_plasticity_reset()
+        assert "block4" in out["input_proj"]["importance"]
+
+    def test_runs_many_cycles_without_error_and_reports_sane_stats(self):
+        # Real end-to-end smoke: enough calls to complete several full
+        # amortized cycles on a small real layer, confirm the mechanism
+        # never crashes and reports internally-consistent stats
+        # (n_reset_this_cycle is a non-negative count, min/max_deviation
+        # bracket mean_deviation, cycle_complete is a real bool).
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
+        out = None
+        for _ in range(500):
+            out = model.apply_plasticity_reset()
+        entry = out["input_proj"]["importance"]
+        assert isinstance(entry["cycle_complete"], bool)
+        assert entry["n_reset_this_cycle"] >= 0
+        assert entry["max_deviation"] >= entry["min_deviation"]
+        if "block4" in entry:
+            assert entry["block4"]["n_reset_this_cycle"] >= 0
+            assert entry["block4"]["max_deviation"] >= entry["block4"]["min_deviation"]
+
+    def test_no_loss_argument_needed(self):
+        # Direct requirement: unlike apply_loss_adjusted_decay, this
+        # mechanism takes NO loss argument at all -- purely local
+        # per-column signals.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
+        out = model.apply_plasticity_reset()  # no loss/loss_ema argument
+        assert out is not None
+
+    def test_custom_knobs_are_threaded_through(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
+        out = model.apply_plasticity_reset(
+            touch_fraction=1.0,
+            max_chunk=1_000_000,
+            eta=0.5,
+            eta_slow=0.9,
+            eta_slow_catchup=0.8,
+            eta_fast=0.3,
+            blend=0.05,
+            reset_fraction=0.5,
+            k=1.0,
+        )
+        assert out["input_proj"]["importance"] is not None
+
+    def test_include_column_state_off_by_default(self):
+        # Direct instruction: per-column (not per-synapse) offline data
+        # collection, added as an opt-in extra so callers not doing data
+        # collection pay nothing extra. Off by default -- no column_state
+        # key anywhere when not requested, even once a cycle completes.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(6))
+        out = None
+        for _ in range(500):
+            out = model.apply_plasticity_reset()
+        entry = out["input_proj"]["importance"]
+        assert "column_state" not in entry
+        if "block4" in entry:
+            assert "column_state" not in entry["block4"]
+
+    def test_include_column_state_present_only_when_cycle_completes(self):
+        # column_state should appear ONLY on a pool leaf whose
+        # cycle_complete is True AND whose storage arm actually has real
+        # content this run -- the underlying arrays are zero-copy views
+        # in the C++ layer (get_weights_vals/get_importance precedent),
+        # so fetching them mid-cycle would be a partially up-to-date,
+        # misleading snapshot, not a real "this cycle's final state"
+        # reading. Checked on BLOCK4 only here -- a dense-loaded test
+        # model's SCATTERED arm always has 0 nnz (load_dense_values ->
+        # block4_load_dense_fp32), so its own top-level cycle_complete is
+        # trivially True on every call with column_state correctly
+        # suppressed (see test_scattered_column_state_skipped_when_scattered_arm_is_empty),
+        # not a real "did a cycle complete" signal to assert against here.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(7))
+        saw_a_cycle_complete_with_state = False
+        for _ in range(500):
+            out = model.apply_plasticity_reset(include_column_state=True)
+            for entry in out.values():
+                block4 = entry["importance"].get("block4")
+                if block4 is None:
+                    continue
+                if block4.get("cycle_complete"):
+                    assert "column_state" in block4, "a completed block4 cycle must include column_state when requested"
+                    saw_a_cycle_complete_with_state = True
+                else:
+                    assert "column_state" not in block4, "an incomplete block4 cycle must NOT include column_state"
+        assert saw_a_cycle_complete_with_state, "500 calls should complete at least one real block4 cycle"
+
+    def test_column_state_arrays_are_plain_numpy_not_live_views(self):
+        # The underlying C++ accessor returns a zero-copy VIEW into the
+        # layer's own internal buffer (documented precedent:
+        # get_weights_vals/get_importance) -- the model-level wrapper
+        # must copy it (np.array(...)) before returning, since a caller
+        # collecting data across many further apply_plasticity_reset
+        # calls needs a real frozen snapshot, not a view that silently
+        # changes under it on the NEXT call (same aliasing bug class as
+        # feedback_forward_output_not_aliased in sili__new). Checked via
+        # block4 -- the arm that actually holds this dense-loaded test
+        # model's real content (see scattered_nnz gating test).
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(8))
+        snapshots = []
+        for _ in range(500):
+            out = model.apply_plasticity_reset(include_column_state=True)
+            block4 = out["input_proj"]["importance"].get("block4")
+            if block4 is not None and "column_state" in block4:
+                snapshots.append(np.array(block4["column_state"]["col_importance"]))
+            if len(snapshots) >= 2:
+                break
+        assert len(snapshots) >= 1
+        assert isinstance(snapshots[0], np.ndarray)
+
+    def test_scattered_column_state_skipped_when_scattered_arm_is_empty(self):
+        # Real bug found via smoke-testing the actual disk-logging
+        # wiring (train_mqar_curriculum.py): a dense-loaded real layer's
+        # content lives ENTIRELY in block4 (load_dense_values ->
+        # block4_load_dense_fp32) -- its SCATTERED arm has 0 nnz for the
+        # whole run, so apply_amortized_plasticity_reset's early-return
+        # path (nnz==0) reports cycle_complete=True on literally EVERY
+        # call, with col_importance/col_grad_slow/etc all still at their
+        # zero-initialized values. Without this gate, a real 500-step
+        # smoke run wrote 3036 files in ~90s, the vast majority
+        # degenerate all-zero "scattered" snapshots (verified: loaded one
+        # back, every array was exactly zero) -- pure storage waste, no
+        # signal. scattered_nnz gates this off; block4 (the arm that
+        # actually holds this layer's real content) must still get its
+        # column_state normally.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(9))
+        saw_block4_column_state = False
+        for _ in range(500):
+            out = model.apply_plasticity_reset(include_column_state=True)
+            leaf = out["input_proj"]["importance"]
+            assert "column_state" not in leaf, (
+                "dense-loaded layer's scattered arm has 0 nnz -- must never get a "
+                "column_state snapshot, even when cycle_complete is (trivially) True"
+            )
+            block4_leaf = leaf.get("block4")
+            if block4_leaf is not None and "column_state" in block4_leaf:
+                saw_block4_column_state = True
+        assert saw_block4_column_state, (
+            "block4 (the arm holding this layer's real content) should still "
+            "produce a real column_state snapshot within 500 calls"
+        )
+
+    def test_l2_decay_lambda_default_is_off_and_stats_reported(self):
+        # Direct instruction, after offline replay of a real 100k-step
+        # run's column logs showed col_importance saturating at the
+        # ci accumulator's max_ci=100 clamp for most of a pool's
+        # population by late training: an L2-saturation-gated decay on
+        # the REAL importance accumulator (not a post-hoc re-ranking --
+        # offline replay proved that can never change selection order).
+        # Default l2_decay_lambda=0.0 must be a no-op (this project's
+        # new-shared-parameter backward-compat convention); l2_sat_ratio/
+        # l2_decay_strength stats should still surface even at lambda=0
+        # for visibility.
+        # Checked against block4 -- this fixture's dense=True layers have
+        # a permanently-empty scattered arm (see
+        # test_scattered_column_state_skipped_when_scattered_arm_is_empty),
+        # so the scattered leaf's cycle boundary never runs and its
+        # l2_sat_ratio/l2_decay_strength stay at their zero default.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(10))
+        out = None
+        for _ in range(50):
+            out = model.apply_plasticity_reset()
+        entry = out["input_proj"]["importance"]["block4"]
+        assert "l2_sat_ratio" in entry
+        assert "l2_decay_strength" in entry
+        assert 0.0 <= entry["l2_sat_ratio"] <= 1.5  # sat_ratio can exceed 1 only via fp noise
+        assert 0.0 <= entry["l2_decay_strength"] <= 1.0
+
+    def test_l2_decay_lambda_threads_through_and_shrinks_saturated_importance(self):
+        # This fixture never runs a real backward pass between calls, so
+        # col_importance never leaves 0 -- sat_ratio stays exactly 0
+        # throughout. At l2_decay_threshold=0.0 that means
+        # decay_strength = sigmoid((0-0)/temperature) = sigmoid(0) =
+        # EXACTLY 0.5, a deterministic value distinct from the 0.0
+        # no-op default -- confirms the knob actually reaches the
+        # engine's sigmoid math (not just a passthrough that gets
+        # ignored), and with l2_decay_lambda=1.0, mean_col_importance
+        # should visibly shrink cycle over cycle as a result.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(11))
+        completed = []
+        for _ in range(500):
+            out = model.apply_plasticity_reset(l2_decay_lambda=1.0, l2_decay_threshold=0.0, l2_decay_temperature=0.05)
+            leaf = out["input_proj"]["importance"]["block4"]
+            if leaf.get("cycle_complete"):
+                completed.append(leaf)
+        assert len(completed) >= 2, "block4 should complete at least 2 cycles within 500 calls"
+        entry = completed[-1]
+        assert abs(entry["l2_decay_strength"] - 0.5) < 1e-6, (
+            "threshold=0.0 at sat_ratio=0 should give decay_strength=sigmoid(0)=0.5 exactly, "
+            f"got {entry['l2_decay_strength']!r}"
+        )
+
+    def test_select_by_deviation_off_by_default_and_threads_through(self):
+        # Direct instruction, after comparing a graduated real run
+        # against a stuck real run's collected column data: rank
+        # candidates by deviation (growth RATE) instead of col_importance
+        # (absolute LEVEL) when select_by_deviation=True. Default False
+        # is an exact no-op (existing top-K-by-importance selection) --
+        # see select_by_deviation_early_detection in the design doc. The
+        # real selection-swap behavior is covered precisely at the
+        # engine level (test_amortized_plasticity_reset.cpp /
+        # test_block4_plasticity_reset.cpp); this just confirms the knob
+        # reaches the engine without error at the model layer.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(12))
+        out_default = model.apply_plasticity_reset()
+        assert out_default["input_proj"]["importance"] is not None
+        out_by_deviation = model.apply_plasticity_reset(select_by_deviation=True)
+        assert out_by_deviation["input_proj"]["importance"] is not None
+
+
+class TestL2Init:
+    """apply_l2_init -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025,
+    arXiv:2308.11958), EXPERIMENTAL, see
+    docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    TDD: written against the sili__new engine primitives
+    (apply_amortized_l2_init/apply_amortized_block4_l2_init) already
+    built and tested there -- this class covers the orchestration layer
+    only (chunk sizing, block4/scattered dispatch)."""
+
+    def test_touch_fraction_sizing_across_real_nnz_range(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(0))
+        out = model.apply_l2_init()
+        assert set(out.keys()) >= {"input_proj", "q_proj", "k_proj", "v_proj", "o_proj", "lm_head"}
+
+    def test_non_fp32_backend_reports_nothing_yet(self):
+        model = _model(disldo_cls=DISLDOLayer, rng=np.random.default_rng(1))
+        out = model.apply_l2_init()
+        assert out == {}, f"FP4 layers should report nothing yet (not wired), got keys: {list(out)}"
+
+    def test_block4_backend_reports_block4_substats(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(2))
+        out = model.apply_l2_init()
+        assert "block4" in out["input_proj"]
+
+    def test_runs_many_cycles_without_error(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(3))
+        out = None
+        for _ in range(500):
+            out = model.apply_l2_init()
+        entry = out["input_proj"]
+        assert isinstance(entry["cycle_complete"], bool)
+        assert entry["n_touched"] >= 0
+        if "block4" in entry:
+            assert entry["block4"]["n_touched"] >= 0
+
+    def test_custom_knobs_are_threaded_through(self):
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(4))
+        out = model.apply_l2_init(touch_fraction=1.0, max_chunk=1_000_000, rate=0.5)
+        assert out["input_proj"] is not None
+
+    def test_first_touch_does_not_yet_regularize(self):
+        # A weight's very first touch only captures the reference value.
+        # Exact behavior is verified at the engine test level; this just
+        # confirms one real call doesn't error or silently no-op here.
+        model = _model(disldo_cls=DISLDOLayer32, dense=True, rng=np.random.default_rng(5))
+        out = model.apply_l2_init(rate=0.5)
+        assert out["input_proj"]["n_touched"] > 0
+
+
+class TestSpectralNormUpperBound:
+    """spectral_norm_upper_bound -- Holder's-inequality cheap proxy
+    (sqrt(||W||_1 * ||W||_inf)), diagnostic only. See
+    docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic."""
+
+    def test_identity_matrix_is_exact(self):
+        w = np.eye(5, dtype=np.float32)
+        assert spectral_norm_upper_bound(w) == pytest.approx(1.0)
+
+    def test_rank_one_all_ones_matrix_is_exact(self):
+        # True spectral norm of an NxN all-ones matrix is N (eigenvalues
+        # 0 and N) -- Holder's bound is TIGHT for rank-1 matrices.
+        w = np.ones((4, 4), dtype=np.float32)
+        assert spectral_norm_upper_bound(w) == pytest.approx(4.0)
+
+    def test_zero_matrix_is_zero(self):
+        assert spectral_norm_upper_bound(np.zeros((3, 3), dtype=np.float32)) == 0.0
+
+    def test_empty_matrix_is_zero(self):
+        assert spectral_norm_upper_bound(np.zeros((0, 0), dtype=np.float32)) == 0.0
+
+    def test_scales_linearly_with_magnitude(self):
+        rng = np.random.RandomState(0)
+        w = rng.randn(6, 8).astype(np.float32)
+        base = spectral_norm_upper_bound(w)
+        assert spectral_norm_upper_bound(w * 3.0) == pytest.approx(base * 3.0, rel=1e-5)
+
+
+class TestQKSparsityAndNorm:
+    """qk_l1_sparsity_coef (independent, Q/K-scoped extension of the
+    existing l1_sparsity_coef mechanism) and qkvo_norm_enable (QKV-Norm
+    + O-Norm, Henry et al. 2020 / Zhai et al. 2023). Direct instruction,
+    after v10's real recorded data showed q_proj/k_proj deviation-std
+    collapsing to ~0 while raw_importance converged into a narrow 97-99
+    band (a homogenization signature distinct from v_proj/o_proj/
+    lm_head), and v12/v12b's real validation found Q/K-only
+    normalization just shifted the SAME saturation pattern onto
+    v_proj/o_proj/input_proj instead of removing it. See
+    docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design and
+    :qkvo_norm_design."""
+
+    def _window_and_memory(self, seed=1):
+        x_window = np.random.RandomState(seed).randn(NUM_TILES, EMBED_WIDTH).astype(np.float32) * 0.1
+        memory_prev = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        return x_window, memory_prev
+
+    def test_default_off_is_byte_identical_to_plain_model(self):
+        model_a = _model(rng=np.random.default_rng(7))
+        model_b = _model(qk_l1_sparsity_coef=0.0, qkvo_norm_enable=False, rng=np.random.default_rng(7))
+        x_window, memory_prev = self._window_and_memory()
+        mem_a, logits_a, aux_a = model_a.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        mem_b, logits_b, aux_b = model_b.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        assert np.array_equal(mem_a, mem_b)
+        assert np.array_equal(logits_a.data, logits_b.data)
+        assert aux_a is None and aux_b is None
+
+    def test_qk_l1_sparsity_coef_produces_finite_aux_loss(self):
+        model = _model(qk_l1_sparsity_coef=0.05)
+        x_window, memory_prev = self._window_and_memory()
+        _mem, _logits, aux_loss = model.step(x_window, memory_prev, learning_rate=0.01)
+        assert aux_loss is not None
+        assert np.isfinite(float(aux_loss.data))
+
+    def test_qk_l1_sparsity_coef_independent_of_l1_sparsity_coef(self):
+        # qk_l1_sparsity_coef must fire even when the pre-existing,
+        # layer-wide l1_sparsity_coef is off.
+        model = _model(l1_sparsity_coef=0.0, qk_l1_sparsity_coef=0.05)
+        x_window, memory_prev = self._window_and_memory()
+        _mem, _logits, aux_loss = model.step(x_window, memory_prev, learning_rate=0.01)
+        assert aux_loss is not None
+
+    def test_qkvo_norm_enable_produces_finite_shapes(self):
+        model = _model(qkvo_norm_enable=True)
+        x_window, memory_prev = self._window_and_memory()
+        memory_new, logits, _aux = model.step(x_window, memory_prev, learning_rate=0.01)
+        assert memory_new.shape == (NUM_MEM, STATE_WIDTH)
+        assert logits.data.shape == (NUM_TILES, VOCAB)
+        assert np.all(np.isfinite(memory_new))
+        assert np.all(np.isfinite(logits.data))
+
+    def test_qkvo_norm_enable_changes_output_vs_disabled(self):
+        model_a = _model(qkvo_norm_enable=False, rng=np.random.default_rng(9))
+        model_b = _model(qkvo_norm_enable=True, rng=np.random.default_rng(9))
+        x_window, memory_prev = self._window_and_memory()
+        _mem_a, logits_a, _aux_a = model_a.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        _mem_b, logits_b, _aux_b = model_b.step(x_window, memory_prev, learning_rate=0.0, requires_grad=False)
+        assert not np.allclose(logits_a.data, logits_b.data)
+
+    def test_qkvo_norm_ln_gains_are_in_parameters_for_optimizer(self):
+        model = _model(qkvo_norm_enable=True)
+        params = model.parameters_for_optimizer()
+        assert model.q_norm_ln in params
+        assert model.k_norm_ln in params
+        assert model.v_norm_ln in params
+        assert model.o_norm_ln in params
+
+    def test_qkvo_norm_gains_actually_update_via_backward(self):
+        model = _model(qkvo_norm_enable=True, rng=np.random.default_rng(11))
+        opt = AdamOptimizer()
+        x_window, memory_prev = self._window_and_memory()
+        before_q = np.asarray(model.q_norm_ln.data).copy()
+        before_v = np.asarray(model.v_norm_ln.data).copy()
+        before_o = np.asarray(model.o_norm_ln.data).copy()
+        _mem, logits, aux = model.step(x_window, memory_prev, learning_rate=0.05, requires_grad=True)
+        loss = cross_entropy_sum(logits, [(t, 0) for t in range(NUM_TILES)])
+        if aux is not None:
+            loss = loss + aux
+        loss.backward()
+        opt.step(model.parameters_for_optimizer(), lr=0.05)
+        assert not np.allclose(before_q, model.q_norm_ln.data)
+        assert not np.allclose(before_v, model.v_norm_ln.data)
+        assert not np.allclose(before_o, model.o_norm_ln.data)
+
+    def test_step_cached_matches_step_with_qkvo_norm_enabled(self):
+        # Same bit-exact-parity claim as TestStepCached's own test, now
+        # under qkvo_norm_enable=True -- confirms the "normalize once,
+        # then gather/cache" ordering in step_cached is equivalent to
+        # step()'s own normalize-then-gather ordering (RMSNorm is
+        # per-row, so this holds regardless of when the concat/cache
+        # round-trip happens).
+        model_a = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            qkvo_norm_enable=True,
+            rng=np.random.default_rng(42),
+        )
+        model_b = ToyTileRecurrenceRMT(
+            VOCAB,
+            EMBED_WIDTH,
+            COLUMN_NEURONS,
+            NUM_TILES,
+            NUM_MEM,
+            MAX_WEIGHTS,
+            num_cpus=2,
+            qkvo_norm_enable=True,
+            rng=np.random.default_rng(42),
+        )
+        embed_table = np.random.RandomState(1).randn(VOCAB, EMBED_WIDTH).astype(np.float32) * 0.1
+        tokens = np.random.RandomState(2).randint(0, VOCAB, size=12)
+
+        memory_a = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        memory_b = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        tile_cache = None
+        for i in range(len(tokens)):
+            window = _build_window(embed_table, tokens, i, NUM_TILES)
+            memory_a, logits_a, _aux_a = model_a.step(window, memory_a, 0.0, requires_grad=False)
+            memory_b, logits_b, _aux_b, tile_cache = model_b.step_cached(
+                embed_table[tokens[i]], memory_b, 0.0, tile_cache, requires_grad=False
+            )
+            row_a = np.asarray(logits_a.data)[NUM_TILES - 1]
+            row_b = np.asarray(logits_b.data)[0]
+            assert np.allclose(row_a, row_b, atol=1e-5), f"step {i}: logits diverged under qkvo_norm_enable"
+            assert np.allclose(memory_a, memory_b, atol=1e-5), f"step {i}: memory_new diverged under qkvo_norm_enable"

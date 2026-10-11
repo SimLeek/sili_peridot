@@ -1,0 +1,33 @@
+# K=1 precision control: train_steps=40000 seed=1000 eval_every=4000 embed_width=8 column_neurons=4 state_width=32 vocab=128 l1_sparsity_coef=0.05 peak_lr=0.01
+
+=== sparse_fp4_multi_digit ===
+  [sparse_fp4_multi_digit] step=  4000/40000  mean_query_loss=4.8376  acc=0.0250  (83s elapsed, 0.0208s/step)
+  [sparse_fp4_multi_digit] step=  8000/40000  mean_query_loss=4.8306  acc=0.0250  (165s elapsed, 0.0207s/step)
+  [sparse_fp4_multi_digit] step= 12000/40000  mean_query_loss=4.8400  acc=0.0000  (244s elapsed, 0.0204s/step)
+  [sparse_fp4_multi_digit] step= 16000/40000  mean_query_loss=4.8069  acc=0.0000  (323s elapsed, 0.0202s/step)
+  [sparse_fp4_multi_digit] step= 20000/40000  mean_query_loss=4.7271  acc=0.0250  (401s elapsed, 0.0201s/step)
+  [sparse_fp4_multi_digit] step= 24000/40000  mean_query_loss=4.7301  acc=0.0000  (479s elapsed, 0.0199s/step)
+  [sparse_fp4_multi_digit] step= 28000/40000  mean_query_loss=4.7163  acc=0.0250  (561s elapsed, 0.0200s/step)
+  [sparse_fp4_multi_digit] step= 32000/40000  mean_query_loss=4.6942  acc=0.0000  (663s elapsed, 0.0207s/step)
+  [sparse_fp4_multi_digit] step= 36000/40000  mean_query_loss=4.6953  acc=0.0000  (823s elapsed, 0.0229s/step)
+  [sparse_fp4_multi_digit] step= 40000/40000  mean_query_loss=4.6703  acc=0.0250  (905s elapsed, 0.0226s/step)
+sparse_fp4_multi_digit FINAL: {'num_kv_pairs': 1, 'seq_len': 4, 'acc': 0.03333333333333333, 'elapsed_s': 905.5946531295776}  (total 906s)
+
+=== sparse_fp32 ===
+  [sparse_fp32] step=  4000/40000  mean_query_loss=4.8563  acc=0.0000  (33s elapsed, 0.0082s/step)
+  [sparse_fp32] step=  8000/40000  mean_query_loss=4.8541  acc=0.0000  (67s elapsed, 0.0084s/step)
+  [sparse_fp32] step= 12000/40000  mean_query_loss=4.8530  acc=0.0000  (153s elapsed, 0.0127s/step)
+  [sparse_fp32] step= 16000/40000  mean_query_loss=4.8471  acc=0.0250  (188s elapsed, 0.0117s/step)
+  [sparse_fp32] step= 20000/40000  mean_query_loss=4.8412  acc=0.0000  (231s elapsed, 0.0115s/step)
+  [sparse_fp32] step= 24000/40000  mean_query_loss=4.8412  acc=0.0000  (316s elapsed, 0.0132s/step)
+  [sparse_fp32] step= 28000/40000  mean_query_loss=4.8321  acc=0.0250  (353s elapsed, 0.0126s/step)
+  [sparse_fp32] step= 32000/40000  mean_query_loss=4.8391  acc=0.0000  (386s elapsed, 0.0121s/step)
+  [sparse_fp32] step= 36000/40000  mean_query_loss=4.8355  acc=0.0250  (419s elapsed, 0.0116s/step)
+  [sparse_fp32] step= 40000/40000  mean_query_loss=4.8285  acc=0.0000  (452s elapsed, 0.0113s/step)
+sparse_fp32 FINAL: {'num_kv_pairs': 1, 'seq_len': 4, 'acc': 0.0, 'elapsed_s': 451.7674078941345}  (total 452s)
+
+# SUMMARY
+                      arm       acc
+   sparse_fp4_multi_digit    0.0333
+              sparse_fp32    0.0000
+dense_fp4 (prior run, 200000 steps)    0.1667

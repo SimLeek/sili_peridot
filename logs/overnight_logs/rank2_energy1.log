@@ -1,0 +1,44 @@
+# arm=rank2 use_energy=True train_steps=28000 checkpoint_every=1000 seed=9710 state_width=1024 num_tiles=32 max_weights=16384
+/home/simleek/claude_code/sili__new/sili/cpu.py:83: RuntimeWarning: overflow encountered in exp
+  return x / (1.0 + np.exp(-x))
+/home/simleek/claude_code/sili__new/sili/cpu.py:87: RuntimeWarning: overflow encountered in exp
+  sig = 1.0 / (1.0 + np.exp(-x))
+step=   1000  acc=0.0167  (2008s elapsed, 2.008s/step)
+step=   2000  acc=0.0167  (4036s elapsed, 2.018s/step)
+step=   3000  acc=0.0333  (6126s elapsed, 2.042s/step)
+step=   4000  acc=0.0125  (8283s elapsed, 2.071s/step)
+/home/simleek/claude_code/sili_peridot/model/toy_recall_models.py:165: RuntimeWarning: overflow encountered in multiply
+  self.v[key] = self.beta2 * self.v[key] + (1.0 - self.beta2) * (g * g)
+step=   5000  acc=0.0375  (10534s elapsed, 2.107s/step)
+step=   6000  acc=0.0083  (12847s elapsed, 2.141s/step)
+/home/simleek/claude_code/sili_peridot/model/toy_precision_models.py:611: RuntimeWarning: invalid value encountered in divide
+  np.maximum.at(row_max_pass, r_sub, v_sub / np.maximum(col_scale[c_sub], 1e-12))
+/home/simleek/claude_code/sili_peridot/model/toy_precision_models.py:611: RuntimeWarning: invalid value encountered in maximum
+  np.maximum.at(row_max_pass, r_sub, v_sub / np.maximum(col_scale[c_sub], 1e-12))
+/home/simleek/claude_code/sili_peridot/model/toy_precision_models.py:607: RuntimeWarning: invalid value encountered in maximum
+  np.maximum.at(col_max, c_sub, v_sub / np.maximum(row_scale[r_sub], 1e-12))
+/home/simleek/claude_code/sili_peridot/model/toy_precision_models.py:589: RuntimeWarning: invalid value encountered in maximum
+  np.maximum.at(row_max, row_of, abs_vals)
+step=   7000  acc=0.0208  (15001s elapsed, 2.143s/step)
+step=   8000  acc=0.0375  (16948s elapsed, 2.119s/step)
+step=   9000  acc=0.0167  (18895s elapsed, 2.099s/step)
+step=  10000  acc=0.0417  (20970s elapsed, 2.097s/step)
+step=  11000  acc=0.0250  (23013s elapsed, 2.092s/step)
+step=  12000  acc=0.0292  (25070s elapsed, 2.089s/step)
+step=  13000  acc=0.0333  (27115s elapsed, 2.086s/step)
+step=  14000  acc=0.0000  (28863s elapsed, 2.062s/step)
+step=  15000  acc=0.0000  (30098s elapsed, 2.007s/step)
+step=  16000  acc=0.0000  (31088s elapsed, 1.943s/step)
+step=  17000  acc=0.0000  (32078s elapsed, 1.887s/step)
+step=  18000  acc=0.0000  (33075s elapsed, 1.837s/step)
+step=  19000  acc=0.0000  (34074s elapsed, 1.793s/step)
+step=  20000  acc=0.0000  (35028s elapsed, 1.751s/step)
+step=  21000  acc=0.0000  (35953s elapsed, 1.712s/step)
+step=  22000  acc=0.0000  (36876s elapsed, 1.676s/step)
+step=  23000  acc=0.0000  (37795s elapsed, 1.643s/step)
+step=  24000  acc=0.0000  (38713s elapsed, 1.613s/step)
+step=  25000  acc=0.0000  (39635s elapsed, 1.585s/step)
+step=  26000  acc=0.0000  (40558s elapsed, 1.560s/step)
+step=  27000  acc=0.0000  (41483s elapsed, 1.536s/step)
+step=  28000  acc=0.0000  (42405s elapsed, 1.514s/step)
+# DONE arm=rank2 use_energy=True (42405s total)

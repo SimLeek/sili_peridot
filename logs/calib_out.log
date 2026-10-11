@@ -1,0 +1,20 @@
+# MQAR curriculum precision=fp32 max_steps=1500 seed=1000 peak_lr=0.015 num_tiles=16 k_max=10 additive_rank=1 dynamic_rank_control=True rank_grace_period_steps=50 use_critic=False recurrent_only_output=False embed_width=36 input_sparsity_p=None wide_max_weights=None dy_sparsity_p=None use_tile_cache=False output_dy_sparsity_p=None streak_threshold=10 wrong_streak_threshold=100000000 dy_r_target=0.9 dy_k_min=0 dy_k_max=None target_steps_per_sec=95.69 dy_surprise_alpha=None x_r_target=0.9 x_k_min=0 trajectory_log_every=None r_target_min=0.5
+  step=    193  phase=vocab  vocab=  16  k=  1  loss_ema=1.6302  acc_ema=0.6449  [LEVEL_UP]
+  step=    200  phase=vocab  vocab=  16  k=  1  loss_ema=2.7756  acc_ema=0.5598  t[in=3.28s(3%) q=27.75s(22%) k=28.89s(23%) v=28.97s(23%) o=28.74s(23%) attention=0.18s(0%) lm=0.18s(0%) other=6.62s(5%) / 124.61s]  steps/sec=1.6  max_streak=10/10  dy_r_target[in=0.765 q=0.765 k=0.765 v=0.765 o=0.765]  x_r_target[in=0.881 q=0.741 k=0.735 v=0.734 o=0.736]
+  step=    400  phase=vocab  vocab=  16  k=  1  loss_ema=3.2621  acc_ema=0.1554  t[in=2.49s(3%) q=21.37s(22%) k=22.20s(23%) v=22.20s(23%) o=21.01s(22%) attention=0.18s(0%) lm=0.17s(0%) other=6.41s(7%) / 96.03s]  steps/sec=1.8  max_streak= 2/10  dy_r_target[in=0.650 q=0.650 k=0.650 v=0.650 o=0.650]  x_r_target[in=0.863 q=0.609 k=0.598 v=0.598 o=0.606]
+  step=    600  phase=vocab  vocab=  16  k=  1  loss_ema=2.9615  acc_ema=0.1255  t[in=2.02s(3%) q=17.47s(22%) k=17.84s(23%) v=17.91s(23%) o=16.38s(21%) attention=0.17s(0%) lm=0.16s(0%) other=6.36s(8%) / 78.31s]  steps/sec=2.0  max_streak= 3/10  dy_r_target[in=0.553 q=0.553 k=0.553 v=0.553 o=0.553]  x_r_target[in=0.845 q=0.500 k=0.500 v=0.500 o=0.503]
+  step=    800  phase=vocab  vocab=  16  k=  1  loss_ema=2.7611  acc_ema=0.1113  t[in=1.67s(3%) q=14.45s(22%) k=14.81s(22%) v=14.79s(22%) o=13.50s(20%) attention=0.18s(0%) lm=0.16s(0%) other=6.34s(10%) / 65.90s]  steps/sec=2.2  max_streak= 2/10  dy_r_target[in=0.500 q=0.500 k=0.500 v=0.500 o=0.500]  x_r_target[in=0.827 q=0.500 k=0.500 v=0.500 o=0.500]
+  step=   1000  phase=vocab  vocab=  16  k=  1  loss_ema=3.4682  acc_ema=0.1103  t[in=1.52s(3%) q=13.26s(22%) k=13.58s(22%) v=13.16s(22%) o=12.47s(21%) attention=0.17s(0%) lm=0.16s(0%) other=6.36s(10%) / 60.69s]  steps/sec=2.3  max_streak= 2/10  dy_r_target[in=0.500 q=0.500 k=0.500 v=0.500 o=0.500]  x_r_target[in=0.810 q=0.500 k=0.500 v=0.500 o=0.500]
+  step=   1200  phase=vocab  vocab=  16  k=  1  loss_ema=3.1049  acc_ema=0.0930  t[in=1.53s(2%) q=13.68s(22%) k=14.22s(23%) v=13.12s(21%) o=12.63s(20%) attention=0.19s(0%) lm=0.16s(0%) other=6.33s(10%) / 61.86s]  steps/sec=2.5  max_streak= 3/10  dy_r_target[in=0.500 q=0.500 k=0.500 v=0.500 o=0.500]  x_r_target[in=0.793 q=0.500 k=0.500 v=0.500 o=0.500]
+  step=   1400  phase=vocab  vocab=  16  k=  1  loss_ema=3.0618  acc_ema=0.1459  t[in=1.51s(2%) q=14.21s(23%) k=14.40s(23%) v=13.11s(21%) o=12.50s(20%) attention=0.17s(0%) lm=0.16s(0%) other=6.36s(10%) / 62.40s]  steps/sec=2.5  max_streak= 2/10  dy_r_target[in=0.500 q=0.500 k=0.500 v=0.500 o=0.500]  x_r_target[in=0.777 q=0.500 k=0.500 v=0.500 o=0.500]
+
+FINAL precision=fp32 final_vocab=16 final_k=1 final_phase=vocab graduated=False total_steps=1500 steps_per_sec=2.6 peak_rss_mb=130.5 (582s)
+PEAK precision=fp32 peak_vocab=16 peak_k=1 peak_phase=vocab
+STAGE_HISTORY_JSON [{"step": 193, "event": "level_up", "from": {"vocab": 8, "k": 1, "phase": "vocab"}, "to": {"vocab": 16, "k": 1, "phase": "vocab"}}]
+
+=== E[|h|] just before each layer's _to_sparse call (last 400 samples) ===
+input_proj   n= 400  mean(|h|)=0.05877  median=0.05314  p90=0.09763
+q_proj       n= 400  mean(|h|)=0.22834  median=0.22299  p90=0.35565
+k_proj       n= 400  mean(|h|)=0.41541  median=0.31121  p90=0.79419
+v_proj       n= 400  mean(|h|)=0.41541  median=0.31121  p90=0.79419
+o_proj       n= 400  mean(|h|)=0.17083  median=0.18098  p90=0.24699
