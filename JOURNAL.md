@@ -11685,3 +11685,18 @@ sleep mechanism's cadence for real-time/wall-clock deployment (e.g. a
 robot sleeping on an hours schedule, not a training-step schedule) --
 likely needs steps/lr/gradient-sparsity re-tuned together, not just the
 gate itself.
+
+## 2026-10-11 -- next task decided: GPU port of the kernel-level work
+
+Direct instruction, after confirming the 4 `block4_*_TODO_DELETE.hpp`
+files in `sili__new` are still live (none orphaned -- all `#include`d
+by `cpu_backend.cpp`, all still the only block4 implementation of
+CiRenorm/WeightRenorm/decay/plasticity_reset, the kernel-decomposition
+refactor their own comments describe as the delete trigger hasn't
+happened): the next task is getting this kernel-level work onto GPU so
+MQAR training/ablation iterates faster -- CPU-only runs taking hours
+per 100k-step config was the real limiter on how many configs/seeds
+this round's plasticity investigation could try. Recorded as a todo
+only (`sili__new/TODO.md`'s new "GPU port of the block4/plasticity
+kernel-level work" section, mirrored in this repo's `todolist.md`),
+not sized or designed yet -- explicitly not started in this PR.
