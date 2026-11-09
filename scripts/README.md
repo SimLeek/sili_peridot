@@ -1,0 +1,77 @@
+# scripts/ index
+
+Auto-generated navigational index of the `.py` files directly inside this
+`scripts/` directory (top level only). `sandbox_arm_launchers/` is a
+subdirectory with its own separate README — not covered here.
+
+| File | Summary |
+|---|---|
+| `analyze_column_log.py` | Offline analysis of per-column plasticity snapshots from `launch_dense_lr_unscaled_plasticity_reset_column_log.py`; one-off exploratory script, disposable. |
+| `analyze_raw_ci_recovery.py` | Offline analysis of the raw-ci-recovery diagnostic run's per-step synapse samples; finds value "drops" and measures recovery time. |
+| `analyze_run1_vs_v3.py` | Compares the graduated "run1" against the original v3 run (stuck at vocab=126/k=2) at matched step counts, using logged column-level stats. |
+| `analyze_v3_l2decay.py` | Offline analysis of the v3 (l2decay) run's per-column snapshots (importance, L2 saturation ratio, decay strength). |
+| `analyze_v6_stall.py` | Analyzes v6's plateau (stuck at vocab=64/k=3) by checking whether the EVT-derived deviation gate is still firing or has gone dormant during the stall, and what a percentile-based alternative threshold would have done on the same data. |
+| `compare_mqar_curriculum_results.py` | Parses stdout logs of one or more `train_mqar_curriculum.py` runs and prints a comparison table of peak vocab/K each precision (fp4/fp8/fp32) actually held for a genuine streak. |
+| `debug_energy_log_sigmas_runaway.py` | Checkpoint/repro script for the `baseline_energy` skip-rate investigation; reproduces a non-finite failure, noted NOT to be reliably reproducible step-for-step despite a fixed seed. |
+| `dense_tanh_no_bptt_control.py` | Isolation control swapping DISLDOLayer out for plain dense float32 + Adam (same tanh cell, same no-BPTT convention) to check whether a confident-but-wrong decision boundary is FP4/DISLDO-specific or architectural. |
+| `diagnose_dense_vs_sparse.py` | Diagnostic comparing the same model/seed dense vs sparse at every pipeline stage via `debug=True` instrumentation, to find where their value distributions diverge. |
+| `disldo_no_bptt_ablation.py` | First rung of the no-BPTT ablation ladder: full-density residual-accumulate DISLDO recurrent control (no tanh) — found to explode (pure forward-pass linear-feedback instability). |
+| `disldo_tanh_no_bptt_ablation.py` | Second rung of the ablation ladder: adds tanh squashing to the no-BPTT DISLDO recurrent control, fixing forward-pass instability but still near-chance accuracy. |
+| `disldo_tanh_sparse_ablation.py` | Third rung of the ablation ladder: same tanh cell as rung 2 but sparse (not full) density, removing the effective-lr collapse caused by `lr_per_row_nnz` dividing by full in*out row width. |
+| `empty_init_synaptogenesis_ladder.py` | Graduated wall-clock test ladder (tiers ~1/2/4/8/16/32/64 min) for the zero-weight-init + synaptogenesis-growth design, each tier run to completion and measured honestly rather than time-budget-truncated. |
+| `energy_param_validation.py` | Standalone full validation (4 dense arms x 5 seeds x 15000 steps) of an alternate `EnergyDynamics` config (activation_cost=0.02, precision=0.01) chosen from a quick skip-rate probe. |
+| `estimate_wide_scaling.py` | Pre-calculates expected sparsity speedup at a target `state_width` from calibration data, before committing compute to actually training at that width. |
+| `fit_mqar_loss_curve.py` | Fits an exponential-approach curve to a logged MQAR loss trajectory and reports the estimated asymptote, distinguishing "still converging" from "genuinely plateaued." |
+| `fp32_handrolled_control.py` | Diagnostic control isolating precision alone: same architecture and hand-rolled training loop as the real toy models, but fp32 dense instead of FP4/DISLDO. |
+| `l1_sparsity_probe.py` | LANDMARK RESULT script: L1 output-sparsity on all 4 layers reaches mean=1.0000 across 5 seeds at coef=0.05/0.07, beating spectral norm's 0.8858; defines `OriginalArchModel`, `run`, `evaluate` reused by many other scripts. |
+| `landmark_checklist.py` | Pre-commit regression checklist: runs the 4-config dense-init L1-sparsity sweep (baseline x {energy, zero_init} x {on, off}) and prints both old-style and real eval-accuracy metrics as each seed/config completes. |
+| `learning_slope.py` | Generic learning-slope detector: parses any `step=N acc=X` log and reports whether accuracy is trending up, flat, or indistinguishable from chance via Theil-Sen slope + a one-sided test. |
+| `live_synapse_display.py` | Live, side-by-side visualization tool (via `displayarray`/OpenCV) of every layer's weight/importance matrices plus the plasticity-reset algorithm's live state; reusable, wired into `train_mqar_curriculum.py`. |
+| `lr_calibration_probe.py` | Short sweep of `peak_lr` multipliers (10x-100x) on the baseline config over 1500 steps/2 seeds, reporting old-style and real eval accuracy. |
+| `lr_optimal_search_baseline.py` | Longer, fully-converging `find_optimal_lr` run on the `baseline` config, giving a time budget large enough to actually converge past an earlier time-budget-truncated search. |
+| `lr_per_row_nnz_ab_test.py` | A/B test of `lr_per_row_nnz` True vs False (both correctly implemented, no Python-side pre-division bug) to see whether damping the per-synapse update by row connection count helps or hurts accuracy. |
+| `lr_range_test.py` | Smith-style LR range test: ramps `peak_lr` exponentially over a short fixed-difficulty run and reports the LR of steepest loss descent, as a cheap alternative to full 100k-step bracketing runs. |
+| `mqar_calibrated_sweep.py` | Full K=[1,2,4,8] MQAR sweep with a per-K step budget calibrated to cost roughly equal wall-clock time, built on the K=1 saturation run's measured per-step costs. |
+| `mqar_k1_calibration.py` | K=1 MQAR saturation/calibration run (used to pick step budgets for `mqar_calibrated_sweep.py`). |
+| `mqar_k1_precision_control.py` | K=1 MQAR precision control comparing DISLDOLayer vs DISLDOLayer32 via `TrueMultiDigitLayer`, with a documented state-width workaround for a crash. |
+| `mqar_multi_seed_validation.py` | Reusable multi-seed A/B harness for `train_mqar_curriculum.train_curriculum()`, built because the engine has confirmed run-to-run nondeterminism that a single-seed comparison can't distinguish from a real effect. |
+| `plasticity_sim.py` | Offline pure-Python sandbox for testing candidate plasticity-reset algorithms against real recorded training data without needing a new C++ engine run per candidate; faithfully ports the C++ selection/deviation math. |
+| `probe_attention_sigma.py` | Probes `gaussian_attention`'s sigma parameter (content-driven vs position-anchored attention) distribution split by correct/incorrect predictions, comparing configs that did/didn't hit a vocab ceiling. |
+| `probe_sigma_gradient.py` | Direct check of whether `log_sigmas.grad` is genuinely zero at `embed_width=32` (a real bug/saturation) vs just small (an LR-mismatch issue). |
+| `prototype_peak_synapse_learning_comparison.py` | Small, fast end-to-end learning comparison of whether a per-synapse peak-correction mechanism helps a tiny recurrent net learn a delayed-credit deviation-detection task. |
+| `prototype_synapse_peak_credit.py` | Minimal throwaway verification that a per-synapse (not just per-row) peak-eligibility correction via `backward_sparse` can give real credit to a row's weights even when that row is silent at the query tick. |
+| `rank2_baseline_probe.py` | Isolated probe (run separately from `landmark_checklist.py`) of whether `scale_rank=2` helps the non-zero-init baseline arms too, reusing `landmark_checklist`'s `run_config` for comparable numbers. |
+| `replay_synapse_display.py` | Replays a completed/in-progress run's recorded synapse snapshots at a smooth fixed frame rate (30-60fps), reusing `live_synapse_display.py`'s rendering with recorded `.npz` data instead of a live loop. |
+| `stochastic_nnz_drift_probe.py` | Characterizes nnz drift under stochastic DISLDOLayer with `dense=True` (expected stable density, but drift observed) and counts exact-(0,0) weight/importance rounding events. |
+| `stochastic_scale_dense_confirmation.py` | Compares deterministic vs stochastic DISLDOLayer rounding over 12 seeds at a fixed dense config, reporting mean/SEM/paired-t accuracy gap. |
+| `stochastic_stability_vs_scale_sparsity.py` | Sweeps whether the stochastic-vs-deterministic FP4 rounding accuracy gap on an out-of-context copy task shrinks as state_width or input sparsity grows. |
+| `stuck_weights_scale_dependence_probe.py` | Tests whether FP4 synapses getting stuck at initial values is a toy-scale-only artifact (rank-N value_scale absorbing the gradient signal) by comparing `state_width=32` vs `state_width=256`. |
+| `stuck_weights_stochastic_probe.py` | Companion to the scale-dependence probe: tests whether stochastic (vs deterministic) rounding alone unsticks FP4 weights at toy scale. |
+| `superposition_convergence_extrapolation.py` | Fits a power-law-with-floor curve to each (hidden_width, arm) loss trajectory in the long-run superposition sweep log and estimates whether/when it would cross under the no-superposition baseline. |
+| `superposition_multi_digit_probe.py` | Tests whether `TrueMultiDigitLayer` (two summed FP4 digit-layers) closes the fp4-vs-fp32 superposition gap better than a single plain FP4 layer, at the widths already run in the long sweep. |
+| `superposition_step_budget_probe.py` | Isolates the "just needs more steps" hypothesis from width: fixes `hidden_width=10` and sweeps only `n_steps` to see if float+Adam eventually clears the no-superposition baseline. |
+| `superposition_stoch_extension_check.py` | One-time falsification check: reruns the two cheapest predicted-to-cross fp4_stoch/multi_digit_stoch configs well past their fit-predicted crossing step, to see if any fp4 arm genuinely crosses the baseline in observed (not just extrapolated) data. |
+| `superposition_width_sweep_long.py` | Long-horizon version of `superposition_width_sweep.py` with a genuinely long step budget and built-in progress logging, since the original sweep's arms were still improving, not plateaued, at 32000 steps. |
+| `superposition_width_sweep.py` | Sweeps `hidden_width` (holding compression ratio fixed) to see at what width, if any, FP4 superposition packing starts to beat the no-superposition baseline. |
+| `torch_mqar_control.py` | Diagnostic control: same architecture shape as the toy small transformer but full fp32 torch + real Adam, to isolate whether stuck-at-chance MQAR results are caused by FP4/DISLDO or by the hand-rolled training loop. |
+| `torch_rnn_control.py` | Diagnostic control: a "should just work" ceiling for the out-of-context deviation-detection task using PyTorch's real-BPTT `nn.RNN`/`nn.LSTM`. |
+| `train_mqar_curriculum.py` | Adaptive MQAR curriculum trainer with student-paced difficulty (vocab/K level-up on streaks); the main CLI-driven curriculum harness many diagnostic scripts build on. |
+| `train_mqar_k_sweep.py` | MQAR trainer scaled by K (number of simultaneous key-value associations) on `ToyTileRecurrenceRealFP4`, using the current best-known production config (TrueMultiDigitLayer, dense, l1_sparsity_coef=0.05). |
+| `train_mqar_precision_sweep.py` | Real-engine MQAR test matrix: {fp4, fp4_dual, fp8} x {rank1, rank2} x {magnitude_scale on/off}, plus an fp32 control arm, built on `train_mqar_rmt_synapse_ablation.py`'s harness. |
+| `train_mqar_rmt_ablation.py` | Runs `ToyTileRecurrenceRMTAblation` for one named single-factor-swap config at a time (optimizer/clip/attn-bias/norm/l1-sparsity), bracketed by two known-result sanity checks. |
+| `train_mqar_rmt_optimizer_ablation.py` | Torch-based ablation of DISLDO's custom RMSprop-like optimizer's four properties that differ from Adam (bias correction, momentum, contrib-in-ci, raw-delta clipping), toggled independently. |
+| `train_mqar_rmt_reference.py` | Runs `ToyTileRecurrenceRMT` (a faithful sili-native RMT reproduction) on the same K=1 MQAR harness as `train_mqar_k_sweep.py`, as the same-engine/different-architecture control. |
+| `train_mqar_rmt_standard.py` | Runs `ToyTileRecurrenceRMTStandard` (a genuinely vanilla torch RMT implementation, not an exact port) on the same K=1 MQAR harness, to check if a standard implementation solves the task cleanly. |
+| `train_mqar_rmt_synapse_ablation.py` | Replicates the torch clip-vs-no-clip finding on the real sili engine (`ToyTileRecurrenceRMT`), after two real engine bug fixes (contrib formula, NaN/Inf guards) made the torch port's prediction untrustworthy. |
+| `train_mqar_rmt_torch_reference.py` | Runs `ToyTileRecurrenceRMTTorch` (exact-as-possible torch port) on the same K=1 MQAR harness, to isolate "is sili__new broken" from "does even a correct architecture fail here" after the sili control failed to learn. |
+| `train_peridot_main.py` | THE canonical sili_peridot entry point: the project's current best-known-working recipe (sparse DISLDO + magnitude regularization + intrinsic sleep-gated energy annealing) for training on MQAR, documented with its best reached result (vocab=126, k=7). |
+| `train_tile_curriculum.py` | Fast curriculum test harness for `ToyTileRecurrenceRealFP4` across arms (rank1/rank2/fp8), with/without energy and attention. |
+| `train_tile_rankn_energy_overnight_old.py` | Earlier version of `train_tile_rankn_energy_overnight.py` (near-identical docstring/setup); superseded by the non-`_old` file. |
+| `train_tile_rankn_energy_overnight.py` | Overnight tile-recurrence validation: rank1/rank2 FP4 and FP8, with/without a corrected `EnergyDynamics` config, at near-full-scale `state_width` (not toy scale), on real MQAR recall. |
+| `train_toy_beyond_context_comparison.py` | Tier 1 of the out-of-context benchmark suite: tests whether tile-recurrence's recurrent state genuinely extends effective range beyond a fixed local window vs a structurally-windowed dense transformer, using a gradual one-increment-at-a-time curriculum. |
+| `train_toy_beyond_context_peak_eligibility_only.py` | Runs the out-of-context comparison harness with only the `PeakEligibilityDISLDOLayer` variant (reduced step budget), comparing against recorded dense/tile/tile+energy results. |
+| `train_toy_precision_comparison.py` | 2x2 (+1) comparison: Adam-on-artificial-FP4 vs importance-on-real-FP4, crossed with energy on/off, plus a third arm giving the row-scale its own Adam-style normalization — isolates optimizer/precision/energy confounds per `feedback_do_science_correctly`. |
+| `train_toy_recall_comparison.py` | Real training experiment: does `ToyTileRecurrence`'s column-averaged wide recurrent state actually learn, at rough context-visibility parity with a dense causal baseline. |
+| `train_toy_tile_precision_comparison.py` | Real MQAR run for `ToyTileRecurrenceRealFP4` (tile recurrence on real sili/DISLDOLayer): a bounded three-stage sweep over optimizer variant, then capacity (column_neurons), then tile-count/context scaling. |
+| `weight_update_magnitude_vs_width.py` | Sweeps `state_width` and measures real per-synapse weight-update magnitude (realized vs raw pre-quantization) to see if it trends toward FP4's quantization threshold as width grows. |
+| `zeroinit_minimal_repro.py` | Minimal, fast repro of a bug where all zero-init model configs produced eval accuracy bit-identical to a completely untrained model (degenerate constant-token output, not real learning). |
