@@ -1152,10 +1152,11 @@ class TestStepCached:
         assert np.all(np.isfinite(logits.data))
         assert aux_loss is None
         assert len(tile_cache) == 1  # grows by one per call, caps at NUM_TILES-1
-        for k_row, v_row, x_normed_row in tile_cache:
+        for k_row, v_row, x_normed_row, fired in tile_cache:
             assert k_row.shape == (STATE_WIDTH,)
             assert v_row.shape == (STATE_WIDTH,)
             assert x_normed_row.shape == (STATE_WIDTH,)
+            assert fired is False  # sleep_energy_enable is off by default in _model()
 
     def test_cache_length_caps_at_num_tiles_minus_1(self):
         model = _model()
@@ -1168,6 +1169,39 @@ class TestStepCached:
                 new_embed, memory, learning_rate=0.0, tile_cache=tile_cache
             )
             assert len(tile_cache) <= NUM_TILES - 1
+
+    def test_fired_row_gets_eviction_priority_over_non_fired(self):
+        # REM-retention: a row sleep's forced-firing picked (_row_fired_this_tick
+        # True) should survive an eviction a plain-FIFO cache would have dropped
+        # it in, at the cost of evicting a non-fired row instead. Monkeypatch
+        # the fire signal to a controlled sequence instead of relying on real
+        # EnergyDynamics dynamics actually firing on cue. learning_rate=0.0
+        # throughout so weights (and thus each embed's own k_row) stay fixed
+        # across calls -- lets last_debug["k"] right after pushing A serve as
+        # an exact reference for "A's own row" to check for later.
+        model = _model()
+        model.retain_fired_rows = True  # opt-in, off by default
+        fire_sequence = iter([True, False, False])  # row A fires, B/C don't
+        model._row_fired_this_tick = lambda *_a, **_k: next(fire_sequence)
+        memory = np.zeros((NUM_MEM, STATE_WIDTH), dtype=np.float32)
+        tile_cache = None
+        embed_a = np.full(EMBED_WIDTH, 1.0, dtype=np.float32)
+        embed_b = np.full(EMBED_WIDTH, 2.0, dtype=np.float32)
+        embed_c = np.full(EMBED_WIDTH, 3.0, dtype=np.float32)
+        a_k_row = None
+        for j, embed in enumerate((embed_a, embed_b, embed_c)):
+            memory, _logits, _aux, tile_cache = model.step_cached(
+                embed, memory, learning_rate=0.0, tile_cache=tile_cache
+            )
+            if j == 0:
+                a_k_row = model.last_debug["k"].reshape(-1).copy()
+        assert len(tile_cache) == NUM_TILES - 1 == 2
+        fired_flags = [row[3] for row in tile_cache]
+        # Plain FIFO would have kept (B, C) and dropped A -- this policy
+        # keeps A (fired) instead, dropping B.
+        assert fired_flags.count(True) == 1, "the fired row (A) should still be in the cache"
+        k_rows = [row[0] for row in tile_cache]
+        assert any(np.array_equal(k, a_k_row) for k in k_rows), "A's row should have survived, not B's"
 
     def test_weights_actually_update_via_backward(self):
         model = _model()

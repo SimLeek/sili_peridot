@@ -316,6 +316,7 @@ def train_curriculum(
     tile_cache_credit_k_rows: int | None = None,
     tile_cache_credit_fraction: float | None = 0.5,
     tile_cache_credit_fraction_fn=None,
+    retain_fired_rows: bool = False,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -637,6 +638,9 @@ def train_curriculum(
     # externally responsive -- e.g. "sleep nightly instead of every
     # minute" for an online/embodied deployment -- not fixed
     # hyperparameters baked in at construction time.
+    # retain_fired_rows: opt-in, default off -- untested effect on
+    # quality, don't silently change existing sleep_enable=True runs.
+    # See ToyTileRecurrenceRMT.__init__'s own docstring.
     # k_first_target/k_first_vocab: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.k_first_target_odometer_reordering.
     #
@@ -768,6 +772,7 @@ def train_curriculum(
         use_energy=use_energy,
         energy_kwargs=energy_kwargs,
         sleep_energy_kwargs=sleep_energy_kwargs,
+        retain_fired_rows=retain_fired_rows,
         rng=model_rng,
     )
     opt = AdamOptimizer()

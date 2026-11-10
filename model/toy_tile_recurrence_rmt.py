@@ -123,6 +123,7 @@ class ToyTileRecurrenceRMT:
         energy_kwargs: dict | None = None,
         sleep_energy_enable: bool = False,
         sleep_energy_kwargs: dict | None = None,
+        retain_fired_rows: bool = False,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -338,6 +339,10 @@ class ToyTileRecurrenceRMT:
         self.sleep_energy_kwargs = sleep_energy_kwargs or {}
         self._sleep_energy: dict = {}  # call-site key -> EnergyDynamics, lazily built
         self._sleep_aux_loss: Tensor | None = None
+        # Opt-in, default off -- untested effect, don't silently change
+        # existing sleep_enable=True behavior (e.g. train_peridot_main.py's
+        # winning recipe). See step_cached()'s own eviction-priority comment.
+        self.retain_fired_rows = retain_fired_rows
 
         state_width = self.state_width
         if rng is None:
@@ -1584,6 +1589,22 @@ class ToyTileRecurrenceRMT:
         _h_out, aux, _actual_p = ed(x)
         self._sleep_aux_loss = aux if self._sleep_aux_loss is None else self._sleep_aux_loss + aux
 
+    def _row_fired_this_tick(self, layer_name: str, call_site: str | None = None) -> bool:
+        """True if sleep's forced-firing (see _accumulate_sleep_energy
+        above, EnergyDynamics.kept_indices -- "the gate decision energy
+        already made") selected ANY column for the row just passed
+        through that call. Only meaningful right after the matching
+        _accumulate_sleep_energy call on a SINGLE-row tensor (the one
+        content row step_cached() ever processes) -- for a multi-row
+        tensor this would need per-row unraveling, not done here."""
+        if not self.sleep_energy_enable:
+            return False
+        key = layer_name if call_site is None else f"{layer_name}:{call_site}"
+        ed = self._sleep_energy.get(key)
+        if ed is None or ed.kept_indices is None:
+            return False
+        return ed.kept_indices.size > 0
+
     def _to_sparse(self, x: Tensor, layer_name: str) -> Tensor:
         """Sparsity plan Phase 6 helper; no-op unless x_r_target[layer_name]
         or input_sparsity_p is set. Real bug fix: wires _children/_backward
@@ -2247,6 +2268,7 @@ class ToyTileRecurrenceRMT:
             **self._wide_extra_kwargs("input_proj"),
         )  # [1, sw]
         self._accumulate_sleep_energy(x_wide_new, "input_proj")
+        new_row_fired = self._row_fired_this_tick("input_proj")
         x_normed_new = rmsnorm_tensor(x_wide_new, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -2587,10 +2609,22 @@ class ToyTileRecurrenceRMT:
                 k_new.data.copy().reshape(sw),
                 v_new.data.copy().reshape(sw),
                 x_normed_new.data.copy().reshape(sw),
+                new_row_fired,
             )
         ]
         if len(new_cache) > (n_content - 1):
-            new_cache = new_cache[-(n_content - 1) :]
+            overflow = len(new_cache) - (n_content - 1)
+            if self.retain_fired_rows:
+                # Opt-in (see __init__'s own retain_fired_rows docstring):
+                # REM-fired rows get priority to stay -- prefer dropping
+                # non-fired, then oldest, rows. Still hard-bounded at
+                # n_content-1, no window growth -- if everything left is
+                # fired, the oldest fired ones go too. See JOURNAL.md's
+                # REM-token-retention entry.
+                drop = set(sorted(range(len(new_cache)), key=lambda i: (new_cache[i][3], i))[:overflow])
+                new_cache = [row for i, row in enumerate(new_cache) if i not in drop]
+            else:
+                new_cache = new_cache[-(n_content - 1) :]
 
         # Fold in energy/sleep/balance aux losses, same as step()'s own fold.
         if self._energy_aux_loss is not None:

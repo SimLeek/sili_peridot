@@ -11913,3 +11913,75 @@ and the recurrent memory's own never-cached long-horizon credit) --
 queued as the next piece, after this round's testing is fully wrapped
 up. The memory-snapshot-cache "combined" case and Part 3's N-D
 generalization remain deferred as before.
+
+## 2026-11-11 -- Per-token magnitude selection re-confirmed losing;
+REM-fired-row cache retention (opt-in)
+
+Two quick, separate follow-ups before moving on to recurrent-memory
+credit, clarified as genuinely distinct tasks (previously conflated in
+this session's own discussion): (1) does magnitude-guided SELECTION of
+which cached rows get Mechanism A's correction beat blind round-robin,
+per-TOKEN this time, not per-neuron/column as previously tested; (2) a
+separate, unrelated idea -- tokens that trigger sleep's forced-firing
+should also get a better shot at staying in context, not just at being
+trained on.
+
+**(1) Per-token magnitude ranking, re-confirmed losing.** Same 40-seed,
+~34k-param sweep setup as the dose-response run, same 50% budget,
+comparing blind round-robin (already validated) against ranking live
+cached rows by `|cache_k_tensor.grad|+|cache_v_tensor.grad|` each
+query step instead. Blind round-robin (0.2166) edged out
+magnitude-ranked (0.2120), not significant (paired t-test p=0.0951,
+n=40) but directionally consistent with Arm C's precedent
+(`project_dense_vs_sparse_mqar_confusion_matrix`) now confirmed on this
+axis too, not just the column axis. Not pursued further; blind
+round-robin stays the real mechanism.
+
+**(2) REM-fired-row retention, opt-in (`retain_fired_rows`, default
+False).** Clarified during discussion: this is NOT about selecting
+backprop targets by importance (that's (1), and the general
+magnitude-guided pattern is the thing already shown losing) -- it's
+about keeping a token in context a little longer when it happens to be
+the one sleep's forced-firing picked that tick, as a side effect
+independent of training it. `EnergyDynamics.kept_indices` ("the gate
+decision energy already made") already exposes exactly this: for
+`step_cached()`'s single new content row through
+`_accumulate_sleep_energy(x_wide_new, "input_proj")`, `kept_indices`
+non-empty means THIS row fired. New `_row_fired_this_tick()` reads
+that; `tile_cache`'s tuple extends again, to `(k_row, v_row,
+x_normed_row, fired)`; `step_cached()`'s eviction, when
+`retain_fired_rows=True`, prefers dropping non-fired rows (then oldest)
+over fired ones, instead of strict FIFO -- still hard-bounded at
+`n_content-1`, no window growth, so if everything left is fired the
+oldest fired ones go too. Confirmed directly (grep): sleep was never
+discarding the tokens it processes from the cache at all -- `in_sleep`
+only ever gates `requires_grad`/which loss backprops, never skips a
+cache update -- so this is a pure, new addition, not a bug fix for an
+existing discard.
+
+**Known approximation, not solved here**: `gaussian_attention`'s
+`centers`/`sigmas` bias attention by a row's ARRAY POSITION in the
+reassembled K/V, which normally equals true age. Skip-evicting a
+middle row to protect a fired one breaks that equivalence -- the
+retained row ends up at a slot-position that no longer matches its
+true age. Same spirit as the already-accepted "stale cached weights"
+approximation (drift is small and bounded in practice), but a real,
+distinct approximation worth naming rather than silently introducing.
+Fixing it properly would mean tracking true age through the attention
+bias itself, or bounding how far retention can skip -- bigger scope
+than this pass.
+
+**Explicitly opt-in, not default**: direct instruction -- the quality
+effect of this retention policy is genuinely untested, so it must not
+silently change behavior for any existing `sleep_enable=True` run
+(e.g. `train_peridot_main.py`'s winning recipe). Smoke-tested only
+(no crash, sane finite output, a direct unit test of the eviction
+priority itself with a controlled fire sequence) -- no dose-response
+validation attempted, unlike Mechanism A, since this is a much smaller,
+qualitatively different change (retention policy, not a new credit
+mechanism) and wasn't asked to be validated to that same bar yet.
+
+Next: recurrent state token credit hold/assign (Mechanism B) --
+peak-eligibility-style credit for the recurrent memory's own
+never-cached long-horizon influence, generalized to k-hot per the
+earlier k-hot-generalization instruction.
