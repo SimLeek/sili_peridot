@@ -1,8 +1,10 @@
 # scripts/ index
 
 Auto-generated navigational index of the `.py` files directly inside this
-`scripts/` directory (top level only). `sandbox_arm_launchers/` is a
-subdirectory with its own separate README — not covered here.
+`scripts/` directory (top level only). `sandbox_arm_launchers/`'s own
+files are documented in its own section below, folded into this single
+README after that subdirectory was consolidated from ~80 files down to
+11 (see JOURNAL.md's 2026-11-09 entry for the full story).
 
 | File | Summary |
 |---|---|
@@ -65,8 +67,9 @@ subdirectory with its own separate README — not covered here.
 | `train_mqar_rmt_synapse_ablation.py` | Replicates the torch clip-vs-no-clip finding on the real sili engine (`ToyTileRecurrenceRMT`), after two real engine bug fixes (contrib formula, NaN/Inf guards) made the torch port's prediction untrustworthy. |
 | `train_mqar_rmt_torch_reference.py` | Runs `ToyTileRecurrenceRMTTorch` (exact-as-possible torch port) on the same K=1 MQAR harness, to isolate "is sili__new broken" from "does even a correct architecture fail here" after the sili control failed to learn. |
 | `train_peridot_main.py` | THE canonical sili_peridot entry point: the project's current best-known-working recipe (sparse DISLDO + magnitude regularization + intrinsic sleep-gated energy annealing) for training on MQAR, documented with its best reached result (vocab=126, k=7). |
+| `sili_dense_bench.py` | Micro-benchmark harness comparing DISLDOLayer32 dense vs sparse-init forward+backward wall-time per call across input_proj/q-k-v-o_proj shapes. Relocated from `sandbox_arm_launchers/` -- not a launcher, a standalone benchmark tool. |
+| `torch_vs_sili_backward.py` | PyTorch-side counterpart to `sili_dense_bench.py` -- benchmarks `torch.nn.Linear`+RMSprop forward+backward wall-time on the same shapes (CPU and CUDA if available). Relocated from `sandbox_arm_launchers/`, same reason. |
 | `train_tile_curriculum.py` | Fast curriculum test harness for `ToyTileRecurrenceRealFP4` across arms (rank1/rank2/fp8), with/without energy and attention. |
-| `train_tile_rankn_energy_overnight_old.py` | Earlier version of `train_tile_rankn_energy_overnight.py` (near-identical docstring/setup); superseded by the non-`_old` file. |
 | `train_tile_rankn_energy_overnight.py` | Overnight tile-recurrence validation: rank1/rank2 FP4 and FP8, with/without a corrected `EnergyDynamics` config, at near-full-scale `state_width` (not toy scale), on real MQAR recall. |
 | `train_toy_beyond_context_comparison.py` | Tier 1 of the out-of-context benchmark suite: tests whether tile-recurrence's recurrent state genuinely extends effective range beyond a fixed local window vs a structurally-windowed dense transformer, using a gradual one-increment-at-a-time curriculum. |
 | `train_toy_beyond_context_peak_eligibility_only.py` | Runs the out-of-context comparison harness with only the `PeakEligibilityDISLDOLayer` variant (reduced step budget), comparing against recorded dense/tile/tile+energy results. |
@@ -75,3 +78,32 @@ subdirectory with its own separate README — not covered here.
 | `train_toy_tile_precision_comparison.py` | Real MQAR run for `ToyTileRecurrenceRealFP4` (tile recurrence on real sili/DISLDOLayer): a bounded three-stage sweep over optimizer variant, then capacity (column_neurons), then tile-count/context scaling. |
 | `weight_update_magnitude_vs_width.py` | Sweeps `state_width` and measures real per-synapse weight-update magnitude (realized vs raw pre-quantization) to see if it trends toward FP4's quantization threshold as width grows. |
 | `zeroinit_minimal_repro.py` | Minimal, fast repro of a bug where all zero-init model configs produced eval accuracy bit-identical to a completely untrained model (degenerate constant-token output, not real learning). |
+
+## scripts/sandbox_arm_launchers/ index
+
+Consolidated 2026-11-09 from ~80 near-duplicate single-call launcher
+scripts (each hardcoding one `train_curriculum(...)` call differing from
+a sibling by a few kwargs -- e.g. "v19b"/"v19c" were v19 with only
+`seed` changed) down to this. See JOURNAL.md's 2026-11-09 entry for the
+full consolidation story, including the verification discipline used
+(every retired file's replacement preset was checked against that
+file's own real, unmodified source before deletion) and two real bugs
+it caught (a `peak_lr` transcription rounding error, and `v12`/`v12b`'s
+use of a now-removed `qk_norm_enable` parameter -- those two files were
+deleted, not folded in, since the capability they tested no longer
+exists and substituting the newer `qkvo_norm_enable` would misrepresent
+what they tested).
+
+| File | Summary |
+|---|---|
+| `launch.py` | Generic single-run launcher: `python3 launch.py <preset> [--seed N] [--max-steps N] [--num-cpus N] [--k-start N]`. Looks up the named preset in `launcher_configs.PRESETS`, applies any CLI overrides, runs it. Run with no preset name to list all available presets. |
+| `launcher_configs.py` | The actual historical configs: `PRESETS` (one entry per retired launcher, built as base dicts + `{**BASE, override}` derived variants so "X is just Y with Z changed" stays visible) and `SWEEPS` (sweep-axis definitions for `sweep.py`). |
+| `launcher_common.py` | Shared `make_log_fn`/`make_trajectory_log_fn`/`print_final_summary` helpers, lifted verbatim from `train_mqar_curriculum.main()`'s own already-complete superset implementation -- every retired launcher's `log_fn` was a strict subset of the same available fields, never different data. |
+| `sweep.py` | Generic multi-run sweep: `python3 sweep.py <sweep_name>`. Runs a base preset against a list of override dicts from `launcher_configs.SWEEPS`, prints a comparison table. Replaces the handful of genuine multi-run sweep scripts that couldn't collapse into a single `launch.py` preset. |
+| `run_sandbox_dense_probe.py` | Dense sandbox probe with a `--num-cpus` flag -- merges the former plain and `_cpu8` variants (identical except that one override). Monkeypatches `train_mqar_curriculum._build_targets` to return raw mqar_pairs unchanged. |
+| `calibrate_energy_scale.py` | Energy-scale calibration probe: monkeypatches `ToyTileRecurrenceRMT._to_sparse` to record mean\|h\| per layer over a short run. Kept separate -- a genuinely unique monkeypatch mechanism, not a `train_curriculum` config variant. |
+| `diagnose_raw_ci_recovery.py` | Diagnostic capturing raw per-synapse ci recovery dynamics (`raw_ci_sample_fn`, fires on every real weight update) alongside the usual plasticity column snapshots. Kept separate -- its own bespoke npz-capture mechanism and log_fn (l2decay-focused, not deviation-focused). |
+| `launch_kfirst_remote.py` | MQAR curriculum (k_first_target odometer mode) with per-layer wall-time breakdown + dy/x_r_target trajectory logging, now via `launcher_common`'s shared helpers instead of its own near-identical copy. |
+| `confusion_matrix_diagnostic.py` | Runs baseline + Arm A/B/C(+A+C) and reports two failure-mode proxies (input-starvation dead-neuron fraction; backward gradient-energy retention). Kept separate -- bespoke diagnostic printing beyond plain log_fn fields. |
+| `width_scaling_knee_probe.py` | Sweeps `column_neurons` at fixed `embed_width`, measuring the knee-elbow R and k_mean/state_width ratio after a short warm-up. Kept separate -- varies a module-level constant, not a `train_curriculum` kwarg, and captures bespoke per-layer model internals. |
+| `width_scaling_knee_probe_matched.py` | Controlled version of `width_scaling_knee_probe.py`, pinning the curriculum at a fixed stage so widths are compared at matched task difficulty. Kept separate, same reason. |

@@ -36,6 +36,7 @@ sys.path.insert(0, ".")
 import numpy as np
 
 import scripts.train_mqar_curriculum as m
+from scripts.sandbox_arm_launchers.launcher_common import print_final_summary
 
 m.NUM_CPUS = 4
 m.K_START = 2
@@ -145,9 +146,4 @@ r = m.train_curriculum(
 )
 for name in list(_buffers):
     _flush(name)
-print(
-    f"\nFINAL final_vocab={r['final_vocab']} final_k={r['final_k']} "
-    f"steps_per_sec={r['steps_per_sec']:.2f} ({r['elapsed_s']:.0f}s)",
-    flush=True,
-)
-print("DONE_DIAGNOSE_RAW_CI_RECOVERY", flush=True)
+print_final_summary(r, label="diagnose_raw_ci_recovery")
