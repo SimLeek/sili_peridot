@@ -11985,3 +11985,234 @@ Next: recurrent state token credit hold/assign (Mechanism B) --
 peak-eligibility-style credit for the recurrent memory's own
 never-cached long-horizon influence, generalized to k-hot per the
 earlier k-hot-generalization instruction.
+
+## 2026-11-10 -- Mechanism B: formal proof, 5 negative self-supervised
+attempts, 1 validated win (RSM-inspired sparse memory + local loss)
+
+Direct instruction before any further Python work: formally prove, in
+Bend (not Lean -- see `tile_cache_gradient_routing`'s own README for
+why), that synaptic-hold/e-prop credit (1) genuinely approximates true
+BPTT's cross-time credit signal, (2) is cheaper than literal BPTT, (3)
+approximates it increasingly well -- ideally exactly -- as activity
+sparsifies. Done: `sili__new/bend_proofs/synaptic_hold_bptt_approximation/`
+(PR #55), `ALL PROOFS CHECK`. For a residual update `h_t = h_{t-1} +
+D_t`, the identity-trace approximation's error vs true BPTT's full
+Jacobian product is, by the standard distributive/powerset expansion, a
+sum over subsets of ONLY the ticks with nonzero `D_t` ("active" ticks)
+-- independent of how many inactive ticks sit in between. `n`
+consecutive fully-inactive ticks give EXACTLY zero error, for any `n`,
+not asymptotically (`all_inactive_is_exact`). This settles the math;
+it says nothing about whether any given selection mechanism correctly
+classifies ticks as active/inactive, or whether a real model's
+Jacobians are well-approximated by the proof's scalar model -- those
+are the empirical questions the rest of this entry is about.
+
+**Toy-scale empirical setup** (not the real `ToyTileRecurrenceRMT` --
+see "next" below): `model/toy_beyond_context_task.py`'s
+`generate_deviation_sequence` -- a periodic body (`DEVIATION_BASE_
+PATTERN`, period 3) with AT MOST ONE deviating position, answer = did
+a deviation occur. A single `DISLDOLayer` cell + head, `M_prev` reset
+to zero each sequence, trained with `lr_schedule`/curriculum matching
+`prototype_peak_synapse_learning_comparison.py`'s existing harness.
+`no_memory` (forces `M_prev=0` always) is PROVABLY bound at the task
+prior (0.5) by construction -- `QUERY_TOKEN` is a fixed constant
+unconditional on the answer, so a deterministic net fed an identical
+query input must produce an identical output distribution. All
+comparisons below are against this real floor and against `plain`
+(real memory, zero cross-time credit -- sometimes scores at or below
+`no_memory` itself, confirming there is no "baseline that already uses
+memory well" to amplify; any working mechanism has to add a genuinely
+new signal, not improve an existing one).
+
+**Oracle version, validated.** `scripts/prototype_surprise_gated_exact_
+credit.py`: a hard (binary) gate on the state update, `surprise = (tok
+!= expected_tok(pos))` read directly off `DEVIATION_BASE_PATTERN` --
+forces the update to be EXACTLY zero on every regular tick, matching
+`all_inactive_is_exact`'s precondition literally, not approximately.
+Since the task guarantees <=1 active tick ever, the identity-trace
+credit (held row -> query-time gradient, coefficient 1, zero decay) is
+not just a good approximation, it is mathematically exactly equal to
+true BPTT for this task. Measured: **0.90-0.99 mean accuracy across
+n_bits in {2,3,4,6}, p<0.0001 vs every baseline, 50 seeds, full
+6000-step training** (one side-finding, unrelated to the mechanism
+itself: ~2/5 seeds showed a full-accuracy regression at this longer
+training length that didn't appear at 1000-1500 steps -- a real,
+separate training-instability issue, not chased further this session).
+This empirically confirms the proof's mechanism works, given a correct
+activity signal. The remaining, much harder problem: getting that
+signal without reading the answer key.
+
+**Five negative results, self-supervised (no oracle access to
+DEVIATION_BASE_PATTERN anywhere), each confirmed at real statistical
+power after at least one earlier false-positive wash-out:**
+
+1. **Soft/continuous surprise gate**
+   (`scripts/prototype_selfsup_eprop_credit.py`): a small predictor
+   (own `DISLDOLayer`, own next-token cross-entropy loss) reads `M_
+   prev`, its own prediction error gates the state update
+   multiplicatively, its own gradient w.r.t. `M_prev` (a real, local,
+   one-step BPTT target -- NOT a reattached cross-tick graph, still
+   O(1)/step) is routed via the held-row trace into the cell's weights
+   EVERY tick. Result (50 seeds, full 6000 steps): significantly
+   **worse** than `no_memory` at nearly every n_bits (e.g. n=4:
+   0.341 vs 0.492, p=0.0006) -- not a failure to help, active harm.
+2. **Lateral inhibition** ("don't fire next to me" -- a soft,
+   Gaussian-by-index-distance local-max penalty reusing
+   `gaussian_attention`'s own weighting idea, reused for intra-layer
+   unit competition instead of cross-token attention; rejected doing
+   real KL/variational sparsity per direct instruction -- "gross
+   statistics embedded in the activation," and it would also force
+   one-concept-per-unit rather than allowing distributed/redundant
+   codes). Applied independently to the cell's delta, the predictor's
+   output, and `M_prev` itself
+   (`scripts/prototype_lateral_inhibition_eprop_credit.py`). An
+   apparent win at 10 seeds did NOT replicate at 50 (all 8 arms
+   statistically tied with the no-inhibition baseline at n>=4,
+   p>0.1).
+3. **Hard-thresholded gate** (0.3/0.5/0.7, same self-supervised
+   surprise signal, binary instead of continuous --
+   `scripts/prototype_lateral_inhibition_eprop_credit.py`'s
+   `HardGateEPropCell` equivalent): no threshold beat `no_memory` or
+   the soft-gate baseline at n>=4; one result significant in the
+   WRONG direction (n=6, p=0.0058, worse).
+4. **Explicit step-index feature** for the predictor (not oracle
+   access to the pattern's period or values -- just "how far into
+   this sequence am I," the same category of information any real
+   sequence model gets from positional encoding): a marginal win at
+   20 seeds (n=6, p=0.0038 vs the no-feature baseline) flipped to
+   significantly WORSE than `no_memory` at 50 seeds (n=3 p=0.0042, n=6
+   p=0.0135).
+5. **Gating-only, no per-tick crediting** -- isolates whether the
+   per-tick noisy crediting itself (vs. the surprise signal's
+   quality) was the harm source: keep the self-supervised predictor
+   purely as a gate, credit the cell ONLY once at the rare query event
+   (matching the oracle's own schedule exactly). Result: no longer
+   significantly worse than `no_memory` (p=0.39-0.81) -- confirms
+   per-tick crediting WAS part of the harm -- but also no better
+   (tied with the already-harmful dense-crediting baseline too,
+   p=0.26-0.41). Removing the harm doesn't produce a rescue; the
+   self-supervised surprise signal itself was never better than
+   random at picking the informative tick.
+
+**Direct instruction after (5)'s negative conclusion**: research
+whether this is a solved problem in the literature before declaring
+the hypothesis space exhausted. Found Srivastava/Van Hoesel/Hawkins-
+style "Recurrent Sparse Memory" (RSM, arXiv:1905.11589, "Learning
+distant cause and effect using only local and immediate credit
+assignment") -- a genuinely different approach from everything above:
+no held-row credit routing, no separate surprise predictor, no
+query-time correction hack at all. Instead the memory's OWN
+representation is made combinatorially sparse via winner-take-all +
+REFRACTORY SELF-INHIBITION (a temporal analog of the lateral-inhibition
+idea above -- competition across TIME via a per-unit decaying
+refractory trace, not across space via a Gaussian neighborhood), and
+the whole thing is trained with only a SHALLOW (backprop depth 2:
+decoder then encoder), purely LOCAL, self-supervised next-token
+prediction loss every tick -- no BPTT, no eligibility trace, nothing
+routed backward in time at all. RSM reports 99.2% on Embedded Reber
+Grammar (near-identical task shape: long-distance signal across random
+distractors) vs LSTM's 100%, Elman RNN's 0%.
+
+**6. RSM-inspired sparse memory + local loss -- VALIDATED, the first
+non-oracle win of this investigation.**
+(`scripts/prototype_rsm_inspired_cell.py`-equivalent in this session's
+scratch work, not yet promoted to a committed script -- see "next"
+below.) Hard top-k winner-take-all on the cell's raw state-update
+magnitude, re-weighted each tick by `(1 - phi)` where `phi` is a
+per-unit refractory trace (`phi <- max(phi * decay, mask)`, reset per
+sequence) -- gradient flows only through the surviving (winning)
+units' values, a standard k-sparse/straight-through mask, not through
+the selection itself. A SEPARATE shallow decoder (own weights) predicts
+the literal next body token from this tick's sparse activity; its
+cross-entropy loss backprops through the decoder and into the cell's
+weights for exactly the surviving units -- backprop depth 2, no
+further. The task's own query-time loss trains the SAME shared cell/
+head weights on top, unchanged from every other arm. Confirmed at 30
+seeds then REPLICATED at 50 seeds, k_active in {3,4,6} (out of
+`STATE_WIDTH=16`), 1500-step budget:
+
+| n_bits | no_memory | plain | rsm_k3 | rsm_k4 | rsm_k6 |
+|---|---|---|---|---|---|
+| 2 (in-ctx) | 0.497 | 0.616 | 0.736 (p<.0001, p=.016) | 0.778 (p<.0001, p=.0015) | 0.701 (p<.0001, p=.025) |
+| 3 (out) | 0.510 | 0.474 | 0.634 (p=.0021, p=.0010) | 0.666 (p=.0001, p<.0001) | 0.648 (p=.0002, p<.0001) |
+| 4 (out) | 0.475 | 0.500 | 0.591 (p=.0048, p=.027) | 0.573 (p=.021, p=.096) | 0.573 (p=.0058, p=.057) |
+| 6 (out) | 0.510 | 0.438 | 0.423 (p=.0082, WORSE) | 0.393 (p=.0008, WORSE) | 0.455 (p=.11, tied) |
+
+(p-values: vs `no_memory`, vs `plain`, paired t-test.) All three
+k-values significantly beat BOTH `no_memory` and `plain` at n=2, n=3,
+and (mostly) n=4 -- n=3/4 are genuinely out-of-context (window=2), so
+this is real cross-time credit, not in-window pattern matching. Honest
+boundary: it does NOT extend to n=6 -- actively worse there for k=3/4,
+tied for k=6. Likely cause, not yet confirmed: a fixed k-sparse code
+over `STATE_WIDTH=16` units probably exhausts its combinatorial
+capacity, or the refractory decay schedule needs horizon-dependent
+tuning, past a certain span. First non-oracle mechanism in this entire
+investigation (toy-scale or otherwise) to show a real, replicated win
+over the "no cross-time credit" baselines.
+
+**Why this works where the predictor-based approaches didn't**: every
+failed attempt (1-5 above) tried to figure out WHICH past ticks to
+credit -- i.e., solve the same selection problem the oracle solved by
+cheating. RSM's insight sidesteps that problem entirely: make the
+representation itself carry a combinatorially distinct code per
+distinct history (via competition, not selection-for-credit), and
+only ever train it with an ordinary, SHALLOW, local loss. There is no
+credit-routing mechanism to get wrong.
+
+**(a) Done this same pass**: promoted the oracle + RSM-inspired cell
+into `scripts/prototype_surprise_gated_exact_credit.py` and
+`scripts/prototype_rsm_inspired_memory_credit.py` (the latter
+reproduces the replicated 50-seed table above); deleted the 3
+negative-result scratch scripts (findings recorded above, nothing left
+to reproduce from them).
+
+**(b) Done this same pass, NOT yet quality-validated**: ported the
+RSM-inspired mechanism onto the REAL `ToyTileRecurrenceRMT`
+architecture's own memory write, as an opt-in mechanism (`rsm_memory_
+write_enable: bool = False`, `rsm_k_active: int | None = None`,
+`rsm_refractory_decay: float = 0.7` -- threaded through
+`train_curriculum()` too). PASS 1's write (`attn_mem_n`, the residual
+term added to `memory_prev`) gets the same hard winner-take-all +
+refractory-self-inhibition sparsification as the toy cell, applied to
+the flattened `num_memory_slots * state_width` write in both `step()`
+and `step_cached()` -- gradient flows through surviving units' values
+only, same straight-through convention. A new `rsm_decoder` layer
+(own weights, lazily constructed only when enabled -- byte-identical
+RNG consumption for every other layer when off) predicts the actual
+next token from that tick's sparse write; `model.rsm_decoder_step_
+loss(next_token_id, lr)` returns that loss for the CALLER to backward
+every tick (deliberately NOT folded into `step()`'s own returned
+`aux_loss`, which is only ever backward'd at target/sleep positions --
+RSM's recipe needs a real backward every tick to train the write
+encoding, not just the rare ones). Backprop depth is bounded by this
+tick's own write-pipeline graph (`rsm_decoder` -> `o_proj`, further if
+`qkvo_norm_enable`/`gaussian_attention` -- all WITHIN one call, never
+crossing a `step()` boundary into a prior tick, since `memory_prev_t`/
+`x_normed` are fresh leaves every call, same "no BPTT" guarantee as
+everything else here).
+
+Smoke-tested only, this pass: constructor + `step()` + `step_cached()`
+run clean (finite output) both with the flag on and off; a 30-step
+`train_curriculum()` run completes with the flag on; a 100-step
+default-flag-off run is unaffected (regression check) -- real,
+measured overhead at this tiny model scale (embed_width=8,
+num_tiles=16): **1.68x slower** (20.7 -> 12.3 steps/sec), expected and
+inherent to forcing a real backward every tick instead of only at
+target/sleep positions, not a bug.
+
+**Explicitly NOT done, the actual open question**: whether this
+mechanism helps real MQAR curriculum progression at all -- the toy
+deviation-detection task's validated win does not transfer by
+assumption. A real decisive comparison (multi-seed, against the
+`plain`/no-RSM baseline, tracking peak_vocab/peak_k reached, matching
+this project's own established validation bar for Mechanism A/B) is
+the next, separate, unstarted step, along with sweeping `rsm_k_active`/
+`rsm_refractory_decay` for this architecture's actual `state_width`
+(untuned, carried over from the toy cell's `STATE_WIDTH=16` scale
+without re-derivation).
+
+**(c) Still open, not investigated**: the n=6 boundary (why the sparse
+code's cross-time credit breaks down past a certain horizon) remains a
+real, not-yet-understood limitation worth its own investigation before
+trusting this at longer horizons -- likely relevant to how far the
+real MQAR validation above should expect this to hold up too.

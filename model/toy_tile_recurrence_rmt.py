@@ -9,7 +9,7 @@ from sili.energy import EnergyDynamics, GradSelectionEnergy
 from sili.sparse_rnn import CSR, DISLDOLayer, _nucleus_top_k_csr
 from sili.tensor import Tensor, concat, exp, gather, gaussian_attention, power, reduce_sum, relu, tensor_abs
 
-from .toy_recall_models import rmsnorm_tensor
+from .toy_recall_models import cross_entropy_sum, rmsnorm_tensor
 
 
 def _knee_elbow_r(x2d: np.ndarray) -> float:
@@ -124,6 +124,9 @@ class ToyTileRecurrenceRMT:
         sleep_energy_enable: bool = False,
         sleep_energy_kwargs: dict | None = None,
         retain_fired_rows: bool = False,
+        rsm_memory_write_enable: bool = False,
+        rsm_k_active: int | None = None,
+        rsm_refractory_decay: float = 0.7,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -258,7 +261,14 @@ class ToyTileRecurrenceRMT:
             wake_gate_steps -- see JOURNAL.md's 2026-10-03 "energy-driven
             sleep annealing" entry. Keyed by layer name; caller picks
             whether to backward on self._sleep_aux_loss. No-op unless
-            sleep_energy_enable=True."""
+            sleep_energy_enable=True.
+        rsm_memory_write_enable, rsm_k_active, rsm_refractory_decay:
+            RSM-inspired sparse memory write, see JOURNAL.md 2026-11-10
+            (toy-scale validated, NOT yet at this scale). Winner-take-
+            all + refractory inhibition on the flattened PASS-1 write;
+            rsm_k_active = survivors (None: 25%, untuned). Caller calls
+            rsm_reset_sequence() at sequence boundaries. No-op unless
+            True."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -344,6 +354,15 @@ class ToyTileRecurrenceRMT:
         # winning recipe). See step_cached()'s own eviction-priority comment.
         self.retain_fired_rows = retain_fired_rows
 
+        # See __init__'s own rsm_memory_write_enable docstring above.
+        self.rsm_memory_write_enable = rsm_memory_write_enable
+        self.rsm_refractory_decay = rsm_refractory_decay
+        self._rsm_write_width = self.num_memory_slots * self.state_width
+        self.rsm_k_active = rsm_k_active if rsm_k_active is not None else max(1, round(0.25 * self._rsm_write_width))
+        self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
+        self._rsm_last_write: Tensor | None = None  # LIVE Tensor (not detached) -- see rsm_decoder_step_loss
+        self.rsm_decoder = None  # constructed below, after rng is guaranteed non-None
+
         state_width = self.state_width
         if rng is None:
             rng = np.random.default_rng()
@@ -403,6 +422,20 @@ class ToyTileRecurrenceRMT:
         self.lm_head = disldo_cls(
             embed_width, vocab_size, max_weights, num_cpus, rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs
         )
+
+        # See __init__'s own rsm_memory_write_enable docstring. Only
+        # draws from `rng` (and only constructs this layer) when
+        # enabled -- byte-identical RNG consumption for every existing
+        # layer above when the flag is off, same convention as every
+        # other opt-in mechanism in this constructor.
+        if self.rsm_memory_write_enable:
+            self.rsm_decoder = disldo_cls(
+                self._rsm_write_width,
+                vocab_size,
+                self._rsm_write_width * vocab_size,
+                num_cpus,
+                rng=np.random.default_rng(int(rng.integers(0, 2**31 - 1))),
+            )
 
         # See docs/research/toy_tile_recurrence_rmt.rst:critic_head_design.
         self.use_critic = use_critic
@@ -1544,6 +1577,35 @@ class ToyTileRecurrenceRMT:
                 results[name] = (c.get_scale_rank(), additive_rank)
         return results
 
+    def rsm_reset_sequence(self) -> None:
+        """Reset the RSM refractory trace, same cadence as `memory_prev`."""
+        self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
+
+    def _rsm_sparsify_write(self, attn_mem_n: Tensor) -> Tensor:
+        """Winner-take-all + refractory inhibition, see __init__'s
+        rsm_memory_write_enable docstring. Straight-through mask."""
+        flat = attn_mem_n.data.reshape(-1).astype(np.float32)
+        activity = np.abs(flat)
+        priority = (1.0 - self._rsm_phi) * activity
+        k = min(self.rsm_k_active, flat.shape[0])
+        top_idx = np.argpartition(priority, -k)[-k:]
+        mask = np.zeros_like(flat)
+        mask[top_idx] = 1.0
+        self._rsm_phi = np.maximum(self._rsm_phi * self.rsm_refractory_decay, mask)
+        mask_t = Tensor(mask.reshape(attn_mem_n.data.shape))
+        sparse = attn_mem_n * mask_t
+        self._rsm_last_write = sparse
+        return sparse
+
+    def rsm_decoder_step_loss(self, next_token_id: int, learning_rate: float) -> Tensor | None:
+        """Shallow local self-supervised loss, JOURNAL.md 2026-11-10.
+        Caller backs this EVERY tick, unlike step()'s own aux_loss."""
+        if self.rsm_decoder is None or self._rsm_last_write is None:
+            return None
+        write = self._rsm_last_write.reshape((1, self._rsm_write_width))
+        logits = self.rsm_decoder.forward(write, learning_rate)
+        return cross_entropy_sum(logits, [(0, next_token_id)])
+
     def _apply_energy(self, x: Tensor, region: str) -> Tensor:
         """Homeostatic energy gating (task #269), applied to a region's
         FULL continuous tensor BEFORE its x_r_target nucleus selection --
@@ -1829,6 +1891,7 @@ class ToyTileRecurrenceRMT:
         self._energy_aux_loss = None  # see _apply_energy's own docstring
         self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
         self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
+        self._rsm_last_write = None  # see _rsm_sparsify_write's own docstring
 
         if content_dy_sparsity_schedule is not None:
             if len(content_dy_sparsity_schedule) != n_content:
@@ -1980,6 +2043,8 @@ class ToyTileRecurrenceRMT:
         self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
+        if self.rsm_memory_write_enable:
+            attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
@@ -2254,6 +2319,7 @@ class ToyTileRecurrenceRMT:
         self._energy_aux_loss = None
         self._sleep_aux_loss = None
         self._balance_aux_loss = None
+        self._rsm_last_write = None
 
         new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
         new_embed_t = Tensor(new_embed_2d)
@@ -2394,6 +2460,8 @@ class ToyTileRecurrenceRMT:
         self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
+        if self.rsm_memory_write_enable:
+            attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 

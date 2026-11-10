@@ -317,6 +317,9 @@ def train_curriculum(
     tile_cache_credit_fraction: float | None = 0.5,
     tile_cache_credit_fraction_fn=None,
     retain_fired_rows: bool = False,
+    rsm_memory_write_enable: bool = False,
+    rsm_k_active: int | None = None,
+    rsm_refractory_decay: float = 0.7,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -773,6 +776,9 @@ def train_curriculum(
         energy_kwargs=energy_kwargs,
         sleep_energy_kwargs=sleep_energy_kwargs,
         retain_fired_rows=retain_fired_rows,
+        rsm_memory_write_enable=rsm_memory_write_enable,
+        rsm_k_active=rsm_k_active,
+        rsm_refractory_decay=rsm_refractory_decay,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -1001,6 +1007,8 @@ def train_curriculum(
 
         memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
         tile_cache = None  # reset every sequence, same as memory
+        if rsm_memory_write_enable:
+            model.rsm_reset_sequence()  # reset the refractory trace, same cadence as memory
         for i in range(seq_len + offset):
             # See docs/research/train_mqar_curriculum.rst:
             # train_curriculum.use_tile_cache_query_step_fallback.
@@ -1045,13 +1053,31 @@ def train_curriculum(
                 # never participated in sleep_enable at all, which is why
                 # the two used to be hard-guarded mutually exclusive).
                 memory, logits, aux, tile_cache = model.step_cached(
-                    new_embed, memory, lr, tile_cache, requires_grad=in_sleep
+                    new_embed, memory, lr, tile_cache, requires_grad=(in_sleep or rsm_memory_write_enable)
                 )
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
-                memory, logits, aux = model.step(window, memory, lr, requires_grad=((i in targets) or in_sleep))
+                memory, logits, aux = model.step(
+                    window, memory, lr, requires_grad=((i in targets) or in_sleep or rsm_memory_write_enable)
+                )
                 logit_row = num_tiles - 1
+
+            # RSM-inspired sparse memory write (JOURNAL.md 2026-11-10):
+            # shallow, purely local self-supervised next-token loss,
+            # EVERY tick -- not folded into `aux` since that's only ever
+            # backward'd at target/sleep positions (see
+            # rsm_decoder_step_loss's own docstring for why this needs
+            # its own backward here, independent of that). No-op unless
+            # rsm_memory_write_enable=True.
+            if rsm_memory_write_enable:
+                _rsm_next_i = i + 1
+                _rsm_next_tok = int(combined_tokens[_rsm_next_i]) if _rsm_next_i < seq_len + offset else None
+                if _rsm_next_tok is not None:
+                    rsm_loss = model.rsm_decoder_step_loss(_rsm_next_tok, lr)
+                    if rsm_loss is not None:
+                        rsm_loss.backward()
+                        opt.step(model.parameters_for_optimizer(), lr=lr)
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
             if in_sleep:
