@@ -11700,3 +11700,77 @@ this round's plasticity investigation could try. Recorded as a todo
 only (`sili__new/TODO.md`'s new "GPU port of the block4/plasticity
 kernel-level work" section, mirrored in this repo's `todolist.md`),
 not sized or designed yet -- explicitly not started in this PR.
+
+## 2026-11-09 -- scripts/sandbox_arm_launchers/ consolidated 80 files
+down to 8 + 2 relocated; v12/v12b deleted (used a now-removed param)
+
+Direct instruction, after noticing "v19b/v19c" is literally "v19 with
+one field (seed) changed" as the dominant pattern across the whole
+directory: consolidated ~68 near-duplicate single-call launcher
+scripts into `launch.py` (generic launcher) + `launcher_configs.py`
+(the actual per-run config data, one `PRESETS` entry per retired file,
+built as base dicts + `{**BASE, override}` derived variants so "X is
+just Y with Z changed" stays visible, not hidden) + `launcher_common.py`
+(the shared `log_fn`/`trajectory_log_fn`/final-summary helpers, lifted
+verbatim from `train_mqar_curriculum.main()`'s own already-complete
+superset implementation -- every retired file's log_fn was a strict
+subset of the SAME available fields, never different data) +
+`sweep.py` (generic multi-run sweep, replacing the handful of genuine
+sweep scripts that couldn't collapse into a single-call preset).
+`run_sandbox_dense_probe.py`/`run_sandbox_dense_probe_cpu8.py` merged
+into one file via a `--num-cpus` flag (their only real difference).
+`sili_dense_bench.py`/`torch_vs_sili_backward.py` relocated to
+`scripts/` (misplaced -- not launchers at all).
+
+**Verification discipline**: every retired file's replacement preset
+was checked against the ORIGINAL file's own real source (via a harness
+that runs the unmodified original through `runpy`, intercepting only
+`train_curriculum` to cap steps at 30 and force `num_cpus=1` for
+determinism -- zero risk of a transcription error, since the real
+file executes) before deletion. 65 of 67 attempted presets matched
+exactly (`final_vocab`/`final_k`/`stage_history` identical). One real
+transcription slip caught this way and fixed: `armc_lr_scaled_invp`/
+`armc_lr_scaled_invsqrtp`'s `peak_lr` had been hand-rounded
+(0.0248/0.0158) instead of computed via the original files' own exact
+formula (`0.01/p`, `0.01/sqrt(p)`, `p = 0.5 - asin(0.3)/pi`) -- fixed
+to compute the real value (0.024813.../0.015752...) instead of a
+rounded literal.
+
+**v12/v12b deleted, not folded in**: both called `qk_norm_enable=True`,
+a Q/K-ONLY normalization flag that no longer exists on
+`train_curriculum`'s signature -- confirmed via the verification
+harness itself (both originals raised `TypeError: unexpected keyword
+argument 'qk_norm_enable'` when actually run against the current
+engine). Root cause, confirmed via `git log -S` and
+`train_mqar_curriculum.py`'s own comment: this isn't a rename.
+`qkvo_norm_enable` "supersedes the earlier `qk_norm_enable`... v12/
+v12b's real validation found Q/K-only normalization just shifted the
+same saturation pattern onto v_proj/o_proj/input_proj instead of
+removing it" -- v12's whole point was testing the narrower fix, found
+it insufficient, and v13 (qkvo, broader) was built BECAUSE of that
+finding and superseded it. Substituting `qkvo_norm_enable=True` would
+have silently run v13's broader config under v12's name, erasing the
+exact distinction v12 existed to test. Deleted both files (direct
+instruction) rather than keep them as permanently-unrunnable dead
+code -- the negative finding that made them obsolete is already fully
+captured in `train_mqar_curriculum.py`'s own comment and in this entry,
+so nothing is lost by removing the files themselves.
+
+**One real mistake made and reported during this work, for the
+record**: while smoke-testing the `diagnose_raw_ci_recovery.py` refactor
+(left as its own file, not folded into the preset table -- see its
+unique npz-capture mechanism), a manual verification run overwrote the
+real `chunk0000.npz` for all 6 layer pools under
+`logs/raw_ci_diagnostic/dense_lr_unscaled_v3_samples_run2/` with 20-step
+test data, because that file's `raw_ci_sample_fn` flushes to its real
+output directory unconditionally at script exit regardless of step
+count (unlike the `plasticity_column_log_dir` mechanism elsewhere, which
+needs a full amortized cycle -- confirmed separately that the 65-preset
+verification sweep above did NOT trigger any such writes). Searched
+exhaustively for recovery (tracked files, full history, stash, reflog,
+all unreachable dangling commits/trees) -- no trace found in this
+checkout. The lost chunk covers roughly the first ~1000 steps of that
+diagnostic's 6 layer pools; the remaining ~99 chunks per pool are
+intact. Lesson applied going forward: audit any file for real
+output-path side effects BEFORE executing it for verification, not just
+cap the step count.
