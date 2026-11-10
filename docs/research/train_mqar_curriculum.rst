@@ -442,6 +442,15 @@ default (vocab-first) run already has once ITS vocab phase is exhausted.
 Graduation for this mode mirrors the default run's own terminal condition
 ("vocab already maxed out AND k has grown past its own cap").
 
+**Use this mode by default (2026-09-11).** Leaving ``k_first_target``
+unset runs k=1 for the entire vocab ramp -- tens of thousands of steps
+with only ONE query-key pair per sequence, which risks training a
+positional/relative-position shortcut instead of genuine key-value
+binding, and entrenches synapse importance against the k>1 feature
+before the model ever needs it (see this section's own rationale above).
+Only leave ``k_first_target`` unset when the test specifically calls for
+isolating vocab growth from k growth -- not as a default choice.
+
 .. _train_curriculum.embed_table_builder_sdr_hook:
 
 ``embed_table_builder``: caller-controlled SDR embedding structure
@@ -592,3 +601,339 @@ behavior change for existing callers.
 alongside the binary correct/incorrect outcome so a caller can compute
 real confidence/hedging signals (target-token probability, entropy)
 itself instead of only seeing whether the prediction was right.
+
+.. _train_curriculum.width_scaling_lr_fanin_hypothesis:
+
+``DEFAULT_PEAK_LR``: width-scaling LR/fan-in hypothesis (UNCONFIRMED)
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.width_scaling_lr_fanin_hypothesis``
+
+2026-09-18, dense-vs-sparse-mqar-300k investigation (full writeup in
+``JOURNAL.md`` under this date; memory ``project_width_scaling_lr_fanin_law``).
+A dense ``state_width=288`` run stalled at vocab=64/k=3 for 86,257 of
+100,000 steps; ``peak_lr=0.01`` broke straight past that wall (vocab=126/k=3
+by step 13,601), while scaling ``max_grad_norm`` instead did nothing
+comparable. Isolates the cause to the fixed learning rate, not gradient
+clipping.
+
+**Rough law, one data point, not yet confirmed**::
+
+    lr(N) ~= lr_base * (N_base / N) ^ alpha,   0.5 <= alpha <= 1.0
+
+for dense hidden-to-hidden matrices (``q``/``k``/``v``/``o_proj``, each
+``N x N``, ``N = state_width``, realized fan-in = fan-out = ``N``).
+``alpha=1.0`` is muP's known hidden-layer prescription (rank-1 weight
+update, coherent effect across all ``N`` inputs, needs ``lr ~ 1/N`` to stay
+O(1)); ``alpha=0.5`` is naive per-element/NTK scaling and is the value that
+happened to match the one tested point (``0.01`` vs. predicted ``0.0067``
+at alpha=1.0). Do not treat either exponent as settled from a single run.
+
+**Correction, 2026-09-18 (same day): NOT a monotonic "lower is always
+better" relationship.** A third data point, ``peak_lr=0.0067`` (the
+alpha=1.0 value), came back WORSE than the unscaled ``peak_lr=0.015``
+baseline -- ``vocab=32/k=3`` (stuck) vs. unscaled's ``vocab=64/k=3``
+(stuck), where ``peak_lr=0.01`` reached ``vocab=126/k=3`` and held it.
+``0.01`` is a real sweet spot with both neighbors doing worse, not an
+endpoint on a one-directional curve -- the
+``lr(N) ~= lr_base*(N_base/N)^alpha`` power-law framing may not even be
+the right functional form (a single exponent can't produce a U-shape).
+Needs more points near ``0.01`` (e.g. ``0.008``, ``0.012``) before
+trusting any specific value as "the" width-288 LR.
+
+**Correction to an earlier draft of this hypothesis**: sparsity does NOT
+automatically cap this. ``x_r_target``/``dy_r_target`` (this file's own
+selection knobs) are *proportional* -- a fraction of the layer's width --
+so realized fan-in under them still scales with ``N`` exactly like dense
+does; only an *absolute*, width-independent per-neuron synapse budget
+(``max_weights``-style, sized as a fixed count rather than ``in*out``,
+see ``sili__new``'s own ``disldo_max_weights_sizing`` guidance) would
+decouple fan-in from width and, on this hypothesis, remove the need to
+keep lowering ``peak_lr`` as ``N`` grows.
+
+Separately, Arm C's backward sine-wave time-gate (this file's
+``dy_time_gate_cutoff``, see ``train_curriculum.cli_gradient_sparsity_args``)
+is itself a form of gradient sparsity that may already be doing something
+like this by a different mechanism -- gating which neurons update *this
+step* reduces the coherent per-step change a wide layer's rank-1 update
+would otherwise cause, the same instability this LR law is about, without
+touching the nominal ``peak_lr`` at all. If that reading is right, the
+right effective-LR model is not ``lr(N)`` alone but ``lr(N, gate_density)``
+jointly -- grad-sparsity density trading off against how much the nominal
+LR needs to shrink.
+
+**Correction, 2026-09-18 (same day)**: item 2 as originally written called
+for testing this via a *structural* (``max_weights``-capped) fan-in cap.
+That is a known-bad direction at this model scale, already tried and
+reversed multiple times before this investigation -- see
+``project_sili_wide_model_mqar_baseline`` memory (``dense=False`` + a
+pre-chosen ``max_weights`` budget degenerated to ``per_row=2``, reversed
+back to ``dense=True`` + activation/gradient-only sparsity) and
+``project_sili_synaptogenesis_pruning_testing`` memory (structural
+growth/pruning at this same toy scale produced chance-level accuracy).
+Real biological fan-in (1000-10000 synapses/neuron) doesn't fit inside
+``state_width<=288`` without forcing near-full density anyway. A launched
+width=288 run under this design was killed mid-run once this was caught;
+its launcher scripts were deleted, not left around to be reused by
+accident. Don't re-attempt a pre-chosen structural budget at this scale --
+see ``feedback_check_journal_before_new_mechanism`` (check standing
+guidance before building a new mechanism for a fresh question, not just
+for a fresh failure).
+
+**Not yet confirmed -- pending before this is treated as established**:
+
+1. A third ``(N, peak_lr)`` point (e.g. ``state_width=192`` or a second
+   width=288 LR value) to actually pin ``alpha`` instead of bracketing it.
+2. **Done, 2026-09-19 -- NEGATIVE at both widths.** ``dy_k_min=
+   dy_k_max=64`` (forcing an exact fixed count, overriding ``dy_r_target``'s
+   own natural energy-based selection entirely) stalled hard at both
+   widths: ``launch_dy_fixed_count_width128.py`` reached only
+   ``vocab=16/k=3`` (one level-up, step 925, then flat for 99,075
+   steps); ``launch_dy_fixed_count_width288.py`` reached ``vocab=32/k=2``
+   (step 25,688, then flat) -- got further before stalling but still far
+   short of the dense/Arm C results at either width. Confirmed NOT a
+   width-specific fluke. Reads as: forcing an EXACT count via this
+   clamp, rather than letting ``dy_r_target`` pick its own natural k, is
+   itself actively harmful -- not a safe dynamic stand-in for the
+   abandoned structural fan-in cap after all. The underlying "does an
+   absolute, non-width-proportional budget decouple LR from width"
+   question is still open; a real answer needs a DIFFERENT dynamic
+   mechanism than this one, not yet designed.
+3. **Designed and queued (2026-09-18)**: sweep Arm C's
+   ``dy_time_gate_cutoff`` (gate density) against required ``peak_lr`` at
+   fixed width=288 -- does a denser gate (closer to ungated) need dense's
+   lower LR, and does a sparser gate tolerate the current, un-scaled
+   ``DEFAULT_PEAK_LR``. 2x2 grid: cutoff in {0.0 (~50% density), 0.6
+   (~29.5% density)} x peak_lr in {0.015 unscaled, 0.01 scaled} --
+   ``launch_armc_gatemid_lr_unscaled.py`` / ``launch_armc_gatemid_lr_scaled.py``
+   / ``launch_armc_gatesparse_lr_unscaled.py`` /
+   ``launch_armc_gatesparse_lr_scaled.py``. This is itself dynamic (not structural)
+   sparsity, so no conflict with the correction above.
+
+.. _train_curriculum.dense_was_hardcoded_true:
+
+``dense``: promoted from a hardcoded ``True`` to a real parameter
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.dense_was_hardcoded_true``
+
+2026-09-18, discovered while designing an absolute (non-width-proportional)
+fan-in-cap test for
+``train_curriculum.width_scaling_lr_fanin_hypothesis``. `ToyTileRecurrenceRMT`'s
+``dense`` constructor kwarg (forces every layer's ``max_weights`` up to
+``in_features*out_features`` and preseeds fully connected -- see
+``sili__new``'s ``DISLDOLayer32`` docstring) was unconditionally hardcoded to
+``True`` at this file's model-construction call site -- not exposed as a
+``train_curriculum`` parameter at all.
+
+**Consequence, now fixed but worth recording**: every "sparse" arm run under
+this curriculum to date (Arm A/B/C, the knee-adaptive `x_r_target`, all of
+it) applied its sparsity ONLY as dynamic per-step top-k/nucleus SELECTION
+(`x_r_target`/`dy_r_target`/`dy_gate_mask`) on top of a genuinely
+fully-connected weight matrix underneath. None of them tested real
+STRUCTURAL sparsity -- a bounded total synapse count
+(`wide_max_weights`, grown/pruned via synaptogenesis,
+`sili__new`'s `reserve_connections`/`synap_compute_cutoff`) -- because
+there was no way to turn `dense` off. `dense: bool = True` is now a real
+parameter (default unchanged, so every existing run/test is unaffected);
+`dense=False` plus an explicit `wide_max_weights` is required to actually
+exercise structural sparsity through this file.
+
+**Do not actually set `dense=False` at this model scale** -- direct
+correction, same day, after a launched width=288 structural-sparsity
+test was caught and killed mid-run. `project_sili_wide_model_mqar_baseline`
+and `project_sili_synaptogenesis_pruning_testing` memories already
+document this exact failure mode repeatedly: a pre-chosen `max_weights`
+budget at toy scale degenerates (`per_row=2`, or chance-level accuracy),
+reversed back to `dense=True` + activation/gradient-only sparsity each
+time it was tried. Real biological fan-in (1000-10000/neuron) doesn't
+fit inside `state_width<=288` without forcing near-full density anyway.
+The parameter exists for when model scale grows enough for a real
+fan-in budget to make sense, not for use now.
+
+.. _train_curriculum.lr_override_fn_range_test:
+
+``lr_override_fn``: bypass hook for the LR range test
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.lr_override_fn_range_test``
+
+2026-09-18, built for ``scripts/lr_range_test.py`` in response to
+``train_curriculum.width_scaling_lr_fanin_hypothesis`` needing several
+full 100k-step runs just to bracket a good ``peak_lr`` by hand. A
+callback ``lr_override_fn(step) -> float``, checked FIRST in the LR
+block (ahead of warmup and the accuracy-decay schedule) -- when set,
+this file's own peak_lr/warmup/accuracy-based LR schedule is skipped
+entirely for the whole run, letting a caller impose an arbitrary
+per-step LR (an exponential ramp, for the range test's purposes)
+without needing to fork or reimplement any of this file's training
+loop, curriculum, logging, or model-construction logic. ``None``
+(default): zero behavior change for every existing caller.
+
+.. _train_curriculum.polyak_lr_f_star_assumption:
+
+``polyak_lr``/``polyak_f_star``: why ``f_star=0`` is reasonable here
+-------------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.polyak_lr_f_star_assumption``
+
+Per-layer Stochastic-Polyak-Step-size (SPS_max variant -- see
+``model/toy_tile_recurrence_rmt.rst:per_layer_learning_rate_polyak`` for
+the full mechanism). ``f_star`` is Polyak's assumed optimal/floor loss
+value -- the classic SPS_max trick is to just assume ``f_star=0`` rather
+than estimate it online. That's a reasonable assumption specifically
+for this task: MQAR's per-query cross-entropy loss has a genuine near-0
+floor (a solvable deterministic key->value mapping), and
+``write_time_aux_targets=False`` (this file's own default, see that
+parameter's own history) already removed the one source of structurally
+irreducible loss at non-query write positions ("predict next token"
+when the next token in MQAR's random layout isn't actually
+predictable). A more involved online-estimated ``f_star`` (parameter-
+free Polyak, Abdukhakimov et al. 2025) exists in the literature for
+tasks where 0 isn't a reasonable floor -- not needed here, not built.
+
+.. _armc_gate_density_lr_equation:
+
+Arm C gate-density LR compensation: candidate equation
+-------------------------------------------------------------------------------
+
+*ID:* ``armc_gate_density_lr_equation``
+
+2026-09-18, direct request to work out an equation relating Arm C's
+gate density ``p`` (fraction of steps a given neuron is trainable) to
+its needed ``peak_lr``, and test the predicted steps-to-milestone
+against dense's own. Arm C doesn't change how STRONG an update is when
+a neuron fires, only how OFTEN -- two effects both point toward
+scaling ``lr`` up as ``p`` shrinks: (1) frequency dilution -- a neuron
+sees ``~p*T`` update events over ``T`` steps instead of ``T``, so
+matching dense's cumulative movement in the same budget needs each
+event proportionally bigger; (2) stability headroom -- the width-
+scaling law's instability comes from ALL neurons moving coherently on
+the same step (train_curriculum.width_scaling_lr_fanin_hypothesis's
+``lr ~ 1/N``); at density ``p`` only ``p*N`` move at once, so a larger
+``lr`` should be tolerable before hitting the same instability.
+
+**Naive candidate**: ``lr_armc(p) = lr_dense_optimal / p``. Bracketed
+against the milder ``lr_dense_optimal / sqrt(p)``, same caution as the
+width-scaling law's own alpha=1.0-vs-0.5 finding (the "theoretically
+justified" stronger exponent came back WORSE than the milder one
+there -- don't assume 1/p is right just because the derivation sounds
+clean).
+
+Two launchers at ``cutoff=0.3`` (``p~=0.403``, same cutoff as
+``launch_dense_forward_arm_c_backward.py``):
+``launch_armc_lr_scaled_invp.py`` (``peak_lr~=0.0248``),
+``launch_armc_lr_scaled_invsqrtp.py`` (``peak_lr~=0.0158``). Direct
+comparison point: dense's own record is ``vocab=126/k=3`` at step
+13,601 (``peak_lr=0.01``, see ``MQAR_LEADERBOARD.md``) -- does either
+compensation formula close the gap to a comparable step count, or is
+Arm C's own dynamics (see ``project_dense_vs_sparse_mqar_confusion_
+matrix`` memory -- won the confusion-matrix arm despite the LOWEST
+gradient-energy retention of any row) enough on its own that
+compensation isn't even the right frame.
+
+The UNCOMPENSATED comparison (same nominal ``peak_lr`` as dense, not
+scaled by ``p``) is already covered by test 3's grid
+(``launch_armc_gatemid_lr_unscaled.py`` etc.) -- this is specifically
+the compensated/equation-driven version, isolating whether the formula
+itself closes the gap rather than just observing that SOME lr works
+better than another.
+
+**Update, 2026-09-19: test 3's grid complete, and it doesn't cleanly
+support either direction.** cutoff=0.0 (~50%)/unscaled=0.015 and
+cutoff=0.6 (~29.5%)/scaled=0.01 BOTH reached ``vocab=126, k=3``; both
+cross-combinations (~50%/scaled, ~29.5%/unscaled) got stuck at
+``k=2``. A genuine crossover with only 2 LR samples per density --
+reads more like each density has its OWN narrow LR sweet spot (same
+non-monotonic shape ``width_scaling_lr_fanin_hypothesis`` already
+found for dense: 0.01 good, 0.015 too high, 0.0067 too low) than like
+a clean monotonic ``lr(p)`` trend in either direction. The two
+compensation tests here (both scaling LR UP as density drops) are one
+more data point toward mapping that sweet-spot surface, not a
+confirmation or refutation of ``1/p``/``1/sqrt(p)`` specifically --
+don't over-read either result alone.
+
+**Real confound found, 2026-09-19 (same day)**: ``dy_time_gate_seed``
+defaulted to ``None`` (OS-entropy seeded) in all 4 of test 3's grid
+launchers -- each cell got a different, uncontrolled Arm C phase/
+period realization, so the crossover above could be partly or wholly
+an artifact of that rather than a real (density, LR) interaction.
+Direct correction on the fix: a single FIXED seed across cells doesn't
+control anything either -- for a sine-wave gate whose period
+(``dy_time_gate_period_range``, default 50-200 steps) is comparable to
+the run length, one fixed seed just picks a different arbitrary phase
+realization to compare against. Resolving this needs statistical power
+(multiple independent seeds per cell), not seed-pinning -- see
+``feedback_statistical_power_not_seeding`` memory, the same lesson.
+``armc_gate_density_lr_seed_sweep.py``: same 2x2 grid x 3 seeds, short
+budget (25000 steps, covers the vocab=64/k=3 milestone every original
+cell reached by step 28,083) -- reports step-of-vocab=64/k=3 per cell
+so within-cell seed spread can be compared against the between-cell
+gap before trusting the crossover as real.
+
+.. _armc_polyak_threshold_not_selection:
+
+Polyak + Arm C: threshold-level control only, not selection -- design note, not built
+-------------------------------------------------------------------------------------------
+
+*ID:* ``armc_polyak_threshold_not_selection``
+
+2026-09-18/19, resolving a real conflict found while exploring
+combined dynamic-LR + dynamic-grad-sparsity: Polyak step size is
+inherently SCALE-TRACKING (``lr`` must shrink as the residual/gradient
+magnitude shrinks near convergence -- that's the whole point of its
+annealing behavior). Magnitude-based selection (top-k, ``dy_r_target``)
+is inherently SCALE-INVARIANT (always grabs "the biggest k available,"
+whatever their absolute magnitude that step) -- so a Polyak ``lr``
+computed from a magnitude-selected subset's own gradient norm can't
+track true convergence progress (top-k keeps re-normalizing itself),
+while a Polyak ``lr`` computed from the PRE-selection full gradient
+describes a step that isn't the one actually applied. Neither resolves
+cleanly -- Polyak and NAIVE magnitude-based (top-k-style) selection are
+genuinely in tension, not just awkward to combine.
+
+**Resolution (design note, not yet built)**: Arm C's gate is NOT
+magnitude-based at all -- ``gate_j(t) = sin(...) > cutoff`` selects
+WHICH neurons update this step from pure time/phase dynamics,
+completely independent of gradient magnitude. That sidesteps the
+conflict above by construction: a Polyak-style (or any residual-
+tracking) controller could safely adjust Arm C's ``cutoff`` (the
+DENSITY knob, a single scalar) as the residual shrinks, WITHOUT ever
+touching the actual on/off selection identity -- no self-normalizing
+top-k feedback loop to fight, since which neurons fire this step stays
+governed by phase/time alone. Two cleanly separated roles: Polyak-like
+control over HOW MUCH sparsity (the threshold/density), pure amortized
+time-division over WHICH neurons.
+
+**Broader principle, empirically grounded, not just theoretical**:
+every SIGNAL-GUIDED grad-sparsity selection mechanism tried in this
+investigation (``project_dense_vs_sparse_mqar_confusion_matrix``'s Arm
+A/B, magnitude/energy-based ``dy_r_target`` itself) has underperformed
+Arm C's pure time-division amortization on final outcome, despite Arm C
+having the LOWEST gradient-energy retention of any row tested. Grad
+sparsity's real value here looks like temporal amortization -- fair,
+guaranteed turn-taking over time -- not a signal to be found and
+optimized; repeated attempts at finding a good selection SIGNAL haven't
+borne fruit. Worth remembering specifically if a future attempt at a
+FULLY sparse model (both forward AND backward, not just Arm C's
+backward-only-with-dense-forward setup tested so far) struggles to
+reach the full vocab=126/k=3 milestone -- the fix is more likely to be
+"amortize better" (time-division, coverage guarantees) than "select
+better" (a smarter magnitude/energy signal).
+
+**Disambiguation, 2026-09-29 (do not conflate the two "energy"s)**:
+the "energy" in "magnitude/energy-based ``dy_r_target``" above is
+SIGNAL-PROCESSING energy -- ``top_k_csr_nucleus``'s cumulative sum of
+squared ``|dy|``, a magnitude proxy. It's still fundamentally
+"chase the biggest gradient," which is exactly the class of selection
+signal this note found underperforms Arm C. ``EnergyDynamics`` (see
+``sili/energy.py``, ``apply_energy_dynamics.decay_mean_reversion``)
+tracks a DIFFERENT, per-neuron homeostatic quantity that is
+ANTI-correlated with recent activity by construction (quiet neurons
+accumulate it, active ones drain it) -- it shares Arm C's "guaranteed
+attention to underused elements" fairness property that WON here,
+while still being state-informed rather than blind time-division. A
+top-k-by-``EnergyDynamics``-state grad-selection arm is NOT a rerun of
+the already-rejected magnitude/signal-energy result above and is
+untested -- see the MQAR investigation's own scratch notes (2026-09-29)
+for the proposed design.

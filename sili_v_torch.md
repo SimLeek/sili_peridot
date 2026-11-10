@@ -21,20 +21,20 @@ Measured on this machine (archengineeringpc1), single run, RSS via
 
 | | torch (HF forward) | sili (B6/B7 path) |
 |---|---|---|
-| Perplexity | 16.1493 | 173.3711 |
-| Accuracy | 0.4825 | 0.2652 |
-| Wall-clock (build+eval) | 6.51s | 109.32s (build 68.4s + eval 40.9s) |
-| Peak RSS (this phase) | 11421 MB | 5749 MB |
-| RSS before phase | 7217 MB | 6636 MB |
+| Perplexity | 16.1493 | 187.7721 |
+| Accuracy | 0.4825 | 0.2674 |
+| Wall-clock (build+eval) | 7.73s | 135.52s (build 74.7s + eval 60.8s) |
+| Peak RSS (this phase) | 11468 MB | 5926 MB |
+| RSS before phase | 7227 MB | 6520 MB |
 
-RSS checkpoints: start 262 MB, after load+prune
-6452 MB, after freeing torch model+trim
-6636 MB.
+RSS checkpoints: start 272 MB, after load+prune
+6462 MB, after freeing torch model+trim
+6520 MB.
 
 Per-text loss (torch): [2.4744, 2.3127, 3.5558, 1.9847, 3.5818]
-Per-text loss (sili):  [4.9213, 6.1931, 5.1339, 4.764, 4.765]
+Per-text loss (sili):  [5.0761, 6.3092, 5.1484, 4.7761, 4.8663]
 Per-text accuracy (torch): [0.4643, 0.6818, 0.36, 0.56, 0.3462]
-Per-text accuracy (sili):  [0.2857, 0.0909, 0.32, 0.36, 0.2692]
+Per-text accuracy (sili):  [0.2857, 0.1818, 0.28, 0.32, 0.2692]
 
 ## Reading these numbers
 

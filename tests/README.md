@@ -1,0 +1,45 @@
+# tests/ index
+
+Auto-generated navigational index of this directory's test files (one row
+per `.py` file, alphabetical). Not documentation — see each file's own
+docstring/comments for details. `__pycache__/` is excluded.
+
+| File | What it tests |
+|---|---|
+| `conftest.py` | Shared pytest fixtures/hooks; defines `trim_memory()` and a `pytest_runtest_teardown` hook that calls glibc `malloc_trim` after every test to keep RSS bounded across the real-checkpoint test files. |
+| `test_checkpoint.py` | `model/checkpoint.py`'s MiniCPM5 checkpoint loader and `verify_checkpoint_matches_config`, using a tiny fake config/state-dict and (opt-in) the real MiniCPM5-1B-Base checkpoint. |
+| `test_config.py` | `MiniCPM5Config.from_json` field loading and derived projection shapes, validated against the real checkpoint's `config.json`. |
+| `test_curriculum.py` | `model/curriculum.py`'s stage-list building and window-advance logic, plus windowed `run_folded_recurrence` behavior from `sili_block.py`. |
+| `test_dense_energy_rl_sweep.py` | Opt-in multi-seed sweep validating `EnergyDynamics` (`use_energy=True`) as a fix for dense connectivity's chance-level collapse. Run via `SILI_RUN_BASE_SWEEP=1`. |
+| `test_dense_magnitude_penalty_sweep.py` | Opt-in multi-seed sweep validating `magnitude_penalty_coef=0.01` as a fix for `ToyTileRecurrenceRealFP4`'s dense-connectivity NaN/collapse, same config as `test_residual_base_sweep_dense.py`. Run via `SILI_RUN_BASE_SWEEP=1`. |
+| `test_eval_eigenvalues.py` | `model/eval_eigenvalues.py`'s `SpectralProbe` and exact SVD/eigval-based spectral norm/radius probes against hand-built/random matrices with known ground truth; one opt-in end-to-end test against the baseline model. |
+| `test_eval_lr.py` | `model/eval_lr.py`'s generic optimal-lr bracketing search against a synthetic unimodal log(lr) curve; one opt-in test against the real baseline tile-recurrence config. |
+| `test_eval_output_collapse.py` | `model/eval_output_collapse.py`'s collapse-detection metrics against hand-built prediction/logit sets with known collapse properties; one opt-in test against the real baseline model's eval loop. |
+| `test_eval_pruning.py` | `model/eval_pruning.py`'s `EvalResult` (perplexity/accuracy) and `compare_dense_vs_pruned` against the real MiniCPM5-1B-Base checkpoint pruned via `model/prune.py` (integration-marked). |
+| `test_eval_quantization.py` | `model/eval_quantization.py`'s `compare_pruned_vs_quantized` quality comparison against the real checkpoint, pruned then quantized via `build_quantized_dense_state_dict_streaming` (integration-marked, memory-sensitive). |
+| `test_eval_rank_floor.py` | `model/eval_rank_floor.py`'s `permutation_matrix`/`eckart_young_floor` closed-form properties, and that Low/FullRankDenseLayer reach their predicted floor/ceiling; one opt-in 3-arm real comparison (LowRank vs DISLDOLayerDeterministic vs DISLDOLayer32). |
+| `test_eval_stuck_weights.py` | `model/eval_stuck_weights.py`'s percentile-based stuck-synapse detection and `(row,col)`-keyed snapshot diffing on synthetic data; one opt-in test against a real baseline training interval. |
+| `test_eval_superposition.py` | `model/eval_superposition.py`'s sparse-feature sampling/importance/no-superposition-baseline statistics; one opt-in real comparison of FP4 DISLDOLayer vs DISLDOLayer32 at matched density. |
+| `test_fold.py` | `model/fold.py`'s per-suffix weight folding (`fold_suffix`/`fold_all_suffixes`), lossless verification, and streaming/save variants, including real-checkpoint folding classes. |
+| `test_live_synapse_display.py` | Pure (non-GUI) image-composition logic in `scripts/live_synapse_display.py` (`normalize_to_uint8`, `heatmap`, `compose_frame`/`compose_pool_panel`, `deviation_strip`); window push tested via monkeypatched cv2 calls, no real display. |
+| `test_plasticity_sim.py` | `scripts/plasticity_sim.py`'s plasticity-state update/decay/simulate functions; `cycle_boundary` test cross-checks bit-faithfulness against sili__new's own C++ engine test fixture. |
+| `test_prune.py` | `model/prune.py`'s threshold-based and calibrated pruning (`prune_state_dict`, `prune_state_dict_by_role`, `_role_of`) and sparse-to-dense conversion, including real-checkpoint pruning classes. |
+| `test_quantize.py` | `model/quantize.py`'s `build_quantized_dense_state_dict_streaming`, and that rank-1 quantization recovers more signal than per-row quantization, using a tiny fake sparse state dict. |
+| `test_replay_synapse_display.py` | `scripts/replay_synapse_display.py`'s pure filesystem-reading logic (`discover_pools`, `build_event_timeline`, `deviation_from_col_state`) against real `tmp_path` snapshot trees, and `replay()` with a stubbed display object. |
+| `test_residual_base_sweep_dense.py` | Dense-connectivity counterpart to `test_residual_base_sweep.py`; opt-in multi-seed sweep comparing residual base=4/6/12/24 under dense connectivity. Run via `SILI_RUN_BASE_SWEEP=1`. |
+| `test_residual_base_sweep.py` | Opt-in multi-seed, multi-arm sweep that justified `TrueMultiDigitLayer`'s default residual base=12 over base=4 (sparse-echo connectivity); asserts base=12 beats base=4 on a majority of seeds. Run via `SILI_RUN_BASE_SWEEP=1`. |
+| `test_sili_block.py` | `model/sili_block.py`'s RMSNorm/RoPE (vs torch reference), `build_step_layers`, `apply_fold_step`, activation-density row-budget routing (per-suffix/per-layer), `run_folded_recurrence`, and window-growth (`grow_window_layer`, incl. rank-1 mode). |
+| `test_sili_model.py` | `model/sili_model.py`'s `build_sili_model`, `compute_logits_sili`, `evaluate_next_token_prediction_sili`, and sparse embedding/lm_head wiring, using a fake tokenizer and tiny config. |
+| `test_sili_vs_torch_integration.py` | Real head-to-head integration test: next-token perplexity/accuracy/wall-clock/memory for the same pruned MiniCPM5-1B-Base weights run through torch (float32) vs sili's own fold-depth recurrence compute path (FP4-quantized); writes results to `sili_v_torch.md`. |
+| `test_tile_recurrence.py` | `model/tile_recurrence.py`'s `TileState`, `build_tile_window`, `default_tile_gaussian_params`, `apply_tile_step` gradient flow/behavior, and `run_tile_recurrence`, including a real-dims smoke test. |
+| `test_toy_beyond_context_task.py` | `model/toy_beyond_context_task.py`'s `generate_parity_sequence`: sequence shape/dtype, query-token placement, correct XOR answer, and bit/vocab validity. |
+| `test_toy_precision_models.py` | `model/toy_precision_models.py`'s FP4/FP8 fake-quantization functions (`fake_quantize_fp4`, row-scale/rank1/rankN variants) and the family of `ToySmallTransformer*` precision variants (ArtificialFP4, RealFP4, RowScale/Rank1 Adam, Quant4/8-RankN, PeakEligibility). |
+| `test_toy_recall_models.py` | `model/toy_recall_models.py`'s tensor-level building blocks (`rmsnorm_tensor`, `DenseTensorLinear`, `AdamOptimizer`, `backward_with_grad_clip`, `lr_schedule`) and the `ToySmallTransformer`/`ToyTileRecurrence` forward+step models. |
+| `test_toy_recall_task.py` | `model/toy_recall_task.py`'s MQAR/induction sequence generation (`generate_sequence`, `generate_mqar_sequence`) and `induction_correct`, including lag/seq_len validation errors. |
+| `test_toy_tile_precision_models.py` | `model/toy_tile_precision_models.py`'s `ToyTileRecurrenceRealFP4` (shapes/finiteness, weight updates with no external optimizer) and its energy/row-scale-Adam/rank1-Adam/long-horizon-stability variants. |
+| `test_toy_tile_recurrence_rmt_ablation.py` | `model/toy_tile_recurrence_rmt_ablation.py`'s `ToyTileRecurrenceRMTAblation` across a swap-grid of config toggles (custom optimizer, hard clip, gaussian bias, rmsnorm, l1 sparsity) vs baseline configs. |
+| `test_toy_tile_recurrence_rmt.py` | Large suite for `model/toy_tile_recurrence_rmt.py`'s `ToyTileRecurrenceRMT` (the project's main model): widening, output/dy sparsity, dy_r_target, dy_surprise, x_r_target, input-selection trajectory, cross-layer budget allocation, step caching/content schedule, loss-adjusted decay, plasticity reset, L2 init, spectral norm bound, and QK sparsity/norm. |
+| `test_toy_tile_recurrence_rmt_standard.py` | `model/toy_tile_recurrence_rmt_standard.py`'s `ToyTileRecurrenceRMTStandard` (torch reference variant): shapes/finiteness and an opt-in real training-convergence check on a single repeated example. |
+| `test_toy_tile_recurrence_rmt_torch.py` | `model/toy_tile_recurrence_rmt_torch.py`'s `ToyTileRecurrenceRMTTorch` (torch port): shapes/finiteness and `l1_sparsity_coef` auxiliary-loss behavior. |
+| `test_training_checkpoint.py` | `model/training_checkpoint.py`'s `save_training_checkpoint`/`load_training_checkpoint` and `sparse_linear_layer_state_dict`/`_from_state_dict` roundtrips, using a tiny config and the real fold-depth recurrence suffixes. |
+| `test_train_mqar_curriculum.py` | Regression/sanity tests for `scripts/train_mqar_curriculum.py`'s Phase 7 wiring (`embed_width`/`input_sparsity_p`/`wide_max_weights` threaded into `ToyTileRecurrenceRMT`) and `steps_per_sec` instrumentation, calling `train_curriculum()` directly. |

@@ -2,12 +2,61 @@ from __future__ import annotations
 
 import math
 import time
+from typing import ClassVar
 
 import numpy as np
+from sili.energy import EnergyDynamics, GradSelectionEnergy
 from sili.sparse_rnn import CSR, DISLDOLayer, _nucleus_top_k_csr
 from sili.tensor import Tensor, concat, exp, gather, gaussian_attention, power, reduce_sum, relu, tensor_abs
 
 from .toy_recall_models import rmsnorm_tensor
+
+
+def _knee_elbow_r(x2d: np.ndarray) -> float:
+    """Kneedle-style elbow detection on the batch-averaged, per-row-
+    sorted cumulative squared-magnitude ("energy") curve: the point
+    maximizing vertical distance from the diagonal y=x on the curve
+    normalized to [0,1]x[0,1] -- where additional active neurons stop
+    paying for themselves in captured signal energy. Answers "how much
+    of the signal is actually needed" from the data itself instead of
+    assuming a fixed threshold (e.g. 99.95%) by hand. Returns R (energy
+    fraction retained at the elbow), not k directly, so it's a drop-in
+    replacement value for x_r_target/dy_r_target.
+
+    Each row is sorted independently (descending) before averaging --
+    summing raw values across rows first would mix each row's OWN
+    largest-magnitude dims with others' smallest, destroying the
+    per-row energy-concentration shape this is meant to measure."""
+    rows, cols = x2d.shape
+    v2 = x2d.astype(np.float64) ** 2
+    sorted_v2 = -np.sort(-v2, axis=1)
+    mean_sorted = sorted_v2.mean(axis=0)
+    total = float(mean_sorted.sum())
+    if total <= 0:
+        return 1.0
+    cum = np.cumsum(mean_sorted) / total
+    k_norm = np.arange(1, cols + 1) / cols
+    elbow_idx = int(np.argmax(cum - k_norm))
+    return float(cum[elbow_idx])
+
+
+def spectral_norm_upper_bound(w: np.ndarray) -> float:
+    """Cheap O(rows*cols) upper bound on a matrix's spectral norm (largest
+    singular value), via Holder's inequality: sigma_max(W) <=
+    sqrt(||W||_1 * ||W||_inf) = sqrt(max abs column-sum * max abs
+    row-sum) -- no power iteration needed. Loose in general, but EXACT
+    for a rank-1 matrix (e.g. an all-ones matrix), same order as the
+    project's existing L1-output-sparsity spectral-norm proxy
+    (project_hybrid_precision_plan.md) -- a diagnostic to check whether
+    qk_l1_sparsity_coef/qk_norm_enable actually bound Q/K's weight
+    matrices, not a training-time loss itself. See
+    docs/research/toy_tile_recurrence_rmt.rst:qk_spectral_norm_diagnostic."""
+    if w.size == 0:
+        return 0.0
+    abs_w = np.abs(w)
+    norm_1 = float(abs_w.sum(axis=0).max())
+    norm_inf = float(abs_w.sum(axis=1).max())
+    return math.sqrt(norm_1 * norm_inf)
 
 
 class ToyTileRecurrenceRMT:
@@ -32,6 +81,8 @@ class ToyTileRecurrenceRMT:
         dense: bool = False,
         clip_range: float = 6.0,
         l1_sparsity_coef: float = 0.0,
+        qk_l1_sparsity_coef: float = 0.0,
+        qkvo_norm_enable: bool = False,
         magnitude_clip_penalty_coef: float = 0.0,
         min_sigma: float = 1e-3,
         synapse_kwargs: dict | None = None,
@@ -52,7 +103,26 @@ class ToyTileRecurrenceRMT:
         x_r_target: float | None = None,
         x_k_min: int = 0,
         x_k_max: int | None = None,
+        x_balance_bias_step: float | None = None,
+        x_balance_loss_coef: float = 0.0,
+        x_balance_freq_beta: float = 0.99,
+        x_r_target_auto: bool = False,
+        x_r_target_auto_beta: float = 0.98,
+        x_r_target_auto_margin: float = 0.0,
+        dy_time_gate_cutoff: float | None = None,
+        dy_time_gate_phase_step: float = 0.02,
+        dy_time_gate_period: float = 125.0,
+        dy_time_gate_seed: int | None = None,
+        dy_energy_gate_density: float | None = None,
+        dy_energy_gate_kwargs: dict | None = None,
+        dy_energy_lr_scale_enable: bool = False,
+        dy_energy_lr_scale_kappa: float = 0.5,
+        dy_energy_lr_scale_setpoint: float = 1.0,
         r_target_min: float = 0.05,
+        use_energy: bool = False,
+        energy_kwargs: dict | None = None,
+        sleep_energy_enable: bool = False,
+        sleep_energy_kwargs: dict | None = None,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -64,6 +134,18 @@ class ToyTileRecurrenceRMT:
         use_critic: See docs/research/toy_tile_recurrence_rmt.rst:critic_head_design.
         magnitude_clip_penalty_coef, min_sigma:
             See docs/research/toy_tile_recurrence_rmt.rst:magnitude_clip_and_min_sigma_design.
+        qk_l1_sparsity_coef: same _l1_sparsity_split mechanism as
+            l1_sparsity_coef, scoped ONLY to q_proj/k_proj -- a cheap,
+            low-calculation proxy pushing Q/K output magnitude down
+            (project_hybrid_precision_plan.md's own prior finding: an L1
+            output-sparsity penalty approximates what real spectral
+            normalization achieves, at a fraction of the cost). 0.0
+            (default): byte-identical, no extra work. See
+            docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design.
+        qkvo_norm_enable: QKV-Norm + O-Norm, extends qk_norm_enable to
+            V and o_proj's output too. False (default): byte-identical,
+            no extra work. See
+            docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
         recurrent_only_output:
             See docs/research/toy_tile_recurrence_rmt.rst:recurrent_only_output_ablation.
         input_sparsity_p, dy_sparsity_p, wide_max_weights, output_dy_sparsity_p:
@@ -74,6 +156,79 @@ class ToyTileRecurrenceRMT:
             See docs/research/toy_tile_recurrence_rmt.rst:dy_surprise_design.
         x_r_target, x_k_min, x_k_max:
             See docs/research/toy_tile_recurrence_rmt.rst:x_r_target_design.
+        x_balance_bias_step, x_balance_loss_coef, x_balance_freq_beta:
+            two independent, mutually-exclusive-in-practice load-balancing
+            probes for the x_r_target nucleus selection, prototype-only.
+            x_balance_bias_step != None: auxiliary-loss-free balancing
+            (DeepSeek-V3-style, arXiv:2408.15664) -- a per-dim bias added
+            to the ranking score BEFORE top-k, nudged +/-step each call
+            by whether that dim was selected; never touches loss/gradient.
+            x_balance_loss_coef > 0: classic MoE-style auxiliary
+            load-balancing loss (f_j * mean(x_j^2) summed, f_j = EMA'd
+            empirical selection frequency, detached) added to the total
+            training loss; selection itself stays plain magnitude top-k.
+            Both no-op by default. See project memory
+            project_sparsity_floor_generalization_scoping.md's 2026-09-11
+            entries for the full design rationale and MoE/biology
+            precedent research.
+        x_r_target_auto, x_r_target_auto_beta, x_r_target_auto_margin:
+            whenever forward-axis nucleus selection runs (x_r_target set
+            OR x_r_target_auto True), the batch's elbow R (_knee_elbow_r
+            -- see its own docstring) is ALWAYS measured and EMA'd per
+            layer into self._x_knee_r_target, purely as a diagnostic --
+            "how much signal does this layer's own data actually need,"
+            not a fixed hand-picked threshold. x_r_target_auto=True goes
+            further: uses that live, self-discovered value (+ the fixed
+            margin) AS x_r_target for the real selection, replacing the
+            constructor's fixed x_r_target for this layer entirely.
+            beta controls how fast the tracked elbow adapts; margin adds
+            a fixed safety buffer on top of the raw measured elbow.
+            Untested in combination with x_balance_bias_step/
+            x_balance_loss_coef -- should compose (auto sets the target
+            the balancing mechanisms then rank against) but not verified.
+        dy_time_gate_cutoff, dy_time_gate_phase_step, dy_time_gate_period,
+        dy_time_gate_seed: Arm C -- pure time-division fairness on the
+            BACKWARD/dy axis, independent of any measured signal.
+            gate_j(t) = sin(angle_j(t)) > cutoff decides whether neuron
+            j's incoming weights are updated THIS step. angle_j(t) =
+            angle_j(t-1) + N(2*pi/period, phase_step) -- ONE accumulating
+            per-neuron state, started uniform in [0, 2*pi), advanced each
+            call by a small NORMAL-distributed increment whose MEAN
+            (2*pi/period) is the same fixed constant for every neuron (so
+            every neuron cycles at the same average rate -- no per-neuron
+            period draw) and whose spread (phase_step) supplies the
+            wobble directly, no separate additive phase-noise term needed
+            (task correction 2026-09-19/20 -- the earlier t/period_j/
+            phase_j(t) three-state version used a global step counter, a
+            separate per-neuron uniform-random period, AND a separate
+            additive phase random walk; this replaces all three with one
+            state variable and one random draw per step, same intended
+            effect -- "infinitesimal" per-step drift, never an exactly
+            repeating pattern -- with far fewer ops). cutoff is the
+            single tunable density knob (higher = fewer neurons trainable
+            per step) -- the time-axis analog of dy_r_target's density
+            setpoint. No-op unless dy_time_gate_cutoff is set; mutually
+            exclusive with dy_r_target/dy_sparsity_p when active (takes
+            priority, see sili's DISLDOLayer32.forward dy_gate_mask).
+            Requires disldo_cls to support dy_gate_mask (DISLDOLayer32
+            only, currently).
+        dy_energy_gate_density, dy_energy_gate_kwargs: Arm G -- top-k
+            BACKWARD/dy grad-selection by GradSelectionEnergy state
+            (sili.energy.GradSelectionEnergy) instead of Arm C's blind
+            time-division. One tracker per wide layer, fed that layer's
+            own forward output every call (see _timed_layer_forward);
+            each call selects the density-fraction of neurons with the
+            HIGHEST (quietest) energy as dy_gate_mask. dy_energy_gate_kwargs
+            is keyed by layer name, e.g. {"q_proj": {"drive":...,
+            "activation_cost":..., "decay":...}, ...} (mirrors
+            energy_kwargs' own per-name convention) -- required per-layer
+            since each layer's own output-magnitude scale differs.
+            No-op unless dy_energy_gate_density is set; mutually exclusive
+            with dy_time_gate_cutoff (time-gate takes priority if both
+            set -- not intended to be combined this way, set only one).
+        dy_energy_lr_scale_enable/kappa/setpoint: Arm H -- lr multiplier
+            M=exp(kappa*(energy-setpoint)), composes atop active
+            selection (_wide_extra_kwargs), shares Arm G's tracker.
         r_target_min: floor the amortized closed-loop controllers
             (apply_amortized_dy_r_target_control/apply_amortized_
             x_r_target_control/apply_cross_layer_budget_allocator) ratchet
@@ -84,7 +239,25 @@ class ToyTileRecurrenceRMT:
             (curriculum never leveled past its starting vocab tier in
             100k steps) well before reaching the requested speedup
             target. Exposed here so the floor itself can be swept to find
-            the largest speedup a given model size actually tolerates."""
+            the largest speedup a given model size actually tolerates.
+        use_energy, energy_kwargs: task #269 -- homeostatic energy gating
+            (sili.energy.EnergyDynamics) applied to the two most nucleus-
+            sparsity-starved activation regions -- "state" (combined_normed,
+            feeding q/k/v_proj) and "embed_input" (x_window_t, feeding
+            input_proj) -- one EnergyDynamics instance per region, not
+            per-layer, not global. energy_kwargs is keyed BY REGION NAME,
+            e.g. {"state": {...}, "embed_input": {...}} (mirrors x_r_target/
+            dy_r_target's own per-layer-name dict convention) -- required
+            per-region since the two regions' E[|h|] measure ~4x apart
+            (state~=0.23, embed_input~=0.06 at width=288) and
+            EnergyDynamics.drive must be calibrated against the region it
+            actually gates, not shared. No-op unless use_energy=True.
+        sleep_energy_enable, sleep_energy_kwargs: 'sleep' annealing on
+            each wide layer's own output via fire_wake_gradient, no
+            wake_gate_steps -- see JOURNAL.md's 2026-10-03 "energy-driven
+            sleep annealing" entry. Keyed by layer name; caller picks
+            whether to backward on self._sleep_aux_loss. No-op unless
+            sleep_energy_enable=True."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -94,6 +267,8 @@ class ToyTileRecurrenceRMT:
         self.rms_eps = rms_eps
         self.clip_range = clip_range
         self.l1_sparsity_coef = l1_sparsity_coef
+        self.qk_l1_sparsity_coef = qk_l1_sparsity_coef
+        self.qkvo_norm_enable = qkvo_norm_enable
         self.magnitude_clip_penalty_coef = magnitude_clip_penalty_coef
         self.min_sigma = min_sigma
         self.recurrent_only_output = recurrent_only_output
@@ -108,6 +283,32 @@ class ToyTileRecurrenceRMT:
         self.x_r_target: dict = dict.fromkeys(self._WIDE_LAYER_NAMES, x_r_target)
         self.x_k_min = x_k_min
         self.x_k_max = x_k_max
+        # See __init__'s own x_balance_bias_step/x_balance_loss_coef docstring.
+        self.x_balance_bias_step = x_balance_bias_step
+        self.x_balance_loss_coef = x_balance_loss_coef
+        self.x_balance_freq_beta = x_balance_freq_beta
+        self._x_balance_bias: dict = {}  # layer_name -> np.float32[n_in], Arm B
+        self._x_balance_freq: dict = {}  # layer_name -> np.float32[n_in], Arm A
+        self._balance_aux_loss: Tensor | None = None
+        # See __init__'s own x_r_target_auto docstring.
+        self.x_r_target_auto = x_r_target_auto
+        self.x_r_target_auto_beta = x_r_target_auto_beta
+        self.x_r_target_auto_margin = x_r_target_auto_margin
+        self._x_knee_r_target: dict = {}  # layer_name -> float, EMA'd elbow R
+        # See __init__'s own dy_time_gate_* docstring (Arm C).
+        self.dy_time_gate_cutoff = dy_time_gate_cutoff
+        self.dy_time_gate_phase_step = dy_time_gate_phase_step
+        self.dy_time_gate_period = dy_time_gate_period
+        self._dy_time_gate_rng = np.random.default_rng(dy_time_gate_seed)
+        self._dy_time_gate_angle: dict = {}  # layer_name -> np.float64[n_out]
+        # See __init__'s own dy_energy_gate_* docstring (Arm G).
+        self.dy_energy_gate_density = dy_energy_gate_density
+        self.dy_energy_gate_kwargs = dy_energy_gate_kwargs or {}
+        self._grad_select_energy: dict = {}  # layer_name -> GradSelectionEnergy
+        # See __init__'s own dy_energy_lr_scale_* docstring (Arm H).
+        self.dy_energy_lr_scale_enable = dy_energy_lr_scale_enable
+        self.dy_energy_lr_scale_kappa = dy_energy_lr_scale_kappa
+        self.dy_energy_lr_scale_setpoint = dy_energy_lr_scale_setpoint
         # See docs/research/toy_tile_recurrence_rmt.rst:input_selection_stats_design.
         self.last_input_selection: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
@@ -120,9 +321,23 @@ class ToyTileRecurrenceRMT:
         self.dy_surprise_alpha = dy_surprise_alpha
         self.dy_surprise_beta = dy_surprise_beta
         self._layer_surprise: dict = {}
+        # Per-layer LR override for apply_polyak_lr, below. Empty (default):
+        # byte-identical to today's exact behavior -- see
+        # docs/research/toy_tile_recurrence_rmt.rst:per_layer_learning_rate_polyak.
+        self.layer_lr_override: dict = {}
         # See docs/research/toy_tile_recurrence_rmt.rst:sparsity_phase6_design.
         self.output_dy_sparsity_p = output_dy_sparsity_p
         self._output_extra_kwargs = {"dy_sparsity_p": output_dy_sparsity_p} if output_dy_sparsity_p is not None else {}
+        # See __init__'s own use_energy/energy_kwargs docstring above.
+        self.use_energy = use_energy
+        self.energy_kwargs = energy_kwargs or {}
+        self._energy: dict = {}  # region name -> EnergyDynamics, lazily built
+        self._energy_aux_loss: Tensor | None = None
+        # See __init__'s own sleep_energy_enable/sleep_energy_kwargs docstring above.
+        self.sleep_energy_enable = sleep_energy_enable
+        self.sleep_energy_kwargs = sleep_energy_kwargs or {}
+        self._sleep_energy: dict = {}  # call-site key -> EnergyDynamics, lazily built
+        self._sleep_aux_loss: Tensor | None = None
 
         state_width = self.state_width
         if rng is None:
@@ -189,6 +404,13 @@ class ToyTileRecurrenceRMT:
         self.critic_head = None
         # See docs/research/toy_tile_recurrence_rmt.rst:amortized_l2_decay_design.
         self._l2_decay_factor: dict = {}
+        # EXPERIMENTAL, added 2026-09-20 -- critical-learning-periods/
+        # loss-of-plasticity forgetting mechanism, sustained-loss stall
+        # tracking for apply_loss_adjusted_decay. See
+        # docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design.
+        self._decay_loss_ema: float | None = None
+        self._decay_loss_floor: float | None = None
+        self._decay_stall_steps: int = 0
         # See docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design.
         self._layer_timing: dict = {}
         if use_critic:
@@ -204,6 +426,12 @@ class ToyTileRecurrenceRMT:
         self.input_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.memory_ln = Tensor(np.ones(state_width, dtype=np.float32))
         self.state_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        # QKV-Norm gains -- unused (never touched by forward, no gradient)
+        # unless qkvo_norm_enable=True. See _apply_qkvo_norm.
+        self.q_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.k_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.v_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
+        self.o_norm_ln = Tensor(np.ones(state_width, dtype=np.float32))
 
         # Interleaved position layout + widened cold-start sigma: real bug
         # fix. See docs/research/toy_tile_recurrence_rmt.rst:interleaved_position_layout_bug.
@@ -279,6 +507,24 @@ class ToyTileRecurrenceRMT:
     def _real_layers(self):
         return [layer for _name, layer in self._named_real_layers()]
 
+    @property
+    def last_grad_selection(self) -> dict:
+        """Real per-layer GRADIENT-axis (dy_r_target) R/k stats, pulled
+        from each disldo_cls layer's own last_grad_selection (set inside
+        sili's dy_r_target nucleus branch, sili/sparse_rnn.py) -- mirrors
+        last_input_selection's x-axis equivalent, which previously had no
+        counterpart: the dy axis only ever exposed its setpoint (r_bar),
+        never a measured achieved density. A layer with no entry yet
+        (never had a dy_r_target backward call, or its disldo_cls doesn't
+        support dy_r_target at all, e.g. DISLDOLayer8/fp8) is simply
+        omitted."""
+        out = {}
+        for name, layer in self._named_real_layers():
+            sel = getattr(layer, "last_grad_selection", None)
+            if sel is not None:
+                out[name] = sel
+        return out
+
     def _timed_call(self, name: str, fn, *args, **kwargs) -> Tensor:
         """Generic per-component forward+backward timing, and the task #374
         surprise-signal capture point -- same accounting as
@@ -304,17 +550,34 @@ class ToyTileRecurrenceRMT:
                 _orig()
                 _rec["bwd_s"] += time.perf_counter() - tb0
                 _rec["bwd_calls"] += 1
-                if self.dy_surprise_alpha is not None and _out.grad is not None:
+                # Always tracked (not gated on dy_surprise_alpha) -- also the
+                # per-layer gradient-energy signal for Polyak-style dynamic
+                # LR (docs/research/toy_tile_recurrence_rmt.rst:
+                # per_layer_learning_rate_polyak), same "cheap, always on"
+                # precedent as the knee-elbow diagnostic in _to_sparse.
+                if _out.grad is not None:
                     self._update_layer_surprise(_name, _out.grad)
 
             out._backward = _timed_backward
         return out
 
-    def _timed_layer_forward(self, layer, layer_name: str, *args, **kwargs) -> Tensor:
+    def _timed_layer_forward(self, layer, layer_name: str, x, learning_rate, *args, **kwargs) -> Tensor:
         """Real per-layer forward+backward timing, and the task #374
-        surprise-signal capture point. See
+        surprise-signal capture point. self.layer_lr_override (task #? --
+        see docs/research/toy_tile_recurrence_rmt.rst:
+        per_layer_learning_rate_polyak), when it has an entry for
+        layer_name, OVERRIDES the passed-in learning_rate for THIS layer
+        only -- empty dict (default): byte-identical to today's exact
+        behavior, same as every other conditional kwarg here. lm_head/
+        critic_head calls don't go through this method, so per-layer
+        overrides never reach them (mirrors self.dy_r_target's own
+        wide-layers-only scope). See
         docs/research/toy_tile_recurrence_rmt.rst:layer_timing_design."""
-        return self._timed_call(layer_name, layer.forward, *args, **kwargs)
+        lr = self.layer_lr_override.get(layer_name, learning_rate) if self.layer_lr_override else learning_rate
+        out = self._timed_call(layer_name, layer.forward, x, lr, *args, **kwargs)
+        if layer_name in self._WIDE_LAYER_NAMES:
+            self._update_grad_select_energy(layer_name, out)
+        return out
 
     def reset_layer_timing(self) -> None:
         """Zero self._layer_timing -- call at the start of a measurement
@@ -354,11 +617,95 @@ class ToyTileRecurrenceRMT:
         r_t = r_bar * (ratio**self.dy_surprise_alpha)
         return min(max(r_t, self.r_target_min), 0.99)
 
+    # See docs/research/toy_tile_recurrence_rmt.rst:arm_c_single_state_angle_fix
+    # -- corrected 2026-09-19/20 from an earlier t/period_j/phase_j(t) design
+    # that didn't match original intent and used more state/ops than needed.
+    def _dy_time_gate(self, layer_name: str) -> np.ndarray | None:
+        """Arm C: gate_j(t) = sin(angle_j(t)) > cutoff. angle_j(t) =
+        angle_j(t-1) + N(2*pi/period, phase_step) -- ONE accumulating
+        per-neuron state (no global step counter, no separate per-neuron
+        period draw, no separate additive phase term), started uniform in
+        [0, 2*pi). The increment's MEAN (2*pi/period) is the same fixed
+        constant for every neuron, so every neuron cycles at the same
+        average rate; its spread (phase_step) supplies the "infinitesimal"
+        wobble directly -- the co-active neuron set never exactly repeats,
+        same intent as before with far fewer ops. No-op (returns None)
+        unless dy_time_gate_cutoff is set. See __init__'s own docstring."""
+        if self.dy_time_gate_cutoff is None:
+            return None
+        n_out = getattr(self, layer_name).out_features
+        angle = self._dy_time_gate_angle.get(layer_name)
+        if angle is None:
+            angle = self._dy_time_gate_rng.uniform(0.0, 2 * np.pi, size=n_out)
+        mean_step = 2 * np.pi / self.dy_time_gate_period
+        angle = angle + self._dy_time_gate_rng.normal(mean_step, self.dy_time_gate_phase_step, size=n_out)
+        self._dy_time_gate_angle[layer_name] = angle
+        return np.sin(angle) > self.dy_time_gate_cutoff
+
+    def _dy_energy_gate(self, layer_name: str) -> np.ndarray | None:
+        """Arm G: top-k BACKWARD/dy grad-selection by GradSelectionEnergy
+        state, using that layer's own tracked energy (updated in
+        _timed_layer_forward from the layer's own forward output).
+        No-op (returns None) unless dy_energy_gate_density is set. See
+        __init__'s own docstring."""
+        if self.dy_energy_gate_density is None:
+            return None
+        ge = self._grad_select_energy.get(layer_name)
+        if ge is None:
+            return None
+        k = round(self.dy_energy_gate_density * len(ge.energy))
+        return ge.top_k_mask(k)
+
+    def _dy_energy_lr_scale(self, layer_name: str) -> np.ndarray | None:
+        """Arm H multiplier from Arm G's shared tracker. See __init__'s
+        own dy_energy_lr_scale_* docstring."""
+        if not self.dy_energy_lr_scale_enable:
+            return None
+        ge = self._grad_select_energy.get(layer_name)
+        if ge is None:
+            return None
+        return np.exp(self.dy_energy_lr_scale_kappa * (ge.energy - self.dy_energy_lr_scale_setpoint)).astype(np.float32)
+
+    def _update_grad_select_energy(self, layer_name: str, output: Tensor) -> None:
+        """Feeds the per-layer GradSelectionEnergy tracker, shared by
+        Arm G/H. No-op unless one is enabled. Called from
+        _timed_layer_forward per wide-layer call."""
+        if self.dy_energy_gate_density is None and not self.dy_energy_lr_scale_enable:
+            return
+        ge = self._grad_select_energy.get(layer_name)
+        if ge is None:
+            kwargs = self.dy_energy_gate_kwargs.get(layer_name, {})
+            n_out = getattr(self, layer_name).out_features
+            ge = GradSelectionEnergy(n_out=n_out, **kwargs)
+            self._grad_select_energy[layer_name] = ge
+        ge.update(np.asarray(output.data))
+
     def _wide_extra_kwargs(self, layer_name: str) -> dict:
         """Extra kwargs for ONE of the 5 affected layers' forward() calls;
         layer_name must be one of _WIDE_LAYER_NAMES. Live (not cached) since
         self.dy_r_target[name] is mutable post-construction. See
-        docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design."""
+        docs/research/toy_tile_recurrence_rmt.rst:dy_r_target_nucleus_design.
+        Arm H composes on top of whichever selection fires below (falls
+        back to dy_sparsity_p=1.0 standalone) -- see __init__'s own
+        dy_energy_lr_scale_* docstring."""
+        kw = self._wide_selection_kwargs(layer_name)
+        scale = self._dy_energy_lr_scale(layer_name)
+        if scale is not None:
+            kw["energy_lr_scale"] = scale
+            if not kw or (len(kw) == 1 and "energy_lr_scale" in kw):
+                kw["dy_sparsity_p"] = 1.0
+        return kw
+
+    def _wide_selection_kwargs(self, layer_name: str) -> dict:
+        """The dy_gate_mask/dy_r_target/dy_sparsity_p selection logic
+        alone, factored out of _wide_extra_kwargs so Arm H's
+        energy_lr_scale can compose on top without duplicating it."""
+        gate = self._dy_time_gate(layer_name)
+        if gate is not None:
+            return {"dy_gate_mask": gate}
+        energy_gate = self._dy_energy_gate(layer_name)
+        if energy_gate is not None:
+            return {"dy_gate_mask": energy_gate}
         r_target = self._effective_dy_r_target(layer_name)
         if r_target is not None:
             kw = {"dy_r_target": r_target}
@@ -429,6 +776,63 @@ class ToyTileRecurrenceRMT:
             updated[name] = current
         return updated
 
+    def apply_polyak_lr(
+        self,
+        loss: float,
+        f_star: float = 0.0,
+        c: float = 0.0005,
+        lr_max: float = 0.05,
+        bootstrap_lr: float = 0.01,
+    ) -> dict:
+        """Per-layer Stochastic-Polyak-Step-size (SPS_max variant):
+        lr_layer = min(lr_max, c * max(loss - f_star, 0) / Lbar_layer),
+        using each wide layer's OWN EMA-smoothed gradient energy
+        (self._layer_surprise[name]["Lbar"] -- see _timed_call) -- same
+        global loss, per-layer denominator, one step lagged (this
+        step's Lbar reflects last step's backward, same lag convention
+        as _effective_dy_r_target). f_star=0 assumed (SPS_max -- see
+        docs/research/train_mqar_curriculum.rst:
+        polyak_lr_f_star_assumption). bootstrap_lr: used for any layer
+        with no Lbar yet.
+
+        Uses Lbar (EMA-smoothed), NOT the raw per-call E_t -- direct
+        finding, 2026-09-19: E_t swings by orders of magnitude call to
+        call (observed range ~0 to ~2000 for a single wide layer),
+        constantly saturating the formula against lr_max regardless of
+        its value. c=0.5 (a typical SPS damping factor from the
+        literature) was also wildly miscalibrated for THIS setup's
+        actual Lbar scale (~0.02-0.15 typically) -- empirically
+        recalibrated to c=0.0005, lr_max=0.05 so computed values land
+        in the same range the LR range test/grid search already found
+        safe (~0.01-0.06), not a literature default that turned out not
+        to transfer. See
+        docs/research/toy_tile_recurrence_rmt.rst:
+        per_layer_learning_rate_polyak's update for the full story
+        (first validation run, uncalibrated, failed to learn at all).
+
+        TODO, not yet built: PER-NEURON Polyak (one lr per row of a
+        layer, not one per layer) -- structural/grad sparsity act
+        row-wise already, so this per-layer version can't adapt to a
+        layer whose neurons have very different realized fan-in/update
+        frequency this step. Real extra work (needs the per-row E_t
+        version of this same hook, see sili__new's
+        disldo_layer_forward.last_grad_norm_sq_polyak_hook TODO) -- try
+        per-layer first, revisit if it doesn't adapt well.
+
+        Sets self.layer_lr_override (consumed by _timed_layer_forward
+        for the 5 wide layers only, never lm_head/critic_head) and
+        returns it. See
+        docs/research/toy_tile_recurrence_rmt.rst:
+        per_layer_learning_rate_polyak."""
+        residual = max(loss - f_star, 0.0)
+        updated = {}
+        for name in self._WIDE_LAYER_NAMES:
+            lbar = self._layer_surprise.get(name, {}).get("Lbar")
+            lr = bootstrap_lr if not lbar else min(lr_max, c * residual / lbar)
+            self.layer_lr_override[name] = lr
+            updated[name] = lr
+        return updated
+
     def apply_cross_layer_budget_allocator(
         self,
         measured_sps: float,
@@ -468,7 +872,17 @@ class ToyTileRecurrenceRMT:
         return updated
 
     def parameters_for_optimizer(self) -> list[Tensor]:
-        return [self.input_ln, self.memory_ln, self.state_ln, self.centers, self.log_sigmas]
+        return [
+            self.input_ln,
+            self.memory_ln,
+            self.state_ln,
+            self.centers,
+            self.log_sigmas,
+            self.q_norm_ln,
+            self.k_norm_ln,
+            self.v_norm_ln,
+            self.o_norm_ln,
+        ]
 
     def magnitude_rescale_output(self, target: float, correction_rate: float, scale_invariant: bool = False) -> None:
         """Apply to every real weight layer, skipping backends with no
@@ -501,6 +915,566 @@ class ToyTileRecurrenceRMT:
                     self._l2_decay_factor[name] = decay_factor
                 stats = dict(stats, target=target, decay_factor=decay_factor)
                 results[name] = stats
+        return results
+
+    # block4 tiles are BLOCK4_TILE x BLOCK4_TILE (4x4=16) cells -- a block4
+    # chunk_size counts TILES, not individual synapses, unlike every other
+    # storage type's decay call. See apply_loss_adjusted_decay's own
+    # touch_fraction docstring section for why this matters.
+    _BLOCK4_TILE_SLOTS = 16
+
+    def apply_loss_adjusted_decay(
+        self,
+        loss: float,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        importance_half_life_touches: float | None = 500.0,
+        weight_half_life_touches: float | None = None,
+        min_stall_steps: int = 200,
+        ramp_steps: int = 200,
+        beta_fast: float = 0.9,
+        beta_floor: float = 0.999,
+        improve_tol: float = 1e-3,
+    ) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- critical-learning-periods/
+        loss-of-plasticity forgetting (Achille et al. 2019 "Critical
+        Learning Periods in Deep Neural Networks"; Dohare et al., *Nature*
+        2024 "Loss of plasticity in deep continual learning"). Direct
+        hypothesis this implements: a training stall isn't "variance" --
+        the network structurally can't un-learn early bad adaptations
+        (matching real critical-learning-periods findings), so SUSTAINED
+        high loss (not one noisy step) should trigger MORE forgetting to
+        restore plasticity. See
+        docs/research/toy_tile_recurrence_rmt.rst:loss_adjusted_decay_design.
+
+        Two INDEPENDENT, separately-toggleable arms -- direct instruction:
+        implement both, note both are actively being tested, either may
+        be removed if it doesn't show benefit:
+
+        1. ``importance_half_life_touches`` (default on, 500 touches):
+           decays each layer's per-synapse IMPORTANCE -- this project's
+           RMSprop-style second-moment accumulator (see
+           feedback_importance_is_already_the_optimizer) -- the
+           mechanism-specific fix for adaptive optimizers' own
+           documented "freezing" of heavily-used units.
+        2. ``weight_half_life_touches`` (default OFF, ``None``): decays
+           each layer's actual WEIGHT -- the more classic forgetting
+           mechanism. Shares the SAME per-layer C++ weight-decay cursor
+           as ``apply_amortized_l2_decay`` (there is only one
+           ``_decay_cursor`` per layer) -- do not enable this arm in a
+           training loop that also calls ``apply_amortized_l2_decay``
+           every step; both would drive the same cursor out of sync with
+           each other's own decay_factor intent. Off by default for
+           exactly this reason.
+
+        SEVERITY, real miscalibration caught before ever launching a real
+        run: the first version used an abstract 0..1 "strength" combined
+        with a per-touch floor (``decay_factor = max(min_decay_factor, 1 -
+        stall_frac*strength)``) with NO principled connection to how many
+        TIMES a synapse actually gets touched over a real stall's
+        duration -- and the known historical stalls this hypothesis is
+        meant to address ran FLAT for 74,000-99,000+ training steps once
+        stalled. At ``strength=0.3``, full stall settled at
+        ``decay_factor=0.7`` per touch (the ``min_decay_factor=0.5`` floor
+        was never even reached -- ``max(0.5, 1-1*0.3)=0.7``); compounded
+        over the ~100-call amortized cycle this design already uses,
+        that's ~0.7 per ~100 calls per synapse, and empirically crushed a
+        real width=288 layer's weights to float-zero within ~1400 calls
+        -- a small fraction of one historical stall's real length. That
+        would have made the very thing under test ("does BOUNDED,
+        recoverable forgetting restore plasticity") into an accidental
+        full deletion instead, well before the stall it's meant to help
+        with even finishes.
+
+        Fixed by deriving ``decay_factor`` from a HALF-LIFE IN TOUCHES
+        instead, the same style ``apply_amortized_l2_decay``'s own
+        RST docs already establish for THIS project's decay_factor
+        derivations (``2^(-cycle_length/H)`` for a chosen half-life
+        ``H``): ``decay_factor_at_full_stall = 2**(-1/half_life_touches)``
+        -- a synapse touched ``half_life_touches`` times in a row under
+        FULLY saturated stall (``stall_frac=1``) is reduced to exactly
+        half, not to numerical zero. Interpolated toward 1.0 (no decay) as
+        ``stall_frac`` falls: ``decay_factor = 1 - stall_frac*(1 -
+        decay_factor_at_full_stall)``. Default ``500`` touches, each
+        touch spaced ~1 amortized cycle (~100 calls at the default
+        ``touch_fraction``) apart -- ~50,000 calls, the same ORDER OF
+        MAGNITUDE as the historical stalls' own real length, to halve at
+        worst -- bounded, testable, and deliberately conservative for a
+        first empirical run rather than a guessed severity. ``None``
+        disables an arm entirely (an exact no-op, not merely a large
+        half-life).
+
+        Stall signal: a fast EMA of loss (``beta_fast``) vs a
+        slow-relaxing floor (``beta_floor``) -- ``self._decay_stall_steps``
+        counts consecutive steps since the EMA last beat the floor by at
+        least ``improve_tol`` (relative) -- a TIE or a smaller dip does
+        NOT reset stall (real bug caught by testing: a plain ``<=``
+        comparison let the EMA's own filter-transient settling from its
+        initial value read as continuous "improvement" on a genuinely
+        flat/oscillating loss, permanently masking a real stall -- fixed
+        by requiring a real margin, not just a decrease). Reset to 0 the
+        instant a genuine improvement occurs -- purely from LOSS (the
+        ``loss`` argument, whatever a caller's own loss signal is --
+        prediction/curiosity/external-input, never accuracy/correctness:
+        this project's curriculum advancement separately tracks
+        ``acc_ema``/``streak`` for its OWN purposes, but neither is an
+        input here, since a deployed system may not have ground truth to
+        check against). The floor still relaxes slowly upward on
+        non-improving steps so a genuine curriculum-driven loss increase
+        (harder level) doesn't read as a permanent stall forever.
+        ``min_stall_steps``: a REAL BASELINE/GRACE PERIOD, not merely a
+        gentle ramp -- real gap caught by direct question ("I feel like
+        it would need to establish a baseline and shouldn't necessarily
+        decay all the time"): without this, ``stall_frac`` (and therefore
+        ``decay_factor``) is technically nonzero after almost every call,
+        since ``stall_steps`` starts incrementing from the very FIRST call
+        (the initial ``ema==floor`` tie never counts as improvement) and
+        keeps incrementing on any call that doesn't beat the floor by a
+        full ``improve_tol`` -- ordinary noisy-but-productive training
+        doesn't clear a fresh margin every single call either, so decay
+        was ALWAYS slightly active, just negligibly so most of the time --
+        never a clean, exact "off" state. Fixed: ``stall_frac`` is now
+        EXACTLY 0 (``decay_factor`` exactly 1.0, a true no-op) for the
+        first ``min_stall_steps`` consecutive non-improving calls, only
+        ramping in afterward:
+        ``stall_frac = min(1, max(0, stall_steps - min_stall_steps) /
+        ramp_steps)``. Default 200 (same order as ``ramp_steps``, so full
+        severity is reached only after ~400 consecutive non-improving
+        calls total) -- small relative to the historical stalls' own
+        74,000-99,000+ step length, but large enough that ordinary
+        training noise/short plateaus never trigger any decay at all.
+
+        The DECAY_FACTOR (how hard each touched synapse decays) is applied
+        UNIFORMLY across every real layer -- loss is a single global
+        signal, no finer-than-per-layer signal is available without new
+        per-neuron instrumentation (same per-layer, not per-neuron,
+        limitation ``apply_polyak_lr`` already documents for itself).
+
+        KNOWN GAP, high priority, not yet fixed (direct instruction:
+        prefer per-neuron over per-layer wherever possible, since
+        synapses-per-neuron differ between neurons in any genuinely
+        sparse layer): the decay_factor itself is per-layer, and the
+        CHUNK/touch selection below is not neuron-aware either -- it
+        walks the flat underlying array/cursor, not per-row (per-neuron).
+        NOTE, corrected 2026-09-20: a fully dense layer having uniform
+        fan-in does NOT make per-layer and per-neuron equivalent, even
+        there -- different neurons still receive different gradient
+        signal / contribute differently to the loss even with identical
+        fan-in, so a genuinely per-neuron mechanism would still decay
+        them differently. The reason per-layer is acceptable FOR NOW is
+        granularity parity with the source literature (Achille et al.
+        2019; Dohare et al. 2024 test unit-/layer-level interventions,
+        not a loss-attributed per-neuron scheme either) -- not that this
+        method's fan-in-uniform case happens to make the two identical.
+        A genuinely sparse layer additionally has heterogeneous per-row
+        nnz on top of that (a high-fan-in neuron and a low-fan-in
+        neuron's few synapses could be touched at very different
+        effective rates purely from the flat cursor's walk order) --
+        must be fixed (e.g. a per-row-aware cursor, or scaling each row's
+        own decay_factor by its own realized fan-in or gradient signal)
+        before trusting this on sparse configs, and ideally before
+        trusting the PER-NEURON claim at all even on dense ones. Tracked,
+        not silently dropped.
+
+        ``touch_fraction``: FRACTION OF EACH LAYER'S OWN nnz to touch per
+        call (chunk_size = clip(round(nnz*touch_fraction), min_chunk,
+        max_chunk)), NOT one shared absolute chunk_size -- real bug
+        caught before ever launching a real run: this project's layers
+        span a ~150x nnz range at width=288 (lm_head early in the vocab
+        curriculum: 576; q/k/v/o_proj fully dense: 82944). One shared
+        absolute chunk_size either barely touches the big layers (a
+        practical no-op) or, for the SMALL layers, exceeds their own nnz
+        entirely -- the amortized cursor then wraps around and touches
+        (decays) EVERY synapse in that layer more than once per call,
+        which compounds much faster than the half-life above assumes
+        (each "touch" the half-life counts is meant to be ~one per
+        amortized cycle, not several per call). touch_fraction makes
+        every
+        layer's own full amortized cycle take roughly ``1/touch_fraction``
+        calls regardless of its absolute size, sidestepping both
+        failure modes.
+
+        Calls the block4 counterpart
+        (``apply_amortized_block4_l2_decay``/
+        ``apply_amortized_block4_importance_decay``) too when the layer
+        has one, since ``dense=True`` routes weights into block4 storage
+        -- see feedback_block4_scattered_parity_required. block4's own
+        chunk_size counts TILES (``_BLOCK4_TILE_SLOTS=16`` cells each),
+        not individual synapses -- reusing the scattered chunk_size
+        directly there would over-touch a block4-resident layer by
+        roughly 16x relative to touch_fraction's intent, so the block4
+        call gets its own chunk_size divided by ``_BLOCK4_TILE_SLOTS``.
+        Exact (not just an upper bound) for a layer whose tiles are all
+        still dense-format -- true for every ``dense=True`` config tested
+        so far (16 live cells/tile at init exceeds ``switch_point``'s
+        14-cell sparse threshold, forcing dense format from the start);
+        becomes a slight over-touch approximation if synaptogenesis later
+        demotes some tiles to sparse-packed (fewer than 16 live cells
+        each) -- not yet a concern for any config this has been run
+        against.
+
+        Returns ``{layer_name: {"stall_frac": ..., "importance": {...} |
+        None, "weight": {...} | None}}``."""
+        if self._decay_loss_ema is None:
+            self._decay_loss_ema = loss
+            self._decay_loss_floor = loss
+        else:
+            self._decay_loss_ema = beta_fast * self._decay_loss_ema + (1.0 - beta_fast) * loss
+        if self._decay_loss_ema < self._decay_loss_floor * (1.0 - improve_tol):
+            self._decay_loss_floor = self._decay_loss_ema
+            self._decay_stall_steps = 0
+        else:
+            self._decay_stall_steps += 1
+            self._decay_loss_floor = beta_floor * self._decay_loss_floor + (1.0 - beta_floor) * self._decay_loss_ema
+        stall_frac = min(1.0, max(0, self._decay_stall_steps - min_stall_steps) / max(ramp_steps, 1))
+
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            # Per-LAYER (not per-neuron -- see the docstring's KNOWN GAP
+            # section) touch amount, sized relative to THIS layer's own
+            # nnz so a full amortized cycle takes ~1/touch_fraction calls
+            # regardless of absolute layer size -- see touch_fraction's
+            # own docstring section for the no-op/deletion-op failure
+            # modes this avoids.
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            # block4 chunk_size counts TILES, not synapses -- see
+            # _BLOCK4_TILE_SLOTS's own docstring section.
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            entry = {"stall_frac": stall_frac, "importance": None, "weight": None}
+            if importance_half_life_touches is not None and hasattr(layer, "apply_amortized_importance_decay"):
+                floor = 2.0 ** (-1.0 / importance_half_life_touches)
+                imp_decay_factor = 1.0 - stall_frac * (1.0 - floor)
+                stats = layer.apply_amortized_importance_decay(chunk_size, imp_decay_factor)
+                if hasattr(layer, "apply_amortized_block4_importance_decay"):
+                    stats = dict(
+                        stats,
+                        block4=layer.apply_amortized_block4_importance_decay(block4_chunk_size, imp_decay_factor),
+                    )
+                entry["importance"] = dict(stats, decay_factor=imp_decay_factor, chunk_size=chunk_size)
+            if weight_half_life_touches is not None and hasattr(layer, "apply_amortized_l2_decay"):
+                floor = 2.0 ** (-1.0 / weight_half_life_touches)
+                w_decay_factor = 1.0 - stall_frac * (1.0 - floor)
+                stats = layer.apply_amortized_l2_decay(chunk_size, w_decay_factor)
+                if hasattr(layer, "apply_amortized_block4_l2_decay"):
+                    stats = dict(stats, block4=layer.apply_amortized_block4_l2_decay(block4_chunk_size, w_decay_factor))
+                entry["weight"] = dict(stats, decay_factor=w_decay_factor, chunk_size=chunk_size)
+            results[name] = entry
+        return results
+
+    def apply_plasticity_reset(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        eta: float = 0.99,
+        eta_slow: float = 0.99,
+        eta_slow_catchup: float = 0.95,
+        eta_fast: float = 0.5,
+        blend: float = 0.10,
+        reset_fraction: float = 0.01,
+        k: float = 1.0,
+        eta_var: float = 0.9,
+        l2_decay_lambda: float = 0.0,
+        l2_decay_threshold: float = 0.9,
+        l2_decay_temperature: float = 0.05,
+        max_ci: float = 100.0,
+        select_by_deviation: bool = False,
+        include_column_state: bool = False,
+    ) -> dict:
+        """EXPERIMENTAL -- per-neuron utility-based plasticity reset
+        (Continual-Backprop-inspired). See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+        for the full derivation (single top-K FROZEN pool, gated by a
+        local gradient-activity z-score; the dead pool was pruned after
+        a real relaunch showed a self-reinforcing spiral; k=1.0
+        recalibrated from real data). No ``loss`` argument. Same
+        ``touch_fraction``/``_BLOCK4_TILE_SLOTS`` chunk sizing as
+        ``apply_loss_adjusted_decay``. ``include_column_state=True``
+        additionally fetches a per-column snapshot (plain numpy copies)
+        for any pool whose cycle just completed -- see
+        plasticity_column_state in the design doc. Returns
+        ``{layer_name: {"importance": {...}}}``, nested ``"block4"`` key
+        when that layer has block4 storage.
+
+        ``l2_decay_lambda=0.0`` (default) is an exact no-op. When >0, a
+        SEPARATE population-level decay shrinks every touched column's
+        REAL underlying importance accumulator (not just the frozen-pool
+        picks), gated by a soft sigmoid on how close the population's L2
+        norm sits to the ``max_ci`` ceiling -- see
+        plasticity_reset_design.l2_saturation_decay. Deliberately NOT
+        gated on any step/age counter (infinite-horizon requirement).
+
+        ``select_by_deviation=False`` (default) ranks candidates by
+        ``col_importance`` (absolute LEVEL). ``True`` ranks by deviation
+        (growth RATE) instead -- catches a column accelerating fast
+        while its absolute level is still low, which top-K-by-level
+        structurally cannot see. Found by directly comparing a real run
+        that graduated against a real run that got stuck: the stuck
+        run's importance was already growing 17-147x faster from early
+        in training, well before either run's importance reached a high
+        absolute level. See
+        select_by_deviation_early_detection."""
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            if not hasattr(layer, "apply_amortized_plasticity_reset"):
+                continue
+            stats = layer.apply_amortized_plasticity_reset(
+                chunk_size,
+                eta,
+                eta_slow,
+                eta_slow_catchup,
+                eta_fast,
+                blend,
+                reset_fraction,
+                k,
+                eta_var,
+                l2_decay_lambda,
+                l2_decay_threshold,
+                l2_decay_temperature,
+                max_ci,
+                select_by_deviation,
+            )
+            # scattered_nnz gate: a dense-loaded real layer's content lives
+            # ENTIRELY in block4 (load_dense_values -> block4_load_dense_fp32),
+            # so the scattered arm's apply call trivially reports
+            # cycle_complete=True on every single call (early-return path
+            # for nnz==0) with degenerate all-zero column state -- skip
+            # attaching that noise rather than logging a stream of
+            # meaningless snapshots for an arm that will never have real
+            # content for this run's config.
+            if (
+                include_column_state
+                and stats.get("cycle_complete")
+                and hasattr(layer, "plasticity_column_state")
+                and getattr(layer, "scattered_nnz", 1) > 0
+            ):
+                stats = dict(
+                    stats, column_state={key: np.array(v) for key, v in layer.plasticity_column_state().items()}
+                )
+            if hasattr(layer, "apply_amortized_block4_plasticity_reset"):
+                block4_stats = layer.apply_amortized_block4_plasticity_reset(
+                    block4_chunk_size,
+                    eta,
+                    eta_slow,
+                    eta_slow_catchup,
+                    eta_fast,
+                    blend,
+                    reset_fraction,
+                    k,
+                    eta_var,
+                    l2_decay_lambda,
+                    l2_decay_threshold,
+                    l2_decay_temperature,
+                    max_ci,
+                    select_by_deviation,
+                )
+                if (
+                    include_column_state
+                    and block4_stats.get("cycle_complete")
+                    and hasattr(layer, "plasticity_column_state_block4")
+                ):
+                    block4_stats = dict(
+                        block4_stats,
+                        column_state={key: np.array(v) for key, v in layer.plasticity_column_state_block4().items()},
+                    )
+                stats = dict(stats, block4=block4_stats)
+            results[name] = {"importance": stats}
+        return results
+
+    # Empirically-derived per-layer (target_mean, target_std) for
+    # CiRenorm's StableRegion arm -- medians from real GRADUATED runs
+    # (v13/v15, step>=3000 window) of sili_peridot's own dense-vs-sparse
+    # MQAR investigation. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.ci_renorm.
+    _CI_RENORM_STABLE_TARGETS: ClassVar[dict[str, tuple[float, float]]] = {
+        "q_proj": (0.09, 0.18),
+        "k_proj": (0.10, 0.13),
+        "v_proj": (0.40, 0.35),
+        "input_proj": (1.05, 1.47),
+        "o_proj": (0.20, 0.67),
+        "lm_head": (0.09, 0.03),
+    }
+
+    def apply_ci_renorm(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        mode: str = "off",
+        eff_lr: float = 0.01,
+        max_ci_ref: float = 100.0,
+        trust_ratio_min: float = 0.1,
+        trust_ratio_max: float = 10.0,
+    ) -> dict:
+        """EXPERIMENTAL -- rescales each layer's real per-synapse ci back
+        toward a healthy region every call (never resets/prunes any
+        synapse). See
+        sili__new's docs/research/delta_csr_types.rst:synapse_policy.ci_renorm
+        for the full derivation, including the "importance was not a
+        misnomer" motivation for rescaling instead of the per-neuron
+        plasticity_reset mechanism's top-K reset action.
+
+        mode="off" (default): byte-identical no-op. "trust_ratio":
+        LAMB-inspired multiplicative rescale toward a weight-norm-implied
+        target, self-calibrating, no manual targets needed.
+        "stable_region": affine renormalize toward
+        _CI_RENORM_STABLE_TARGETS' empirically-derived per-layer
+        (mean, std) -- a layer not in that dict (e.g. critic_head) is
+        skipped. Same touch_fraction/chunk sizing as apply_plasticity_reset."""
+        if mode == "off":
+            return {}
+        mode_int = {"trust_ratio": 1, "stable_region": 2}[mode]
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            if not hasattr(layer, "apply_amortized_ci_renorm"):
+                continue
+            if mode == "stable_region":
+                if name not in self._CI_RENORM_STABLE_TARGETS:
+                    continue
+                target_mean_scalar, target_std_scalar = self._CI_RENORM_STABLE_TARGETS[name]
+                target_mean = np.full(layer.out_features, target_mean_scalar, dtype=np.float32)
+                target_std = np.full(layer.out_features, target_std_scalar, dtype=np.float32)
+            else:
+                target_mean = np.empty(0, dtype=np.float32)
+                target_std = np.empty(0, dtype=np.float32)
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            stats = layer.apply_amortized_ci_renorm(
+                chunk_size,
+                mode_int,
+                target_mean,
+                target_std,
+                eff_lr,
+                max_ci_ref,
+                trust_ratio_min,
+                trust_ratio_max,
+            )
+            if hasattr(layer, "apply_amortized_block4_ci_renorm"):
+                stats = dict(
+                    stats,
+                    block4=layer.apply_amortized_block4_ci_renorm(
+                        block4_chunk_size,
+                        mode_int,
+                        target_mean,
+                        target_std,
+                        eff_lr,
+                        max_ci_ref,
+                        trust_ratio_min,
+                        trust_ratio_max,
+                    ),
+                )
+            results[name] = stats
+        return results
+
+    # Empirically-derived per-layer (target_mean, target_std) for
+    # WeightRenorm -- medians from v18/v18c's own real recorded weight
+    # data (step<8000, before either run's own drift became meaningful).
+    # Weight mean is ~0 everywhere (fan-in-scaled, zero-mean by
+    # construction); only std varies by layer. See sili__new's
+    # docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    _WEIGHT_RENORM_STABLE_TARGETS: ClassVar[dict[str, tuple[float, float]]] = {
+        "q_proj": (0.0, 0.059),
+        "k_proj": (0.0, 0.059),
+        "v_proj": (0.0, 0.059),
+        "input_proj": (0.0, 0.162),
+        "o_proj": (0.0, 0.060),
+        "lm_head": (0.0, 0.163),
+    }
+
+    def apply_weight_renorm(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        mode: str = "off",
+    ) -> dict:
+        """EXPERIMENTAL -- rescales each layer's real per-synapse WEIGHT
+        back toward a healthy region every call (never touches
+        importance). Companion to apply_ci_renorm, built after
+        CiRenorm's StableRegion arm was found to let weight itself run
+        away in a positive-feedback loop even while ci stayed correctly
+        bounded (real result: v18 GRADUATED, its same-seed repeat v18b
+        stalled at (64,3) with v_proj weight norm growing 17->360 over
+        95k steps while ci stayed near target the whole time). See
+        sili__new's
+        docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+
+        mode="off" (default): byte-identical no-op. "stable_region":
+        affine renormalize toward _WEIGHT_RENORM_STABLE_TARGETS'
+        empirically-derived per-layer (mean, std) -- the only meaningful
+        mode here (unlike CiRenorm, there's no TrustRatio arm: its own
+        formula is derived FROM weight norm, so applying it to
+        renormalize weight itself would be circular)."""
+        if mode == "off":
+            return {}
+        mode_int = {"stable_region": 2}[mode]
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            if not hasattr(layer, "apply_amortized_weight_renorm"):
+                continue
+            if name not in self._WEIGHT_RENORM_STABLE_TARGETS:
+                continue
+            target_mean_scalar, target_std_scalar = self._WEIGHT_RENORM_STABLE_TARGETS[name]
+            target_mean = np.full(layer.out_features, target_mean_scalar, dtype=np.float32)
+            target_std = np.full(layer.out_features, target_std_scalar, dtype=np.float32)
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            stats = layer.apply_amortized_weight_renorm(chunk_size, mode_int, target_mean, target_std)
+            if hasattr(layer, "apply_amortized_block4_weight_renorm"):
+                stats = dict(
+                    stats,
+                    block4=layer.apply_amortized_block4_weight_renorm(
+                        block4_chunk_size, mode_int, target_mean, target_std
+                    ),
+                )
+            results[name] = stats
+        return results
+
+    def apply_l2_init(
+        self,
+        touch_fraction: float = 0.01,
+        min_chunk: int = 4,
+        max_chunk: int = 2048,
+        rate: float = 0.0001,
+    ) -> dict:
+        """EXPERIMENTAL -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs
+        2025, arXiv:2308.11958). See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+        Regularizes weight toward its OWN initial value, not zero and
+        not a population-relative ceiling. Always-on, no selection/
+        gating step, independent cursor from apply_plasticity_reset.
+        `rate` is highly sensitive -- the 0.0001 default reflects real
+        sandbox findings, not a guess (0.01 crushed importance to
+        near-zero over a ~3000-cycle run)."""
+        results = {}
+        for name, layer in self._named_real_layers():
+            nnz = layer.nnz
+            if nnz <= 0:
+                continue
+            chunk_size = int(min(max_chunk, max(min_chunk, round(nnz * touch_fraction))))
+            block4_chunk_size = int(max(1, round(chunk_size / self._BLOCK4_TILE_SLOTS)))
+            if not hasattr(layer, "apply_amortized_l2_init"):
+                continue
+            stats = layer.apply_amortized_l2_init(chunk_size, rate)
+            if hasattr(layer, "apply_amortized_block4_l2_init"):
+                block4_stats = layer.apply_amortized_block4_l2_init(block4_chunk_size, rate)
+                stats = dict(stats, block4=block4_stats)
+            results[name] = stats
         return results
 
     def apply_dynamic_rank_control(
@@ -553,13 +1527,62 @@ class ToyTileRecurrenceRMT:
     def report_ranks(self) -> dict:
         """{layer_name: (scale_rank, additive_rank)} for every real layer
         with a C++ backend -- the answer to "what best rank numbers does
-        dynamic control end up with" (task #292)."""
+        dynamic control end up with" (task #292). additive_rank reads 0
+        for backends without AQRS's additive branch (e.g. DISLDOLayerV/
+        fp32) rather than crashing -- get_scale_rank alone doesn't imply
+        get_additive_rank exists."""
         results = {}
         for name, layer in self._named_real_layers():
             c = getattr(layer, "_c", None)
             if c is not None and hasattr(c, "get_scale_rank"):
-                results[name] = (c.get_scale_rank(), c.get_additive_rank())
+                additive_rank = c.get_additive_rank() if hasattr(c, "get_additive_rank") else 0
+                results[name] = (c.get_scale_rank(), additive_rank)
         return results
+
+    def _apply_energy(self, x: Tensor, region: str) -> Tensor:
+        """Homeostatic energy gating (task #269), applied to a region's
+        FULL continuous tensor BEFORE its x_r_target nucleus selection --
+        see __init__'s own use_energy/energy_kwargs docstring for why
+        (breaking nucleus-selection's dead-neuron lock-in is the whole
+        point, and that only works if energy sees the pre-selection
+        values). No-op unless use_energy=True. Lazily builds one
+        EnergyDynamics per region name on first call (region, not layer
+        name -- q_proj/k_proj/v_proj all call this with region="state" on
+        the SAME combined_normed tensor, so they share one instance, not
+        three). energy_kwargs is keyed BY REGION NAME (mirrors x_r_target/
+        dy_r_target's own per-layer-name dict convention) -- required,
+        since "state" and "embed_input" measure ~4x apart in E[|h|]
+        (state~=0.23, embed_input~=0.06 at width=288, measured directly,
+        see JOURNAL.md) and EnergyDynamics.drive must be calibrated per
+        the region it actually gates, not shared. aux_loss accumulates
+        into self._energy_aux_loss for the caller to fold into step()'s
+        own aux_loss before returning -- step() resets
+        self._energy_aux_loss to None at its own start."""
+        if not self.use_energy:
+            return x
+        ed = self._energy.get(region)
+        if ed is None:
+            ed = EnergyDynamics(**self.energy_kwargs[region])
+            self._energy[region] = ed
+        h_out, aux, _actual_p = ed(x)
+        self._energy_aux_loss = aux if self._energy_aux_loss is None else self._energy_aux_loss + aux
+        return h_out
+
+    def _accumulate_sleep_energy(self, x: Tensor, layer_name: str, call_site: str | None = None) -> None:
+        """Sleep annealing (see __init__'s sleep_energy_enable docstring).
+        Unlike _apply_energy above, does NOT gate x -- the forced-fire
+        signal is the fire_wake_gradient it injects, applied via the
+        caller's choice of which loss to backward. call_site disambiguates
+        a layer's multiple per-step call sites at different shapes."""
+        if not self.sleep_energy_enable:
+            return
+        key = layer_name if call_site is None else f"{layer_name}:{call_site}"
+        ed = self._sleep_energy.get(key)
+        if ed is None:
+            ed = EnergyDynamics(**self.sleep_energy_kwargs[layer_name])
+            self._sleep_energy[key] = ed
+        _h_out, aux, _actual_p = ed(x)
+        self._sleep_aux_loss = aux if self._sleep_aux_loss is None else self._sleep_aux_loss + aux
 
     def _to_sparse(self, x: Tensor, layer_name: str) -> Tensor:
         """Sparsity plan Phase 6 helper; no-op unless x_r_target[layer_name]
@@ -569,18 +1592,28 @@ class ToyTileRecurrenceRMT:
         docs/research/toy_tile_recurrence_rmt.rst:to_sparse_gradient_detach_bug
         and :x_r_target_design."""
         x_r_target = self.x_r_target.get(layer_name)
-        if x_r_target is None and self.input_sparsity_p is None:
+        if x_r_target is None and self.input_sparsity_p is None and not self.x_r_target_auto:
             return x
         x_np = np.asarray(x.data, dtype=np.float32)
         x2d = x_np[np.newaxis, :] if x_np.ndim == 1 else x_np
-        if x_r_target is not None:
-            ptrs, indices, values = _nucleus_top_k_csr(
-                x2d, x_r_target, self.num_cpus, k_min=self.x_k_min, k_max=self.x_k_max
-            )
+        if x_r_target is not None or self.x_r_target_auto:
+            knee_r = self._update_knee_r_target(layer_name, x2d)
+            if self.x_r_target_auto:
+                x_r_target = knee_r
+            if self.x_balance_bias_step is not None:
+                ptrs, indices, values = self._nucleus_top_k_balanced(x2d, layer_name, x_r_target)
+            else:
+                ptrs, indices, values = _nucleus_top_k_csr(
+                    x2d, x_r_target, self.num_cpus, k_min=self.x_k_min, k_max=self.x_k_max
+                )
             csr = CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
         else:
             csr = CSR.from_dense(x2d, self.input_sparsity_p, self.num_cpus)
         self._update_input_selection_stats(layer_name, x2d, csr)
+        if x_r_target is not None:
+            freq = self._update_x_balance_freq(layer_name, csr)
+            if self.x_balance_loss_coef > 0.0:
+                self._accumulate_balance_loss(x, layer_name, freq)
         out = Tensor(csr, _children=(x,), _op="to_sparse", backend=x.backend)
 
         def _bwd():
@@ -593,6 +1626,102 @@ class ToyTileRecurrenceRMT:
 
         out._backward = _bwd
         return out
+
+    def _nucleus_top_k_balanced(
+        self, x2d: np.ndarray, layer_name: str, r_target
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Arm B -- auxiliary-loss-free load balancing (DeepSeek-V3-style,
+        arXiv:2408.15664). Same nucleus/energy-threshold contract as
+        _nucleus_top_k_csr, but ranking uses vⱼ²+biasⱼ instead of raw vⱼ²
+        -- biasⱼ is a persistent per-dim state nudged +/-x_balance_bias_step
+        each call by whether that dim was selected THIS call, never touched
+        by gradient. R(v,k) energy accounting stays in TRUE vⱼ² units
+        (bias only changes ranking, never what gets stored). See __init__'s
+        x_balance_bias_step docstring."""
+        rows, cols = x2d.shape
+        bias = self._x_balance_bias.get(layer_name)
+        if bias is None:
+            bias = np.zeros(cols, dtype=np.float64)
+        ptrs = np.zeros(rows + 1, dtype=np.int64)
+        all_indices: list[np.ndarray] = []
+        all_values: list[np.ndarray] = []
+        selected_mask = np.zeros(cols, dtype=bool)
+        for row in range(rows):
+            v_row = x2d[row]
+            v_sq = v_row.astype(np.float64) ** 2
+            total = float(np.sum(v_sq))
+            score = v_sq + bias
+            order = np.argsort(-score, kind="stable")
+            if total <= 0:
+                k = 0
+            else:
+                cum = np.cumsum(v_sq[order])
+                k = int(np.searchsorted(cum, r_target * total) + 1)
+                k = min(k, cols)
+            if self.x_k_min:
+                k = max(k, self.x_k_min)
+            if self.x_k_max is not None:
+                k = min(k, self.x_k_max)
+            sel = np.sort(order[:k])
+            all_indices.append(sel.astype(np.int32))
+            all_values.append(v_row[sel])
+            ptrs[row + 1] = ptrs[row] + k
+            selected_mask[sel] = True
+        step = self.x_balance_bias_step
+        bias = bias + step * (~selected_mask).astype(np.float64) - step * selected_mask.astype(np.float64)
+        self._x_balance_bias[layer_name] = bias
+        indices = np.concatenate(all_indices) if all_indices else np.zeros(0, dtype=np.int32)
+        values = np.concatenate(all_values) if all_values else np.zeros(0, dtype=np.float32)
+        return ptrs, indices, values
+
+    def _update_x_balance_freq(self, layer_name: str, csr: CSR) -> np.ndarray:
+        """EMA'd per-dim forward-axis selection frequency -- the mode-1
+        (input starvation) diagnostic proxy, per the dense-vs-sparse
+        confusion matrix plan. Split out from _accumulate_balance_loss so
+        it can run as a pure measurement regardless of which mechanism
+        (if any) is active, not just under Arm A. Returns the updated
+        frequency array (also stored in self._x_balance_freq)."""
+        cols = csr.cols
+        selected_mask = np.zeros(cols, dtype=np.float32)
+        for row in range(csr.rows):
+            start, end = int(csr.ptrs[row]), int(csr.ptrs[row + 1])
+            selected_mask[csr.indices[start:end]] = 1.0
+        freq = self._x_balance_freq.get(layer_name)
+        beta = self.x_balance_freq_beta
+        freq = selected_mask if freq is None else beta * freq + (1.0 - beta) * selected_mask
+        self._x_balance_freq[layer_name] = freq
+        return freq
+
+    def _update_knee_r_target(self, layer_name: str, x2d: np.ndarray) -> float:
+        """EMA's _knee_elbow_r's raw per-call measurement into
+        self._x_knee_r_target (always tracked as a diagnostic whenever
+        this is called) and returns the smoothed value + the configured
+        safety margin, clipped to 0.999 -- the value x_r_target_auto
+        uses AS x_r_target when enabled. See __init__'s own
+        x_r_target_auto docstring."""
+        raw = _knee_elbow_r(x2d)
+        prev = self._x_knee_r_target.get(layer_name)
+        beta = self.x_r_target_auto_beta
+        smoothed = raw if prev is None else beta * prev + (1.0 - beta) * raw
+        self._x_knee_r_target[layer_name] = smoothed
+        return min(0.999, smoothed + self.x_r_target_auto_margin)
+
+    def _accumulate_balance_loss(self, x: Tensor, layer_name: str, freq: np.ndarray) -> None:
+        """Arm A -- classic MoE-style auxiliary load-balancing loss
+        (differentiable, added to the total training loss; selection
+        itself stays plain magnitude top-k, unaffected). fⱼ (EMA'd
+        empirical selection frequency, detached bookkeeping, from
+        _update_x_balance_freq) times differentiable per-dim energy xⱼ²,
+        summed across dims -- pushes the model to shrink activation
+        energy on frequently-selected dims relative to others, the same
+        f_i*P_i shape as standard MoE router balancing losses.
+        Accumulates into self._balance_aux_loss, reset each step() call
+        and folded into the final aux_loss there (mirrors
+        self._energy_aux_loss's own accumulate-then-combine pattern).
+        See __init__'s x_balance_loss_coef docstring."""
+        freq_t = Tensor(freq.astype(np.float32))
+        term = reduce_sum(power(x, 2) * freq_t, axis=None) * self.x_balance_loss_coef
+        self._balance_aux_loss = term if self._balance_aux_loss is None else self._balance_aux_loss + term
 
     def _update_input_selection_stats(self, layer_name: str, x2d: np.ndarray, csr: CSR) -> None:
         """Real per-layer INPUT-axis R/k trajectory stats, overwritten
@@ -657,6 +1786,13 @@ class ToyTileRecurrenceRMT:
         n = float(np.asarray(out_tensor.data).size)
         return reduce_sum(power(excess, 2)) * (self.magnitude_clip_penalty_coef / n)
 
+    def _apply_qkvo_norm(self, t: Tensor, ln: Tensor) -> Tensor:
+        """QKV-Norm/O-Norm -- no-op unless qkvo_norm_enable. See
+        docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design."""
+        if not self.qkvo_norm_enable:
+            return t
+        return rmsnorm_tensor(t, ln, self.rms_eps)
+
     def step(
         self,
         x_window: np.ndarray,
@@ -669,6 +1805,9 @@ class ToyTileRecurrenceRMT:
         See docs/research/toy_tile_recurrence_rmt.rst:step_design."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
+        self._energy_aux_loss = None  # see _apply_energy's own docstring
+        self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
+        self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
 
         if content_dy_sparsity_schedule is not None:
             if len(content_dy_sparsity_schedule) != n_content:
@@ -690,7 +1829,14 @@ class ToyTileRecurrenceRMT:
                 return self._wide_extra_kwargs(layer_name)
 
         x_window_t = Tensor(x_window.astype(np.float32))
-        x_window_sparse = self._to_sparse(x_window_t, "input_proj")
+        # Energy gates a SEPARATE variable, not x_window_t itself --
+        # last_debug["x_window_t"] below is the embedding-learning hook's
+        # dL/d(raw embedding) Tensor; gradient still flows through the
+        # energy gate back to this same object (h*gate_np keeps h's
+        # identity), so keeping x_window_t un-reassigned preserves that
+        # hook's contract exactly, energy on or off.
+        x_window_energized = self._apply_energy(x_window_t, "embed_input")
+        x_window_sparse = self._to_sparse(x_window_energized, "input_proj")
         x_wide = self._timed_layer_forward(
             self.input_proj,
             "input_proj",
@@ -700,12 +1846,14 @@ class ToyTileRecurrenceRMT:
             **self.synapse_kwargs,
             **_kw("input_proj", "content"),
         )  # [n_content, sw]
+        self._accumulate_sleep_energy(x_wide, "input_proj")
         x_normed = rmsnorm_tensor(x_wide, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
         memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
 
         combined_normed = concat([memory_normed, x_normed], axis=0)  # [total_slots, sw]
+        combined_normed = self._apply_energy(combined_normed, "state")
 
         # Each of q/k/v_proj gets its OWN _to_sparse call on combined_normed.
         # See docs/research/toy_tile_recurrence_rmt.rst:to_sparse_gradient_detach_bug.
@@ -751,6 +1899,9 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(q)
         _accumulate_penalty(k)
         _accumulate_penalty(v)
+        self._accumulate_sleep_energy(q, "q_proj")
+        self._accumulate_sleep_energy(k, "k_proj", "pass1")
+        self._accumulate_sleep_energy(v, "v_proj", "pass1")
 
         # Clip q/k/v BEFORE gaussian_attention -- real bug fix, see
         # docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
@@ -762,18 +1913,26 @@ class ToyTileRecurrenceRMT:
         # See docs/research/toy_tile_recurrence_rmt.rst:magnitude_clip_and_min_sigma_design.
         sigmas.data = np.maximum(sigmas.data, self.min_sigma)
 
+        # QKV-Norm (no-op unless qkvo_norm_enable): normalize the FULL
+        # q/k/v tensors once, then every gather below draws from these
+        # instead of the raw post-clip q/k/v. See
+        # docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
+        q_attn = self._apply_qkvo_norm(q, self.q_norm_ln)
+        k_attn = self._apply_qkvo_norm(k, self.k_norm_ln)
+        v_attn = self._apply_qkvo_norm(v, self.v_norm_ln)
+
         # Reorder k/v into PHYSICAL position order for attention KEYS;
         # q stays LOGICAL (self.centers already holds the physical value).
         # See docs/research/toy_tile_recurrence_rmt.rst:interleaved_position_layout_bug.
-        k_phys = gather(k, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
-        v_phys = gather(v, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        k_phys = gather(k_attn, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
+        v_phys = gather(v_attn, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
 
         mem_idx = [m * sw + c for m in range(n_mem) for c in range(sw)]
         content_idx = [(n_mem + t) * sw + c for t in range(n_content) for c in range(sw)]
 
         # --- PASS 1: WRITE.
         # See docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
-        q_mem = gather(q, mem_idx).reshape((n_mem, sw))
+        q_mem = gather(q_attn, mem_idx).reshape((n_mem, sw))
         centers_mem = gather(self.centers, list(range(n_mem)))
         sigmas_mem = gather(sigmas, list(range(n_mem)))
         attn_pre_o_mem = self._timed_call(
@@ -797,8 +1956,10 @@ class ToyTileRecurrenceRMT:
             **_kw("o_proj", "mem"),
         )
         _accumulate_penalty(attn_mem)
+        self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, against the FRESH memory_new_t, not stale
@@ -826,20 +1987,24 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
+        self._accumulate_sleep_energy(k_mem_fresh, "k_proj", "mem")
+        self._accumulate_sleep_energy(v_mem_fresh, "v_proj", "mem")
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
+        k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
+        v_mem_fresh_attn = self._apply_qkvo_norm(v_mem_fresh, self.v_norm_ln)
 
         # Content's own k/v (from pass 1) stay unchanged; only memory is
         # refreshed. Rebuilt via the SAME interleaved-physical gather.
         # See docs/research/toy_tile_recurrence_rmt.rst:interleaved_position_layout_bug.
-        k_content_only = gather(k, content_idx).reshape((n_content, sw))
-        v_content_only = gather(v, content_idx).reshape((n_content, sw))
-        k2 = concat([k_mem_fresh, k_content_only], axis=0)
-        v2 = concat([v_mem_fresh, v_content_only], axis=0)
+        k_content_only = gather(k_attn, content_idx).reshape((n_content, sw))
+        v_content_only = gather(v_attn, content_idx).reshape((n_content, sw))
+        k2 = concat([k_mem_fresh_attn, k_content_only], axis=0)
+        v2 = concat([v_mem_fresh_attn, v_content_only], axis=0)
         k2_phys = gather(k2, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
         v2_phys = gather(v2, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
 
-        q_content = gather(q, content_idx).reshape((n_content, sw))
+        q_content = gather(q_attn, content_idx).reshape((n_content, sw))
         centers_content = gather(self.centers, list(range(n_mem, n_mem + n_content)))
         sigmas_content = gather(sigmas, list(range(n_mem, n_mem + n_content)))
         if self.recurrent_only_output:
@@ -878,7 +2043,9 @@ class ToyTileRecurrenceRMT:
             **_kw("o_proj", "content"),
         )
         _accumulate_penalty(attn_content)
+        self._accumulate_sleep_energy(attn_content, "o_proj", "content")
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
+        attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
         # Debug instrumentation: cheap reference-only capture for bisecting
         # NaN/Inf. See docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
@@ -942,7 +2109,7 @@ class ToyTileRecurrenceRMT:
                         self._timed_call(
                             "attention",
                             gaussian_attention,
-                            q,
+                            q_attn,
                             k_phys,
                             v_phys,
                             self.centers,
@@ -962,10 +2129,37 @@ class ToyTileRecurrenceRMT:
             for term in l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
 
+        # qk_l1_sparsity_coef: independent of l1_sparsity_coef above,
+        # scoped ONLY to q_proj/k_proj. See
+        # docs/research/toy_tile_recurrence_rmt.rst:qk_l1_sparsity_design.
+        if self.qk_l1_sparsity_coef > 0.0:
+            qk_l1_terms = [
+                self._l1_sparsity_split(
+                    self.q_proj,
+                    self._to_sparse(combined_normed, "q_proj"),
+                    learning_rate,
+                    self.qk_l1_sparsity_coef,
+                    requires_grad=requires_grad,
+                    layer_name="q_proj",
+                    **_kw("q_proj", "full"),
+                ),
+                self._l1_sparsity_split(
+                    self.k_proj,
+                    self._to_sparse(combined_normed, "k_proj"),
+                    learning_rate,
+                    self.qk_l1_sparsity_coef,
+                    requires_grad=requires_grad,
+                    layer_name="k_proj",
+                    **_kw("k_proj", "full"),
+                ),
+            ]
+            for term in qk_l1_terms:
+                aux_loss = term if aux_loss is None else aux_loss + term
+
         # Residual against RAW content value, kept live regardless of
         # recurrent_only_output. See
         # docs/research/toy_tile_recurrence_rmt.rst:recurrent_only_output_ablation.
-        pre_norm_content = x_wide + attn_content
+        pre_norm_content = x_wide + attn_content_n
         content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
         _accumulate_penalty(content_out)  # pre-clip, same reasoning as above
         content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)
@@ -993,6 +2187,7 @@ class ToyTileRecurrenceRMT:
             **self.synapse_kwargs,
             **self._output_extra_kwargs,
         )
+        self._accumulate_sleep_energy(logits, "lm_head")
 
         # Advantage-actor-critic value head, exposed via attribute not
         # return value. See docs/research/toy_tile_recurrence_rmt.rst:critic_head_design.
@@ -1009,6 +2204,13 @@ class ToyTileRecurrenceRMT:
             if self.use_critic
             else None
         )
+
+        if self._energy_aux_loss is not None:
+            aux_loss = self._energy_aux_loss if aux_loss is None else aux_loss + self._energy_aux_loss
+        if self._sleep_aux_loss is not None:
+            aux_loss = self._sleep_aux_loss if aux_loss is None else aux_loss + self._sleep_aux_loss
+        if self._balance_aux_loss is not None:
+            aux_loss = self._balance_aux_loss if aux_loss is None else aux_loss + self._balance_aux_loss
 
         return memory_new, logits, aux_loss
 
@@ -1091,12 +2293,22 @@ class ToyTileRecurrenceRMT:
         sigmas = exp(self.log_sigmas)
         sigmas.data = np.maximum(sigmas.data, self.min_sigma)
 
-        q_mem = gather(q_step, self._mem_idx_step).reshape((n_mem, sw))
-        k_mem_from_prev = gather(k_step, self._mem_idx_step).reshape((n_mem, sw))
-        v_mem_from_prev = gather(v_step, self._mem_idx_step).reshape((n_mem, sw))
-        q_new = gather(q_step, self._new_content_idx_step).reshape((1, sw))
-        k_new = gather(k_step, self._new_content_idx_step).reshape((1, sw))
-        v_new = gather(v_step, self._new_content_idx_step).reshape((1, sw))
+        # QKV-Norm (no-op unless qkvo_norm_enable), same "normalize once,
+        # then gather" order as step()'s own q_attn/k_attn/v_attn --
+        # RMSNorm is per-row, so normalizing before vs. after this
+        # gather/cache round-trip is equivalent, preserving byte-parity
+        # with step(). See
+        # docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design.
+        q_step_attn = self._apply_qkvo_norm(q_step, self.q_norm_ln)
+        k_step_attn = self._apply_qkvo_norm(k_step, self.k_norm_ln)
+        v_step_attn = self._apply_qkvo_norm(v_step, self.v_norm_ln)
+
+        q_mem = gather(q_step_attn, self._mem_idx_step).reshape((n_mem, sw))
+        k_mem_from_prev = gather(k_step_attn, self._mem_idx_step).reshape((n_mem, sw))
+        v_mem_from_prev = gather(v_step_attn, self._mem_idx_step).reshape((n_mem, sw))
+        q_new = gather(q_step_attn, self._new_content_idx_step).reshape((1, sw))
+        k_new = gather(k_step_attn, self._new_content_idx_step).reshape((1, sw))
+        v_new = gather(v_step_attn, self._new_content_idx_step).reshape((1, sw))
 
         # Reassemble FULL [n_content, sw] content k/v: cache (oldest
         # first, zero-padded) plus this step's fresh row at the end.
@@ -1140,7 +2352,8 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(attn_mem)
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem, self.state_ln, self.rms_eps)
+        attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
+        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, only the newest content row's own query ---
@@ -1167,9 +2380,11 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(v_mem_fresh)
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
+        k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
+        v_mem_fresh_attn = self._apply_qkvo_norm(v_mem_fresh, self.v_norm_ln)
 
-        k2_full = concat([k_mem_fresh, k_content_full], axis=0)
-        v2_full = concat([v_mem_fresh, v_content_full], axis=0)
+        k2_full = concat([k_mem_fresh_attn, k_content_full], axis=0)
+        v2_full = concat([v_mem_fresh_attn, v_content_full], axis=0)
         k2_phys = gather(k2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
         v2_phys = gather(v2_full, self._kv_phys_gather_idx).reshape((self.total_slots, sw))
 
@@ -1211,8 +2426,9 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(attn_content)
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
+        attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
-        pre_norm_content = x_wide_new + attn_content
+        pre_norm_content = x_wide_new + attn_content_n
         content_out = rmsnorm_tensor(pre_norm_content, self.state_ln, self.rms_eps)
         _accumulate_penalty(content_out)
         content_out.data = np.clip(content_out.data, -self.clip_range, self.clip_range)
@@ -1285,6 +2501,30 @@ class ToyTileRecurrenceRMT:
                 ),
             ]
             for term in l1_terms:
+                aux_loss = term if aux_loss is None else aux_loss + term
+
+        if self.qk_l1_sparsity_coef > 0.0:
+            qk_l1_terms = [
+                self._l1_sparsity_split(
+                    self.q_proj,
+                    self._to_sparse(combined_normed_step, "q_proj"),
+                    learning_rate,
+                    self.qk_l1_sparsity_coef,
+                    requires_grad=requires_grad,
+                    layer_name="q_proj",
+                    **self._wide_extra_kwargs("q_proj"),
+                ),
+                self._l1_sparsity_split(
+                    self.k_proj,
+                    self._to_sparse(combined_normed_step, "k_proj"),
+                    learning_rate,
+                    self.qk_l1_sparsity_coef,
+                    requires_grad=requires_grad,
+                    layer_name="k_proj",
+                    **self._wide_extra_kwargs("k_proj"),
+                ),
+            ]
+            for term in qk_l1_terms:
                 aux_loss = term if aux_loss is None else aux_loss + term
 
         if self.l1_sparsity_coef > 0.0:

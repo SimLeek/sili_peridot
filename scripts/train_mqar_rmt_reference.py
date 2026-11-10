@@ -40,7 +40,14 @@ EMBED_WIDTH = 16
 COLUMN_NEURONS = 8
 NUM_MEMORY_SLOTS = 2  # RMT's own experiments use a small handful; not yet tuned for this task
 MAX_WEIGHTS_PER_LAYER = 512
-NUM_CPUS = 4
+# 16, not 4: on arch-sandbox (dual-CCX Ryzen 7 3800XT, pinned via
+# OMP_PROC_BIND/OMP_PLACES set in sili/__init__.py), num_cpus=16 measured
+# fastest for disldo_backward's group-aware reduction (812us vs 1605us
+# at num_cpus=4, width=288) -- see disldo_backward.ccx_aware_reduction in
+# sili__new/docs/research/linear_disldo.rst. Machine-specific: re-measure
+# with sili__new's bench_one_cpu.py before trusting this value on
+# different hardware (e.g. this laptop's single-CCX topology).
+NUM_CPUS = 16
 VOCAB = 128
 PEAK_LR = 0.01
 WARMUP_STEPS = 100

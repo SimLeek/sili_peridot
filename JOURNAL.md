@@ -8619,3 +8619,3084 @@ point on quality sweeps and instead prioritize the deterministic
 engine/hardware-level optimizations first (making each future test run
 in seconds rather than hours), then return to this floor sweep once
 iteration is cheap. See [[feedback_prioritize_deterministic_speedups_before_sweeps]].
+
+## Dense-vs-sparse MQAR at ~300k params: confusion matrix (mechanism x failure mode), Arm C early win
+--------------------------------------------------------------------
+
+Resumed after the engine speedups above landed. Direct instruction:
+stop asking "does sparse match dense in the SAME step count" and ask
+whether sparse EVENTUALLY matches dense within some *bounded, finite*
+extra time/compute -- and separate the FORWARD (`x_r_target`, input-axis
+top-k) and BACKWARD (`dy_r_target`, gradient-axis top-k) mechanisms
+instead of treating "sparse" as one combined condition. Full design in
+the (uncommitted, local) plan file; summarizing the results here.
+
+**Real dense reference, real kernel.** `DIDLDOLayer32` (Group B,
+`_cpu.DIDLDOLayerV`, dense weight storage) wired into
+`train_mqar_curriculum.py` as a new `"fp32_dense"` precision -- the
+existing `DISLDOLayer32(dense=True)` "dense" arm was still Group A
+(sparse/block4-capable) storage, just densely initialized, not the real
+dense engine. No compatibility shim needed in sili__new:
+`train_curriculum` already zeroes `additive_rank`/`dynamic_rank_control`
+for `precision=="fp32"` (AQRS has nothing to correct at full precision)
+and `_wide_extra_kwargs` already omits sparsity kwargs when unset --
+both just needed extending to cover `"fp32_dense"` too. Confirmed at
+200/3000 steps: same peak (vocab=16, k=3) as the old dense=True
+reference at the same seed, 1.56x faster (7.69 vs 4.92 steps/sec).
+
+**Real dense reference, full run (arch-sandbox, completed, 100,000
+steps, 5368s)**: `final_k=3, peak_k=3` -- reached k=3 at step 2294 and
+NEVER progressed further for the remaining 97,706 steps (loss still
+oscillating 2.0-2.8 at step 100,000, streak never broke past 4/10).
+
+**This is EXPECTED, not a bug or an unresolved wall** -- direct
+correction after initially flagging it as concerning: k=3 is the
+architectural ceiling for this config -- the maximum k representable
+IN-CONTEXT without requiring superposition of recurrent tokens, which is
+a much, much harder regime the model isn't being asked to solve here.
+Dense reaching that ceiling at step 2294 and holding it for the rest of
+the budget is the CORRECT terminal state, not a stall needing
+investigation (no multi-seed sweep needed -- this isn't seed noise, it's
+structural). Reframes the whole comparison in a GOOD way: the question
+isn't "does sparse eventually match an unbounded/unproven dense
+capability," it's "does sparse reach the SAME achievable ceiling (k=3)
+in a comparable step budget" -- and Arm C's confusion-matrix run (below)
+already reached k=3 within 3000 steps, essentially step-comparable to
+dense's own step 2294, not needing "bounded extra time" at all so far.
+Pushing past k=3 (superposition) is a separate, much harder research
+question, out of scope for this comparison as currently configured.
+
+**Confusion matrix: mechanism x failure mode, not axis x axis.**
+Corrected mid-design after direct pushback: the question isn't "which
+axis (forward/backward) is responsible" -- both independently hurt
+learning already, established by prior work (r_target_min cliff, etc.).
+The real question is which of several candidate FIX mechanisms
+addresses which of two distinct failure modes:
+- **Mode 1, input starvation**: a forward-axis dim whose activation is
+  rare/small enough that `x_r_target` top-k almost never selects it --
+  no output flows through it, so no gradient can reach it at all.
+- **Mode 2, grad signal insufficiency**: a dim IS selected on forward,
+  but `dy_r_target` top-k keeps too little of its gradient for the
+  update to be a useful learning signal.
+
+Measured via `scripts/sandbox_arm_launchers/confusion_matrix_diagnostic.py`,
+5 rows, 3000 steps each, same seed=1000, `x_r_target=dy_r_target=0.9`,
+`r_target_min=0.3` (baseline row has no balancing mechanism at all --
+"baseline" here means plain magnitude top-k on BOTH axes, NOT the dense
+arm above):
+
+| Mechanism | Peak k (3000 steps) | Mode 1 (dead dims, q/k/v_proj) | Mode 2 (mean R retained) |
+|---|---|---|---|
+| baseline (plain magnitude top-k, both axes) | 2 | 38-40% | ~0.90 |
+| Arm A (`x_balance_loss_coef`, forward aux loss) | 1 | 3.5-6% | ~0.90 |
+| Arm B (`x_balance_bias_step`, forward bias-free) | 1 | 0% | ~0.90 |
+| Arm C (sine-wave time-gate, backward axis) | **3** | ~20% | 0.35-0.47 |
+| Arm A + Arm C | 2 | 0.7-2.8% | 0.42-0.48 |
+
+**Real, unexpected result**: Arm A and Arm B dramatically fixed mode 1
+(baseline's 38-40% dead dims down to near-zero) but scored WORSE on
+final outcome than baseline (k=1 vs k=2) at this short budget -- fixing
+the diagnosed failure mode did not translate into better task
+performance here, contradicting the simple "starvation is the
+bottleneck, fix it and outcome improves" story. Arm C, despite the
+LOWEST gradient-energy retention of any row (throws away the most raw
+backward signal), reached the best outcome (k=3). One seed, one short
+(3000-step) run per row -- could well be noise, not yet a settled
+result; needs more seeds/longer budgets before trusting the ranking,
+but a real, mechanistically-interesting early signal, especially
+alongside the dense reference's own stall above.
+
+**Arm C design** (`dy_time_gate_cutoff`/`_phase_step`/`_period_range` on
+`ToyTileRecurrenceRMT`, `dy_gate_mask` hook on sili__new's
+`DISLDOLayer32.forward`): per-neuron `gate_j(t) = sin(2*pi*t/period_j +
+phase_j(t)) > cutoff` decides whether neuron j's incoming weights update
+this step -- independent of any measured signal. `phase_j(t) =
+phase_j(t-1) + N(0, phase_step)` is a slow random WALK (noise added
+BEFORE the sine, not a fixed deterministic phase) so the co-active
+neuron set never exactly repeats; `period_j` drawn once per neuron.
+`cutoff` is the single tunable density knob. Guarantees every neuron
+periodically gets a training turn BY CONSTRUCTION, sidestepping the
+self-reinforcement failure mode magnitude-only selection can hit (loud
+dims keep winning, quiet ones never prove they'd be useful) -- distinct
+from Arms A/B, which still ultimately rank by some signal.
+
+**Stated prediction, recorded before this result** (see plan file):
+magnitude-based selection should learn faster early (grabs the most
+informative signal first) but risks a ceiling; Arm C should be slower
+to start but keep closing the gap, with no analogous ceiling, since
+coverage is guaranteed by construction. What actually happened: Arm C
+was already AHEAD at step 3000, not slower -- the "no ceiling" half of
+the prediction looks right so far, the "slower start" half doesn't (at
+least not at this budget/seed). Needs more data before treating either
+half as confirmed.
+
+**Not yet done**: more seeds (this is one seed per row); longer budgets
+(3000 steps is short); a real step-for-step comparison of Arm C's exact
+k=3 arrival step against dense's step 2294 (both currently just "within
+3000 steps" vs "at 2294" -- close, not yet precisely matched); whether
+Arm C (or a variant) can be pushed toward the superposition regime
+(k>3) as a genuinely harder follow-on question, separate from this
+comparison's current scope.
+
+## Real methodological gap found: the current dense reference never replicated the 2026-09-07 success config
+--------------------------------------------------------------------
+
+Direct instruction, prompted by remembering a smaller (~70k-param,
+embed_width=16) model reaching vocab=128 at k=3 previously. Checked
+JOURNAL.md directly rather than trusting memory alone: confirmed real --
+`arm_nolevel_down` (2026-09-07) reached vocab=126 at step 43,286,
+embed_width=16/state_width=128. That success combined THREE factors,
+not the one or two initially accounted for here:
+
+1. `K_START=2` (skip the k=1 shortcut stage) -- already suspected and
+   being tested (launch_arm_c_plus_knee_skip_k1.py, corrected from an
+   initial K_START=3 overreach -- k=2 is the more complex, genuine
+   associative-binding case worth testing, not just "skip everything
+   easy").
+2. `wrong_streak_threshold` effectively infinite (LEVEL_DOWN disabled)
+   -- already matched in every launcher this pass (100000000 throughout),
+   not a regression.
+3. **"no-aux-loss"** -- NOT previously accounted for. `_build_targets`'s
+   fallback (`targets.setdefault(i, tokens[i+1])` for every non-query
+   write position) mixes a "predict next token" signal into every
+   training step alongside the real MQAR objective. The 2026-09-07
+   investigation found removing it helped (bounded, if anything lower
+   loss), but only ever did so via an ad-hoc module-level monkeypatch
+   (`scripts/sandbox_arm_launchers/run_sandbox_dense_probe.py`'s `_q`,
+   itself recovered from arch-sandbox earlier this session without
+   realizing what it was) -- never promoted to a real, reusable
+   parameter. Every run in THIS investigation (dense reference,
+   confusion matrix, Arm C variants) had this signal ALWAYS ON,
+   unconditionally, with no way to turn it off.
+
+**Fixed**: `write_time_aux_targets: bool = False` is now a real
+`train_curriculum` parameter (`scripts/train_mqar_curriculum.py`) --
+per direct instruction, OFF by default, not opt-in: predict-next-token
+only makes sense as a training signal if the next token is actually
+predictable, and in MQAR's random key/value layout it structurally
+isn't. `True` restores the old always-on behavior for anyone who needs
+it. Full pytest suite stayed green (no existing test relied on the old
+default).
+
+**Launched** `launch_width288_nolevel_down_control.py` (local, not
+arch-sandbox -- both remote runs were already at load 8/16) -- the
+first width-288 run matching ALL THREE of the historical success
+factors exactly, isolating width as the only real remaining variable.
+Direct test of whether the current ~300k-param scaling is genuinely
+degenerate (per direct concern: "something's off if the larger model
+isn't reaching top performance in fewer steps than the smaller model")
+or whether it just needed these same curriculum fixes the smaller model
+needed. Result pending.
+
+**Margin sweep (knee_margin_sweep.py) also landed while this was being
+investigated** -- 6 margins x 4000 steps, same Arm C + k_first_target=3
+(k=1 included) curriculum: margins {0.03, 0.05, 0.2} reached k=3 within
+budget, {0.0, 0.08, 0.12} stayed at k=2 -- noisy, non-monotonic, no
+clean "higher margin = better" trend at this short budget. Real
+correction from the earlier premature read: the standard-curriculum
+full run's slow progress at margin=0.05 specifically was NOT evidence
+the knee-adaptive mechanism doesn't work -- 0.05 was a single untested
+guess. This sweep is the actual calibration; margin's effect (if any)
+may only show up at a longer horizon than 4000 steps, same "don't
+over-read a slow phase" lesson as the 2026-09-07 investigation's own
+explicit methodological note (a long flat-or-worsening stretch does not
+reliably distinguish a real ceiling from an unusually long convergence
+basin).
+
+## 2026-09-18: width-scaling degeneracy resolved (peak_lr, not grad clip) + fan-in/fan-out LR scaling law
+
+Direct question: why does state_width=288 (dense, all 3 historical-
+success factors matched -- K_START=2, LEVEL_DOWN disabled,
+write_time_aux_targets=False) take MORE steps to reach vocab=126 than
+the historical state_width=128 run, when it should take FEWER (more
+capacity, same task)? Completed 100k-step dense reference
+(`launch_width288_nolevel_down_control.py`) got stuck at vocab=64/k=3
+for its last 86,257 steps -- never reached vocab=126 at all.
+
+Read the actual code for 4 candidate mechanisms. Ruled out
+`l1_sparsity_coef`/`magnitude_clip_penalty_coef` (both properly
+normalized `sum(...)/n` by element count, width-invariant already).
+Two remained as real, unnormalized-by-width code patterns: (1) global
+gradient-norm clipping (`clip_grad_norm_` in
+`model/toy_recall_models.py`) computes ONE L2 norm across ALL
+parameters combined, clipped to a fixed `MAX_GRAD_NORM=1.0` never
+scaled by parameter count; (2) fixed `peak_lr=0.015` regardless of
+`state_width`, a standard muP-style concern for hidden-to-hidden
+matmuls (q/k/v/o_proj, each `state_width x state_width`).
+
+Promoted both to real `train_curriculum` parameters (not monkeypatches):
+`max_grad_norm: float | None = None` and the already-exposed `peak_lr`.
+Ran both as direct, isolated tests against the width=288 dense
+reference, same budget (100k steps):
+
+- `max_grad_norm=1.5` (sqrt(288/128)-scaled from 1.0): tracked baseline's
+  pace, no breakthrough (vocab=64/k=2 at step ~21,750, comparable to or
+  slower than baseline's own trajectory at that stage).
+- `peak_lr=0.01` (scaled down from 0.015): reached vocab=126/k=2 at
+  step 11,261 and vocab=126/k=3 at step 13,601 -- i.e. it blew straight
+  past the exact wall (vocab=64/k=3) the baseline got stuck behind for
+  86,257 steps, and did so FASTER than baseline even reached its own
+  stall point. Clean, unambiguous result: **the fixed peak_lr, not
+  gradient-norm clipping, is the dominant driver of the width-scaling
+  degeneracy.**
+
+### Rough scaling law (recorded per direct instruction, not yet independently re-derived from more data points)
+
+For DENSE hidden-to-hidden matrices (q/k/v/o_proj, each
+`N x N` where `N = state_width`, realized fan-in/fan-out both equal
+to the full layer width `N`), peak_lr should shrink as width grows:
+
+    lr(N) ~= lr_base * (N_base / N) ^ alpha,   0.5 <= alpha <= 1.0
+
+Two anchor points:
+- alpha=1.0 (**muP's known hidden-layer prescription** -- Yang & Hu,
+  "Feature Learning in Infinite-Width Neural Networks", 2021: because
+  a linear layer's per-step weight update is rank-1
+  (`dW_ij = delta_i * x_j`), its induced effect on the layer's output
+  is COHERENT across all `N` inputs, so keeping that induced change
+  O(1) instead of O(N) requires `lr ~ 1/N`) predicts
+  `lr(288) = 0.015 * (128/288) ~= 0.0067` -- not yet tested.
+- alpha=0.5 (naive per-element/NTK-style scaling) predicts
+  `lr(288) = 0.015 * sqrt(128/288) ~= 0.0100` -- this is almost
+  exactly the `peak_lr=0.01` value tested above, which DID resolve the
+  degeneracy. Rough match, one data point -- not proof of the exact
+  exponent, just consistent with alpha somewhere in [0.5, 1.0] and
+  closer to 0.5 than 1.0 so far.
+
+**Your framing, recorded as the key open hypothesis**: this scaling
+requirement should be a property of DENSE connectivity specifically,
+not width per se -- because it's driven by realized fan-in/fan-out
+(how many synapses actually feed into/out of a given neuron), and
+dense connectivity is the special case where realized fan-in/fan-out
+EQUALS total layer width `N` and therefore grows without bound as the
+model scales.
+
+**Correction (same day, direct pushback on the first draft of this)**:
+sparsity does NOT necessarily cap this. `x_r_target`/`dy_r_target` are
+PROPORTIONAL -- a fraction of layer width -- so realized fan-in under
+them still scales with `N` exactly like dense does; only an ABSOLUTE,
+width-independent per-neuron synapse budget (figure: 1000-10000
+synapses/neuron, `max_weights`-style sized as a fixed count rather than
+`in*out`, see [[feedback_disldo_max_weights_sizing]]) would decouple
+fan-in from width and, on this hypothesis, remove the need to keep
+lowering `peak_lr` as `N` grows.
+
+**Second correction, also direct**: Arm C's backward sine-wave
+time-gate is itself a form of GRADIENT sparsity that may explain its
+own confusion-matrix win via a related but distinct mechanism --
+gating which neurons update at a given step reduces the coherent
+per-step change a wide layer's rank-1 update would otherwise cause
+(the same instability this LR law is about), without touching nominal
+`peak_lr` at all. If that reading holds, the right effective-LR model
+isn't `lr(N)` alone but `lr(N, gate_density)` jointly -- grad-sparsity
+density trading off against how much nominal LR needs to shrink. Not
+yet tested.
+
+**Why this matters for the broader dense-vs-sparse-amortization
+question** ([[project_dense_vs_sparse_mqar_confusion_matrix]]): if the
+absolute-fan-in-budget framing holds, it's a SECOND, independent way
+sparsity could beat dense at scale, distinct from the original "sparse
+eventually catches up given enough steps" question -- dense strictly
+requires ever-shrinking LR (and therefore, all else equal, ever-slower
+convergence) as it's scaled up with no ceiling, while absolute-budget
+sparse connectivity would not.
+
+**Recorded, not yet confirmed** -- added as a hedged code comment +
+companion-doc section (`scripts/train_mqar_curriculum.py`'s
+`DEFAULT_PEAK_LR`,
+`docs/research/train_mqar_curriculum.rst:train_curriculum.width_scaling_lr_fanin_hypothesis`)
+so it's visible at the exact constant someone would touch when scaling
+the model, per direct instruction -- explicitly marked UNCONFIRMED,
+not to be reported as settled until these land:
+
+1. A third `(N, peak_lr)` data point to actually pin `alpha` (currently
+   only bracketed 0.5-1.0 by theory, matched at alpha=0.5 by one run).
+2. Same width=128-vs-288 comparison on the SPARSE arm with an absolute
+   (not width-proportional) fan-in cap, at a single fixed `peak_lr` --
+   does width=288 need dense's LR cut or not.
+3. Sweep Arm C's `dy_time_gate_cutoff` (gate density) against required
+   `peak_lr` at fixed width -- tests the joint `lr(N, gate_density)`
+   reading above.
+
+Six overnight/local runs from the write_time_aux_targets fix are still
+either completed (dense baseline, dense-fwd+ArmC-bwd, both plateaued
+below vocab=126) or in flight (4x Arm C + knee variants on
+arch-sandbox) -- unaffected by this LR finding since none scaled
+`peak_lr`; worth rerunning the more promising sparse arms at a
+width-288-appropriate LR once this scaling law has more data points.
+
+**`launch_dense_lr_scaled.py` (peak_lr=0.01) completed its full 100k
+steps** (14,399s, final steps/sec=6.95): held `vocab=126, k=3` for the
+entire remaining 86,399 steps after reaching it at step 13,601, no
+regression (LEVEL_DOWN disabled) and no further LEVEL_UP to k=4 --
+consistent with k=3 being this config's expected architectural ceiling
+(established earlier this same day), not a new stall to chase. First
+run in this project's documented history to reach `vocab=126, k=3`
+simultaneously at all. Recorded in the new `MQAR_LEADERBOARD.md`
+(running log of best setups vs. param count, requested directly) as the
+current record on both steps and wall-clock.
+
+## 2026-09-18 (cont'd) -- correction: structural sparsity is a known-bad
+## direction at this model scale, caught before wasting the full budget
+
+Built and launched "test 2" for the width-scaling LR/fan-in hypothesis
+as a STRUCTURAL fan-in cap (`dense=False`, `wide_max_weights=64*
+state_width`, sized to avoid the `per_row=2` degenerate floor
+specifically) at width=288, unscaled `peak_lr=0.015`. Direct correction
+from the user, mid-run: "I've said not to do structural sparsity here a
+few times because it keeps getting set so the fan-in/out is 1 or 2
+instead of sane values" -- and that real biological fan-in (1000-10000/
+neuron) needs a larger model than this one to make sense of at all.
+
+Checked memory as this should have been checked BEFORE building the
+test (see `feedback_check_journal_before_new_mechanism`, whose scope
+this widens: applies to building a new experiment, not just diagnosing
+a fresh failure). Confirmed the precedent is real and already
+documented: `project_sili_wide_model_mqar_baseline` (dense=False + a
+pre-chosen `max_weights` budget degenerated to `per_row=2`, reversed
+back to `dense=True` + activation/gradient-only sparsity -- "we don't
+know the optimal sparse topology yet, so a pre-chosen max_weights
+budget would bake in an unvalidated guess") and
+`project_sili_synaptogenesis_pruning_testing` (structural growth/
+pruning at this same toy scale produced chance-level accuracy,
+0.09 vs 0.79 for the static-sparsity control). Avoiding the literal
+`per_row=2` floor numerically (this run's sizing gave per-neuron
+fan-in=64, well above it) does NOT make a pre-chosen structural budget
+a valid direction here -- the reversal wasn't about picking a better
+number, it was "topology itself must not be pre-guessed" at this scale
+at all.
+
+Killed the run mid-flight (before it produced a result worth trusting
+either way) and deleted both launcher scripts
+(`launch_sparse_absolute_fanin_width288.py`/`...width128.py`) rather
+than leave a known-bad design sitting in the repo to be reused by
+accident. Kept the underlying `dense: bool = True` parameter promotion
+(scripts/train_mqar_curriculum.py) -- exposing it as a real,
+default-safe parameter isn't itself the mistake, and it's what a future
+larger-scale attempt at real structural sparsity will need -- but added
+explicit warnings at both the code comment and
+`docs/research/train_mqar_curriculum.rst` doc-section not to set
+`dense=False` at the current model scale.
+
+`width_scaling_lr_fanin_hypothesis`'s pending test 2 is now reframed:
+test the same "does an absolute, non-width-proportional budget decouple
+LR from width" question via DYNAMIC per-step selection (a fixed
+absolute connection COUNT per step, not a width-proportional fraction)
+instead of a structural weight-existence cap -- not yet designed.
+
+## 2026-09-18 (cont'd) -- built and queued the redesigned test 2 + test 3
+
+Built both remaining tests from `width_scaling_lr_fanin_hypothesis`'s
+pending list, per direct instruction ("build those and queue them up.
+We want to be able to draw conclusions once all the tests are done").
+
+**Test 2 (redesigned, dynamic not structural)**: `dy_k_min=dy_k_max=64`
+forces an absolute per-step backward-selection count regardless of
+width (clamps the nucleus top-k's result past whatever `dy_r_target`
+would pick), `dense=True` kept at its default -- structural
+connectivity untouched, the mechanism validated as safe at this scale.
+`launch_dy_fixed_count_width128.py` / `launch_dy_fixed_count_width288.py`,
+both unscaled `peak_lr=0.015`.
+
+**Test 3**: 2x2 grid, Arm C `dy_time_gate_cutoff` in {0.0 (~50%
+density), 0.6 (~29.5% density)} x `peak_lr` in {0.015 unscaled, 0.01
+scaled}, width=288, dense forward. `launch_armc_gatemid_lr_unscaled.py`
+/ `launch_armc_gatemid_lr_scaled.py` /
+`launch_armc_gatesparse_lr_unscaled.py` /
+`launch_armc_gatesparse_lr_scaled.py`.
+
+All 6 smoke-tested, full pytest green, committed (`4c378fc`).
+
+**Queue** (6 new runs, on top of the 5 already in flight: 1 local
+alpha1-LR test + 4 arch-sandbox Arm C+knee variants). Local has one
+free 4-core slot right now; arch-sandbox is full (16/16). Launch order,
+by informativeness first / cheap-and-fast-to-free-a-slot second:
+
+1. `launch_dy_fixed_count_width128.py` -- LAUNCHED locally (this entry).
+2. `launch_dy_fixed_count_width288.py`
+3. `launch_armc_gatemid_lr_unscaled.py`
+4. `launch_armc_gatemid_lr_scaled.py`
+5. `launch_armc_gatesparse_lr_unscaled.py`
+6. `launch_armc_gatesparse_lr_scaled.py`
+
+Launch each remaining one (in this order) into whichever machine frees
+a slot next, tracked via Monitor completion notifications rather than
+polling. Once all 11 total runs (5 original + 6 new) have finished or
+clearly plateaued, draw conclusions across the whole
+`width_scaling_lr_fanin_hypothesis` question together -- that was the
+explicit point of building the full set before analyzing any of it.
+
+## 2026-09-18 (cont'd) -- launch_arm_c_plus_knee.py (standard curriculum,
+## K_START=1, margin=0.05) finished: weakest completed result so far
+
+Ran the full 100k-step budget (48,301s, ~13.4h, steps/sec=2.07 --
+arch-sandbox 4-way contended). Reached `vocab=32, k=1` at step 6,848
+and then went completely flat for the remaining 93,152 steps -- no
+further LEVEL_UP at all, unlike the width=288 dense arms' stalls which
+at least held a harder milestone (k=3). This is the weakest completed
+result in this whole investigation. Predates the LR fix (peak_lr=0.015
+unscaled) -- worth a rerun at peak_lr~=0.01 once the current queue
+clears, per the same width-scaling finding that resolved dense.
+
+Launched `launch_dy_fixed_count_width288.py` into the freed
+arch-sandbox slot (queue item 2). 3 arch-sandbox Arm C+knee variants
+and 2 local runs (alpha1-LR test, dy_fixed_count width=128) still in
+flight; 4 items remain queued (test 2's already-launched width=288 run
+was item 2, so items 3-6 -- the Arm C gate-density grid -- are next).
+
+## 2026-09-18 (cont'd) -- alpha=1.0 LR test finished: WORSE than unscaled,
+## revealing a real sweet spot rather than "lower is always better"
+
+`launch_dense_lr_alpha1_scaled.py` (peak_lr=0.0067, the muP-predicted
+alpha=1.0 value) completed its full 100k steps (14,068s, steps/sec=
+7.11). Result: reached `vocab=32, k=3` at step 10,283, then flat for
+the remaining 89,717 steps -- WORSE than the unscaled `peak_lr=0.015`
+baseline, which at least reached `vocab=64, k=3` before stalling. Three
+real data points now:
+
+| peak_lr | alpha | outcome |
+|---|---|---|
+| 0.015 (unscaled) | 0 | stuck at vocab=64/k=3 |
+| 0.01 | ~0.5 | **reached vocab=126/k=3, held to completion** |
+| 0.0067 | 1.0 (muP) | stuck at vocab=32/k=3 -- worse than unscaled |
+
+This is NOT a monotonic "lower LR is always better, just find the
+right exponent" relationship -- 0.01 is a real sweet spot with both
+neighbors doing worse, not an endpoint on a one-directional curve. Too
+high (0.015) plausibly still hits the coherent-rank-1-update
+instability the muP argument describes; too low (0.0067) is a
+different failure entirely -- plausibly just too little signal per
+step to escape a harder curriculum tier in a comparable number of
+steps, unrelated to the fan-in/width argument. The
+`lr(N) ~= lr_base*(N_base/N)^alpha` power-law framing may not be the
+right functional form at all -- pinning a single alpha won't capture a
+U-shaped response. Needs a 4th+ data point near 0.01 (e.g. 0.008,
+0.012) to characterize the actual shape before trusting any single
+number as "the" width-288 LR.
+
+Freed a local slot -- launched queue item 3,
+`launch_armc_gatemid_lr_unscaled.py` (Arm C gate cutoff=0.0 ~50%
+density, peak_lr=0.015 unscaled).
+
+## 2026-09-18 (cont'd) -- per-layer Polyak dynamic LR built (`polyak_lr`)
+
+Researched task-agnostic dynamic-LR methods per direct request before
+building anything further: D-Adaptation/Prodigy need a distance-to-
+solution estimate that's ungrounded without knowing the answer ahead
+of time; hypergradient descent needs consecutive-step gradient
+VECTORS (per-synapse detail, too much to expose); Stochastic Polyak
+Step-size only needs loss + a gradient-energy scalar. Direct
+instruction: apply Polyak per-layer directly (not via a separate
+mechanism like trust ratio, which needs a weight norm -- "still kind
+of ridiculous" as a signal), per-neuron noted as a TODO (real extra
+work, try per-layer first).
+
+Built across both repos:
+- `sili__new` (`feature/dy-external-gate-hook`, commit `c5cddc2`):
+  `DISLDOLayer32._bwd()` now stores `self._last_grad_norm_sq` (universal
+  hook, ahead of every sparsification branch). Turned out NOT to be
+  needed for this mechanism (see below) but harmless/tested/kept for
+  other future non-`_timed_call` callers.
+- `sili_peridot` (commit `0e2ba63`): discovered `_timed_call` already
+  captures each layer's own `dy` for the `dy_surprise_alpha` mechanism
+  -- just needed to make that capture UNCONDITIONAL (same "always track
+  the diagnostic" precedent as the knee-elbow tracker) rather than
+  building a new hook. `apply_polyak_lr(loss, f_star=0, c=0.5,
+  lr_max=0.1)` computes `lr_layer = min(lr_max, c*max(loss-f_star,0)/
+  E_t_layer)` per wide layer, lagged one step (same convention as
+  `_effective_dy_r_target`); `self.layer_lr_override` is checked first
+  in `_timed_layer_forward`, empty by default (byte-identical when
+  unused, confirmed: full 338-test suite green).
+  `f_star=0` (SPS_max) is reasonable here specifically -- MQAR's
+  cross-entropy loss has a genuine near-0 floor, and
+  `write_time_aux_targets=False` already removed the one irreducible-
+  loss source. `polyak_lr_max` defaults to 0.1, informed directly by
+  the LR range test's own found instability regime (~0.1-0.32).
+
+Smoke-tested (200-300 steps): loss decreases steadily, no
+instability, no warnings once `lr_max` was tightened from an initial
+1.0 (which did trigger the engine's high-lr warning early on, before
+any layer had a real E_t yet).
+
+Queued `launch_polyak_lr_width288.py` (commit `8976574`) -- direct
+validation against the current leaderboard record (`peak_lr=0.01`,
+step 13,601): does `polyak_lr=True`, with NO peak_lr tuned by hand at
+all, reach `vocab=126/k=3` comparably or better. Both machines fully
+loaded, added to the back of the existing queue.
+
+## 2026-09-18 (cont'd) -- test 2's width=128 leg finished: worst result
+## of the whole investigation
+
+`launch_dy_fixed_count_width128.py` (dy_k_min=dy_k_max=64, dense=True,
+unscaled peak_lr=0.015) completed 100k steps (9,080s, 11.01 steps/sec):
+ONE level-up at step 925 (vocab=16, k=2->3), then completely flat for
+the remaining 99,075 steps -- the worst result recorded so far, worse
+even than the abandoned structural-sparsity attempt's own concerns.
+Suggests forcing `dy_k_min=dy_k_max=64` (exactly half of state_width=
+128's output columns per sample, overriding `dy_r_target=0.9`'s own
+natural energy-based selection) is itself actively harmful, not
+necessarily a safe stand-in for the structural cap it was meant to
+replace. Holding judgment until the width=288 companion
+(`launch_dy_fixed_count_width288.py`, still running on arch-sandbox)
+reports back -- if it ALSO stalls hard, that's a real negative result
+for the dy_k_min/dy_k_max=64 approach generally, not a width=128-
+specific fluke.
+
+Launched queue item 1 into the freed local slot:
+`launch_armc_gatemid_lr_scaled.py` (Arm C gate cutoff=0.0, peak_lr=0.01
+scaled).
+
+## 2026-09-18 (cont'd) -- test 3 data point: Arm C tolerates the
+## unscaled LR that broke dense
+
+`launch_armc_gatemid_lr_unscaled.py` (Arm C backward gate cutoff=0.0,
+~50% density, dense forward, peak_lr LEFT UNSCALED at 0.015) finished:
+reached `vocab=126, k=3` at step 24,331 (100k steps, 19,803s total,
+5.05 steps/sec). This is the SAME unscaled peak_lr that left the fully-
+dense arm permanently stuck at vocab=64/k=3 for its whole remaining
+budget -- direct, clean confirmation of the `lr(N, gate_density)`
+reading: gate density really does let a layer tolerate an LR that
+breaks the fully-dense arm outright. Not FASTER than the LR-fixed
+dense record (24,331 steps / ~80min est. vs dense's 13,601 steps /
+~30min) -- Arm C here is trading LR-robustness for raw speed at this
+particular density/cutoff, not beating dense on both axes the way
+`peak_lr=0.01` alone did.
+
+Launched queue item 2 into the freed local slot:
+`launch_armc_gatesparse_lr_unscaled.py` (Arm C gate cutoff=0.6, ~29.5%
+density, peak_lr=0.015 unscaled) -- the sparser-gate counterpart, will
+tell us whether tolerance improves further as density drops.
+
+## 2026-09-18 (cont'd) -- reversal: dense's own best LR is WORSE for Arm C
+
+`launch_armc_gatemid_lr_scaled.py` (same cutoff=0.0/~50% density as
+the unscaled row above, but peak_lr=0.01 -- dense's own best value)
+finished: `vocab=126, k=2` at step 20,642, then flat for the remaining
+79,358 steps -- NEVER reached k=3. Compared directly against its
+unscaled sibling (same gate density, peak_lr=0.015): that one reached
+vocab=126 SOONER (step 17,146 vs 20,642) and went on to reach k=3 at
+step 24,331. So for Arm C at this density, the lower LR that helped
+dense is not just unnecessary, it's actively WORSE on both axes.
+
+Plausible reading: Arm C's own time-gating may already provide some of
+the same effective-step-size moderation dense needed a lower nominal
+LR for (per `armc_gate_density_lr_equation`'s stability-headroom
+argument) -- stacking a LOWER lr on top of that gives none of
+`lr(N, gate_density)`'s predicted benefit, and may just be leaving
+useful signal on the table (too conservative). This is consistent
+with (and lends support to) the two just-launched compensation-
+equation tests
+(`launch_armc_lr_scaled_invp.py`/`launch_armc_lr_scaled_invsqrtp.py`),
+both of which scale LR UP, not down, for Arm C -- the opposite
+direction from what dense needed.
+
+Launched queue item 3 into the freed local slot:
+`launch_armc_gatesparse_lr_scaled.py` (Arm C gate cutoff=0.6, ~29.5%
+density, peak_lr=0.01 scaled) -- will show whether this reversal holds
+at the sparser gate density too, or is specific to ~50% density.
+
+## 2026-09-19 -- sparser gate did worse, not better, at the same LR
+
+`launch_armc_gatesparse_lr_unscaled.py` (cutoff=0.6, ~29.5% density,
+peak_lr=0.015 unscaled) finished: `vocab=126, k=2` at step 30,097, then
+flat for the remaining 69,903 steps -- NEVER reached k=3. Direct
+comparison, same LR, only density differs: the ~50%-density sibling
+(`launch_armc_gatemid_lr_unscaled.py`) reached vocab=126 sooner (step
+17,146 vs 30,097) AND went on to reach k=3 (step 24,331). Test 3's
+grid so far (3 of 4 cells done):
+
+| cutoff (density) | peak_lr | result |
+|---|---|---|
+| 0.0 (~50%) | 0.015 unscaled | **vocab=126, k=3 @ step 24,331 -- best Arm C result so far** |
+| 0.0 (~50%) | 0.01 scaled | vocab=126, k=2 @ step 20,642, stuck |
+| 0.6 (~29.5%) | 0.015 unscaled | vocab=126, k=2 @ step 30,097, stuck |
+| 0.6 (~29.5%) | 0.01 scaled | running |
+
+Within this small grid, MORE density (not less) and the HIGHER,
+un-scaled LR (not the width-scaled-down one) both independently helped
+-- cuts against a naive "sparser gate tolerates/benefits from more
+aggressive LR" reading. Plausible cause: sparser gating compounds the
+already-low gradient-energy retention Arm C showed in the original
+confusion-matrix run (0.35-0.47 R vs baseline's 0.90) -- going sparser
+may be trading away real signal faster than any LR-robustness benefit
+can make up for. Waiting on the 4th cell before drawing a firmer
+conclusion; genuinely useful either way -- the "sparser is better"
+assumption isn't holding up so far.
+
+Launched queue item 4 into the freed local slot:
+`launch_polyak_lr_width288.py` (per-layer Polyak dynamic LR
+validation, no hand-tuned peak_lr at all).
+
+## 2026-09-19 -- Polyak + naive top-k are mathematically in tension; Arm C's
+## threshold (not selection) is the clean place for Polyak to act
+
+Direct question: does a "Polyak dynamic-grad-sparsity" or "Polyak
+dynamic-grad-sparsity + dynamic-LR" exist mathematically, even if not
+in the literature. Researched (searched "Adaptive Top-K in SGD",
+"Sparse Polyak" -- neither is quite this: the former adapts k under a
+communication-cost constraint, not Polyak's own residual signal; the
+latter is about a sparse PARAMETER estimate, not sparse gradient
+computation).
+
+Worked through the math with direct pushback ("I think polyak and
+naive top-k sparsity might be mutually exclusive") that turned out to
+be exactly right: Polyak step size is scale-TRACKING by construction
+(lr must shrink with the residual to anneal correctly near
+convergence). Magnitude-based top-k selection is scale-INVARIANT by
+construction (always grabs "the biggest k available" regardless of
+absolute scale, self-renormalizing every step). Try to compute Polyak's
+lr from a top-k'd gradient and neither choice of gradient norm (pre- or
+post-selection) resolves it: pre-selection describes a step that isn't
+the one actually applied; post-selection loses the absolute-scale
+signal Polyak's annealing needs, because top-k keeps re-finding "the
+current biggest k" regardless of how far training has actually
+progressed.
+
+Resolution (direct instruction, recorded as a design note, NOT built):
+Arm C's sine-wave gate isn't magnitude-based at all, so it sidesteps
+this conflict by construction. A Polyak-style (or any residual-
+tracking) controller could safely shrink Arm C's `cutoff` (the density
+threshold, a single scalar) as training progresses, WITHOUT touching
+which specific neurons fire each step -- that stays pure time/phase
+amortization, untouched by any gradient signal. Two cleanly separated
+roles instead of one conflicted one.
+
+Broader principle worth keeping, stated directly: grad sparsity's real
+value in this investigation looks like AMORTIZATION over time (fair,
+guaranteed turn-taking), not a signal to be found and optimized --
+every signal-guided selection mechanism tried (Arm A/B, `dy_r_target`
+itself) has underperformed Arm C's pure time-division on final outcome,
+despite Arm C's own lowest gradient-energy retention of any row.
+Recorded specifically because it'll matter if a future attempt at a
+FULLY sparse model (both forward AND backward, not just Arm C's
+backward-only-with-dense-forward setup tested so far) struggles to
+reach vocab=126/k=3 -- the fix is more likely "amortize better" than
+"select better." Full writeup:
+`docs/research/train_mqar_curriculum.rst:
+armc_polyak_threshold_not_selection`, memory
+`project_dense_vs_sparse_mqar_confusion_matrix`.
+
+## 2026-09-19 (cont'd) -- arm_c_plus_knee_margin0.py finished: another
+## weak, LR-fix-predating result; launched queue item 5
+
+`launch_arm_c_plus_knee_margin0.py` (K_START=2, margin=0.0, unscaled
+peak_lr=0.015) finished: `vocab=32, k=2` at step 4,483, then flat for
+the remaining 95,517 steps -- consistent with the other 2 completed
+Arm C+knee variants (all weak, all predate the LR fix). 2 of 4 knee
+variants remain running (skip-k1, margin=0.15).
+
+Freed arch-sandbox slot -- synced code, launched queue item 5:
+`launch_armc_lr_scaled_invp.py` (Arm C gate-density LR compensation,
+1/p, cutoff=0.3).
+
+## 2026-09-19 (cont'd) -- test 3 grid complete: a crossover, not a
+## monotonic density-vs-LR trend
+
+`launch_armc_gatesparse_lr_scaled.py` (cutoff=0.6, ~29.5% density,
+peak_lr=0.01) finished: `vocab=126, k=3` at step 43,905 -- the
+slowest Arm C milestone yet, but a real success. Completes the 2x2
+grid:
+
+| cutoff (density) | peak_lr | result |
+|---|---|---|
+| 0.0 (~50%) | 0.015 unscaled | **k=3 @ 24,331** |
+| 0.0 (~50%) | 0.01 scaled | k=2, stuck |
+| 0.6 (~29.5%) | 0.015 unscaled | k=2, stuck |
+| 0.6 (~29.5%) | 0.01 scaled | **k=3 @ 43,905** |
+
+A genuine crossover: denser+higher-LR succeeded, sparser+lower-LR
+succeeded, both cross-combinations failed at k=2. Neither "sparser
+needs more LR" (the compensation-equation direction just tested via
+`launch_armc_lr_scaled_invp.py`/`invsqrtp.py`) nor "sparser needs less
+LR" holds as a clean rule from this data -- with only 2 LR samples per
+density, this reads more like each density has its OWN narrow LR sweet
+spot (matching how tight the pure-dense sweet spot already turned out:
+0.01 good, 0.015 too high, 0.0067 too low) than like a real monotonic
+trend either direction. Flagging this explicitly since the two
+compensation-equation tests currently running both scale LR UP as
+density drops (cutoff=0.3, p~=0.403, between the two grid points) --
+this grid doesn't confirm that direction is right, though it doesn't
+rule it out either given the different cutoff. Treat their result as
+one more data point toward mapping the (density, LR) sweet-spot
+surface, not as confirmation/refutation of a single clean formula.
+
+## 2026-09-19 (cont'd) -- caught a real seed confound in test 3's grid,
+## corrected to statistical power not seed-pinning
+
+Direct instinct on the grid's crossover: "That's weird... I hope we
+can figure out exactly what it is." Checked `dy_time_gate_seed` --
+defaulted to `None` (OS-entropy seeded) in all 4 of test 3's original
+launchers, so each cell got a DIFFERENT, uncontrolled Arm C phase/
+period realization. First attempt at a fix (4 new launchers, all
+pinned to the SAME `dy_time_gate_seed=42`) was itself wrong -- direct
+correction: "seeds don't matter for this run length but for the
+neuron backprop sin thing for arm C it might depending on how long
+that sin period is... fixing the seed or randomness actually tells us
+nothing, statistics from multiple runs does." For a gate whose period
+is comparable to the run length, ONE fixed seed just relocates the
+same problem to a different arbitrary realization -- exactly
+`feedback_statistical_power_not_seeding`'s lesson, applied here.
+
+Deleted the 4 single-seed launchers, built
+`armc_gate_density_lr_seed_sweep.py` instead: same 2x2 grid x 3
+independent seeds (1000/2000/3000), short budget (25,000 steps --
+covers every original cell's vocab=64/k=3 milestone, up to step
+28,083 for the slowest) instead of the full 100k needed for the
+disputed vocab=126/k=3 milestone (up to 43,905 steps in the original
+data) -- cheap enough to get real statistical signal before committing
+more compute. Launched on arch-sandbox (12 sequential short runs,
+progress printed per combo).
+
+Also: `launch_arm_c_plus_knee_skip_k1.py` (the last-but-one of the
+original 4 knee variants) finished -- `vocab=64, k=2` at step 34,813,
+then flat. Best of the 4 (the others topped out at vocab=32) but still
+never reached k=3; still predates the LR fix. Only `margin=0.15`
+remains running from that batch.
+
+## 2026-09-19 (cont'd) -- all 4 original Arm C+knee variants complete
+
+`launch_arm_c_plus_knee_margin15.py` finished: `vocab=126, k=2` at
+step 34,660, then flat for the remaining 65,340 steps -- never reached
+k=3, but the ONLY one of the 4 to reach full vocab. Full picture, all
+4 now done, all at unscaled peak_lr=0.015 (predate the LR fix):
+
+| variant | peak result |
+|---|---|
+| standard (K_START=1, margin=0.05) | vocab=32, k=1 |
+| margin=0.0 (K_START=2) | vocab=32, k=2 |
+| skip-k1 (K_START=2, margin=0.05) | vocab=64, k=2 |
+| **margin=0.15 (K_START=2)** | **vocab=126, k=2** -- best |
+
+None reached k=3 -- this combined mechanism (knee-adaptive FORWARD
+sparsity + Arm C BACKWARD sparsity together, distinct from the
+backward-only-with-dense-forward Arm C runs in test 3, several of
+which DID reach k=3) still hasn't cleared full mastery at this LR.
+margin=0.15 is the natural candidate for a rerun at the corrected
+peak_lr~=0.01-ish regime, given how much both the LR fix and Arm C's
+own density/LR pairing have mattered elsewhere in this investigation --
+not yet queued, no free machine slot right now (arch-sandbox at 3/3
+jobs including the just-launched seed sweep, local at its own 2
+already-running jobs).
+
+## 2026-09-19 (cont'd) -- polyak_lr's first validation run failed
+## completely; root-caused, fixed, re-running
+
+`launch_polyak_lr_width288.py` finished: `vocab=16, k=3` at step 713,
+then completely flat (loss oscillating 2.2-2.7, never trending down,
+streak never past 2-4/10) for the remaining 99,287 steps -- far worse
+than the hand-tuned `peak_lr=0.01` record. Diagnosed directly by
+patching `apply_polyak_lr` to log its own inputs/outputs (first
+attempt used a shallow copy of `self._layer_surprise` and gave
+misleadingly "frozen" readings -- every snapshot showed the object's
+FINAL mutated state, not its value at capture time; fixed with a real
+deep copy).
+
+Real finding: raw per-call `E_t` for q/k/v/o_proj swings across orders
+of magnitude call to call (observed range ~0 to ~2000 for a single
+layer within one short run), so `c * residual / E_t` constantly
+saturated against `lr_max=0.1` regardless of its value -- and 0.1 is
+already well into the instability regime the LR range test found
+(~0.1-0.32). Training 4 of 5 wide layers at ~0.1 nearly every step for
+100k steps plausibly explains the observed frozen failure outright.
+
+Fixed: switched the denominator to `Lbar` (EMA-smoothed, already
+computed by the same hook, just unused before) instead of noisy raw
+`E_t`, and recalibrated `c` from a literature-typical SPS damping
+factor (0.5) down to `0.0005`, `lr_max` from `0.1` to `0.05` --
+empirically, to land computed values in the ~0.01-0.06 range already
+found safe rather than trusting an off-the-shelf constant that didn't
+transfer to this setup's actual per-layer gradient-energy scale. Short
+(1500-step) smoke test confirms: sane, decreasing lr values (mostly
+0.0006-0.05, falling as loss falls -- real annealing behavior) and
+genuine progress (loss 3.8->1.8, reached k=3) instead of the frozen
+pattern. Caught and fixed two stale hardcoded strings (docstring, then
+the actual runtime print banner) that still claimed the old c=0.5/
+lr_max=0.1 before relaunching, so the log wouldn't be mislabeled for
+its full ~4h run.
+
+One residual imperfection, not yet addressed: `input_proj`'s computed
+lr is driven near-zero (its `Lbar` runs on a different scale than
+q/k/v/o_proj's -- likely from its asymmetric dimensions,
+`embed_width x state_width` vs `state_width x state_width`) -- a
+single shared `c` doesn't calibrate all 5 layers equally well. Worth
+revisiting if the full-length re-run underperforms despite the fix.
+Re-launched on the freed local slot, full 100k-step budget, direct
+comparison against the `peak_lr=0.01` record still pending.
+
+## 2026-09-19 (cont'd) -- test 2 (dy_k_min=dy_k_max=64) complete: negative
+## at both widths, not a width-128-specific fluke
+
+`launch_dy_fixed_count_width288.py` finished: `vocab=32, k=2` at step
+25,688, then flat for the remaining 74,312 steps. Confirms width=128's
+own earlier stall (one level-up at step 925, then completely flat)
+wasn't a fluke -- width=288 got somewhat further before stalling, but
+both are far short of what dense or Arm C reach at their respective
+widths. This closes out test 2 as designed: forcing an EXACT fixed
+count via `dy_k_min=dy_k_max=64` (overriding `dy_r_target`'s own
+natural energy-based selection entirely) looks actively harmful, not a
+safe dynamic stand-in for the structural fan-in cap that got abandoned
+earlier. The underlying "does an absolute, non-width-proportional
+budget decouple LR from width" question stays open -- would need a
+genuinely different dynamic mechanism to test properly, not yet
+designed.
+
+Freed arch-sandbox slot -- no queue items remain to launch (everything
+built this session is now running or complete).
+
+## 2026-09-19 (cont'd) -- 1/p LR compensation test finished weak, adds
+## to the "no clean monotonic lr(p) trend" picture
+
+`launch_armc_lr_scaled_invp.py` (cutoff=0.3, ~40.3% density,
+peak_lr=0.01/p~=0.0248, the naive 1/p compensation formula) finished:
+`vocab=64, k=2` at step 16,724, then flat for the remaining 83,276
+steps -- never reached k=3, weaker than BOTH of test 3 grid's
+successful cells (which each reached k=3). Consistent with the grid's
+own crossover finding: scaling LR up as gate density drops isn't a
+reliable rule, it's a narrow per-density sweet spot each time.
+`launch_armc_lr_scaled_invsqrtp.py` (the milder bracket, same cutoff,
+peak_lr~=0.0158) still running locally -- one more data point before
+treating "scale LR up with sparsity" as settled either way for Arm C.
+
+## 2026-09-19 (cont'd) -- 1/sqrt(p) compensation test finished: better
+## than 1/p, but still hits a wall
+
+`launch_armc_lr_scaled_invsqrtp.py` finished: `vocab=64, k=3` at step
+9,521, then flat for the remaining 90,479 steps -- never reached
+vocab=126. Better than its 1/p sibling (which only reached k=2) on
+both counts -- k=3 not k=2, and genuinely FAST early progress (step
+9,521 to vocab=64/k=3 is comparable to dense's own record-setting run,
+which hit the same milestone at step 8,467). Same alpha=1.0-vs-0.5
+lesson as the width-scaling law itself: the milder exponent beat the
+more "theoretically justified" stronger one.
+
+But neither compensation formula reached the full vocab=126 milestone
+that test 3's own grid found at nearby densities/LRs -- this one hits
+a hard wall at vocab=64, the same SHAPE as the original unscaled-dense
+run's own permanent stall. Both compensation-equation tests are now
+complete: 2/2 fell short of vocab=126, adding more weight to test 3's
+own conclusion that there's no clean, extrapolatable lr(p) formula for
+Arm C -- each (density, LR) combination seems to have its own narrow
+window, not a rule that generalizes from a couple of anchor points.
+
+## 2026-09-20 -- seed sweep resolves the mystery: it's not a crossover,
+## it's density-driven RELIABILITY
+
+`armc_gate_density_lr_seed_sweep.py` finished all 12 runs (2 densities
+x 2 LRs x 3 seeds, 25,000-step budget). Steps to `vocab=64/k=3` (the
+sweep's target metric) per cell, across seeds 1000/2000/3000:
+
+| cell | seed 1000 | seed 2000 | seed 3000 | reached within budget |
+|---|---|---|---|---|
+| gatemid (~50%) unscaled=0.015 | 12,905 | 9,065 | 7,025 | 3/3 |
+| gatemid (~50%) scaled=0.01 | 19,193 | 11,532 | 8,055 | 3/3 |
+| gatesparse (~29.5%) unscaled=0.015 | DNF | DNF | 8,677 | 1/3 |
+| gatesparse (~29.5%) scaled=0.01 | DNF | 13,659 | DNF | 1/3 |
+
+Not a crossover at all. The denser gate reliably reaches the milestone
+REGARDLESS of which LR is used (3/3 both times); the sparser gate is
+unreliable regardless of LR (1/3 both times). The original single-seed
+grid's apparent crossover (denser+unscaled and sparser+scaled both
+"succeeding," both cross-combinations "failing") was almost certainly
+just which single seed got drawn landing on the sparser gate's lucky
+~1-in-3 outcome for two different LR values -- not a genuine
+(density, LR) interaction. Density drives RELIABILITY here, not a
+paired sweet spot with LR. Mechanistically sensible: fewer active
+neurons per step means more variance in which specific neurons get
+useful updates when, so more seed-to-seed spread in outcomes.
+
+This resolves the "that's weird" thread cleanly: the direct instinct
+to check for a seed confound, then the correction to use statistical
+power instead of seed-pinning, both turned out to be exactly right --
+the real answer only showed up once enough independent samples existed
+to separate signal (density matters) from noise (which single seed you
+happened to run).
+
+Also: `launch_polyak_lr_width288.py`'s recalibrated re-run finished --
+`vocab=32, k=3` at step 6,149 (100k steps, 13,176s, 7.59 steps/sec).
+Real progress this time (vs the first run's frozen vocab=16), and
+genuinely fast to its own milestones (k=3 at vocab=16 by step 1,056,
+vocab=32/k=3 by step 6,149) -- but still well short of the hand-tuned
+peak_lr=0.01 record (vocab=126/k=3 at step 13,601). The calibration
+fix clearly worked (real learning, not frozen) but the mechanism
+itself doesn't yet match a hand-tuned constant LR at this width --
+input_proj's still-near-zero lr (noted as a residual imperfection when
+the fix landed) is the most likely next thing to dig into if this is
+worth pursuing further.
+
+All originally-running jobs have now finished; machines are idle, no
+queue items remain.
+
+## 2026-09-21 -- apply_plasticity_reset (Continual-Backprop-inspired
+## per-neuron utility reset): first result in, dense arm underperforms
+## its own historical stall
+
+`launch_dense_lr_unscaled_plasticity_reset.py` finished (100k steps,
+27,894s, 3.59 steps/sec). Raw result: FINAL vocab=32/k=2, PEAK
+vocab=32/k=2 -- reached that (vocab,k) pair at step 4,997 and sat flat
+there for the remaining ~95,000 steps. The historical (no
+plasticity_reset) dense-unscaled run reached vocab=64/k=3 before
+flatlining for its final 86,257 steps. So this arm's peak is LOWER than
+the historical peak -- it did not break the stall, it stalled earlier
+and never reached vocab=64 at all.
+
+Before this result, two real bugs were found and fixed in the
+mechanism itself (both in sili__new's
+`delta_csr_types.hpp:plasticity_select_cycle_boundary`, both caught via
+new per-cycle diagnostic logging added specifically because the first
+loss-instability symptom couldn't otherwise be attributed to a cause):
+1. Cold-start: `col_grad_slow`/`col_grad_fast` both zero-initialized,
+   and because they update at different EMA rates, every column showed
+   a spurious ~50x deviation spike for many cycles after training
+   started -- nothing to do with real frozen columns. Fixed via
+   warm-start (first real delta replaces the zero sentinel directly).
+2. Reset-induced feedback loop: the reset action's own `(1-strength)`
+   importance decay produces a large artificial per-cycle delta next
+   cycle, which (unaccounted for) corrupted `col_grad_slow` and caused
+   the SAME column to be re-flagged repeatedly -- confirmed via a real
+   smoke run showing `dev` pinned at ~16-17 on the same layer/pool
+   across multiple cycles instead of settling. Fixed by adding a
+   variance tracker (`col_grad_var`) and switching the deviation
+   formula from a ratio (`fast/slow`) to a signed z-score
+   (`(fast-slow)/std`), with variance explicitly inflated at reset time
+   proportional to the reset's own perturbation size.
+
+Both fixes are unit-tested (new `test_cold_start_no_spurious_deviation`
+and `test_reset_inflates_variance_preventing_immediate_reflag` in
+`test_amortized_plasticity_reset.cpp`), full regression held at
+baseline throughout (sili__new ctest 175/180 same 5 pre-existing
+failures, sili_peridot pytest 355/11/40 unchanged), and confirmed via
+smoke test before the real 100k-step relaunch (deviation dropped from
+~47 to ~1.5-1.8 and stopped pinning to the same layer).
+
+polyak_lr_width288 and arm_c_plus_knee_margin15 are still running on
+the same fixed engine; results pending. No keep/prune decision made
+yet -- presenting raw per-arm results only until all three are in and
+reviewed together.
+
+`launch_polyak_lr_width288_plasticity_reset.py` finished (100k steps,
+29,539s, 3.39 steps/sec). Raw result: FINAL vocab=32/k=3, PEAK
+vocab=32/k=3 -- reached vocab=32/k=3 at step 68,648 and stayed flat
+there through step 100,000 (~31,352 steps flat). The historical (no
+plasticity_reset) polyak run also peaked at exactly vocab=32/k=3, flat
+for ~94,000 steps. This run's peak EXACTLY MATCHES the historical
+stall point -- it did not break past it, arriving via a different path
+(cycled through lower k-levels longer before settling at k=3).
+
+Direct question raised (dense already had no meaningful seed-to-seed
+variance to begin with, being the plain no-sparsity control, and
+plasticity_reset's whole premise is to REDUCE variance-driven
+stalling, not add it -- so "just unlucky" doesn't explain dense
+underperforming its own historical peak): worth investigating once
+arm_c's result is in, in parallel with any follow-up runs (more seeds,
+or an ablation isolating reset_fraction/dead_fraction) rather than
+serially after.
+
+`launch_arm_c_plus_knee_margin15_plasticity_reset.py` finished (100k
+steps, 34,939s, 2.86 steps/sec). Raw result: FINAL vocab=32/k=2, PEAK
+vocab=32/k=2 -- reached that (vocab,k) pair at step 4,867 and sat flat
+for the remaining ~95,133 steps. The historical (no plasticity_reset)
+arm_c run peaked at vocab=126/k=2 (never reached k=3), flat for its
+final 65,340 steps. This run's peak is far LOWER than the historical
+peak (32 vs 126 vocab) -- same shape as dense's underperformance, not
+polyak's exact-match.
+
+All 3 plasticity_reset runs are now finished:
+
+| arm | this run's PEAK | historical PEAK | result |
+|---|---|---|---|
+| dense_lr_unscaled | vocab=32/k=2 | vocab=64/k=3 | worse |
+| polyak_lr_width288 | vocab=32/k=3 | vocab=32/k=3 | exact match |
+| arm_c_plus_knee_margin15 | vocab=32/k=2 | vocab=126/k=2 (never k=3) | much worse |
+
+Two of three underperformed their own historical stall point; the
+third matched it exactly. None broke past its historical peak. No
+keep/prune call made -- presented to the user as raw results, per
+[[feedback_present_before_keep_prune_decisions]]. Next: investigate
+WHY dense (the plain no-sparsity control, no seed-variance excuse
+available) regressed, likely in parallel with follow-up
+runs/ablations rather than blocking on the investigation first.
+
+## 2026-09-21 -- root cause found from existing data alone (no new
+## instrumentation needed): the dead pool, not the frozen pool
+
+Dug into all 3 finished logs before running anything new. Two checks,
+both cheap (`grep`/`awk` over the existing log files):
+
+1. **Frozen pool never fired, in any of the 3 runs.** `dev` (the
+   z-score gating the top-K-by-importance pool) topped out at 1.82
+   across ~1,200 total log lines and mostly sat 0.6-1.5; with the
+   `k=2.0` default (a blind "standard z-score" guess, never calibrated
+   against real data), `plasticity_boost = max(0, dev-k)` was 0 on
+   literally every touch, all 3 runs, the entire 100k steps. Confirmed
+   via `grep dev= | awk '$1>2.0'` returning zero matches across all
+   three full logs. The frozen pool selected candidates every cycle
+   (hence the climbing `reset=` counter) but never actually moved a
+   single weight.
+2. **Accuracy declined progressively through the whole plateau in all
+   3 runs, not just dropped once and stabilized.** Checked against the
+   TRUE historical (no plasticity_reset) control: it also shows a
+   sharp accuracy drop right after leveling up (task got harder), but
+   then CONVERGES to a stable floor (`width288_nolevel_down_control`'s
+   own vocab=64 plateau: 0.30 -> 0.03 -> 0.03 -> 0.03 -> 0.03, flat).
+   The plasticity_reset runs never converge -- dense's 5 equal-sized
+   chunks across its plateau: 0.10 -> 0.064 -> 0.070 -> 0.055 -> 0.048,
+   still dropping at the end. Same pattern in arm_c. This is active,
+   ongoing harm, not a normal hard stall.
+
+Since the frozen pool is provably inert, the only thing left that
+could cause (2) is the DEAD pool (bottom-K by `importance*|weight|`,
+ungated, full-strength every touch). Traced its own update formula
+(not just the data): `new_imp = (1-blend)*imp` fires as a side effect
+of the SAME touch that selected the column for being low-importance --
+so a column the dead pool just touched comes out with even LOWER
+importance, making it MORE likely to qualify as "dead" again next
+cycle. Only a single-cycle maturity gate (~100 calls) stands between a
+column and immediate re-selection. For a column that's genuinely
+useful but only intermittently active -- exactly what MQAR associative
+recall produces, a key/value pathway silent except when its specific
+token is queried -- one cycle isn't enough time to re-earn importance
+before the next round of "who's lowest now." A self-reinforcing spiral
+built into the formula itself, independent of any particular run's
+data. The original design (see the "Refinement" section of the
+now-superseded plan) explicitly assumed dead-pool targets carried much
+less risk than frozen-pool targets and left it ungated on purpose --
+that assumption is exactly what this data falsifies for a sparse-recall
+task.
+
+Direct instruction, rather than trying to patch the dead pool's
+cooldown timing: prune it entirely, fix the frozen pool, relaunch.
+`dead_fraction=0` was considered as a cheaper ablation but rejected --
+with the frozen pool already confirmed inert, that would just reproduce
+the historical baseline, which 3 existing runs already show.
+
+Two changes made, both in sili__new (`delta_csr_types.hpp`,
+`block4_plasticity_TODO_DELETE.hpp`, `cpu_backend.cpp`,
+`sparse_rnn.py`) plus threading through sili_peridot
+(`model/toy_tile_recurrence_rmt.py`, `scripts/train_mqar_curriculum.py`,
+the 3 launchers):
+1. **Dead pool removed entirely** -- `col_util_dead`, `col_dead_active`,
+   `dead_fraction`, `n_dead_this_cycle`, `mean_col_util_dead` all
+   deleted, not just disabled. Frozen pool is now the only pool.
+2. **Frozen pool's `k` recalibrated from 2.0 to 1.0** -- a best
+   estimate from the tick-level maxima observed in the 3 finished runs
+   (still not the full per-cycle distribution, which wasn't logged).
+   Added `min_deviation`/`max_deviation` to `PlasticityStats`
+   (computed over the actual candidate set each cycle, not just the
+   worst) so a future relaunch can calibrate from real data instead of
+   guessing again.
+
+Verification before relaunch: new/updated C++ unit tests (dead-pool
+tests removed, `test_deviation_distribution_min_max_tracked` added),
+full regression held (sili__new ctest 175/180 same 5 pre-existing
+failures; sili_peridot pytest 355/11/40, two tests fixed for the
+removed `dead_fraction` kwarg). Smoke test on dense confirmed: no
+`dead=` field in the log (pool fully gone), `dev` now genuinely crosses
+`k=1.0` (e.g. `dev=1.81[1.81,1.81]` at step 250, `dev=1.30[1.09,1.49]`
+at step 1000) -- the frozen pool is actually firing now, not silently
+inert. Unexpected bonus: steps/sec roughly TRIPLED (~3.6 -> ~10.7) on
+the smoke run, since removing the dead pool's per-cell `col_util_dead`
+update cut real per-touch overhead.
+
+All 3 relaunched fresh (v2): `dense_lr_unscaled_plasticity_reset`,
+`polyak_lr_width288_plasticity_reset`,
+`arm_c_plus_knee_margin15_plasticity_reset`. Results pending.
+
+Also confirmed already available for a future round, if v2 doesn't
+fully resolve this: `apply_amortized_importance_decay` (+ block4
+counterpart) -- an existing, unconditional, always-on, ungated
+per-synapse importance decay, the raw primitive `apply_loss_adjusted_decay`
+already wraps with a loss-gate. Plus the remaining ablations from the
+original plan (ranking formula, blend/reset_fraction magnitude,
+maturity window length, per-layer reset_fraction, importance-only
+reset, k/eta_slow/eta_fast timescale sweep, gated-vs-ungated frozen
+pool, asymmetric-vs-symmetric catchup) and a head-to-head run of
+`apply_loss_adjusted_decay` itself against the now-fixed
+`apply_plasticity_reset`.
+
+## 2026-09-21 -- per-column data collection for fitting a real
+## reset-selection equation from training data
+
+Direct question after reviewing the log files this investigation
+already produces (importance, loss, accuracy): could a real
+reset-selection equation be FIT from actual data instead of hand-
+derived heuristically? Scoped to per-COLUMN state (not per-synapse) --
+the mechanism only ever selects at column granularity, so per-synapse
+snapshots (up to ~120GB uncompressed/step by a rough estimate) would
+add cost with no added signal for this specific goal; per-column state
+at cycle boundaries is ~3 orders of magnitude cheaper.
+
+Added (both repos): `DISLDOLayerV::plasticity_column_state()`/`_block4()`
+(sili__new) -- zero-copy views into `PlasticityState`'s own arrays
+(`col_importance`, `col_grad_slow`/`col_grad_fast`/`col_grad_var`,
+`col_age`, `col_reset_active`), matching the `get_weights_vals`/
+`get_importance` precedent. `apply_plasticity_reset(include_column_state=True)`
+(sili_peridot) copies these for any pool whose cycle just completed;
+`train_mqar_curriculum.py`'s new `plasticity_column_log_dir` writes one
+small `.npz` per completed cycle per layer/pool, with
+`step`/`loss_ema`/`acc_ema` attached -- the ~1% reset each cycle vs
+the ~99% left alone gives a free treatment/control comparison, no
+separate intervention needed.
+
+Real bug found via smoke-testing the actual wiring (not caught in
+planning): a dense-loaded layer's SCATTERED arm has 0 nnz for the
+whole run (`load_dense_values` routes entirely through
+`block4_load_dense_fp32`) -- its `cycle_complete` trivially fires every
+single call via the engine's empty-nnz early-return path, with
+all-zero column state the whole time. A naive 500-step smoke run wrote
+3036 files, almost entirely that noise. Fixed with a new `scattered_nnz`
+accessor (distinct from the existing combined `.nnz`) gating
+column-state attachment to arms that actually have real content --
+re-verified: 36 files, 408KB, genuine non-zero varying values. TDD
+throughout (6 new sili__new tests, 4 new sili_peridot tests, including
+a dedicated regression test for this exact bug). Both repos committed
++ pushed.
+
+Launched a 4th concurrent run (`launch_dense_lr_unscaled_plasticity_reset_column_log.py`,
+reusing the dense-unscaled v2 config -- cleanest, most-understood arm,
+no polyak_lr/Arm-C confounds -- with logging enabled) alongside the 3
+already-running v2 comparison runs, at `NUM_CPUS=2` (vs the others'
+`NUM_CPUS=4`) since machine load was already ~12.4 on 8 cores before
+adding this one. Storage extrapolates to ~80MB for a full 100k-step
+run (negligible against 180GB free). Data collection only -- no
+results/conclusions from this run yet.
+
+Direct question mid-run: "why is column_log beating dense? Are you
+running the control on it?" First answer (threading-order
+nondeterminism) was wrong and explicitly rejected -- "No I don't care
+about the threading order dependence ffs... It does not meaningfully
+affect this... that doesn't matter for statistical averages." Correct
+mechanism, found by reading the code: `fp4_stochastic_rng_state()` in
+`fp4quant.hpp` seeds each thread's xorshift64* state from
+`std::hash<std::thread::id>{}(std::this_thread::get_id())` -- the OS
+thread ID, not the run's logical seed. This RNG drives both stochastic
+weight-quantization rounding AND `plasticity_reset`'s `fresh_sample`
+draws. Different `NUM_CPUS` changes thread count/partitioning, which
+changes which random stream produces every stochastic draw from step
+one -- functionally an uncontrolled extra seed for the whole run, not
+floating-point reduction-order noise (a different, unrelated effect
+already tracked in `project_backward_sparse_threading_nondeterminism`).
+column_log's own trajectory is therefore not a controlled comparison to
+dense v2 -- it's an accidental second random substrate.
+
+column_log finished (100k steps, `NUM_CPUS=2`): final/peak
+vocab=126/k=2 (peak == final, no late regression), reached at step
+18837 and held for the remaining ~81k steps, steps_per_sec=7.32,
+wall_clock=13657s. Final snapshot count: 12537 `.npz` files, 139MB
+under `logs/plasticity_column_snapshots/dense_lr_unscaled/`. Raw fact
+only, not a comparison to dense v2's own numbers, per the NUM_CPUS/RNG
+finding above -- but as a second independent random substrate it did
+also break past the historical v1 wall (vocab=64 cap), same as all 3
+controlled v2 arms. Equation-fitting against the collected per-column
+data has not started yet.
+
+2026-09-21 -- offline replay found real importance saturation, an
+L2-saturation-gated decay built and launched as v3
+
+Direct instruction: "now that we have the column log, we should be
+able to run various functions on it much, much more quickly and see
+what python or other functions would've allowed the model to learn
+better or not." Built `scripts/analyze_column_log.py` (disposable) and
+found the actual explanation for a previously-flagged, never-diagnosed
+log pattern (the exact same `dev=`/`imp=` line repeating verbatim
+across many ticks): `col_importance` climbs to the ci accumulator's
+`max_ci=100` clamp by ~step 20k-50k, and by run's end most of several
+pools' populations sit tied at that ceiling (`v_proj` 288/288,
+`k_proj` 285/288, `input_proj` 280/288) -- population std of raw
+importance collapses from real spread to the fp32 noise floor,
+degenerating top-K-by-importance selection into whatever a sort's
+tie-break lands on.
+
+Asked whether the current selection criterion actually helps at the
+run's real critical-fail period (a hard stall from step 18837 onward,
+vocab=126/k=2 flat for ~81k steps) without disturbing the success
+period before it -- replayed two candidate fixes split at that exact
+boundary: combined-rank selection (`rank(importance)+rank(deviation)`)
+was NOT surgical, already far more exploratory during the success
+period too; an age-decayed proxy (`col_importance*(1-lambda)^col_age`)
+showed the right asymmetric property but was rejected on a different
+ground -- `col_age` as a decay exponent is a step counter, and this
+project's plasticity mechanisms are held to an infinite-horizon-safe
+standard (fixed-memory EMAs only, nothing anchored to elapsed steps).
+
+Accepted design: an L2-norm saturation ratio
+(`||col_importance||_2/(max_ci*sqrt(n))`, current state only) through
+a SOFT sigmoid (not the earlier clipped-linear ramp). A uniform
+post-hoc re-score of the already-logged trajectory was tried first and
+proven mathematically to be a no-op for selection (top-K under any
+positive scalar multiply is unchanged) -- real decay had to move into
+the actual engine so it opposes real importance growth during
+training, not a frozen log. Built with TDD in sili__new (5 new tests,
+scattered+block4, full 173/173 regression green), wired through
+`apply_plasticity_reset`'s new `l2_decay_lambda`/`l2_decay_threshold`/
+`l2_decay_temperature`/`max_ci` params (default lambda=0.0 exact
+no-op), 361/361 sili_peridot regression green. Smoke-tested, then
+launched as a 4th concurrent run
+(`launch_dense_lr_unscaled_plasticity_reset_v3_l2decay_column_log.py`,
+lambda=0.05 threshold=0.9 temperature=0.05, column logging enabled) at
+`NUM_CPUS=4` (matching dense v2, not the earlier data-collection run's
+`NUM_CPUS=2`) -- a deliberate choice for a clean, controlled comparison
+given this session's own thread-ID-seeded-RNG finding. Data/results
+only -- no comparison yet.
+
+`polyak_lr_width288_plasticity_reset` v2 finished (100k steps,
+`NUM_CPUS=4`): final/peak vocab=64/k=2 (peak == final, no late
+regression), reached at step 19893 via level-ups at
+924/1966/6740/19893, held flat for the remaining ~80,107 steps,
+steps_per_sec=2.59, wall_clock=38599s. Raw fact only.
+
+`dense_lr_unscaled_plasticity_reset` v2 finished (100k steps,
+`NUM_CPUS=4`): final/peak vocab=64/k=3 (peak == final), reached step
+19916 via level-ups at 922/4876/6404/8283/19916, held flat for the
+remaining ~80,084 steps, steps_per_sec=2.13, wall_clock=46992s.
+Matches (not exceeds) the historical reference stall point (vocab=64/
+k=3, historically flat for 86,257 steps). Raw fact only.
+
+v3 (l2decay) observation, still running: since ~step 21500 the
+L2-saturation decay has been persistently active (`l2decay`~0.88
+sustained across `v_proj`/`input_proj`/`o_proj`, not brief spikes).
+Over the same ~17k-step window, `loss_ema` has stayed elevated
+(4.6-4.85, vs ~3.2-3.6 beforehand) and `acc_ema` down to 0.003-0.04
+(vs 0.30-0.49 beforehand). Raw, sustained trend -- not yet interpreted
+as cause-effect, no verdict.
+
+`arm_c_plus_knee_margin15_plasticity_reset` v2 finished (100k steps,
+`NUM_CPUS=4`): final/peak vocab=64/k=2 (peak == final, no late
+regression), reached step 11921 via level-ups at
+1834/4119/7861/11921, held flat for the remaining ~88,079 steps,
+steps_per_sec=1.98, wall_clock=50569s. Raw fact only.
+
+All 3 v2 comparison arms (dense, polyak, arm_c) are now finished; only
+v3 (l2decay) remains running, holding the same loss/acc plateau
+described above (l2sat/l2decay still cycling ~0.85-1.00/0.71-0.88),
+now at higher steps/sec (5.2, up from ~2-3) with CPU contention gone.
+
+v3 (l2decay) finished (100k steps, `NUM_CPUS=4`): final/peak
+vocab=126/k=2 (peak == final), reached step 11573 via level-ups at
+922/3359/4478/6255/9154/11573, held flat for the remaining ~88,427
+steps, steps_per_sec=6.12, wall_clock=16331s. Final l2sat/l2decay:
+1.00/0.88 (sustained since ~step 21500, never backed off once
+triggered). Final loss_ema=4.63, acc_ema=0.008 at step 100000. All 4
+comparison runs (dense v2, polyak v2, arm_c v2, v3 l2decay) are now
+complete. Raw facts only -- no comparison or keep/prune verdict; that
+review is the user's.
+
+2026-09-22 -- v3 decay confirmed to have failed its one job, and why
+guessing the fix isn't safe
+
+Offline replay of v3's collected column data (fine-grained, per-cycle
+deltas, not the earlier coarse 10-point sample): `v_proj`'s
+population-mean `col_importance` averages +0.00087/cycle once decay
+is fully active (std 0.029) -- statistically zero net drift. Decay
+isn't losing to growth, it's tied. Separately, v3's loss/acc plateau
+(loss=4.62, acc=0.046) is statistically indistinguishable from the
+undecayed column_log run's own plateau at the same vocab=126/k=2
+level (loss=4.73, acc=0.031) -- the earlier-flagged "loss crash
+coincides with decay onset" correlation during monitoring was
+confounded by both events following the same curriculum level-up, not
+decay causing harm.
+
+Direct instruction, after I proposed just doubling lambda/touch
+frequency: "sustained decrease to what number exactly, because
+importance 100 is around the ceiling, so if importance is limited
+then it's potentially fighting more than just this decay." Correct --
+`col_importance` (the only signal logged) is a SECOND EMA on top of
+the real per-synapse accumulator's own update rule (`ci_new =
+beta2*ci_old + (1-beta2)*(g^2+contrib^2)`, `beta2=0.999` default,
+found in `update_ci`, `delta_csr_types.hpp`), so the "+4.4/cycle tie"
+can't distinguish a genuinely gradual real recovery (more
+lambda/frequency would help) from `col_importance`'s own lag catching
+up to a raw value that already re-saturated within 1-2 real steps (in
+which case no amount of once-per-cycle decay would ever win).
+
+Direct instruction: "let's do 1 [better diagnostics]... even if
+there's some completely different mechanism at play we can still find
+it. You could even store a video of the ci over time." Built two new
+opt-in captures rather than guessing at a fix: (1)
+`plasticity_raw_importance_log=True` adds the raw, unsmoothed
+per-synapse importance matrix (reshaped to (in_features,out_features))
+to each existing once-per-cycle snapshot -- a full-run "landscape",
+verified safe against the real model class first (a bare hand-built
+layer carries stray scattered content that contaminates the reshape;
+the real model's layers don't, confirmed `scattered_nnz==0` and exact
+length match); (2) `raw_ci_sample_fn(step, model)` fires once per REAL
+weight update (the true cadence, not once per ~50-step cycle),
+tracking 32 sampled synapses/layer, to directly resolve the
+1-step-vs-many-step recovery question. Stored as float32 `.npz`
+(lossless, directly analyzable); a video can be rendered from the same
+data afterward if useful, but isn't the primary artifact (8-bit
+quantization would lose the ~4-unit-scale detail this whole
+investigation turned on). Smoke-tested, then launched as a 30k-step
+diagnostic run (not a comparison arm) -- see
+docs/research/toy_tile_recurrence_rmt.rst:raw_ci_landscape_capture.
+
+2026-09-22 -- the 30k diagnostic was tossed for being too short, a
+re-run at matching length graduated instead of getting stuck, and
+comparing that against the stuck v3 run found a real early-warning
+signal -- select_by_deviation built and launched as v5
+
+The first raw-ci diagnostic (above) was discarded: checked against
+v3's OWN step~30000 snapshot (not a later one), which was already
+fully saturated across all 4 pools while the 30k-step run was nowhere
+close -- a real divergence at matched step count, not an artifact of
+comparing different schedule phases. Relaunched at the full 100k
+steps. That run graduated early (step 18366, vocab=126/k=4) instead of
+getting stuck like the original v3 run -- confirmed via a literal diff
+that the two scripts' `train_curriculum(...)` calls are byte-identical
+(same seed, same everything); the only additions are two read-only
+diagnostic hooks (`layer.importance` reads, never writes to weights/
+synapses). Genuine run-to-run variance in a system that doesn't fully
+reproduce given "the same seed" alone, not a config difference.
+
+Direct instruction: launch a second attempt hoping for a stuck
+trajectory to compare against the graduated one, and investigate what's
+already collected in the meantime. Comparing the graduated run (run1)
+against the original stuck v3 run at MATCHED step counts found:
+`col_importance` in every q/k/v/o_proj pool was already growing
+17-147x faster in the stuck run than the graduated run, visible from
+as early as step 5000-8000 -- well before either run's `l2_sat_ratio`/
+`l2_decay_strength` had done anything, and long before the absolute
+importance LEVEL itself became distinguishable. Verified this wasn't
+driven by a few outlier columns (checked full population std/max/p90
+at matched steps): `q_proj` showed a fairly uniform population-wide
+shift, `o_proj` showed a skewed few-outlier pattern -- genuinely mixed,
+not one simple story. Verified the ABSOLUTE per-cycle delta (not just
+a noisy first/second-half ratio) stayed 17-147x elevated in the stuck
+run across the whole 9000-18000 step window.
+
+Direct instruction on what to build from this: "if we can determine
+some mathematical difference that would push the non-graduated run's
+columns... to be more like the graduated run's... but only when it's
+showing the same signs... we might have a good plasticity function."
+Found the structural gap: `col_grad_fast`/`slow`/`var` (and the
+deviation z-score they feed, already used to gate blend STRENGTH) are
+tracked for every mature column each cycle, not just the selected
+ones -- but the frozen pool's candidates are chosen by top-K
+`col_importance` (absolute LEVEL), so a column accelerating fast while
+still at a low absolute level can never enter the candidate pool,
+regardless of how anomalous its growth rate already is.
+
+Built `select_by_deviation` (sili__new, TDD, 2 new tests each for
+scattered/block4, full 173/173 regression green): default `false` is
+an exact no-op preserving today's top-K-by-importance selection;
+`true` ranks the frozen pool by deviation (growth RATE) instead.
+Deviation is now computed for the whole mature population up front
+(previously only for the already-selected top-K) so either ranking
+needs no duplicated computation -- the reset/blend action on a
+selected column is unchanged, only what gets selected. Wired through
+the model/training script (362/362 sili_peridot regression green),
+smoke-tested, and launched as v5 (`select_by_deviation=True`, L2 decay
+left OFF to isolate this one new variable rather than compounding it
+with the l2_saturation_decay work) -- see
+docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection.
+No results yet.
+
+## 2026-09-22 -- v5 harmed the base model; root cause found (gate
+## defeated by construction) and fixed with an equation-derived
+## threshold, not a guessed one
+
+v5 never progressed past vocab=16/k=3, even after 37,750+ steps --
+strictly worse than every other comparison arm, including the plain
+baseline. Direct correction after the first (wrong) instinct was to
+just recalibrate `k` empirically: "How ... did you think that would
+not harm the base model? Try to do the second option unless you can
+actually find a k value based on an equation and not a guess. I
+vastly prefer not to add guessed hyperparameters."
+
+Root cause, confirmed via direct log analysis (grepped the `dev=`
+value logged for the "worst" column each cycle from both v5's log and
+v3's log, counted what fraction exceeded the gate threshold `k=1.0`):
+`select_by_deviation` selects the TOP `reset_fraction` of the mature
+population's deviations every single cycle -- by construction, an
+extreme order statistic, never a typical one. The gate
+(`plasticity_boost = max(0, deviation-k)`) reused the SAME fixed
+`k=1.0` that had been calibrated for the *unrelated* top-importance
+mode's own, non-maximal deviation distribution. v5: 177/182 cycles
+(97.25%) exceeded k=1.0 -- gate open almost every cycle. v3
+(top-importance mode): only 89/400 (22.25%). Near-full-strength resets
+were firing continuously regardless of whether anything was actually
+pathological, defeating the mechanism's entire "only intervene on
+genuine anomalies" purpose by construction, not by a badly-tuned
+constant.
+
+Fixed with a real equation instead of a new guessed constant:
+`deviation_by_col[j]` is built as a z-score, so under a "nothing
+pathological" null hypothesis it's approximately standard-normal per
+column. Selecting the top order statistics of `N` such draws each
+cycle means the right comparison is "bigger than what pure chance
+among N columns already produces" -- exactly the classical Gaussian
+extreme-value asymptotic (Fisher-Tippett-Gnedenko): the expected
+maximum of `N` i.i.d. standard normals is `sqrt(2*ln(N))`, closed-form
+in the population size alone, no data calibration needed, and it
+scales UP automatically for wider layers (more candidates -> a larger
+expected maximum by pure chance, the same correction a
+Bonferroni-style threshold applies for `N` implicit simultaneous
+comparisons). `k_effective = sqrt(2*ln(mature.size()))` now replaces
+the passed-in `k` ONLY when `select_by_deviation=true`; `k` is used
+unchanged (its own separate calibration) when
+`select_by_deviation=false`, so the default mode is untouched.
+
+TDD (sili__new): 2 new RED-first tests, one per scattered/block4 --
+a 4-mature-column scenario (N=4, expected threshold
+sqrt(2*ln(4))~=1.665) confirms the passed-in `k` has NO effect under
+`select_by_deviation=true` (re-run at k=0 vs k=1000, identical
+result), and that the resulting `plasticity_boost` exactly matches
+`max(0, deviation - sqrt(2*ln(N)))` computed independently from the
+engine's own post-call state -- the literal formula, not just "a
+different number." A companion regression test confirms default mode
+still uses the passed `k` directly. Full regression: 175/180 sili__new
+ctest (same 5 pre-existing `pre_existing_failure` failures, no new
+ones). See
+docs/research/delta_csr_types.rst:plasticity_reset.select_by_deviation_early_detection.k_derivation.
+
+v5 (PID 1953623) and run2 (PID 1949671, the raw-ci-recovery diagnostic
+hoping to capture a matched "stuck" trajectory) were both still
+running when this fix landed -- decision on what to do with them
+(let finish, kill, relaunch a corrected v6) not yet made.
+
+## 2026-09-22 -- v6 (EVT-derived k) early signal: clears vocab=16/k=3
+## by step ~5000, where v5 stayed stuck for 37,750+ steps
+
+Both v5 and run2 were killed (direct instruction) and v6 launched:
+identical config to v5, but running against the fixed engine
+(`k_effective = sqrt(2*ln(N))` instead of the old fixed `k=1.0` that
+was defeated by construction -- see the entry above). Smoke-tested
+(300 steps, clean) before queuing the full 100k-step run.
+
+Early result, raw numbers only (no keep/prune verdict yet -- see
+`feedback_present_before_keep_prune_decisions`): v6 passed vocab=16/
+k=3 (the EXACT point v5 got permanently stuck at) by roughly step
+4750-6250, and by step 16250 had already reached vocab=64/k=3,
+loss_ema~=3.0, acc_ema~=0.2-0.3, steps/sec~=8.5. v5, by contrast, never
+left vocab=16/k=3 across 37,750+ observed steps under the old gate.
+This is a clean early signal that the EVT-derived threshold restores
+the mechanism's intended behavior, though the run is still in
+progress (100k steps total) and hasn't been compared against the
+other arms' own final outcomes yet.
+
+## 2026-09-22 -- v6 finished: full stage history and final numbers,
+## raw facts only
+
+v6 (`select_by_deviation=True`, EVT-derived gate k) ran the full
+100,000 steps (12243s, steps/sec=8.17). Raw numbers, no keep/prune
+verdict (see `feedback_present_before_keep_prune_decisions`):
+
+- FINAL: final_vocab=64, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=64, peak_k=3 (peak == final -- no regression from
+  a higher point reached earlier)
+- STAGE_HISTORY (5 level_ups total, all early):
+  - step 1800: vocab=16,k=2 -> vocab=16,k=3
+  - step 4912: vocab=16,k=3 -> vocab=32,k=2
+  - step 6425: vocab=32,k=2 -> vocab=32,k=3
+  - step 7037: vocab=32,k=3 -> vocab=64,k=2
+  - step 9468: vocab=64,k=2 -> vocab=64,k=3 (last level_up of the run)
+- No further level_ups occurred across the remaining ~90,500 steps.
+  loss_ema drifted from ~3.0 (step 16250) up to ~4.2-4.5 by the
+  step-90000+ region and stayed there; acc_ema drifted down from
+  ~0.2-0.3 (step 16250) to mostly 0.01-0.08 for the back half of the
+  run.
+
+Compared against v5 (old broken gate, same config): v6 clears vocab=
+16/k=3 -- the exact level v5 stayed stuck at for its full 37,750+
+observed steps -- confirming the EVT-derived gate fix does restore
+early progress that the old fixed-k=1.0 gate structurally prevented.
+v6 itself then plateaus at vocab=64/k=3 for the remaining ~90k steps
+of its own run. Whether that plateau is itself a further, separate
+problem (and if so whether it resembles any other observed
+stuck-signature) is not yet analyzed here -- raw facts only.
+
+## 2026-09-22 -- v6's plateau investigated using its own column log:
+## the EVT-derived gate never fired, not once, for the whole run --
+## replaced with a percentile-based threshold, launched as v7
+
+Direct instruction: "check what happened with v6 when it stalled and
+what updates to the equation would fix it, and test those on the log
+a bit if we can before trying another run." v6's launcher had column
+logging enabled (`plasticity_column_log_dir`), giving per-cycle
+`col_grad_fast`/`col_grad_slow`/`col_grad_var`/`col_reset_active`
+snapshots for all 6 pools across the entire 100k-step run --
+`scripts/analyze_v6_stall.py` (disposable, not kept) reconstructed
+per-column deviation and the EVT threshold `sqrt(2*ln(mature_count))`
+from this data directly, no new run needed.
+
+Finding: `gate_open_frac` (fraction of selected columns whose
+deviation actually exceeded the EVT threshold, i.e. got a nonzero
+`plasticity_boost`) was EXACTLY 0.000 in every one of the 6 pools --
+not just during the post-step-9468 plateau, across the ENTIRE run
+including the early climbing phase. Real per-column deviation never
+exceeded ~1.0-1.8 anywhere in the run; the EVT threshold sits at
+~3.1-3.4. So the mechanism was a silent, permanent no-op for the whole
+100k steps -- v6's early progress (clearing vocab=16/k=3, the exact
+point v5 got stuck at) owed nothing to select_by_deviation actually
+doing anything; the reset gate simply never opened. The EVT
+derivation's premise -- that deviation behaves like an
+iid-standard-normal z-score -- doesn't hold in practice, most likely
+because the EMA-lag structure of `col_grad_fast`/`col_grad_slow` (plus
+the asymmetric catchup rate) produces a much more tightly-clustered
+real distribution than the idealized theory assumed.
+
+Tested an alternative directly against the SAME v6 log data before
+implementing anything: instead of a theoretical asymptotic, use the
+population's own empirical `(1-reset_fraction)`-percentile as the
+threshold each cycle (`np.percentile(dev, 99)` for
+`reset_fraction=0.01`) -- still equation-derived (a real order
+statistic, no new guessed constant), self-calibrating to whatever the
+actual spread happens to be. Recomputed on v6's real late-phase
+deviations: this rule would have opened the gate 46.9-100% of the time
+across the 6 pools (input_proj 55.3%, q_proj 50.2%, k_proj 46.9%,
+v_proj 67.5%, o_proj 77.9%, lm_head 100%) -- a sane middle ground
+between the EVT rule's 0% and the original fixed `k=1.0`'s 97.25%.
+
+Implemented in sili__new (TDD, both scattered/block4, full 175/180
+regression green -- same 5 pre-existing failures): `k_effective` under
+`select_by_deviation=true` is now the linear-interpolated percentile
+(matching `numpy.percentile`'s default method) of the mature
+population's own deviation values this cycle, at percentile
+`100*(1-reset_fraction)`. Wired through, smoke-tested, and launched as
+v7 (same config as v5/v6) -- see
+docs/research/toy_tile_recurrence_rmt.rst:select_by_deviation_early_detection
+and docs/research/delta_csr_types.rst (sili__new side)
+`plasticity_reset.select_by_deviation_early_detection.k_derivation`
+for the full two-round derivation.
+
+## 2026-09-23 -- v7 finished: the gate genuinely fired this time, but
+## the run did WORSE than v6 (which never fired at all), raw facts only
+
+v7 ran the full 100,000 steps (11856s, steps/sec=8.43). Raw numbers,
+no keep/prune verdict (see `feedback_present_before_keep_prune_decisions`):
+
+- FINAL: final_vocab=32, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=32, peak_k=3 (peak == final)
+- STAGE_HISTORY (3 level_ups total, all by step 4998):
+  - step 1990: vocab=16,k=2 -> vocab=16,k=3
+  - step 4337: vocab=16,k=3 -> vocab=32,k=2
+  - step 4998: vocab=32,k=2 -> vocab=32,k=3 (last level_up of the run)
+- No further level_ups across the remaining ~95,000 steps. loss_ema
+  hovered ~2.9-3.2 for most of the back half; acc_ema mostly 0.02-0.13,
+  noisy and low.
+
+Compared directly against v6 (EVT-derived gate, confirmed via its own
+column log to have NEVER fired a single real reset the whole run): v6
+still reached vocab=64/k=3 by step 9468. v7, with a gate that DID
+genuinely open (this was checked, not assumed -- the `dev=`/`imp=`
+values logged each cycle show real spread, e.g. step 95000's worst
+column `q_proj.block4(dev=1.19,imp=83.40)` vs v6's late-run values
+which were uniformly capped near the EVT ceiling), plateaued at the
+LOWER vocab=32/k=3 -- worse than a version of the mechanism that did
+nothing at all. Whether this means select_by_deviation resets are
+actively counterproductive once they're allowed to fire on this task,
+or whether v7's specific percentile threshold is firing on the WRONG
+columns (columns that are actually still useful, not genuinely
+pathological), or something else entirely, is not analyzed here --
+raw facts only, same as v6's own column log is available for v7 too
+(`logs/plasticity_column_snapshots/dense_lr_unscaled_v7_select_by_deviation_percentile_k/`)
+if that investigation is wanted next.
+
+## 2026-09-23 -- live, side-by-side synapse visualization built for
+## direct visual inspection, instead of another blind equation-guess
+
+Direct instruction, after v7's counterintuitive result (a genuinely-
+firing gate did WORSE than a permanently-inert one): "my visual cortex
+is still more advanced than probably any tech on this planet. Let's
+either get displayarray (my lib) or opencv working and display all of
+the networks side by side with labels next to each other in lock step
+and I'll just look at all of the synapses for the next run."
+
+Installed `displayarray` (the user's own PyPI library) into
+`.venv_peridot`. Built `scripts/live_synapse_display.py`: pure,
+GUI-free composition functions (unit tested,
+`tests/test_live_synapse_display.py`, 12 new tests) plus a thin
+`LiveSynapseDisplay` class. Per pool, top to bottom: label -> weight
+heatmap ("the synapse") -> deviation/reset strip (red intensity =
+z-score, green flag = selected/reset THIS cycle -- "the algorithm
+acting on them," at the exact boundary between the two matrices it
+touches) -> importance heatmap. All 6 pools tile side by side in one
+window, reusing the exact same per-pool data
+(`column_state`/`raw_importance`) the existing npz column-log snapshots
+already compute -- no duplicated instrumentation. New
+`plasticity_live_display` flag (default False, no-op), independent of
+`plasticity_column_log_dir`.
+
+Smoke-tested against a REAL short run with a real X11 window
+(screenshot-verified, not just no-exception-checked): weight heatmap,
+deviation/reset strip, and importance heatmap all render correctly,
+labels correct, multiple pools tiled side by side. First version
+defaulted to 2-3px/cell upsampling "for visibility" -- direct
+correction ("why so zoomed in... the pixels should just be able to be
+pixels") -- fixed to `cell_px=1` (literal one pixel per synapse) as
+the default.
+
+Full regression: 374 passed (362 baseline + 12 new), 11 skipped, 40
+deselected -- clean.
+
+## 2026-09-23 -- live view superseded by a replay tool (real training
+## cadence isn't close to smooth); smoke-tested against real data
+
+Direct instruction: "Tbh I'd prefer to see the replay unless it's
+running from 30-60fps" -- correct: each pool only completes an
+amortized cycle roughly once every several seconds, nowhere near
+smooth as a live-attached view. Built `scripts/replay_synapse_display.py`,
+reusing every composition function from `live_synapse_display.py`
+(only the data source and pacing model differ): merges all pools'
+recorded `.npz` snapshots into one step-sorted timeline, plays them
+back at a fixed target fps (default 30). Unit tested (pure
+filesystem-reading logic + a dependency-injected fake display,
+`tests/test_replay_synapse_display.py`, 8 new tests).
+
+Extended `plasticity_raw_importance_log` to also capture `raw_weight`
+(same safe reshape as `raw_importance`) so replay can show both panels
+like the live version did. Smoke-tested against a REAL prior run's
+already-recorded data (`dense_lr_unscaled_v3_diagnostic_run2`, the
+only earlier run with raw_importance captured) -- multiple pools
+rendered and played back smoothly through hundreds of real steps
+(screenshot-verified). User's own observation from watching that
+replay: "pretty, but synapses weren't doing much through that process"
+-- expected, since that particular run (v3's original L2-decay
+diagnostic) was already known to be saturated/stuck for most of its
+length; not a new finding, confirms the tool shows what's actually
+there.
+
+New v8 launcher
+(`launch_dense_lr_unscaled_plasticity_reset_v8_select_by_deviation_replay_capture.py`,
+replacing the earlier live-display version) runs v7's exact config
+(percentile-gated select_by_deviation) with full per-synapse capture
+enabled, meant to run normally (background, nothing to watch live) --
+replay it afterward with `scripts/replay_synapse_display.py`. Not yet
+launched as a full run.
+
+Full regression: 382 passed (374 + 8 new), 11 skipped, 40 deselected
+-- clean. See docs/research/toy_tile_recurrence_rmt.rst:live_synapse_display
+for the full writeup (both the live version and its replay successor).
+
+## 2026-09-23 -- v8 finished; replay revealed importance saturation and
+## per-synapse collapse post-~8k steps; built an offline Python
+## sandbox to screen candidate plasticity algorithms against real data
+
+v8 ran the full 100k steps. Replaying it (with the now-labeled panels)
+showed, per direct observation at step~30k (raw facts, not verdicts):
+input_proj's importance had gone to a flat, undifferentiated block;
+q_proj/k_proj/v_proj's importance was solid yellow (saturated near
+max_ci=100) while their weight matrices had lost per-synapse
+individuality (v_proj: dense repeating plaid grid; q_proj/k_proj: still
+fine noise); o_proj's weight had collapsed into a handful of wide
+uniform vertical stripes, importance showing distinct (non-saturated)
+purple/blue stripes; lm_head alone stayed rich and varied throughout.
+Pre-8k ("low rank") weight structure was confirmed normal/expected for
+transformer-style nets, not itself a concern.
+
+Direct instruction: build a fast, offline (pure-Python, no C++ engine
+run needed) sandbox to test candidate plasticity algorithms against
+the REAL recorded data, screening cheaply before committing to a real
+run -- "accumulating whatever the algorithm does to all the arrays
+over time and accumulating the deviation... see if the algorithm is
+continually at least pushing the model towards a good state and not
+away from a good state." New `scripts/plasticity_sim.py`: a faithful
+Python port of `plasticity_select_cycle_boundary`'s grad-tracking +
+deviation + percentile/EVT-k math, validated with a PRECISION
+cross-check against sili__new's own C++ unit test numbers (4-column
+fixture, deviation~=1.2392/-1.4837, k~=-0.803, boost~=2.042 -- exact
+match). 22 new tests, `tests/test_plasticity_sim.py`.
+
+**Honest fidelity check before trusting anything** (matching this
+project's "verify before trusting" discipline): replaying v8's OWN
+exact algorithm against its own recorded natural deltas does NOT
+reproduce v8's real outcome -- reset-event overlap only 21-62%
+(col_importance signal) or 9-17% (raw_mean_ci signal, tried as a
+fix -- did NOT improve fidelity), final saturation 0-26% simulated vs
+100% real. Root cause: each column gets reset ~30 times on average
+over a full 2955-cycle run, and the "natural delta" signal at every
+one of those touches bakes in whatever the real algorithm ACTUALLY did
+that cycle (a documented, expected confound, not a bug) -- with that
+many repeated touches per column, small per-event divergences compound
+into a completely different long-run trajectory. User's direct
+response, confirming this is expected and the intended use is
+directional, not quantitative: "this is of course going to be an
+approximation... This just allows us to see if the algorithm is
+continually at least pushing the model towards a good state and not
+away from a good state."
+
+Built a second, genuinely different candidate as a first real test:
+`ceiling_decay_step` -- a simple LEVEL-based rule (decay any column
+above 90% of max_ci, strength ramping to a max of 5%/cycle at max_ci
+itself), no growth-rate/deviation history needed at all, unlike
+select_by_deviation's RATE-based criterion. Replayed against v8's real
+`raw_mean_ci` growth pressure for all 6 pools: 0% saturation
+throughout the ENTIRE run in every pool (vs real 50-100%, vs the
+replayed v8-algorithm baseline's own fluctuating 0-77%) -- expected by
+construction (it structurally can't let a column sit near max_ci) but
+confirms it actually does that under the real recorded growth
+pressure. Exported to the replay tool's own .npz schema (new
+`export_simulated_trajectory`/`sim_export_dir` -- naming convention
+`<real_run>_sim_<candidate_name>/<pool>/`, direct instruction to keep
+multiple candidates' exports from colliding) so this can be watched
+the same way the real run was:
+`logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture_sim_ceiling_decay/`.
+
+raw_importance in the export is approximated (rescaled from the real
+run's own per-synapse texture to match the simulated column-level
+aggregate) -- weight-level resets can't be exactly reconstructed (the
+real reset's random `fresh` sample was never recorded), documented as
+a known limitation, not hidden. Full regression: 404 passed (382 + 22
+new), clean. Not yet compared visually by the user, not yet tried
+against additional candidates or literature, not yet validated with a
+real engine run -- raw findings only, no keep/prune verdict.
+
+## 2026-09-23 -- two more candidates: a layer-wide rank-preserving
+## decay (direct instruction) and a literature-grounded L2 Init;
+## user now wants research-paper-grounded candidates preferred
+
+After watching the ceiling_decay replay (visible resetting/plasticity
+after step 8k, mostly absent before it -- promising), direct
+correction on the APPROACH, not just wanting more runs to watch:
+"something that reached top importance is probably important, so
+while 90% [avoiding literal saturation] looks good... it's not [good
+enough]... the more the total layer reaches full saturation, the more
+the entire layer importance is lowered, that way there can still be
+outliers while the whole thing is lowered. Basically normalize the
+entire layer importance to a sane lower value." Also: "now I want you
+to prefer research papers" over self-invented heuristics.
+
+`layer_l2_decay_step`: a faithful port of this project's OWN existing
+engine mechanism (the L2-saturation-gated decay built earlier this
+session, never enabled in v8 -- lambda was 0.0 there, never tested
+against real select_by_deviation data until now). Touches EVERY column
+uniformly (not a per-column threshold) at a strength driven by the
+WHOLE population's L2-norm saturation ratio, passed through a soft
+sigmoid -- a uniform multiplicative shrink preserves rank order exactly
+(confirmed via direct test), unlike ceiling_decay_step's per-column
+clipping. Replayed against v8's real raw_mean_ci growth: 0% final
+saturation in all 6 pools, but unlike ceiling_decay, the MAX column
+still reaches a meaningful 54-65 (not pinned near max_ci, but not
+crushed to near-zero either) -- input_proj/o_proj show brief transient
+saturation touches (8.7%/32.6% of cycles at some point) that then
+recover, rather than never occurring at all.
+
+Web search confirmed and grounded two published techniques (direct
+instruction to prefer these over guessing): Shrink-and-Perturb (Ash &
+Adams 2020 -- L2 toward ZERO plus noise, flagged in the literature as
+very hyperparameter-sensitive) and L2 Init (Kumar, Marklund & Van Roy,
+"Maintaining Plasticity in Continual Learning via Regenerative
+Regularization", CoLLAs 2025, arXiv:2308.11958 -- regularize toward
+each parameter's OWN INITIAL value instead of zero, found in the paper
+to mitigate plasticity loss more consistently than Shrink-and-Perturb
+or plain L2). Implemented `simulate_l2_init`, adapting the paper's
+always-on (never saturation-gated) regularization to this project's
+importance-accumulator dynamics -- pulls every column `rate` of the
+way back toward its own first-recorded value, every cycle,
+unconditionally.
+
+**Confirmed the literature's own stated hyperparameter-sensitivity
+directly on real data**: `rate=0.01` (a naive first guess) crushed
+importance to near-zero everywhere (final max 0.04-0.4 across all
+pools) -- so strong it would cripple the ci-based learning-rate
+mechanism entirely (`feedback_importance_is_already_the_optimizer`),
+not just prevent saturation; over v8's real 2955-cycle trajectory,
+`(1-0.01)^2955 ~= 0`, fully explaining the collapse. `rate=0.0001`
+(100x smaller) gives a much saner result: 0% final saturation, max
+importance retained at a real 77-78, with only brief transient
+saturation touches in 2 of 6 pools. Both exported for direct visual
+comparison (rate sensitivity itself now watchable, not just numeric).
+
+All 3 new candidates (layer_l2_decay, l2_init at two rates) exported
+to the replay tool's schema alongside the existing ceiling_decay and
+v8_algorithm_mirrored exports --
+`logs/plasticity_column_snapshots/dense_lr_unscaled_v8_select_by_deviation_replay_capture_sim_{layer_l2_decay,l2_init,l2_init_rate0001}/`.
+Tested in `tests/test_plasticity_sim.py` (6 new tests: layer_l2_decay's
+uniform-touch/rank-preservation/sigmoid-value correctness, l2_init's
+drift-toward-init/always-on/zero-growth behavior). Full regression:
+410 passed (404 + 6 new), clean.
+
+Five candidates now available to compare, none yet picked: v8's real
+algorithm, v8's algorithm replayed through the sandbox (poor fidelity,
+own-sandbox baseline only), ceiling_decay (per-column, 0% saturation
+throughout), layer_l2_decay (layer-wide, 0% final but transient
+touches, preserves rank, max importance 54-65), l2_init at two rates
+(0% saturation, max importance 0.4 vs 77 depending on rate). No
+keep/prune verdict -- raw findings and exports only, per this
+project's standing convention.
+
+## 2026-09-23 -- real-engine validation launched for both promising
+## sandbox candidates: layer_l2_decay (v9) and a newly-built L2 Init (v10)
+
+After watching layer_l2_decay's and l2_init_rate0001's replays side by
+side, direct instruction to move to real validation: "let's try both
+of them and record while seeing if it helps reliably beat mqar rather
+than randomly stalling." First, a UX fix from watching two windows at
+once: both were titled "synapses" with no way to tell them apart --
+`scripts/replay_synapse_display.py`'s `replay()` now defaults
+`window_name` to the run directory's own basename (overridable via
+`--window-name`), 2 new tests.
+
+**v9 (layer_l2_decay)**: this mechanism already existed in the real
+engine (built earlier this session, never enabled -- lambda was 0.0
+everywhere). Launched with `reset_fraction=0.0` to isolate it as the
+ONLY active mechanism, matching exactly what the sandbox tested in
+isolation -- `lambda=0.05 threshold=0.9 temperature=0.05`, same as the
+sandbox run. Running now; early observation (step ~12750, raw fact,
+no verdict): still stuck at vocab=16/k=3, `l2sat` pinned near 1.00
+despite the mechanism being active -- worth watching whether this
+changes as the run continues.
+
+**v10 (L2 Init)**: did NOT exist as a real mechanism before this --
+only tested in the offline sandbox until now. Built for real in
+sili__new (`apply_amortized_l2_init`/`apply_amortized_block4_l2_init`,
+TDD, both scattered/block4, full regression 177/182 clean, same 5
+pre-existing failures) -- see sili__new's own JOURNAL-equivalent
+(`docs/research/delta_csr_types.rst:plasticity_reset.l2_init`) for the
+engine-side details. Wired through `sparse_rnn.py`,
+`toy_tile_recurrence_rmt.py` (new `apply_l2_init` model method), and
+`train_mqar_curriculum.py` (new `l2_init_enable`/`l2_init_rate` etc.
+flags) -- 6 new shallow threading tests
+(`tests/test_toy_tile_recurrence_rmt.py::TestL2Init`). Launched with
+`rate=0.0001` (the sandbox-validated saner rate) and
+`plasticity_reset_enable=True, reset_fraction=0.0` (a deliberate no-op,
+kept only to reuse the existing column-log capture pathway so this run
+stays replayable) -- `l2_init_enable=True` is the only mechanism
+actually touching weights. Smoke-tested before the full launch. Full
+sili_peridot regression: 418 passed (412 + 6 new), clean.
+
+Both v9 and v10 running now, full 100k-step runs, neither finished --
+raw progress only, no keep/prune verdict yet.
+
+## 2026-09-23 -- v10 (L2 Init) finished: full stage history and final
+## numbers, raw facts only
+
+v10 ran the full 100,000 steps (12045s, steps/sec=8.30). Raw numbers,
+no keep/prune verdict:
+
+- FINAL: final_vocab=64, final_k=2, final_phase=kcycle
+- PEAK: peak_vocab=64, peak_k=2 (peak == final)
+- STAGE_HISTORY (4 level_ups total):
+  - step 1883: vocab=16,k=2 -> vocab=16,k=3
+  - step 6076: vocab=16,k=3 -> vocab=32,k=2
+  - step 14844: vocab=32,k=2 -> vocab=32,k=3
+  - step 36662: vocab=32,k=3 -> vocab=64,k=2 (last level_up of the run)
+- No further level_ups across the remaining ~63,300 steps. loss_ema
+  ended around 4.0-4.4; acc_ema mostly 0.05-0.15 for the back half.
+
+Compared against the other real arms: v10's final vocab=64/k=2 is
+below v9's ceiling of vocab=16/k=3 observed so far (v9 still running),
+and below v7/v8's own final states (vocab=32/k=3 and vocab=64/k=3
+respectively). Whether rate=0.0001 was still too aggressive, too weak,
+or something else entirely is not analyzed here -- v10's own column
+log is available for offline inspection
+(`logs/plasticity_column_snapshots/dense_lr_unscaled_v10_l2_init/`) if
+that investigation is wanted next.
+
+**Correction, caught by direct user feedback**: the comparison above
+is WRONG -- vocab dominates k in the curriculum's actual stage
+ordering (`(16,2) < (16,3) < (32,2) < (32,3) < (64,2) < (64,3)`), so
+vocab=64/k=2 comes AFTER vocab=32/k=3 in that ordering, not before it.
+v10 (64,2) is actually ahead of v7 (32,3) and ahead of v9's
+still-running position (16,3) -- only v8 (64,3) is further along. Not
+"below" as stated above. Caught because comparing two different axes
+(vocab and k) informally, without checking the actual stage order,
+produces exactly this kind of self-contradiction -- flagged here
+rather than silently corrected, so the mistake stays visible.
+
+## 2026-09-23 -- v9 (layer_l2_decay) finished: full stage history and
+## final numbers, raw facts only
+
+v9 ran the full 100,000 steps (15191s, steps/sec=6.58). Raw numbers,
+no keep/prune verdict:
+
+- FINAL: final_vocab=16, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=16, peak_k=3 (peak == final)
+- STAGE_HISTORY: only ONE level_up, at step 1347 (vocab=16,k=2 ->
+  vocab=16,k=3) -- nothing else across the remaining ~98,650 steps.
+- Ended with `l2sat=1.00, l2decay=0.88` held steady for the whole
+  observed tail -- importance stayed pinned near max_ci despite the
+  decay mechanism being active the entire run.
+
+Using the correct stage ordering (see correction above): v9 (16,3) is
+the LOWEST of the four completed real arms so far -- below v7 (32,3),
+v10 (64,2), and v8 (64,3).
+
+## 2026-09-23 -- v12 (qk_norm_enable) GRADUATED at step 15143 -- best
+## real result of the whole session so far
+
+Direct instruction after v10's Q/K homogenization finding: implement
+QK-Norm (Henry et al. 2020) and a Q/K-scoped L1 sparsity penalty
+(`qk_l1_sparsity_coef`), plus a spectral-norm diagnostic, and launch
+both as real validation. Full design/citations in
+`docs/research/toy_tile_recurrence_rmt.rst:qk_norm_design`,
+`:qk_l1_sparsity_design`, `:qk_spectral_norm_diagnostic`.
+
+v12 (`qk_norm_enable=True`) reached `GRADUATED` (the curriculum's max
+level) at step 15143 -- `final_vocab=126, final_k=4`, 2480s wall-clock,
+6.11 steps/sec. Full stage history: 8 level-ups, steps 869 / 4581 /
+6256 / 7455 / 8419 / 9217 / 10563 / 15143. No prior arm this session
+(v5 through v11) reached GRADUATED at all -- every other arm was still
+climbing or stalled somewhere in the vocab=16-64 range by step
+100,000. Raw fact, no keep/prune verdict yet.
+
+The `qk_specnorm` diagnostic stayed essentially flat the entire run
+(q~=15.2-15.35, k~=15.03-15.11) -- did not grow unboundedly, consistent
+with QK-Norm bounding the Q/K weight matrices' spectral norm as
+intended.
+
+**Deviation-std verification, per direct instruction ("capture the std
+values again to make sure it fixes it")**: reran the same early/mid/late
+deviation-std analysis used on v10's real data, against v12's real
+recorded `plasticity_column_snapshots/dense_lr_unscaled_v12_qk_norm/`
+(405 q_proj snapshots, steps 50-15118):
+
+```
+q_proj: deviation std (early/mid/late): 0.768 / 0.532 / 0.436   col_importance final: mean=0.42 max=3.23  min=0.18
+k_proj: deviation std (early/mid/late): 0.683 / 0.610 / 0.614   col_importance final: mean=0.29 max=1.41  min=0.14
+v_proj: deviation std (early/mid/late): 0.669 / 0.599 / 0.612   col_importance final: mean=1.19 max=2.68  min=0.69
+input_proj: deviation std (early/mid/late): 0.809 / 0.792 / 0.296   col_importance final: mean=2.69 max=17.83 min=0.06
+o_proj: deviation std (early/mid/late): 0.730 / 0.663 / 0.509   col_importance final: mean=0.24 max=4.00  min=0.06
+lm_head: deviation std (early/mid/late): 0.846 / 0.701 / 0.438   col_importance final: mean=0.19 max=0.35  min=0.07
+```
+
+Directly confirms the fix: q_proj/k_proj's deviation std stays in the
+same 0.4-0.8 range as every other layer throughout, NEVER collapsing
+to the ~0.004 near-zero value v10 showed by its late third -- the
+"homogenization" signature is gone, and q_proj/k_proj are no longer
+distinguishable from v_proj/o_proj/lm_head on this metric. Caveat,
+stated honestly: this run graduated in 15,143 steps vs v10's full
+100,000, so col_importance also never approaches saturation here
+(max single digits to ~18, vs v10's 97-99) -- the absolute
+col_importance comparison isn't apples-to-apples across such
+different run lengths, but the deviation-std shape (never collapsing)
+is the load-bearing confirmation and holds regardless.
+
+v11 (`qk_l1_sparsity_coef=0.05`) still running at time of writing --
+step ~17750/100000, vocab=64/k=2, progressing steadily but nowhere
+near v12's graduation speed so far. No verdict yet, raw progress only.
+
+## 2026-09-23 -- v11 (qk_l1_sparsity_coef) finished: 5 level-ups, stalled
+## 76k steps on the last one, never graduated
+
+v11 ran the full 100,000 steps (12773s, 7.83 steps/sec).
+
+- FINAL: final_vocab=64, final_k=3, final_phase=kcycle
+- PEAK: peak_vocab=64, peak_k=3 (peak == final)
+- STAGE_HISTORY: 5 level-ups -- steps 1990 / 4562 / 6213 / 8244 /
+  84256. The last one (64,2 -> 64,3) took ~76,000 steps by itself,
+  after the first 4 landed within the first 8244 steps.
+- Using the correct stage ordering: v11 (64,3) ties v8's own (64,3)
+  ceiling (the best of v5-v9), well below v12's GRADUATED (126,4).
+
+Deviation-std check, same analysis as v10/v12: q_proj/k_proj do NOT
+collapse to v10's ~0.004 here either -- std stays 0.38-0.58 across all
+three thirds, comparable magnitude to v_proj/o_proj/lm_head:
+
+```
+q_proj: std 0.470/0.424/0.383   col_importance final: mean=99.60 max=99.91 min=99.04
+k_proj: std 0.584/0.363/0.396   col_importance final: mean=99.42 max=99.49 min=98.95
+v_proj: std 0.677/0.494/0.410   col_importance final: mean=99.50 max=99.90 min=97.65
+input_proj: std 0.708/0.606/0.343   col_importance final: mean=100.00 max=100.00 min=99.99
+o_proj: std 0.635/0.526/0.433   col_importance final: mean=3.87  max=83.31 min=0.14
+lm_head: std 0.670/0.652/0.642   col_importance final: mean=0.49  max=0.71  min=0.43
+```
+
+Genuinely interesting, not yet explained: the qk_l1_sparsity_coef
+penalty ALSO avoids the deviation-std collapse (unlike v10), but still
+hit a real 76k-step stall before its last level-up -- avoiding the
+collapse signature did not, by itself, avoid stalling here the way it
+appeared to for v12. Note col_importance for q/k/v/input_proj DID
+reach the same ~99-100 saturated range v10 showed (unlike v12, which
+never got that high because it graduated in only 15k steps) -- so this
+arm still saturates importance, just without the deviation-std
+collapse that saturation alone was hypothesized to cause. Raw finding,
+no explanation asserted yet.
+
+**v12 replication launched**: direct instruction, "Launch V12 again to
+validate while V11 continues running please. Keep both the new and old
+recordings when running v12 again." `v12b`
+(`launch_dense_lr_unscaled_plasticity_reset_v12b_qk_norm_repeat.py`) --
+identical config to v12 except `seed=1001` (v12 used 1000), own
+separate `plasticity_column_log_dir`/log file so v12's original
+recordings stay untouched. Running now.
+
+## 2026-09-23 -- v13 (qkvo_norm_enable) finished: GRADUATED even faster
+## than v12, and the saturation seen everywhere in v12b is gone
+
+Direct instruction, after asking whether v12b's v_proj/o_proj/
+input_proj saturation had research precedent (answered: yes, Zhai et
+al. 2023's own all-linear-layers finding, QKV-Norm being standard in
+Gemma 3/OLMo 2/Qwen 3, and this project's own o_proj-spectral-radius
+history): "Please extend the current qk_norm_enable into a
+qkvo_norm_enable, using the same pattern that works for QK to fix the
+other layers, then launch that as V13 and we'll see if that can
+perform robustly." Renamed `qk_norm_enable` -> `qkvo_norm_enable`,
+added `v_norm_ln`/`o_norm_ln`, wired into both `step()`/`step_cached()`
+with parity confirmed by a dedicated bit-exact test. Full details in
+`docs/research/toy_tile_recurrence_rmt.rst:qkvo_norm_design`.
+
+v13 ran with `seed=1000` (same as v12's own GRADUATED run, for a
+direct comparison) and GRADUATED at step 13342 (1760s, 7.58
+steps/sec) -- FASTER than v12's own step 15143. Full stage history: 8
+level-ups, steps 938 / 4036 / 4776 / 5158 / 5817 / 6349 / 8269 / 13342.
+
+Deviation-std check against ALL SIX pools (not just q/k this time),
+same early/mid/late analysis:
+
+```
+q_proj: std 0.811/0.497/0.399   col_importance final: mean=0.18  max=2.97  min=0.01
+k_proj: std 0.724/0.739/0.341   col_importance final: mean=0.12  max=3.22  min=0.02
+v_proj: std 0.718/0.634/0.643   col_importance final: mean=4.02  max=36.91 min=0.05
+input_proj: std 0.853/0.768/0.712   col_importance final: mean=13.59 max=99.74 min=0.05
+o_proj: std 0.851/0.638/0.589   col_importance final: mean=2.50  max=55.22 min=0.03
+lm_head: std 0.882/0.609/0.473   col_importance final: mean=0.10  max=0.19  min=0.04
+```
+
+Every pool stays in the healthy 0.3-0.88 range throughout -- no
+collapse anywhere (unlike v10's q/k) and no layer pinned at
+`col_importance=100.00` exactly (unlike v12b's v_proj/o_proj/
+input_proj, which hit `min=max=mean=100.00`). input_proj gets closest
+(max=99.74) but keeps real heterogeneity (min=0.05), not a hard
+ceiling. Directly consistent with the hypothesis: normalizing V and
+O too removes the saturation that Q/K-only normalization left free to
+show up elsewhere.
+
+One real data point so far (same seed as v12's own best run) -- given
+v12b showed exactly how much a single seed can mislead, this result on
+its own is encouraging but not yet enough to call `qkvo_norm_enable`
+reliable; a seed-varied replication (the same check that caught v12's
+fragility) would be the natural next step before trusting this. No
+keep/prune verdict.
+
+## 2026-09-24 -- v13b (qkvo_norm_enable, seed=1001) finished: MUCH
+## better than v12b but still didn't fully graduate, and the
+## v/o/input_proj saturation came back anyway
+
+Direct instruction: "Yep. Let's try a replication run!" `v13b`
+(`launch_dense_lr_unscaled_plasticity_reset_v13b_qkvo_norm_repeat.py`)
+-- identical config to v13, `seed=1001` (same seed choice v12b used).
+Ran the full 100,000 steps (13004s, 7.69 steps/sec).
+
+- FINAL: final_vocab=126, final_k=3, final_phase=kcycle -- did NOT
+  reach GRADUATED (k=4), unlike v13's own seed=1000 run.
+- STAGE_HISTORY: 7 level-ups -- steps 1195 / 3158 / 3716 / 4966 / 7199
+  / 8660 / 18094, then flat for the remaining ~81,900 steps on the
+  last (126,2 -> 126,3) transition's aftermath.
+- Using the correct stage ordering: v13b (126,3) is FAR ahead of
+  v12b's (64,2) -- a real, substantial improvement in robustness over
+  Q/K-only normalization, even though it fell short of v13's own
+  GRADUATED result.
+
+Deviation-std check, same analysis:
+
+```
+q_proj: std 0.473/0.370/0.233   col_importance final: mean=8.07  max=16.46 min=3.57
+k_proj: std 0.580/0.276/0.231   col_importance final: mean=7.91  max=16.77 min=3.30
+v_proj: std 0.658/0.320/0.142   col_importance final: mean=100.00 max=100.00 min=100.00
+input_proj: std 0.726/0.269/0.289   col_importance final: mean=100.00 max=100.00 min=100.00
+o_proj: std 0.634/0.390/0.157   col_importance final: mean=100.00 max=100.00 min=100.00
+lm_head: std 0.663/0.649/0.649   col_importance final: mean=0.08  max=0.10  min=0.06
+```
+
+Genuinely important complication: q_proj/k_proj stay healthy and
+UNSATURATED under this second seed too (importance mean ~8, nowhere
+near the ceiling) -- Q/K-norm's fix is holding across both seeds now.
+But v_proj/o_proj/input_proj are back to being FULLY saturated
+(exactly `min=max=mean=100.00`), the SAME pattern v12b showed, DESPITE
+v_norm_ln/o_norm_ln being active this run. The V/O normalization did
+NOT prevent this recurrence under seed=1001, even though it looked
+clean under seed=1000 (v13's own result).
+
+Working hypothesis, not yet verified: Q/K normalization bounds the
+attention SCORE directly (the literal quantity `(Q.K)*scale` feeding
+softmax), giving a tight causal link to the gradient dynamics that
+drive `importance = EMA(g^2)`. V/O normalization only bounds the
+FORWARD activation magnitude (v_attn, attn_mem_n/attn_content_n) --
+it doesn't directly cap the BACKWARD per-synapse squared-gradient
+flowing into v_proj/o_proj's weights, which is what `col_importance`
+actually tracks. If the downstream loss keeps demanding larger
+weight updates from v_proj/o_proj regardless of their OUTPUT being
+normalized, the importance accumulator can still saturate. Not
+confirmed, just the most direct read of why this fix generalized for
+Q/K but not (reliably) for V/O.
+
+Net: `qkvo_norm_enable` is more robust across seeds than the
+Q/K-only version (126,3 vs 64,2 on the harder seed), but not
+demonstrated reliable -- the v/o/input_proj saturation this whole
+investigation started from is still present under at least one seed,
+just with less immediate curriculum-stalling consequence than v9/v11
+showed. No keep/prune verdict; the V/O piece specifically may need a
+different mechanism than the Q/K piece did.
+
+## 2026-09-24 -- confirmed `col_importance` IS RMSprop/Adam's v_t
+## (not just analogous); AdaBelief researched and ruled out on memory
+## grounds; grad-clipping fix recorded as an open TODO
+
+Direct question: "It seems to be the importance saturating for those
+specifically, right? We did have something to counter it, but I think
+we should also double check this, it would be the optimizer state for
+rmsprop and the second optimizer state for adam iirc."
+
+Checked the actual engine code rather than just agreeing:
+`BoundedRMSpropSynapsePolicy::update_ci`
+(`sili__new/sili/lib/headers/delta_csr_types.hpp`) is literally
+`ci = clamp(beta2*ci + (1-beta2)*(g^2+contrib^2), floor, max_ci)`,
+`beta2=0.999` (Adam's own default), then used as
+`delta = -eff_lr*g*S/(sqrt(ci)+eps)` -- Adam/RMSprop's v_t-normalized
+update, verbatim. `max_ci=100` was added because this accumulator was
+measured climbing UNBOUNDED without a cap (0.0005 -> 163+ in an
+earlier unsafe-pocket run). So "saturating at exactly 100.00" (seen
+in v12b and v13b's v_proj/o_proj/input_proj) is this project's own
+circuit-breaker catching what would otherwise be unbounded v_t growth
+-- same functional consequence either way: effective per-synapse LR
+collapses toward zero.
+
+Web-researched the optimizer literature's own answer to this (not
+just the continual-learning literature already used for L2 Init/
+Continual Backprop): **AdaBelief** (Zhuang et al. 2020) replaces
+`v_t=g_t^2`-EMA with `(g_t - m_t)^2`-EMA (squared deviation from the
+gradient's own recent EMA `m_t`) -- a large but CONSISTENT gradient
+keeps the accumulator small and the step size large; only a large AND
+SURPRISING gradient throttles it. Maps closely onto this project's own
+"Critical flaw found" reasoning (a column with real, sustained error
+signal has ci grow BECAUSE it's stuck -- a self-sustaining bad
+equilibrium a raw-g^2 accumulator can't see past). AMSGrad fixes the
+opposite problem (v_t shrinking too fast); Adafactor pairs its second
+moment with explicit update clipping + a beta2 schedule instead of
+changing the moment formula.
+
+**Ruled out, direct instruction**: "we can't add any more optimizer
+bytes into the weights, so those would have to stay rmsprop." AdaBelief
+needs a THIRD per-synapse accumulator (`m_t`) alongside the existing
+`weight`/`ci` pair -- an extra per-synapse float this project's
+compute/bandwidth-bound scattered-CSR design can't absorb
+(`project_sili_sparsity_deployment_target`,
+`project_sili_optimal_hardware_vision`). The per-synapse ci mechanism
+stays exactly the current single-state RMSprop policy; AdaBelief is
+not being built in this form.
+
+**New open TODO, direct instruction ("I also would like the clipping
+fixed, so maybe make that a todo item")**: found while investigating --
+`clip_grad_norm_` in `train_mqar_curriculum.py` only covers
+`model.parameters_for_optimizer()` (LayerNorm-gain/centers/sigmas).
+The actual per-synapse gradients feeding `update_ci` for q/k/v/o/
+input_proj/lm_head -- the ones actually driving the saturation under
+investigation -- are NEVER clipped before being squared into the ci
+EMA, unlike standard Adam/RMSprop practice (clip before squaring, so a
+transient outlier gradient spike doesn't get permanently baked into a
+slow beta2=0.999 EMA). Confirmed via grep: no equivalent exists
+anywhere in the C++ per-synapse backward/update path. NOT YET
+IMPLEMENTED -- recorded as an open item in
+`docs/research/toy_tile_recurrence_rmt.rst:col_importance_is_rmsprop_v_t`,
+needs its own design pass (clip placement, threshold/schedule, global
+vs per-layer/per-column, TDD scattered+block4 parity) before touching
+sili__new.
+
+## 2026-09-24 -- max_abs_grad built and TDD-tested in sili__new; a
+## real process correction on what "RED" should actually mean
+
+Direct instruction: "I think we should actually fix the clip grad norm
+thing first, and use a test in sili to demonstrate its importance...
+it seems like it could be a unit test that completes in a few
+milliseconds rather than an integration test."
+
+First attempt wrote a test for the new `max_abs_grad` parameter,
+confirmed it failed to compile without the header change, and treated
+that as RED. Direct correction: "Wow that's not the failure I'm
+talking about. The stuff in all the research papers about unclipped
+grad causing issues, _that_ is what should be tested, _not_ a missing
+parameter." Right call -- a missing-parameter compile error proves
+nothing about whether the actual bug (heavy-tailed gradient spikes
+poisoning `ci`) is real in this codebase.
+
+Fixed properly: rewrote the test file so the PROBLEM test calls ONLY
+`update_ci`'s pre-existing 6-argument signature, then verified it
+standalone (a throwaway `g++` compile against the header with the
+header fix `git stash`ed out) before touching anything else. Result
+against TODAY's completely unmodified formula:
+
+```
+ci_start=0.000453 ci_baseline=0.000905 ci_spiked=1.949572 ratio=2155.0
+predicted ci_spiked=1.949618 (analytic decay formula)
+PROBLEM TEST PASSED: unclipped g=50 spike poisons ci by 2155.0x after 249 steps
+```
+
+A single g=50 spike (matching Zhang et al. 2020's finding that
+attention architectures produce heavy-tailed gradient noise
+independent of input data) poisons `ci` by 2155x relative to a
+no-spike baseline, 249 steps later -- matching the analytic prediction
+(`2.5*0.999^249` decay of the injected excess) almost exactly. Then
+confirmed the fix resolves it, same standalone-probe discipline:
+clipping to `max_abs_grad=1.0` leaves `ci` at only 1.86x baseline for
+the identical spike.
+
+Implemented `max_abs_grad` on `update_ci` (`PlainRMSpropSynapsePolicy`
++ `BoundedRMSpropSynapsePolicy`, scalar + `Block4Vec`) in sili__new,
+default `1e30` (true no-op, every existing call site stays
+bit-identical) -- full 182-test sili__new regression passes clean.
+Committed and pushed to sili__new
+(`feature/dy-external-gate-hook`, commit a82a5d2). Full design writeup
+in sili__new's
+`docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip`.
+
+Not yet done: threading `max_abs_grad` up through `cpu_backend.cpp`'s
+bindings, `sili/sparse_rnn.py`, and this project's
+`train_mqar_curriculum.py` `synapse_kwargs` -- the engine primitive
+exists and is tested, but no real training run has used it yet.
+
+## 2026-09-23 -- v12b (QK-Norm, seed=1001) finished: did NOT replicate
+## v12's GRADUATED result -- stalled at vocab=64/k=2 for ~90k steps
+
+Ran the full 100,000 steps (11694s, 8.55 steps/sec). Raw facts, no
+spin:
+
+- FINAL: final_vocab=64, final_k=2, final_phase=kcycle -- did NOT
+  graduate.
+- PEAK: peak_vocab=64, peak_k=2 (peak == final).
+- STAGE_HISTORY: 4 level-ups, all within the first 10,168 steps (868 /
+  5053 / 5635 / 10168), then flat for the remaining ~89,832 steps.
+- This is a real, direct contradiction of v12's own result under the
+  same config -- v12 (seed=1000) reached GRADUATED (vocab=126, k=4) by
+  step 15143; v12b (seed=1001) got stuck at (64,2) and never moved
+  again for the rest of the run. Exactly the scenario
+  `feedback_statistical_power_not_seeding` warns about: a single
+  striking seed is not evidence the mechanism reliably works.
+
+Deviation-std check, same analysis as v10/v12/v11:
+
+```
+q_proj: std 0.596/0.430/0.272   col_importance final: mean=7.69  max=71.87  min=0.25
+k_proj: std 0.606/0.244/0.244   col_importance final: mean=4.70  max=78.35  min=0.50
+v_proj: std 0.692/0.245/0.068   col_importance final: mean=100.00 max=100.00 min=100.00
+input_proj: std 0.731/0.437/0.347   col_importance final: mean=100.00 max=100.00 min=100.00
+o_proj: std 0.603/0.257/0.216   col_importance final: mean=100.00 max=100.00 min=100.00
+lm_head: std 0.695/0.645/0.572   col_importance final: mean=0.11  max=0.21  min=0.08
+```
+
+q_proj/k_proj again do NOT collapse to v10's ~0.004 (QK-Norm still
+avoids that specific signature under this seed too) -- but v_proj/
+o_proj/input_proj are now FULLY saturated (`min=max=mean=100.00`
+exactly), a DIFFERENT saturation pattern than v10 ever showed (v10's
+saturation was concentrated in q/k specifically). Raw, unexplained
+observation: QK-Norm removing q/k's own collapse does not appear to
+prevent saturation from showing up elsewhere -- whether that's the
+actual cause of this run's stall is not established, just noted
+honestly rather than assumed.
+
+Net: v12's GRADUATED result does NOT replicate under a different seed.
+Two real data points now exist for `qk_norm_enable` -- one excellent
+(v12), one mediocre and stalled (v12b) -- not yet enough to call this
+mechanism reliable or unreliable. No keep/prune verdict; more seeds
+would be needed to say anything stronger.
+
+## 2026-09-24 -- max_abs_grad threaded through to real training; v14
+## result: fixes the literal ci=100 saturation, but curriculum
+## progress got WORSE, not better
+
+Direct instruction: "Let's set a default, thread it through, and then
+run a real mqar run with it, v14. After that, we can get back to the
+adabelief-style work." Threaded `max_abs_grad` through
+`cpu_backend.cpp`'s `DISLDOLayerV` bindings (new
+`kSynapsePolicyMaxAbsGrad = 8.0f`, data-derived from v13's own
+recorded gradient-scale distribution, joining `max_ci`/`max_abs_delta`
+as a third always-on safety clamp), `sili/sparse_rnn.py`'s
+`DISLDOLayer32.forward`, and `NOCAPS_KWARGS_FP32` in
+`train_mqar_curriculum.py` (active by default for every fp32 run now,
+not a launcher-only flag). Caught two test-local mock SynapsePolicy
+stand-ins that needed the new param too (real compile failure, not
+missed) -- full 182-test C++ + 431-test Python regression clean. Full
+details in sili__new's
+`docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip`.
+
+`v14` ran the identical config to v13b (`qkvo_norm_enable=True`,
+`seed=1001`, the harder seed where v13b's v_proj/o_proj/input_proj
+saturation recurred), now with grad clipping active by default too.
+
+- FINAL: final_vocab=126, final_k=2 -- did NOT reach (126,3) like
+  v13b did, let alone GRADUATED. WORSE than v13b on the same seed.
+- STAGE_HISTORY: 6 level-ups, last at step 11154, then flat for the
+  remaining ~88,850 steps.
+
+Deviation-std + col_importance check, same analysis:
+
+```
+q_proj: std 0.543/0.459/0.352   col_importance final: mean=0.06  max=0.37  min=0.03
+k_proj: std 0.672/0.108/0.259   col_importance final: mean=0.10  max=0.45  min=0.06
+v_proj: std 0.675/0.599/0.539   col_importance final: mean=44.03 max=47.12 min=38.82
+input_proj: std 0.705/0.735/0.577   col_importance final: mean=64.00 max=64.01 min=63.98
+o_proj: std 0.663/0.577/0.535   col_importance final: mean=65.01 max=82.64 min=39.52
+lm_head: std 0.686/0.695/0.630   col_importance final: mean=0.11  max=0.15  min=0.08
+```
+
+Genuinely nuanced result, not a clean win or loss: grad clipping DID
+do what it was built to do -- v_proj/o_proj/input_proj are no longer
+pinned at the hard `min=max=mean=100.00` ceiling v13b showed (now
+38-83, real spread, especially o_proj). The literal saturation
+mechanism this whole investigation started from is gone. But the
+curriculum outcome got WORSE anyway -- fewer level-ups, stalled
+earlier than v13b did. Working hypothesis, not verified: `max_abs_grad
+=8.0` was calibrated from v13's POOLED gradient-scale distribution
+across all 6 pools, dominated by q/k's own (now much lower,
+mean~0.06-0.10) scale -- v/o/input_proj may have a genuinely higher
+natural gradient scale that a single global constant serves poorly,
+clipping USEFUL large updates for those layers along with the harmful
+outlier spikes. A per-layer or per-column threshold (rather than one
+global constant) may be needed -- directly motivates the per-column
+AdaBelief-style work already planned as the next step, rather than
+resolving the need for it.
+
+No keep/prune verdict on `max_abs_grad` as currently calibrated. The
+mechanism itself (proven in isolation via the unit test) works exactly
+as designed; whether a single global threshold is the right shape for
+a model with layers at very different natural gradient scales is now
+a real, evidenced open question, not a hypothetical one.
+
+## 2026-09-25 -- AdaBelief-style row/column centering built, threaded
+## through, v15 (column-only) + v16 (row+column) launched
+
+sili__new side (separate repo, `feature/dy-external-gate-hook`,
+commits `f8ef337`/`cb111ff`): built the per-column AdaBelief-style
+centering work v14's result motivated. `update_ci` gains a trailing
+`m` parameter (default 0, true no-op); centers via
+`residual = clip(g - m, ...)` instead of `clip(g, ...)`. New
+`FirstMomentTracker<VALUE_TYPE>` tracks an ADDITIVE row+column baseline
+`m[i,j] = m_row[i] + m_col[j]`, each axis an independent EMA of signed
+`g` -- chosen over Adafactor's multiplicative row/column
+reconstruction after catching, before implementing, that its
+I-divergence optimality only holds for a nonnegative target (`g^2`),
+not the signed `g` this project needs. Found and fixed a real
+double-counting bug via an end-to-end smoke test (not caught by unit
+tests alone): fitting each axis to raw `g` independently made
+`m_row+m_col` overshoot toward `2g` instead of `g` under confounded
+row/column effects (constant x/dy across a layer) -- fixed by having
+each axis fit the residual against the OTHER axis's OLD (pre-this-
+touch) value instead. Verified: row+column mean importance went from
+16.8844 (buggy, barely different from no-centering's 16.9364) to
+0.4407 (fixed, on par with column-only's 0.5327). 191/191 C++ tests +
+198 pytest pass. Full derivation in sili__new's
+`docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering`.
+
+Threaded through: `sili/sparse_rnn.py`'s `DISLDOLayer32.forward` gets
+`centering_row_enable`/`centering_col_enable`/`centering_beta1` kwargs
+(same `float | None = None` opt-in pattern as `max_abs_grad`). This
+repo's `train_mqar_curriculum.py` gets the same 3 params on
+`train_curriculum`, merged into `synapse_kwargs` (and thus reaching
+every layer via `self.synapse_kwargs`, same broadcast mechanism
+`NOCAPS_KWARGS_FP32` already uses) only when explicitly set -- default
+behavior byte-identical.
+
+`v15`/`v16`: same base config as v14 (`qkvo_norm_enable=True`,
+`seed=1001`, the harder seed), `max_abs_grad=8.0` still active by
+default (complementary to centering, not replaced by it -- clipping
+defends a one-off spike, centering defends a sustained one). Both
+smoke-tested at 150 steps before queuing (finite output, plausible
+steps/sec ~13, no exceptions).
+
+- **v15** (`launch_dense_lr_unscaled_plasticity_reset_v15_qkvo_norm_
+  centering_col.py`): `centering_col_enable=True` only.
+- **v16** (`launch_dense_lr_unscaled_plasticity_reset_v16_qkvo_norm_
+  centering_rowcol.py`): `centering_row_enable=True` AND
+  `centering_col_enable=True`.
+
+Both launched as real 100k-step background runs, logging to
+`logs/dense_lr_unscaled_plasticity_reset_v15_qkvo_norm_centering_col.log`
+and `logs/dense_lr_unscaled_plasticity_reset_v16_qkvo_norm_centering_
+rowcol.log` respectively, plus their own
+`plasticity_column_snapshots/` directories for post-hoc deviation-std
+verification. Direct instruction: "Yep. As usual, please thread it
+through and then launch v15 and v16." Results not yet in -- no
+keep/prune verdict yet, per usual discipline.
+
+## 2026-09-28 -- v15 GRADUATED, v15b/v15c/v16 all stalled; deep
+## statistical pass on all 7 runs; CiRenorm built and launched as v17/v18
+
+**v15 result**: GRADUATED at step 15063, `final_vocab=126 final_k=4`,
+8 level-ups -- clearly better than every other arm in this
+investigation (v14 stalled at (126,2), v16 at (126,3)).
+
+**Verification runs, direct instruction ("launch v15 again to
+verify" then "launch a new seed v15 too for v15c")**: `v15b` (identical
+config+seed=1001, checking this project's own documented multi-threaded
+backward nondeterminism) and `v15c` (seed=1000, checking generalization
+across seeds) both launched, smoke-tested, committed. Neither
+reproduced v15's graduation -- both stalled at `(126,3)`, matching v16.
+v15's graduation did not replicate on either axis tested.
+
+**Deep statistical pass** across all 7 same-family runs (v13/v13b/v14/
+v15/v15b/v15c/v16, 84,121 per-layer-per-cycle snapshots extracted from
+`plasticity_column_snapshots/`) plus targeted literature research (see
+sili__new's own `docs/research/delta_csr_types.rst:synapse_policy.
+ci_renorm` for the full writeup). Key findings, stated as descriptive
+patterns (n=3 graduated vs n=6 stalled is too small for a valid
+significance test -- permutation tests need ~10+/group to reach
+p<0.05 at all):
+
+- Graduated runs keep `v_proj`/`o_proj`/`input_proj`'s AVERAGE `ci` low
+  (medians ~0.1-1.5); every stalled run's average `ci` in those layers
+  climbs toward `max_ci=100` and NEVER recovers spontaneously within
+  100k steps (checked explicitly across all 5 stalled runs -- zero
+  "slingshot"-style plateau exits).
+- Direct instruction after this finding: "the average ci of a layer is
+  literally inversely proportional to the average plasticity of that
+  layer... importance was not a misnomer" -- this rules OUT the
+  per-neuron plasticity_reset mechanism's own reset-to-random-weights
+  action as a fix (the highest-ci columns are genuinely the most
+  important ones; resetting them is real information loss, not a
+  repair). Direct instruction: "Plasticity reset fraction should be
+  removed entirely" (not yet removed from the codebase this session --
+  `reset_fraction=0.0` was already a documented no-op in every v13-v16
+  launcher; actual removal is a separate follow-up).
+
+**CiRenorm built** (sili__new side, commits `6f05ed4`/`7b517b8`): a NEW
+mechanism that RESCALES a layer's real per-synapse `ci` back toward a
+healthy region (never resets/prunes any synapse, preserves relative
+ranking). Two arms tried per direct instruction ("try that, but also
+just try a method that regularly forces the column/layer importance
+average to be in the stable region... stable average and variance
+too... then run both"):
+
+- **TrustRatio**: LAMB-inspired (You et al. 2019) multiplicative
+  rescale toward a target ci implied by each column's own weight norm
+  -- self-calibrating, no manual targets needed.
+- **StableRegion**: affine (z-score) renormalize toward per-layer
+  `(mean, std)` targets pulled directly from v13/v15's own real
+  recorded data.
+
+Found and fixed 4 real bugs during the build (full details in
+sili__new's RST doc): a cursor-resume bug in the pre-existing amortized
+traversal pattern (unconditional `elem_pos` reset double-touches
+cells), a circularity bug in TrustRatio's first formula (estimating `g`
+from `ci` while dividing by `ci` cancels out), a stale-reference
+convergence bug (accumulating stats from the pre- instead of
+post-correction value made corrections collapse toward 0 instead of
+converging -- found via an end-to-end smoke test), and a missing-
+equilibrium bug in TrustRatio (a raw per-touch scale has no fixed
+point, causing geometric decay -- also found via the smoke test).
+211/211 C++ tests pass.
+
+**Threaded through** (this repo): `model/toy_tile_recurrence_rmt.py`
+gets `apply_ci_renorm(touch_fraction, mode, eff_lr, ...)`, iterating
+every real layer, using empirically-derived per-layer stable-region
+targets for `q_proj`/`k_proj`/`v_proj`/`input_proj`/`o_proj`/`lm_head`.
+`train_mqar_curriculum.py` gets `ci_renorm_enable: str = "off"` (|
+"trust_ratio" | "stable_region") plus the usual touch_fraction/chunk
+knobs, called once per real query step. Both modes smoke-tested at 150
+steps; full 431-test pytest regression clean.
+
+**v17/v18 launched**: v14's base config (`qkvo_norm_enable=True`,
+`seed=1001`, `max_abs_grad=8.0` default), deliberately WITHOUT
+centering -- isolates CiRenorm's own contribution against the same
+baseline v15/v16 were compared to, rather than confounding it with
+centering's already-inconclusive effect ("do science correctly":
+enumerate every difference before an A/B). v17 = `ci_renorm_enable=
+"trust_ratio"`, v18 = `ci_renorm_enable="stable_region"`. Both
+smoke-tested at 150 steps before queuing. Results not yet in -- no
+keep/prune verdict.
+
+## 2026-09-30 -- v17/v18 results: TrustRatio worse than baseline,
+## StableRegion graduates 2/3 -- but reveals a new weight-runaway
+## failure mode; WeightRenorm built and launched as v19
+
+**v17 (TrustRatio)**: did NOT graduate, worse than v14's own no-
+CiRenorm baseline -- `final_vocab=64 final_k=2`, peak (64,2), stalled
+at step 4537. **v18 (StableRegion)**: GRADUATED at step 14972,
+`final_vocab=126 final_k=4`, matching v15's own graduation almost
+exactly.
+
+Direct question after this split result: "I'm pretty sure it's
+specifically StableRegion that is mathematically enforcing plasticity,
+not TrustRatio... math can be cyclic or miss the point while looking
+smart." Confirmed by tracing the actual math: TrustRatio's "implied
+target ci" (`(w_norm/eff_lr)^2`) is derived from the column's OWN
+current weight norm -- for exactly the failure mode this was meant to
+fix (a column whose weight has been pushed far by sustained large
+gradient), that derivation gives the MOST-in-need-of-correction
+columns the LEAST correction, since their own already-large weight
+norm inflates their own "acceptable" target right along with it.
+StableRegion's target is externally anchored to real historical data,
+immune to this. LAMB's own math is sound for what LAMB does (bounding
+per-layer update instability); the mistake was treating "trust_ratio=1"
+as "this ci is healthy" when the paper's derivation never claimed
+that.
+
+**v18 replication, direct instruction ("Yep, launch the repeat
+runs.")**: `v18b` (seed=1001 repeat) stalled at `(64,3)`. `v18c`
+(seed=1000, new seed) GRADUATED at `(126,4)`, matching v18. 2 of 3
+StableRegion runs graduated (a better hit rate than centering's
+1-of-3), but v18b's failure needed explaining.
+
+**Deep dive into v18/v18b/v18c's own recorded `raw_importance`/
+`raw_weight` matrices** (not just the smoothed `col_importance` copy)
+found something new: CiRenorm was correctly holding `ci` near the
+StableRegion target in ALL THREE runs, including the stalled v18b --
+the mechanism itself worked as designed. But v18b's `v_proj`/
+`o_proj`/`input_proj` weight norm was left completely unconstrained
+and ran away: bucketed every 5000 steps, `v_proj`'s weight norm climbs
+smoothly from ~17 (matching v18/v18c's own healthy range) to 360 by
+step 95000 -- a genuine, continuously-compounding positive-feedback
+loop, not a step-change. v18c showed the SAME direction of drift, far
+more gently (17.0 -> 18.0 over 40000 steps). Mechanism: pinning `ci`
+to a fixed target while the layer's true gradient magnitude
+legitimately grows (this investigation's own recurring finding) keeps
+the effective step large, letting weight grow faster than warranted,
+which drives larger downstream gradients the fixed `ci` target still
+won't track. Matched-pair analysis (v18 vs v18b, same seed) found
+real `ci` divergence as early as step 5000-8000 -- well before the
+runaway was visible in absolute weight-norm terms -- consistent with
+the same early threading-order sensitivity flagged throughout this
+whole investigation, amplified by this newly-identified feedback loop.
+
+**WeightRenorm built** (sili__new commits `26875f3`/`7ef756a`), direct
+instruction: "I guess we have to do a weight renorm in addition to the
+ci renorm. Exact same method would probably be fine." Reuses
+CiRenorm's own tested arithmetic verbatim (not duplicated) -- only
+change needed was a `clamp_nonnegative` parameter (weight is signed,
+unlike ci). Only StableRegion is meaningful for weight (TrustRatio's
+formula is derived FROM weight norm, so applying it to weight would be
+circular). Targets: empirical per-column weight std from v18/v18c's
+own healthy early-training data (mean~=0 everywhere; std ~0.059 for
+q/k/v/o_proj, ~0.16 for input_proj/lm_head). 218/218 C++ tests pass.
+
+**Threaded through** (this repo): `apply_weight_renorm` (model/
+toy_tile_recurrence_rmt.py) mirrors `apply_ci_renorm` exactly.
+`train_mqar_curriculum.py` gets `weight_renorm_enable: str = "off" |
+"stable_region"`. Smoke-tested combined with `ci_renorm_enable=
+"stable_region"`; full 431-test pytest regression clean.
+
+**v19 launched**: v18's own config (`ci_renorm_enable="stable_region"`)
+PLUS `weight_renorm_enable="stable_region"` -- does constraining weight
+alongside ci prevent the runaway that doomed v18b. Results not yet in
+-- no keep/prune verdict.
+
+## 2026-09-30 -- v19 family results: WeightRenorm fixes the weight
+## runaway, but doesn't fix the actual stall; found the real mechanism
+## (a sharp post-transition bifurcation, not gradual chaos); energy
+## gating launched as v21/v22
+
+**v19 GRADUATED** (126,4). **v19b** (same-seed repeat) stalled at
+(126,3) -- but critically, its weight norm stayed flat (~17) the whole
+run, unlike v18b's own 17->360 runaway. **v19c** (new seed) also
+stalled, at (126,2). So WeightRenorm did fix the specific failure mode
+it targeted (confirmed: weight bounded in all 3 v19-family runs) --
+but 2 of 3 still stalled anyway.
+
+**Real mechanism found, not "threading noise"** -- direct correction:
+"if you roll three dice, you can't blame the fact that two of them
+fell on the floor on the fact that there were three dice." Threading
+is only the SOURCE of the tiny perturbation, not an explanation for
+why the system is sensitive to it. Checked v19b/v19c's own loss/acc
+right at their last level-up: loss does NOT drift, it SPIKES sharply
+within 50-250 steps of the transition, then LOCKS FLAT at an elevated
+plateau for the remaining 90k+ steps (v19b: loss 2.68->4.38 at step
+9201->9250, then holds 3.8-4.7 to step 100000; v19c: loss 2.81->5.44
+at step 7250->7500, holds 4.4-4.7). v19's own successful transitions
+show the same initial dip, but RECOVER within ~1000-1500 steps. So the
+real question is a bifurcation right AT each curriculum transition --
+recover, or fall into a different, stable-but-bad attractor -- not
+gradual divergence. Checked Q/K spectral norm as a candidate
+distinguishing factor at the fork point: ruled out directly, nearly
+identical (~14.6-14.8) in all three runs regardless of outcome.
+
+**Energy gating proposed and built** -- direct instruction: "The
+energy system is exactly the thing that is meant to escape stable
+attractors... We have a more advanced energy system here, and
+applying it could help, but we'd need to be careful to tune it."
+Researched `sili/energy.py`'s `EnergyDynamics`: per-neuron energy
+accumulates via `drive - activation_cost*|h| + noise`; crossing +2.0
+forces a fire (real perturbation, not a soft nudge), crossing -2.0
+shuts off. Applied to "embed_input"/"state" (what the dense layers
+*see*, not weights/ci -- a different lever from CiRenorm/WeightRenorm).
+The one prior negative result in this project (wide288 sparse arm,
+`r_target_min=0.5`) doesn't transfer: that used nucleus top-k sparse
+selection where firing naturally rotates every step, so "hasn't fired
+in N steps" was never a real pathology signal there. This whole
+v13-v22 family is `dense=True` -- no organic rotation -- much closer
+to the original zero-init/pathological-attractor-escape scenario
+energy was built and validated against.
+
+**v21** (`wake_gate_steps=2500`, drive calibrated from a probe that
+turned out NOT to have CiRenorm/WeightRenorm active -- a minor
+calibration gap, not corrected since it was already running): launched
+on v19's config + energy.
+
+**Direct correction on v21's own design**: "there shouldn't really
+even be a 'wake gate steps' per the original design... It should
+ideally work without wake gate and do little during healthy regions
+but provide escape energy in the stable attractor region if tuned
+right." Verified via a real ~20000-step probe (seed=1001, plain
+`qkvo_norm_enable=True`, which itself stalled at vocab=32/k=1 by step
+2500): without `wake_gate_steps`, EVERY neuron accumulates energy
+EVERY step continuously (confirmed by reading `_apply_energy_dynamics`
+directly -- `stale` is all-True when `wake_gate_steps=None`, no
+"frozen/awake" state exists at all). Measured real `|h|` in healthy vs
+stuck windows: `state` drops 0.32->0.25 (mostly separable across
+500-call rolling windows, only 6.7% of healthy windows dip as low as
+the stuck median); `embed_input` drops 0.087->0.050 and goes nearly
+FROZEN once stuck (0.049-0.051, barely varying) -- a genuine
+degenerate-representation signature. Under a drive calibrated neutral
+for the healthy regime, the stuck regime shows real positive drift
+(~1061/~2165 steps to forced-fire for state/embed_input) -- a
+non-tautological, data-verified finding that the pure continuous
+mechanism has real signal to exploit without an artificial gate.
+
+**v22** (no `wake_gate_steps`, drive re-measured under the ACTUAL v19
+stack this time: state=0.342 (drive=0.0171), embed_input=0.094
+(drive=0.0047), activation_cost=0.05 kept from the existing validated
+config): launched as the "without wake gate" comparison v21 needed.
+Both v21 and v22 smoke-tested before launch. Results not yet in -- no
+keep/prune verdict, and per direct instruction this "may take a few
+attempts to tune right."
+
+## 2026-09-29 -- v21/v22 results, and the real answer to "how much escape
+heat does the energy mechanism actually provide"
+
+**v21 (wake_gate_steps=2500) result**: final/peak vocab=16, k=3 --
+the WORST result in the entire investigation, never reaching vocab=32.
+Only one level-up ever (step 6967, k2->k3), then flat for the remaining
+~93000 steps. Same sharp-spike-then-lock signature as every other stall
+(loss 2.26->3.82 within ~33 steps at the step 6967->7000 boundary).
+
+**v22 (no wake_gate_steps) result**: final/peak vocab=32, k=3 -- a real
+stall, meaningfully better than v21. Stage history: 16k2->16k3 (step
+1278), 16k3->32k2 (step 4172), 32k2->32k3 (step 7724), then flat for
+the remaining ~92000 steps.
+
+**CORRECTION (caught re-checking the raw STAGE_HISTORY, not from a new
+run)**: the "matching v19b/v19c's stall level" claim above was wrong --
+v19b/v19c's real stage histories show they cleared the ENTIRE
+vocab-doubling curriculum fast (16->32->64->126, all within ~9200
+steps) and only stalled on the FINAL k-increment at the vocab CEILING
+(v19b: stuck at vocab=126/k=3 from step 9201; v19c: stuck at
+vocab=126/k=2 from step 5097) -- a k-cycle stall at the top of the
+curriculum, not a vocab-doubling stall. v21 (stuck at vocab=16) and v22
+(stuck at vocab=32) never even reached vocab=64, let alone the 126
+ceiling -- this is an earlier and more severe stall than either
+pre-energy baseline failure, not a comparable one. The pure energy
+mechanism, even in its best (no-gate) form tested so far, is currently
+making curriculum progress WORSE than the CiRenorm+WeightRenorm+
+plasticity_reset baseline (v19), not neutral.
+
+**Why v21 underperformed v22 -- found via direct measurement, not
+inference**: an instrumented probe (mirroring v21's config exactly,
+`wake_gate_steps=2500`, corrected drive) initially showed
+`frac_at_fire=0.000000` in every measured window, healthy or stuck --
+looked like the forced-fire mechanism never engages at all. This was a
+measurement artifact: a firing neuron's energy is drained by
+`2*activation_cost` (=0.1) *within the same call* that fires it, so a
+post-call read can never catch a neuron mid-fire (`energy_max` sitting
+at a suspicious, constant ~1.97-1.99 in every window, even "healthy",
+was the tell). Rebuilt the probe to recompute the PRE-drain energy
+directly from `h`/`drive`/`activation_cost` for every call (ignoring
+the exploration-noise term, std<=0.001, ~100x smaller than the 0.1
+drain gap being detected -- negligible for this purpose) and reran on a
+real ~16000-step trajectory (same seed=1001, full v19+v21-style stack).
+
+Real fire/shutoff rates, over 407222 calls:
+```
+state:        frac_would_fire  mean=0.000313  (any-fire in 68.2% of calls)
+              frac_would_shutoff mean=0.075677 (any-shutoff in 99.9% of calls)
+embed_input:  frac_would_fire  mean=0.000185  (any-fire in 10.0% of calls)
+              frac_would_shutoff mean=0.203848 (any-shutoff in 99.7% of calls)
+```
+Firing IS real (not zero), but it is a near-constant, minuscule trickle
+-- ~0.03% of state neurons and ~0.02% of embed_input neurons cross the
++2.0 threshold per call, essentially always a handful of neurons out of
+the whole layer, never a meaningful collective perturbation. Checked
+for a ramp-up/burst around each of the 3 level-up transitions and
+across early/mid/late thirds of the run: NO spike anywhere -- the fire
+rate is flat (~0.03%/0.02%) throughout, whether the model is smoothly
+progressing or approaching a curriculum transition. The mechanism does
+not "sense" difficulty and escalate; it's a constant, tiny, unconditional
+trickle by construction.
+
+Meanwhile SHUTOFF dominates completely: 7.6% of state neurons and 20.4%
+of embed_input neurons are in continuous shutoff (energy<=-2.0) at any
+given moment, present in essentially every single call. The realized
+dynamics are overwhelmingly silencing-biased, not escape-biased --
+this asymmetry falls directly out of calibrating `drive` to be
+"neutral" (zero average energy drift) in the healthy |h| regime: by
+construction only the extreme right tail of the |h| distribution ever
+pushes a neuron up to +2.0, while the much fatter low-|h| tail
+routinely pushes neurons down to -2.0.
+
+**This explains the v21-vs-v22 gap directly**: v21's `wake_gate_steps=2500`
+completely freezes "awake" (recently-fired) neurons out of ALL energy
+dynamics -- fire, shutoff, drive, noise, all of it -- until they go
+stale. Since real fire activity only ever touches ~0.03% of neurons per
+call to begin with, gating the awake majority out of that already-tiny
+trickle removes most of what little escape pressure exists, with no
+compensating benefit. v22 (no gate) lets the same tiny trickle reach
+every neuron continuously, and reached the same stall level as the
+ungated (no-energy) v19 baseline instead of regressing below it.
+
+**Direct answer to "how deep was the basin, and what temperature would
+be needed to escape it"**: at the current "neutral-on-average"
+calibration (`drive = activation_cost * E[|h|]`), the mechanism
+structurally cannot generate more than a trace amount of escape
+pressure -- neutral-by-construction means only the rarest tail events
+ever reach the fire threshold. Nothing observed (flat fire rate across
+transitions, no burst response to being near a curriculum boundary)
+suggests the current calibration is anywhere close to hot enough to
+reliably escape a stable-but-wrong basin. Raising the temperature would
+require a deliberate net-positive drive bias (not neutral) and/or a
+materially larger `exploration` (noise) term than the current 0.001 --
+both untested at this point. No keep/prune verdict offered; this is the
+diagnostic groundwork for deciding whether to try a hotter-calibrated
+v23, not a recommendation itself.
+
+## 2026-09-29 -- deferred idea: loss-adaptive L1_SPARSITY_COEF
+
+Direct suggestion, deferred to a note rather than built now: could
+`L1_SPARSITY_COEF` (currently a fixed 0.05, silently active on all 5
+wide layers in every run since before this v13-v23/G series began)
+be tuned dynamically based on current loss, rather than fixed?
+
+Relevant given today's finding: L1's gradient contribution is a
+FIXED-magnitude nudge (coef*sign(w)), independent of task-gradient
+scale -- and real measured task gradients here run 0.79-3923 (healthy)
+to 32-204,300 (stuck), routinely 4-5 orders of magnitude past the
+0.05 threshold, making L1 structurally near-inert at this task's real
+gradient scale regardless of regime (see today's entry above; v11's
+qk_l1_sparsity_coef=0.05 still hit a real 76k-step stall). A
+loss-adaptive coefficient (e.g. scaling with a measured/EMA'd gradient
+or loss magnitude, similar in spirit to the two-timescale EMA idea
+explored for grad-selection fairness) could keep L1 in the regime
+where it actually competes with the task gradient instead of being
+permanently negligible. Not scoped or built -- flagging for later.
+
+## 2026-09-30 -- literature check: is rank collapse pathological, and are
+we near the research frontier on plasticity?
+
+Direct question after finding lm_head's raw_weight effective rank
+(participation ratio) collapsing over extended plateau training
+(Arm G/Arm G+H/v19c comparison, prior entry) -- is this generalization,
+or a recognized, actively-researched failure mode?
+
+**Rank collapse in transformers**: "From Condensation to Rank Collapse:
+A Two-Stage Analysis of Transformer Training Dynamics" (NeurIPS 2025,
+arXiv:2510.06954) -- training has a natural early "condensation" phase
+(V matrix converges row-wise toward target orientation, healthy) then a
+later phase where Q/K matrices "begin to actively participate...
+driving their collapse" once other params reach quasi-steady-state.
+
+**Spectral collapse IS a recognized causal driver of plasticity loss**,
+not just correlation, per a 2025 cluster:
+- "Learning Continually by Spectral Regularization" (Lewandowski et al.,
+  ICLR 2025) -- regularizes to preserve initialization's singular-value
+  structure throughout training; sustains trainability across
+  architectures in continual settings. Judged likely too EXPENSIVE for
+  practical use here (real singular-value tracking every step) --
+  informative reference, not a near-term implementation target.
+- "Spectral Collapse Drives Loss of Plasticity in Deep Continual
+  Learning" (arXiv:2509.22335)
+- "SingularClip: Preventing Spectral Collapse to Maintain Plasticity in
+  Continual and Reinforcement Learning" (arXiv:2608.18319)
+
+This independently corroborates our own empirical finding -- the
+lm_head rank collapse we measured is consistent with, not an artifact
+outside of, current research on this exact phenomenon.
+
+**Practical candidate: plain weight decay.** A 2025 paper found
+standard weight decay (not a custom mechanism) measurably improves
+language-model plasticity. The plasticity survey's own broader finding
+echoes this: general-purpose regularization from supervised learning
+tends to outperform domain-specific plasticity interventions -- a
+humbling data point given how much custom machinery (L1, energy-based
+selection/lr-scale) this investigation has built. Weight decay should
+be cheap to implement via the existing amortized-cursor infrastructure
+(same pattern as CiRenorm/WeightRenorm/L2 decay). Open question before
+implementing: does it compose with or fight CiRenorm/WeightRenorm's
+own mean/std-targeting (StableRegion pulls toward a nonzero target
+std, decay pulls magnitude toward zero) -- needs a mathematical check
+first, ablation/comparison second if the math doesn't resolve it
+cleanly. Not yet implemented.
+
+**Scale is not the answer.** "Can Scale Save Us From Plasticity Loss in
+Large Language Models?" (arXiv:2606.24752) tested 5M-314M-parameter
+GPT-style models: plasticity-loss onset follows a sublinear scaling
+law with model size -- larger models DELAY it, never eliminate it.
+This toy-scale investigation is studying a genuine, scale-independent
+open problem, not an artifact of under-scaling.
+
+Also referenced: "Plasticity Loss in Deep Reinforcement Learning: A
+Survey" (arXiv:2411.04832, ~50 methods taxonomized).
+
+## 2026-10-03 -- energy-driven "sleep" annealing: rank collapse here is
+purely directional, not magnitude-based, and a cheap existing mechanism
+(no new code) demonstrably reverses it, once pointed at the right axis
+
+**Starting question**: does EnergyDynamics' forced-firing/LRU mechanism
+(built for dead-neuron escape, see
+[[project_wide288_energy_rl_negative_result]]) already function as a
+plasticity-restoring "annealing" system for the lm_head rank collapse
+found in the v18-v24 series, either as currently deployed or in some
+other mode (e.g. a dedicated "sleep" phase, training on `aux_loss`
+alone)?
+
+**First-pass answer was wrong in both directions, corrected twice by
+direct user pushback (see 2026-10-03 session) before landing on the real
+answer:**
+
+1. Initial claim ("EnergyDynamics can't matter for rank, it only sees
+   magnitude, never correlation") was too absolute -- it conflated "is
+   the selector surgically correct" with "can noise injection help at
+   all." A forced, LRU-rotating activation pattern + real backward is
+   mechanistically closer to a stochastic noise regularizer (dropout-
+   family) than a precise correlation-targeting penalty -- it doesn't
+   need to identify which neurons are redundant to still decorrelate
+   them as a side effect of injected activity diversity.
+2. Correction of the correction: don't reach for the expensive, "correct
+   -looking" fix (a periodic pairwise-correlation-computing orthogonality
+   penalty) before checking whether the cheap hack already works. Direct
+   instruction: "Stop seeking out the most direct yet computationally
+   expensive solutions possible instead of the 'hacks' that could work
+   100x faster."
+
+**Real geometry of the collapse, measured directly from v24's own
+saved snapshots (step 48 vs step 99987, every wide layer)**: column norm
+coefficient-of-variation collapses to ~0 everywhere by mid-run (WeightRenorm
+enforces near-perfectly uniform column magnitude), zero near-zero columns
+at any point in any layer -- but mean pairwise |cosine similarity| between
+columns rises in lockstep with participation-ratio decline (lm_head:
+PR 33->6.4, cos 0.13->0.84; v_proj: PR 207->41, cos 0.047->0.41; o_proj:
+PR 207->28, cos 0.047->0.46; q/k_proj stay flat on both). **Rank collapse
+here is 100% directional (columns rotating into alignment), with zero
+shrinkage component** -- confirms there is nothing for a magnitude
+-triggered mechanism to select on by construction (WeightRenorm has
+already erased the one signal it depends on).
+
+**Cheap burst test, real data, zero new mechanism** (isolated
+`DISLDOLayer32`, v24's actual collapsed lm_head weight matrix loaded via
+`load_dense_values`, random input, task loss off, `EnergyDynamics.
+aux_loss` as the only backward signal):
+- First attempt used the mechanism's gentle `energy_loss`/`reactivity`
+  homeostatic term -- wrong lever. That term is tuned to coexist gently
+  alongside a real competing task gradient; with none present it just
+  chased its own setpoint mismatch and inflated magnitude (col norm
+  0.98->1.26) without touching correlation at all.
+- Correct lever: `fire_wake_gradient` (the mechanism's purpose-built
+  "guaranteed-magnitude gradient at forced-fire positions" knob,
+  per-neuron fixed random sign), `wake_gate_steps` OMITTED (continuous,
+  not staleness-gated), `decay`-stabilized, `WeightRenorm` running
+  CONCURRENTLY (per direct instruction -- cleanly separates the
+  magnitude axis, which WeightRenorm owns, from the directional axis,
+  which the forced-firing owns). With this combination: PR rises and
+  mean|cos| falls monotonically, column norm stays flat throughout --
+  clean, controlled, no runaway.
+- **The lever that actually matters is rotation rate (the `decay`
+  parameter, i.e. how fast a neuron's energy climbs back to the +2.0
+  fire threshold), not push magnitude** -- `fire_wake_gradient` swept
+  0.5/1.0/2.0 made almost no difference to the trajectory. Sweeping the
+  decay/rotation rate found a real sweet spot: faster rotation helps up
+  to a point (decay reaching ~95% of its target within ~2% of the
+  window length), but pushing faster still (0.5%, 1% of window) makes
+  the trajectory NOISY and NON-MONOTONIC and ends up WORSE, not better
+  -- a genuine ceiling on how hot this can run, not a monotonic
+  "more is better" knob.
+- At the sweet spot: lm_head's real PR went 6.36->27.16 over 60,000
+  steps, 6.36->29.18 over 130,000 steps (still rising, approaching but
+  not fully reaching the original healthy level of PR=33.45/cos=0.13
+  seen at step 48 of the real run) -- clean the whole way, zero
+  instability, magnitude held flat by WeightRenorm throughout. Full
+  recovery, at this rotation rate, costs on the order of 100k+ steps --
+  comparable to, not dramatically cheaper than, this project's own
+  measured real stall durations (>=53,882 steps) -- so this is a real,
+  substantial sleep phase, not a quick 500-step fix, though it costs
+  zero new engineering (100% already-built `EnergyDynamics`).
+
+**Direct caution from the user, not yet resolved, important for any
+write-up or relaunch**: some of the measured rank decline is plausibly
+real, USEFUL specialization from genuine training, not purely
+pathological redundancy -- the isolated burst test has no task loss at
+all, so it cannot distinguish "undoing harmful collapse" from "erasing
+specialization the task actually needed." This means "push decorrelation
+as far/fast as possible" is NOT established as correct; the right DOSE
+(how much sleep, how often, how hot) is an open calibration question,
+not something this isolated test can answer on its own -- only a real
+in-model test, measuring actual task performance before/after, can.
+
+**How to apply**: this closes the "do we have an annealing system for
+plasticity" question with a real, complete, three-part picture for any
+future summary: (1) magnitude regularization (WeightRenorm/CiRenorm,
+now l2_decay) is solved and validated; (2) directional/rank regularization
+has a working, cheap, zero-new-code candidate (energy-driven sleep,
+calibrated by rotation rate not push magnitude, run concurrently with
+WeightRenorm); (3) the correct DOSE of (2) is unresolved and may trade
+off against genuine specialization -- don't claim this is "solved" until
+a real in-model test (not an isolated single-layer burst) shows it
+helps actual task performance without hurting an already-healthy run.
+Next: wire an actual scheduled sleep phase into the real training loop
+and test it BOTH on a currently-stuck run (does it help escape) AND on
+a top performer like v24/armH (does "raises rank in isolation" actually
+translate to help, or does it hurt a run that's already working by
+disturbing useful, non-pathological correlation structure) -- explicit
+instruction that these may not generalize the same direction.
+
+## 2026-10-04 -- v25/v26 results: blind periodic sleep helps one, hurts
+the other; the real discriminator is intrinsic (q/k freeze), not rank
+
+**v25** (v19c's exact known-stuck config, seed=1000, + sleep every 5000
+steps for 500 steps): reached vocab=126/k=3 at step 17893 -- one level
+PAST where v19c itself ever got (permanently stuck at 126/k=2) -- then
+stuck at k=3 for the remaining ~82k steps.
+
+**v26** (v24's exact top-performer config, seed=1001, + same sleep
+schedule): reached vocab=126/k=2 at step 11021 -- nearly 2x SLOWER than
+v24's own 6230 -- and never progressed past k=2 for the remaining ~89k
+steps, far short of v24's own k=5. v26's trajectory is BYTE-IDENTICAL to
+v24's through step ~4717 (before sleep ever triggers), then diverges
+right around step 5000-5500 -- exactly where the first sleep window
+lands, and exactly where v24's own unmodified run was in its fastest
+stretch of progress (64/k3->126/k2 in ~1500 steps).
+
+So: sleep's cost (slower climb) is paid in both cases; its benefit
+(escaping a plateau) only showed up where the baseline was already
+going to get stuck anyway. Direct correction from the user after this
+was reported: don't gate on curriculum/task bookkeeping (stall
+duration, level-ups, streak) -- "we have to go by intrinsic info...
+assume the model wouldn't have access to" that. Rank/participation
+ratio was checked next (intrinsic, weight-only) as a candidate
+"tiredness" signal and found NOT to discriminate: PR trajectories and
+their slopes are statistically indistinguishable between v19c (stuck)
+and v24 (succeeds) across every window from step 0-8000, in every
+layer -- confirming/extending this project's own earlier finding that
+rank decline happens in every long-running config regardless of
+outcome, not an early differentiator.
+
+**The real discriminator found: q_proj/k_proj's own col_importance
+going completely static (zero delta between successive amortized
+cycles) -- purely intrinsic, already-tracked by plasticity_reset,
+needs no new C++.** Checked when this freeze first happens in each run:
+
+| run | q/k freeze (zero-delta) starts | outcome |
+|---|---|---|
+| v19c (no sleep) | step 13,273 | permanently stuck at 126/k2 |
+| v24 (no sleep) | step 35,848 -- AFTER already reaching k5 at 19,850 | reaches k5, then plateaus |
+| v25 (+ periodic sleep) | step 96,986 | escaped to 126/k3 |
+| v26 (+ periodic sleep) | step 97,752 | stuck at 126/k2 the whole time |
+
+Confirmed real (not a logging artifact): o_proj/v_proj/lm_head keep
+changing at the exact same timestamps in every run -- it's specifically
+q/k going dead, not a global freeze. The timing correlates with outcome
+in the two UNMODIFIED baselines (early freeze = bad fixed point, late
+freeze = good one already banked). But periodic sleep delays this
+freeze almost identically in BOTH v25 and v26 (~97k either way) --
+necessary-but-not-sufficient: v26's q/k kept moving the entire ~89k-step
+stall without that movement ever being productive, a different failure
+mode (churning-without-consolidating) than v19c's original frozen-dead
+one, plausibly caused by sleep's own periodic forcing never letting the
+network settle into v24's good fixed point in the first place.
+
+**Hypothesis, now built and testing**: gate sleep on the freeze itself
+(sleep_gate_layers=("q_proj","k_proj"), new param on train_curriculum)
+instead of a blind schedule -- reactive, purely intrinsic, self-limiting
+(turns off the moment col_importance starts moving again, no separate
+wake-up logic). Reuses plasticity_reset's own col_importance/
+cycle_complete tracking verbatim, zero new C++. This should leave v24's
+own fast, uninterrupted k2->k5 climb completely undisturbed (its
+natural freeze doesn't happen until step 35848, long after k5 is
+reached) while still rescuing a genuinely-dead run the moment it
+freezes. v27 (freeze-gated + v19c's config) and v28 (freeze-gated +
+v24's config) launched to test this directly against v25/v26's own
+results. Unit-verified the freeze-detection logic in isolation
+(5 synthetic cases: first-ever call, moved value, unmoved value,
+incomplete cycle, resumed movement) before launching -- all correct.
+
+## k=4/k=5 in-context ceiling, exact derivation (answering a direct
+question: does solving k=4 also require out-of-context work, and is
+there any "next up" token or other signal besides the raw key/value
+pairs?)
+
+Verified directly from `generate_mqar_sequence` (`model/toy_recall_task.py`).
+`seq_len_for_k(k) = 4k` exactly (the helper's `%2` rounding is
+vestigial -- `4k` is always even). Keys sit at `kvs[0::2]`, positions
+`0, 2, ..., 2k-2`. Queries are placed via `queries[gaps*2] = keys`,
+`gaps` a random permutation of `range(space)`, `space = k`, so:
+
+- max possible query position = `context_size + (k-1)*2 = 4k-2`
+- min possible key position = `0`
+- **worst-case key-to-query gap = `4k-2`** (a real, reachable case --
+  `gaps` is a random assignment, so key-index 0 landing on the largest
+  gap value happens with nonzero probability on real training examples)
+
+Window reach is `num_tiles-1 = 15`. So: k=3 gap=10 (margin +5), **k=4
+gap=14 (margin +1 -- in-context, but by only one token, not an exact
+boundary)**, **k=5 gap=18 (margin -3 -- genuinely exceeds the window)**.
+The `level_prefix` offset shifts both the key's and its query's
+absolute position by the same amount, so it cancels out of the gap and
+doesn't change any of this.
+
+**No "next up" token or other side signal exists.** `queries[gaps*2] =
+keys` -- a query position literally contains the SAME key token
+repeated, with no separate marker. The model must recognize "I've seen
+this exact token before as a key" from pure token-identity recurrence,
+then recall its paired value -- it really is "just all the pairs."
+
+So k=5 is the first level that structurally requires recurrence beyond
+the attention window, by a clean margin of 3 (not an exact boundary).
+This is the baseline this section's k=6/k=7 results (next entry) are
+measured against.
+
+## 2026-10-04 (cont'd) -- v27/v28 results: freeze-gated sleep beats
+EVERY prior result in this investigation, including both unmodified
+baselines
+
+| run | mechanism | reached 126/k2 at | final k |
+|---|---|---|---|
+| v19c (no sleep) | -- | step 7,375 | stuck at k2 forever |
+| v25 (blind periodic sleep) | -- | step 11,936 | k3, then stuck |
+| **v27 (freeze-gated sleep, v19c's config)** | -- | step 10,312 | **k6** |
+| v24 (no sleep) | -- | step 6,230 | k5, then stuck |
+| v26 (blind periodic sleep) | -- | step 11,021 | stuck at k2 forever |
+| **v28 (freeze-gated sleep, v24's config)** | -- | step 7,711 | **k7** |
+
+Both v27 and v28 beat every prior result in the whole v13-v28 series,
+including the completely unmodified baselines -- not just a fix for
+the periodic-schedule disruption, a genuinely new ceiling. Both show
+the same qualitative shape: fast climb through early k-levels, a long
+stall (v27: steps 14,125-49,164; v28: steps 16,893-40,939), then a
+sleep-triggered rescue past it, repeating once more before the run
+ends. Neither fully escaped -- both re-plateaued at their final k by
+step 100,000 -- so this is real, repeated rescue work, not an unlimited
+escape valve.
+
+**k=6/k=7 significance, computed the same way as the k=4/k=5 entry
+above**: worst-case gap = `4k-2` = 22 (k=6) / 26 (k=7), exceeding the
+15-token window reach by 7 and 11 positions respectively -- a
+substantially harder recurrent-memory requirement than k=5's own
+3-token excess. With `NUM_MEMORY_SLOTS=2`, reaching k=6/k=7 at all
+means the model is genuinely using real superposition (multiple
+key-value associations packed into just 2 memory slots), not mastering
+k=5 and getting lucky at the ceiling.
+
+**Known bug, NOT fixed in this PR, tracked for a follow-up**: v27's log
+shows `RuntimeWarning: overflow encountered in multiply` at
+`sili/cpu.py:69` (`Backend.mul`, the generic elementwise Tensor
+multiply used throughout the whole autograd system) around step
+98,250, late in its own k6 plateau. Did not visibly corrupt the run
+(no NaN, loss stayed in its normal 4.4-4.7 range afterward) and did not
+crash (numpy warns rather than raising on fp32 overflow) -- but some
+Tensor value grew large enough to overflow fp32 during an extended
+run, silently, which is a real correctness gap worth closing (root
+cause not yet identified) before pushing these recipes further or
+scaling up.
+
+**Decision (direct instruction)**: this closes out the
+plasticity/sleep-annealing investigation for this PR. Sparsity (DISLDO)
+and plasticity (magnitude regularization + freeze-gated sleep) are both
+demonstrated working together on a real 100k+ step run. `scripts/
+train_peridot_main.py` is now the project's canonical main entry point
+(README.md added, pointing to it). Deferred to a follow-up PR, recorded
+but not started here: the `Backend.mul` overflow fix; scaling this
+recipe with FP4 precision and harder MQAR tasks on a rented RTX
+5090-class GPU, re-running the same small-model-first ablation
+discipline before trusting anything at that scale; and revisiting the
+sleep mechanism's cadence for real-time/wall-clock deployment (e.g. a
+robot sleeping on an hours schedule, not a training-step schedule) --
+likely needs steps/lr/gradient-sparsity re-tuned together, not just the
+gate itself.
+
+## 2026-10-11 -- next task decided: GPU port of the kernel-level work
+
+Direct instruction, after confirming the 4 `block4_*_TODO_DELETE.hpp`
+files in `sili__new` are still live (none orphaned -- all `#include`d
+by `cpu_backend.cpp`, all still the only block4 implementation of
+CiRenorm/WeightRenorm/decay/plasticity_reset, the kernel-decomposition
+refactor their own comments describe as the delete trigger hasn't
+happened): the next task is getting this kernel-level work onto GPU so
+MQAR training/ablation iterates faster -- CPU-only runs taking hours
+per 100k-step config was the real limiter on how many configs/seeds
+this round's plasticity investigation could try. Recorded as a todo
+only (`sili__new/TODO.md`'s new "GPU port of the block4/plasticity
+kernel-level work" section, mirrored in this repo's `todolist.md`),
+not sized or designed yet -- explicitly not started in this PR.
