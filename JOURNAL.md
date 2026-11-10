@@ -11886,16 +11886,26 @@ events ("sleep nightly instead of every minute" for an online/embodied
 deployment), not fixed hyperparameters. Demonstrated end-to-end in
 `tests/test_tile_cache_credit.py`'s runtime-dial test.
 
-**Open question, noted not acted on**: `dy_sparsity_schedule` (per-row
-column-density) and `dy_r_target`/`dy_sparsity_p` (per-call column
-selection) are mutually exclusive in both `DISLDOLayer.forward` and
-`DISLDOLayer32.forward`'s `_bwd()` -- an `if/elif` chain, so setting
-`dy_sparsity_schedule` silently makes `dy_r_target`/`dy_sparsity_p`
-dead for that call. The real want flagged this session: backprop into
-`n` tokens (rows) AND `m` neurons (columns) within those tokens
-combined, not either axis alone -- or `m` neurons scaled by a separate
-token-selection percentage. Not implemented; noted for whenever this
-becomes the actual bottleneck.
+**Open question, resolved as "easy, just not built yet," not acted
+on**: `dy_sparsity_schedule`/`dy_r_target`/`dy_sparsity_p` are wired as
+mutually exclusive via an `if/elif` chain in both `DISLDOLayer.forward`
+and `DISLDOLayer32.forward`'s `_bwd()`, but the underlying methods are
+NOT fundamentally exclusive -- confirmed by reading the actual kernels:
+`_graded_top_k_csr(dy2d, k_per_row, num_cpus)` is the real generic
+mechanism underneath both `dy_sparsity_schedule` (caller-given
+`k_per_row`) AND `dy_sparsity_p` (`np.full(n_rows, k_dy)` -- a uniform
+scalar is just this same kernel's degenerate case). `dy_r_target`'s
+nucleus selection (`_nucleus_top_k_csr`/`_cpu.dense_to_nucleus_top_k_csr`)
+is a structurally parallel kernel producing the same SHAPE of output (a
+per-row `k`), just derived from each row's own gradient-energy profile
+instead of handed in externally. Composing "n tokens (rows) selected by
+a schedule, m neurons (columns) within those rows selected by the
+nucleus criterion instead of a fixed schedule value" is architecturally
+straightforward -- combine the schedule's row-eligibility with a
+nucleus-derived per-row k for eligible rows, feed the result into
+`_graded_top_k_csr`. The `if/elif` is a caller-side wiring choice in
+`_bwd()`, not an algorithmic conflict. Still not implemented -- noted
+for whenever this becomes the actual bottleneck.
 
 **Explicitly deferred, unchanged from the original plan**: Mechanism B
 (ported peak-eligibility for rows already evicted from `tile_cache`,
