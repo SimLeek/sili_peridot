@@ -32,6 +32,7 @@ from sili import _cpu
 from sili.sparse_rnn import DIDLDOLayer32, DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili.tensor import combine_losses
 
+from model.tile_cache_credit import apply_tile_cache_exact_credit
 from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, predicted_token
 from model.toy_recall_task import generate_mqar_sequence
 from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT, spectral_norm_upper_bound
@@ -312,6 +313,9 @@ def train_curriculum(
     dy_sparsity_p: float | None = None,
     use_tile_cache: bool = False,
     use_tile_cache_at_query: bool = False,
+    tile_cache_credit_k_rows: int | None = None,
+    tile_cache_credit_fraction: float | None = 0.5,
+    tile_cache_credit_fraction_fn=None,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -605,6 +609,34 @@ def train_curriculum(
     # them -- the TRUE zero-credit scenario, for measuring the real gap a
     # synaptic-hold/credit mechanism needs to close. See
     # docs/research/train_mqar_curriculum.rst:train_curriculum.use_tile_cache_at_query.
+    # tile_cache_credit_k_rows (opt-in, default None=off; only meaningful
+    # alongside use_tile_cache_at_query): budgeted exact correction for
+    # that many cached rows per query step, via model/tile_cache_credit.py
+    # -- see docs/research/toy_tile_recurrence_rmt.rst:tile_cache_exact_credit.
+    # tile_cache_credit_fraction: scales k_rows to the cache's own size
+    # (num_tiles - 1) instead of a fixed absolute count -- a constant
+    # k_rows covers a SHRINKING fraction of the cache as context grows
+    # (direct instruction: scale to context, not width -- width changes
+    # cost per row, not how many rows need covering). Takes precedence
+    # over tile_cache_credit_k_rows when both are set; same convention as
+    # this file's other density-fraction params (dy_sparsity_p, etc.),
+    # not a raw count. Defaults to 0.5 (not None/off) -- validated this
+    # session via a 40-seed dose-response sweep: zero credit is
+    # significantly worse than dense (p<0.0001), 50% coverage recovers
+    # most of that gap (only borderline-significant vs. dense, p=0.036),
+    # and 100% coverage closes it almost entirely (p=0.069, matching
+    # dense) -- confirming the mechanism itself is correct, not just
+    # under-budgeted. Pass tile_cache_credit_fraction=None explicitly to
+    # get the old zero-credit diagnostic arm back.
+    # tile_cache_credit_fraction_fn: runtime-tunable override, called
+    # with the current step each query step (same pattern as
+    # lr_override_fn below) -- takes priority over the static fraction
+    # when set, so the correction budget can be changed MID-RUN, not
+    # just configured once upfront. Direct motivation: these amortized-
+    # backprop dials (this one, and sleep's own cadence) are meant to be
+    # externally responsive -- e.g. "sleep nightly instead of every
+    # minute" for an online/embodied deployment -- not fixed
+    # hyperparameters baked in at construction time.
     # k_first_target/k_first_vocab: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.k_first_target_odometer_reordering.
     #
@@ -988,9 +1020,13 @@ def train_curriculum(
                 )
                 logit_row = num_tiles - 1
                 # Cache refresh; see use_tile_cache_query_step_fallback anchor.
+                # 3-tuples (k_row, v_row, x_normed_row) -- must match
+                # step_cached()'s own tile_cache tuple shape exactly, see
+                # model/tile_cache_credit.py.
                 k_content = model.last_debug["k"][NUM_MEMORY_SLOTS:]
                 v_content = model.last_debug["v"][NUM_MEMORY_SLOTS:]
-                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), strict=False))
+                x_content = model.last_debug["x_normed"][NUM_MEMORY_SLOTS:]
+                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), x_content[1:].copy(), strict=False))
             elif use_tile_cache:
                 new_embed = embed_table[combined_tokens[i]]
                 # requires_grad mirrors the plain step() branch below
@@ -1113,6 +1149,18 @@ def train_curriculum(
                     if aux is not None:
                         loss = loss + aux
                     loss.backward()
+                if use_tile_cache_at_query:
+                    _fraction = (
+                        tile_cache_credit_fraction_fn(step)
+                        if tile_cache_credit_fraction_fn is not None
+                        else tile_cache_credit_fraction
+                    )
+                    if _fraction is not None:
+                        _k_rows = max(1, round(_fraction * (num_tiles - 1)))
+                    else:
+                        _k_rows = tile_cache_credit_k_rows
+                    if _k_rows is not None:
+                        apply_tile_cache_exact_credit(model, lr, k_rows=_k_rows)
                 # See docs/research/train_mqar_curriculum.rst:
                 # train_curriculum.embed_learning_rate_scatter_gradient.
                 if embed_learning_rate is not None and not use_tile_cache:

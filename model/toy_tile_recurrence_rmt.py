@@ -2063,6 +2063,9 @@ class ToyTileRecurrenceRMT:
             # x_window_t: embedding-learning hook (Tensor, not just .data).
             # See docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
             "x_window_t": x_window_t,
+            # x_normed: rebuilds tile_cache's 3-tuples at the cache-refresh
+            # site -- see model/tile_cache_credit.py.
+            "x_normed": x_normed.data,
         }
 
         if self.l1_sparsity_coef > 0.0:
@@ -2226,9 +2229,10 @@ class ToyTileRecurrenceRMT:
         it accepts. See docs/research/toy_tile_recurrence_rmt.rst:step_cached_design."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
-        self._energy_aux_loss = None  # see step()'s own identical reset
-        self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
-        self._balance_aux_loss = None  # see step()'s own identical reset
+        # Same reset step() itself does, see _accumulate_sleep_energy's docstring.
+        self._energy_aux_loss = None
+        self._sleep_aux_loss = None
+        self._balance_aux_loss = None
 
         new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
         new_embed_t = Tensor(new_embed_2d)
@@ -2319,15 +2323,22 @@ class ToyTileRecurrenceRMT:
 
         # Reassemble FULL [n_content, sw] content k/v: cache (oldest
         # first, zero-padded) plus this step's fresh row at the end.
+        # Tuple is (k_row, v_row, x_normed_row) -- see model/tile_cache_credit.py.
         cache = list(tile_cache) if tile_cache else []
         pad = max(0, (n_content - 1) - len(cache))
         zero_row = np.zeros(sw, dtype=np.float32)
         cache_k_rows = [zero_row] * pad + [row[0] for row in cache[-(n_content - 1) :]] if n_content > 1 else []
         cache_v_rows = [zero_row] * pad + [row[1] for row in cache[-(n_content - 1) :]] if n_content > 1 else []
+        cache_x_rows = [zero_row] * pad + [row[2] for row in cache[-(n_content - 1) :]] if n_content > 1 else []
         cache_k_arr = np.stack(cache_k_rows, axis=0) if cache_k_rows else np.zeros((0, sw), dtype=np.float32)
         cache_v_arr = np.stack(cache_v_rows, axis=0) if cache_v_rows else np.zeros((0, sw), dtype=np.float32)
-        k_content_full = concat([Tensor(cache_k_arr), k_new], axis=0)  # [n_content, sw]
-        v_content_full = concat([Tensor(cache_v_arr), v_new], axis=0)
+        cache_x_arr = np.stack(cache_x_rows, axis=0) if cache_x_rows else np.zeros((0, sw), dtype=np.float32)
+        # Named (not inline): .grad is read back via last_debug after the
+        # caller's own loss.backward() -- see model/tile_cache_credit.py.
+        cache_k_tensor = Tensor(cache_k_arr)
+        cache_v_tensor = Tensor(cache_v_arr)
+        k_content_full = concat([cache_k_tensor, k_new], axis=0)  # [n_content, sw]
+        v_content_full = concat([cache_v_tensor, v_new], axis=0)
 
         k_full = concat([k_mem_from_prev, k_content_full], axis=0)  # [total_slots, sw]
         v_full = concat([v_mem_from_prev, v_content_full], axis=0)
@@ -2455,6 +2466,10 @@ class ToyTileRecurrenceRMT:
             "attn_content": attn_content.data,
             "sigmas": sigmas.data,
             "log_sigmas": self.log_sigmas.data,
+            # Real Tensors, not .data -- see model/tile_cache_credit.py.
+            "cache_k_tensor": cache_k_tensor,
+            "cache_v_tensor": cache_v_tensor,
+            "cache_x_rows": cache_x_arr,
         }
 
         memory_new = memory_new_t.data.copy()
@@ -2568,15 +2583,16 @@ class ToyTileRecurrenceRMT:
         )
 
         new_cache = (list(tile_cache) if tile_cache else []) + [
-            (k_new.data.copy().reshape(sw), v_new.data.copy().reshape(sw))
+            (
+                k_new.data.copy().reshape(sw),
+                v_new.data.copy().reshape(sw),
+                x_normed_new.data.copy().reshape(sw),
+            )
         ]
         if len(new_cache) > (n_content - 1):
             new_cache = new_cache[-(n_content - 1) :]
 
-        # Fold in energy/sleep/balance aux losses, same as step()'s own
-        # identical fold -- without this, sleep_enable's aux loss (and any
-        # stale energy/balance aux from a PRIOR step() call in the same
-        # training run) would never reach the caller.
+        # Fold in energy/sleep/balance aux losses, same as step()'s own fold.
         if self._energy_aux_loss is not None:
             aux_loss = self._energy_aux_loss if aux_loss is None else aux_loss + self._energy_aux_loss
         if self._sleep_aux_loss is not None:

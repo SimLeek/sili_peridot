@@ -1152,9 +1152,10 @@ class TestStepCached:
         assert np.all(np.isfinite(logits.data))
         assert aux_loss is None
         assert len(tile_cache) == 1  # grows by one per call, caps at NUM_TILES-1
-        for k_row, v_row in tile_cache:
+        for k_row, v_row, x_normed_row in tile_cache:
             assert k_row.shape == (STATE_WIDTH,)
             assert v_row.shape == (STATE_WIDTH,)
+            assert x_normed_row.shape == (STATE_WIDTH,)
 
     def test_cache_length_caps_at_num_tiles_minus_1(self):
         model = _model()

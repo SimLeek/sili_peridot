@@ -11774,3 +11774,132 @@ diagnostic's 6 layer pools; the remaining ~99 chunks per pool are
 intact. Lesson applied going forward: audit any file for real
 output-path side effects BEFORE executing it for verification, not just
 cap the step count.
+
+## 2026-11-10 -- KV-cache synaptic hold/credit: use_tile_cache's real
+bugs, the free-gradient discovery, a validated budgeted-credit
+mechanism, and a runtime-tunable dial
+
+PR #26 merged, unholding this work. Direct question that started it:
+"do we have everything needed for transformer kv-cache and one-hot or
+k-hot synapse storing for 1-backprop instead of context_len-backprop."
+
+**Two real pre-existing bugs found, unrelated to anything this session
+changed.** (1) `use_tile_cache`/`sleep_enable` were hard-guarded mutually
+exclusive with no stated rationale -- root cause: `step_cached()` never
+called `_accumulate_sleep_energy()` anywhere and never reset/folded
+`_energy_aux_loss`/`_sleep_aux_loss`/`_balance_aux_loss` the way `step()`
+does, so sleep's forced-firing aux loss could never reach its caller.
+Fixed by mirroring `step()`'s exact 8 call sites plus its reset/fold
+pattern; guard removed. (2) `use_tile_cache` crashed on literally its
+first query step, 100% of the time, independent of sleep:
+`DISLDOLayer32` (the only layer class `ToyTileRecurrenceRMT` uses) never
+had the `dy_sparsity_schedule` kwarg its query-step fallback
+unconditionally passes -- `DISLDOLayer.forward` (scattered) had it,
+`DISLDOLayer32.forward` (dense) didn't. Fixed upstream in `sili__new`
+(PR #55): ported the exact same `_graded_top_k_csr`-backed branch,
+same priority order relative to `dy_r_target`/`dy_sparsity_p`, below
+the DISLDOLayer32-only `dy_gate_mask`.
+
+**The free-gradient discovery.** `Tensor` has no `requires_grad` gate at
+all -- `_acc()` accumulates `.grad` on ANY node a backward chain
+reaches, cached-and-detached or not. Confirmed directly (toy script,
+then inside a real `step_cached()` call via a monkeypatch spy): when
+`use_tile_cache_at_query=True` wraps a cached row's k/v as a fresh
+`Tensor` and feeds it through `gaussian_attention`, that attention
+call's real backward populates the EXACT per-row gradient on it anyway
+-- previously silently discarded, at zero marginal compute cost to
+recover. `step_cached()` now also remembers each cached row's
+pre-k/v-projection input (`x_normed_row`, extending `tile_cache`'s
+tuple to `(k_row, v_row, x_normed_row)`) and stashes the live
+`cache_k_tensor`/`cache_v_tensor` objects (not just `.data`) in
+`last_debug`, so a caller can read `.grad` off them after its own
+`loss.backward()`.
+
+**Mechanism A: `model/tile_cache_credit.py`.**
+`apply_tile_cache_exact_credit(model, lr, k_rows)` uses that free
+gradient plus the remembered exact input to fire a direct
+`layer._c.backward(x_row, dy_row, lr, ...)` correction into
+`k_proj`/`v_proj` for a small, budgeted number of cached rows per query
+step -- no decay, no substitution, because for a row still sitting in
+the cache nothing has actually been lost yet (unlike the older,
+differently-scoped peak-eligibility idea, which exists for rows ALREADY
+evicted / the recurrent memory's own never-cached long-horizon
+influence -- still future work, see below). Selection is **blind
+round-robin**, not gradient-magnitude-ranked: project memory
+`project_dense_vs_sparse_mqar_confusion_matrix` found magnitude-guided
+selection loses to Arm C's blind time-gate every time tried in this
+codebase, so this doesn't re-try that losing pattern -- a fixed
+rotation through live cached positions gives each an equal, periodic
+shot at correction instead.
+
+**Validation history, in order (the direction flipped once, and the
+flip itself is the real finding):**
+- First smoke test (1 seed, 300k params, 300-500 steps):
+  `use_tile_cache_at_query` (zero credit) nominally beat plain `step()`.
+  Surprising -- directly contradicted the motivating hypothesis.
+- 3-seed, then 10-seed replication (still 300k params): zero-credit
+  "beating" dense held up at n=10 (paired t-test p=0.032) -- looked
+  like a real, if backwards, effect.
+- Direct instruction to distrust this rather than accept it ("if the
+  paper says 2+2=5, the paper is wrong") led to two checks: (a) a
+  formal Bend 2 proof (see `sili__new/bend_proofs/
+  tile_cache_gradient_routing/`, `ALL PROOFS CHECK`) that concat/split
+  routes gradient to the exact right rows -- ruled out a routing bug;
+  (b) a direct, cheap (no training) measurement of the real staleness
+  gap (cached k/v computed with weights as of cache-time vs. current
+  weights for the same remembered input): mean gap ~0.04-0.07% of
+  typical k/v magnitude over 2.16M real comparisons, max ~2% -- ruled
+  out staleness as a confound in either direction.
+- Scaled DOWN instead (not up) for iteration speed: `embed_width=12`
+  (~34k params) runs ~6-7x faster per step than the 300k config and
+  still shows real learning (confirmed before trusting any comparison
+  at this size). With n=40 seeds (cheap enough now to actually afford),
+  the result **flipped back** to the originally-expected direction:
+  zero-credit is significantly WORSE than dense (p<0.0001) -- the
+  n=10/300k result was an underpowered fluke, not a real reversal.
+- Fraction-budget dose-response sweep (n=40 seeds, same 34k/500-step
+  config, 8-way parallel via separate `num_cpus=1` OS processes rather
+  than one process's own threading, since every run is already
+  single-threaded for determinism): plain=0.2332, zero-credit=0.1761
+  (p<0.0001 vs plain), 25% cache coverage=0.2004 (p=0.0056 better than
+  zero-credit), 50%=0.2166 (p=0.036 vs plain, borderline), 100%=0.2181
+  (p=0.069 vs plain, no longer significant). Monotonic, and 100%
+  coverage closing the gap to dense almost entirely is exactly the
+  sanity check a real implementation should pass -- confirms the
+  mechanism itself is correct, not just under-budgeted. Strongly
+  diminishing returns past 50% (25%->50% gains +0.016 accuracy,
+  50%->100% only +0.0015), so a sweet spot well under 100% should
+  recover most of the benefit at a fraction of the cost.
+
+**Runtime-tunable dial.** `tile_cache_credit_fraction` scales `k_rows`
+to the cache's own size (`num_tiles - 1`), not a fixed absolute count --
+a constant `k_rows` covers a shrinking fraction of the cache as context
+grows, so the right scaling axis is context length, not model width
+(width changes cost per row, not how many rows need covering). Default
+changed to 0.5 (was off) given the validated sweep above. Added
+`tile_cache_credit_fraction_fn` (same pattern as this file's existing
+`lr_override_fn`): called with the current step each query step, so
+the correction budget can change mid-run, not just at construction --
+direct motivation: these amortized-backprop dials (this one, and
+sleep's own cadence) should be externally responsive to real-world
+events ("sleep nightly instead of every minute" for an online/embodied
+deployment), not fixed hyperparameters. Demonstrated end-to-end in
+`tests/test_tile_cache_credit.py`'s runtime-dial test.
+
+**Open question, noted not acted on**: `dy_sparsity_schedule` (per-row
+column-density) and `dy_r_target`/`dy_sparsity_p` (per-call column
+selection) are mutually exclusive in both `DISLDOLayer.forward` and
+`DISLDOLayer32.forward`'s `_bwd()` -- an `if/elif` chain, so setting
+`dy_sparsity_schedule` silently makes `dy_r_target`/`dy_sparsity_p`
+dead for that call. The real want flagged this session: backprop into
+`n` tokens (rows) AND `m` neurons (columns) within those tokens
+combined, not either axis alone -- or `m` neurons scaled by a separate
+token-selection percentage. Not implemented; noted for whenever this
+becomes the actual bottleneck.
+
+**Explicitly deferred, unchanged from the original plan**: Mechanism B
+(ported peak-eligibility for rows already evicted from `tile_cache`,
+and the recurrent memory's own never-cached long-horizon credit) --
+queued as the next piece, after this round's testing is fully wrapped
+up. The memory-snapshot-cache "combined" case and Part 3's N-D
+generalization remain deferred as before.
