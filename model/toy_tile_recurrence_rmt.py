@@ -2226,6 +2226,9 @@ class ToyTileRecurrenceRMT:
         it accepts. See docs/research/toy_tile_recurrence_rmt.rst:step_cached_design."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
+        self._energy_aux_loss = None  # see step()'s own identical reset
+        self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
+        self._balance_aux_loss = None  # see step()'s own identical reset
 
         new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
         new_embed_t = Tensor(new_embed_2d)
@@ -2239,6 +2242,7 @@ class ToyTileRecurrenceRMT:
             **self.synapse_kwargs,
             **self._wide_extra_kwargs("input_proj"),
         )  # [1, sw]
+        self._accumulate_sleep_energy(x_wide_new, "input_proj")
         x_normed_new = rmsnorm_tensor(x_wide_new, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
@@ -2286,6 +2290,9 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(q_step)
         _accumulate_penalty(k_step)
         _accumulate_penalty(v_step)
+        self._accumulate_sleep_energy(q_step, "q_proj")
+        self._accumulate_sleep_energy(k_step, "k_proj", "pass1")
+        self._accumulate_sleep_energy(v_step, "v_proj", "pass1")
 
         q_step.data = np.clip(q_step.data, -self.clip_range, self.clip_range)
         k_step.data = np.clip(k_step.data, -self.clip_range, self.clip_range)
@@ -2351,6 +2358,7 @@ class ToyTileRecurrenceRMT:
             **self._wide_extra_kwargs("o_proj"),
         )
         _accumulate_penalty(attn_mem)
+        self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
         memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
@@ -2378,6 +2386,8 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
+        self._accumulate_sleep_energy(k_mem_fresh, "k_proj", "mem")
+        self._accumulate_sleep_energy(v_mem_fresh, "v_proj", "mem")
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
         k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
@@ -2425,6 +2435,7 @@ class ToyTileRecurrenceRMT:
             **self._wide_extra_kwargs("o_proj"),
         )
         _accumulate_penalty(attn_content)
+        self._accumulate_sleep_energy(attn_content, "o_proj", "content")
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
         attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
@@ -2561,5 +2572,16 @@ class ToyTileRecurrenceRMT:
         ]
         if len(new_cache) > (n_content - 1):
             new_cache = new_cache[-(n_content - 1) :]
+
+        # Fold in energy/sleep/balance aux losses, same as step()'s own
+        # identical fold -- without this, sleep_enable's aux loss (and any
+        # stale energy/balance aux from a PRIOR step() call in the same
+        # training run) would never reach the caller.
+        if self._energy_aux_loss is not None:
+            aux_loss = self._energy_aux_loss if aux_loss is None else aux_loss + self._energy_aux_loss
+        if self._sleep_aux_loss is not None:
+            aux_loss = self._sleep_aux_loss if aux_loss is None else aux_loss + self._sleep_aux_loss
+        if self._balance_aux_loss is not None:
+            aux_loss = self._balance_aux_loss if aux_loss is None else aux_loss + self._balance_aux_loss
 
         return memory_new, logits, aux_loss, new_cache

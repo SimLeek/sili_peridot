@@ -311,6 +311,7 @@ def train_curriculum(
     dense: bool = True,
     dy_sparsity_p: float | None = None,
     use_tile_cache: bool = False,
+    use_tile_cache_at_query: bool = False,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -596,7 +597,14 @@ def train_curriculum(
     # JOURNAL.md's 2026-08-30 "backward's real cost profiled to per-synapse
     # update math, not snapshot/merge" entry.
     # use_tile_cache: see docs/research/train_mqar_curriculum.rst:
-    # train_curriculum.use_tile_cache_query_step_fallback.
+    # train_curriculum.use_tile_cache_query_step_fallback. use_tile_cache_at_query
+    # (opt-in, default False -- preserves that documented fallback as the
+    # default): instead of falling back to step()'s full-window recompute
+    # at query steps, call step_cached() there too, reusing the cache's
+    # stored (detached) K/V for older tiles with zero gradient reaching
+    # them -- the TRUE zero-credit scenario, for measuring the real gap a
+    # synaptic-hold/credit mechanism needs to close. See
+    # docs/research/train_mqar_curriculum.rst:train_curriculum.use_tile_cache_at_query.
     # k_first_target/k_first_vocab: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.k_first_target_odometer_reordering.
     #
@@ -849,8 +857,6 @@ def train_curriculum(
             log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
     if sleep_enable:
-        if use_tile_cache:
-            raise ValueError("sleep_enable is not supported together with use_tile_cache")
         if sleep_energy_kwargs is None:
             raise ValueError("sleep_enable requires sleep_energy_kwargs")
         if sleep_gate_layers:
@@ -961,7 +967,17 @@ def train_curriculum(
         for i in range(seq_len + offset):
             # See docs/research/train_mqar_curriculum.rst:
             # train_curriculum.use_tile_cache_query_step_fallback.
-            if use_tile_cache and (i in targets):
+            if use_tile_cache and use_tile_cache_at_query and (i in targets):
+                # True zero-credit arm: reuse the cache's stored (detached)
+                # K/V for older tiles even at query time, instead of the
+                # graded-fallback full-window recompute below. See
+                # train_curriculum.use_tile_cache_at_query anchor.
+                new_embed = embed_table[combined_tokens[i]]
+                memory, logits, aux, tile_cache = model.step_cached(
+                    new_embed, memory, lr, tile_cache, requires_grad=True
+                )
+                logit_row = 0  # step_cached returns only the newest position's row
+            elif use_tile_cache and (i in targets):
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
                 memory, logits, aux = model.step(
                     window,
@@ -977,8 +993,18 @@ def train_curriculum(
                 tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), strict=False))
             elif use_tile_cache:
                 new_embed = embed_table[combined_tokens[i]]
+                # requires_grad mirrors the plain step() branch below
+                # (restricted to the non-target case, since this elif is
+                # only reached when i is not in targets): no gradient
+                # needed except during sleep, where the forced-firing
+                # aux loss needs a real backward every tick, not just at
+                # query steps. See model/toy_tile_recurrence_rmt.py's
+                # step_cached() sleep-energy accumulation (added to match
+                # step()'s own identical calls -- previously step_cached
+                # never participated in sleep_enable at all, which is why
+                # the two used to be hard-guarded mutually exclusive).
                 memory, logits, aux, tile_cache = model.step_cached(
-                    new_embed, memory, lr, tile_cache, requires_grad=False
+                    new_embed, memory, lr, tile_cache, requires_grad=in_sleep
                 )
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
