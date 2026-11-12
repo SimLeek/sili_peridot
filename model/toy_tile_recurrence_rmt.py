@@ -128,6 +128,8 @@ class ToyTileRecurrenceRMT:
         rsm_k_active: int | None = None,
         rsm_refractory_decay: float = 0.7,
         rsm_lr_mult: float = 1.0,
+        rsm_novelty_threshold: float | None = None,
+        rsm_novelty_beta: float = 0.9,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -263,14 +265,19 @@ class ToyTileRecurrenceRMT:
             sleep annealing" entry. Keyed by layer name; caller picks
             whether to backward on self._sleep_aux_loss. No-op unless
             sleep_energy_enable=True.
-        rsm_memory_write_enable, rsm_k_active, rsm_refractory_decay:
-            RSM-inspired sparse memory write, see JOURNAL.md 2026-11-10
-            (toy-scale validated, NOT yet at this scale). Winner-take-
-            all + refractory inhibition on the flattened PASS-1 write;
-            rsm_k_active = survivors (None: 25%, untuned). Caller calls
-            rsm_reset_sequence() at sequence boundaries. rsm_lr_mult
-            scales the decoder path's own learning rate only. No-op
-            unless True."""
+        rsm_* (memory_write_enable, k_active, refractory_decay,
+        novelty_threshold, novelty_beta, lr_mult):
+            RSM-inspired sparse memory write: winner-take-all +
+            refractory inhibition on the flattened PASS-1 write.
+            novelty_threshold adds intrinsic change detection so an
+            unchanged input writes a bit-exact zero. Caller must call
+            rsm_reset_sequence() at sequence boundaries. No-op unless
+            enabled.
+            NOT FOR MQAR: measured negative, and expected to be --
+            recall needs MORE state (Zoology arXiv:2312.04927) while
+            this trades state away. Right regime is a fixed generating
+            process + redundant stream; see JOURNAL.md 2026-11-12 and
+            scripts/prototype_rsm_fixed_process_memory.py."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -360,6 +367,10 @@ class ToyTileRecurrenceRMT:
         self.rsm_memory_write_enable = rsm_memory_write_enable
         self.rsm_refractory_decay = rsm_refractory_decay
         self.rsm_lr_mult = rsm_lr_mult
+        self.rsm_novelty_threshold = rsm_novelty_threshold
+        self.rsm_novelty_beta = rsm_novelty_beta
+        self._rsm_novelty_trace: np.ndarray | None = None
+        self.last_rsm_gate: float = 1.0  # diagnostic: 0.0 == this tick wrote nothing
         self._rsm_write_width = self.num_memory_slots * self.state_width
         self.rsm_k_active = rsm_k_active if rsm_k_active is not None else max(1, round(0.25 * self._rsm_write_width))
         self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
@@ -1584,6 +1595,25 @@ class ToyTileRecurrenceRMT:
     def rsm_reset_sequence(self) -> None:
         """Reset the RSM refractory trace, same cadence as `memory_prev`."""
         self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
+        self._rsm_novelty_trace = None
+
+    def _rsm_novelty_gate(self, x_newest: np.ndarray) -> float:
+        """Intrinsic change detection: hard threshold on the normalized
+        distance from an EMA trace of recent input. Graded/scale-free
+        comparison (noise-tolerant, no exact match) but binary output, so
+        unchanged input gives a bit-exact zero write -- top-k picks WHICH
+        units, this picks WHETHER to write. No oracle. Returns 1.0/0.0."""
+        if self.rsm_novelty_threshold is None:
+            return 1.0
+        cur = np.asarray(x_newest, dtype=np.float32).reshape(-1)
+        if self._rsm_novelty_trace is None:
+            self._rsm_novelty_trace = cur.copy()
+            return 1.0  # first tick of a sequence has no history to compare to
+        tr = self._rsm_novelty_trace
+        nov = float(np.linalg.norm(cur - tr) / (np.linalg.norm(tr) + 1e-6))
+        b = self.rsm_novelty_beta
+        self._rsm_novelty_trace = b * tr + (1.0 - b) * cur
+        return 1.0 if nov > self.rsm_novelty_threshold else 0.0
 
     def _rsm_sparsify_write(self, attn_mem_n: Tensor) -> Tensor:
         """Winner-take-all + refractory inhibition, see __init__'s
@@ -1595,7 +1625,12 @@ class ToyTileRecurrenceRMT:
         top_idx = np.argpartition(priority, -k)[-k:]
         mask = np.zeros_like(flat)
         mask[top_idx] = 1.0
-        self._rsm_phi = np.maximum(self._rsm_phi * self.rsm_refractory_decay, mask)
+        if self.last_rsm_gate == 0.0:
+            # Genuinely inactive tick: write nothing, and leave the refractory
+            # trace alone (nothing fired, so nothing becomes refractory).
+            mask = np.zeros_like(mask)
+        else:
+            self._rsm_phi = np.maximum(self._rsm_phi * self.rsm_refractory_decay, mask)
         mask2d = mask.reshape(attn_mem_n.data.shape)
         self._rsm_last_mask = mask2d
         sparse = attn_mem_n * Tensor(mask2d)
@@ -1955,6 +1990,7 @@ class ToyTileRecurrenceRMT:
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
         memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
 
+        _rsm_novelty_src = x_normed.data[-1]  # newest content row; see _rsm_novelty_gate
         combined_normed = concat([memory_normed, x_normed], axis=0)  # [total_slots, sw]
         combined_normed = self._apply_energy(combined_normed, "state")
 
@@ -2063,6 +2099,7 @@ class ToyTileRecurrenceRMT:
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
         if self.rsm_memory_write_enable:
+            self.last_rsm_gate = self._rsm_novelty_gate(_rsm_novelty_src)
             attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
         memory_new_t = self._memory_residual_update(memory_prev_t, attn_mem_n)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
@@ -2360,6 +2397,7 @@ class ToyTileRecurrenceRMT:
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
         memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
 
+        _rsm_novelty_src = x_normed_new.data.reshape(-1)  # see _rsm_novelty_gate
         combined_normed_step = concat([memory_normed, x_normed_new], axis=0)  # [n_mem+1, sw]
 
         # Separate _to_sparse call per consumer, see step()'s own comment.
@@ -2481,6 +2519,7 @@ class ToyTileRecurrenceRMT:
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
         if self.rsm_memory_write_enable:
+            self.last_rsm_gate = self._rsm_novelty_gate(_rsm_novelty_src)
             attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
         memory_new_t = self._memory_residual_update(memory_prev_t, attn_mem_n)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)

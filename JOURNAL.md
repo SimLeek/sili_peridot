@@ -12068,18 +12068,43 @@ combination. Two things were nonetheless established: a real correctness bug in
 the memory update is fixed, and the measurement harness is now validated (the
 no-op-mask control reproduces baseline).
 
-**Also falsified along the way.** The "RSM's objective is misaligned with MQAR"
-hypothesis looked compelling -- MQAR's filler is literally
-`rng.randint(0, vocab_size)`, uniform noise, and the task's own
-`_build_targets` skips the filler region for that exact reason, while RSM's
-benchmarks (Embedded Reber Grammar, bouncing-balls video, maze) are tasks where
-next-input prediction IS the objective. But making the filler learnable changed
-nothing: RSM scored 0.146 (Champernowne counter digits, predictable only by
-carrying a position counter), 0.134 (ramp, predictable from the previous token
-alone), 0.140 (random) -- invariant. The confound dominated all three. Separately,
-"next-step target on every position" HURT the baseline (0.304 vs 0.401).
+**A hypothesis I wrongly reported as falsified (corrected 2026-11-12, direct
+user pushback).** I claimed "RSM's objective is misaligned with this task" was
+falsified because making the filler learnable changed nothing: 0.146
+(Champernowne counter digits), 0.134 (ramp), 0.140 (random) -- invariant. That
+test was INVALID. All three filler modes change the token at EVERY step, so
+temporal redundancy is ~0% in every condition; I varied PREDICTABILITY while
+holding REDUNDANCY pinned at zero, then drew a conclusion about a hypothesis
+that is actually about redundancy. RSM's domain is near-stationary streams --
+successive frames of a video are ~99% identical -- which is the opposite end of
+that axis, not a nearby point on it.
+
+This matters because of the proof. `all_inactive_is_exact` makes the
+eligibility-trace approximation EXACT when intermediate ticks are inactive. In a
+99%-redundant stream most ticks genuinely are near-inactive, which is also where
+winner-take-all + refractory inhibition has a job to do (the same small cell set
+holds persistent content; new cells recruit only on change). In MQAR every tick
+delivers a brand-new token, so every tick is active and the proof's favorable
+regime never occurs. The mechanism was being tested in exactly the regime its own
+theory predicts no advantage.
+
+Related architectural error: RSM's role is to maintain a compressed long-horizon
+history over a redundant stream, which a separate recall-capable readout then
+queries. In this port the decoder instead competed with the task head over shared
+projections, and the task head read the attention output rather than any stable
+RSM code -- so even in a favorable regime the benefit could not have shown up.
+
+Separately and still valid: "next-step target on every position" HURT the
+baseline (0.304 vs 0.401).
 
 **What I would do next**, in priority order:
+0. Test in a REDUNDANT regime, which is the one the proof and the mechanism
+   actually favor: give filler a run length R (same token repeated R times) so
+   redundancy sweeps 0% -> ~88% (R=8) -> ~97% (R=32), holding content fixed.
+   Measure write magnitude on redundant vs changing ticks, not just accuracy --
+   confirm the "inactive tick" precondition is finally satisfied before trusting
+   any accuracy number. Note a fixed-k top-k always selects exactly k units, so
+   inactivity must come from small write MAGNITUDE, not from the mask.
 1. Make the decoder read a consistently-defined object -- the accumulated memory
    state (or a fixed projection of it), not the per-tick rotating masked delta.
    That directly targets Finding 3 and is the closest thing to RSM's actual `y^G`.
@@ -12096,6 +12121,58 @@ Methodological note worth keeping: both real findings this session came from
 directly measuring the mechanism (per-tick state change; no-op-mask control),
 not from sweeping hyperparameters. The sweeps were uniformly flat precisely
 because a confound dominated them.
+
+**Corrections and literature check, same day (2026-11-12, both from direct user
+pushback).**
+
+*(a) The MQAR runs never reached the regime where memory is required.*
+`seq_len_for_k(k) = 4k` and every run stalled at `peak_k=2-3`, so sequences were
+8-12 tokens -- entirely inside the 16-tile window. Key and query were never
+separated by more than the window, so long-term storage was never exercised;
+`recurrent_only_output` forced the readout through memory (which is why memory
+mattered at all) but information only had to survive a few ticks. `rep:32`
+filler on an 8-token sequence is also a single run, so the redundancy never
+materialised either. The "MQAR is adversarial" framing was therefore premature:
+the literature points below still stand, but insufficient GAP was the binding
+constraint in our runs, not those. A purpose-built long-gap probe
+(`[k1,v1,k2,v2, filler*32, kq] -> vq`, gap 32 >> window 16) was then written and
+run, and came back UNINFORMATIVE rather than negative -- all arms at chance
+including baseline, because 600 train steps / 40 eval episodes gives a standard
+error of ~0.038 at p=0.0625, wider than any effect worth detecting. An
+experimental-sizing error, recorded as such.
+
+*(b) RSM has essentially no external adoption, and the idea's validated
+descendant is Titans.* Semantic Scholar lists FOUR citations of arXiv:1905.11589
+in ~7 years, effectively all from the same lab lineage (Cerenaut /
+Rawlinson-Kowadlo) or adjacent self-organizing-map work -- no transformer follow-up,
+no independent replication. Meanwhile the same core idea (write to memory on
+surprise, forget otherwise) was independently reinvented and validated at scale
+as Titans (arXiv:2501.00663, Google Research 2025; follow-up MIRAS), whose
+surprise signal is better specified than ours: GRADIENT-based (the memory
+module's own error) with MOMENTUM over past surprise -- and that momentum term is
+an eligibility trace, so it matches this project's own Bend proof's delta-based
+credit far better than the EMA-of-input-distance gate built here. Titans' Core +
+Long-Term Memory + persistent-memory structure is also close to what
+`ToyTileRecurrenceRMT` already is.
+
+Notably the gradient-surprise ingredient ALREADY EXISTS in this repo:
+`_update_layer_surprise` computes `E_t = ||dy_t||^2` with an EMA -- per-layer
+gradient-energy surprise with momentum -- currently wired to modulate
+`dy_r_target` (backward sparsity) rather than to gate the memory write.
+
+**Revised recommendation:** stop porting RSM (single-lab, unreplicated) and
+instead walk the implementation toward Titans one feature at a time, testing each
+step against the current best. Ordered ladder, smallest/highest-fidelity first:
+(1) replace input-distance novelty with gradient-based surprise, reusing
+`_update_layer_surprise`; (2) two-timescale momentum over surprise (momentary +
+past); (3) adaptive forgetting/decay on memory rather than pure additive
+accumulation; (4) keep the decoder loss OFF (already shown harmful here);
+(5) persistent (data-independent) memory tokens; (6) the MAC/MAG/MAL question of
+how memory combines with attention. Prerequisite before running that ladder:
+establish ONE adequately-powered standing benchmark and hold the update schedule
+constant across arms -- the two failure modes that wasted most of this
+investigation were an under-powered/confounded harness and sweeping before
+measuring.
 
 ## 2026-11-10 -- Mechanism B: formal proof, 5 negative self-supervised
 attempts, 1 validated win (RSM-inspired sparse memory + local loss)

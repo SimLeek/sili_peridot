@@ -318,10 +318,18 @@ def train_curriculum(
     tile_cache_credit_fraction: float | None = 0.5,
     tile_cache_credit_fraction_fn=None,
     retain_fired_rows: bool = False,
+    # Off, and should STAY off for MQAR: measured negative across k_active
+    # 2%-100%, filler predictability, decoder lr/schedule, redundancy 6%-97.5%,
+    # and write-gated inactivity. MQAR rewards large precise state (Zoology,
+    # arXiv:2312.04927) while RSM trades state for ~10x less memory, and RSM's
+    # own stated weakness is unseen sequences -- which MQAR draws fresh every
+    # episode. Accuracy here is monotonic in usable state, so sparsifying the
+    # write strictly costs recall. See JOURNAL.md 2026-11-12.
     rsm_memory_write_enable: bool = False,
     rsm_k_active: int | None = None,
     rsm_refractory_decay: float = 0.7,
     rsm_lr_mult: float = 1.0,
+    rsm_novelty_threshold: float | None = None,
     rsm_decoder_every_tick: bool = True,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
@@ -783,6 +791,7 @@ def train_curriculum(
         rsm_k_active=rsm_k_active,
         rsm_refractory_decay=rsm_refractory_decay,
         rsm_lr_mult=rsm_lr_mult,
+        rsm_novelty_threshold=rsm_novelty_threshold,
         rng=model_rng,
     )
     opt = AdamOptimizer()
