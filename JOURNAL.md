@@ -12775,3 +12775,65 @@ Separately corrected: `theta` cancels only the TRACE mass `1/(1-eta)`
 (Law 3). `alpha` attenuates already-stored content -- retention shape, not
 step magnitude -- so cancelling the full kernel mass
 `1/((1-b)(1-eta))` conflates the two.
+
+## 2026-11-12 (later) -- the r_target_min cliff explained: it is where
+## kept-k falls below the gradient's effective rank
+
+Applying the derive-don't-tune method to the second knob
+(project_sparsity_floor_generalization_scoping: `r_target_min` is
+hand-tuned and needs to scale with model size). Probe:
+`scripts/probe_sparsity_floor_participation_ratio.py`.
+
+**Why the knob has no natural scale.** Nucleus selection keeps the
+smallest top-|v| set with `R(v,k) = sum(v_topk^2)/sum(v^2) >= r_target`,
+so k is a CONSEQUENCE of r_target and the row's spectrum. An energy
+FRACTION is therefore scale-free in the wrong way: across iid gaussian,
+laplace, power-law and lognormal rows at fixed width, the effectively-
+active fraction spans 0.001 to 0.39 -- a 400x range -- while r_target is
+one number.
+
+**The scale-free quantity is the participation ratio**
+`PR(v) = (sum v^2)^2 / sum v^4`, the effective number of active
+components. It is exact on the only unambiguous case: for m equal nonzero
+entries PR = m exactly and the top-m capture R = 1.0, while ANY
+r_target < 1 under-selects and deletes live directions. First check was
+whether `R(v, PR(v))` is a universal constant one could just adopt -- it
+is NOT (0.59 to 1.00 across distributions), so the answer is not a better
+r_target but NO r_target: set k = PR(v) per row, measured.
+
+**Measured on real accumulated gradients, three widths:**
+```
+     layer    PR/n@96  PR/n@192  PR/n@288   r_tgt=0.5 keeps (288)
+input_proj     0.849     0.821     0.342          0.129
+    q_proj     0.544     0.524     0.504          0.191
+    k_proj     0.522     0.537     0.513          0.188
+    v_proj     0.757     0.624     0.262          0.097
+    o_proj     0.715     0.717     0.346          0.125
+```
+1. **PR/n differs 1.6-2.0x BETWEEN LAYERS at every width**, so one shared
+   constant is necessarily wrong for some of them.
+2. **PR/n is not width-invariant**: input_proj 0.85 -> 0.82 -> 0.34 and
+   v_proj 0.76 -> 0.62 -> 0.26 as width grows, while q/k hold near 0.51.
+   That IS the "floor must scale with model size" problem, and PR measures
+   it rather than guessing.
+3. **r_target=0.5 keeps 10-19% where PR says 26-51% are active**, i.e. it
+   discards half to two thirds of the live directions. That is a mechanism
+   for a CLIFF rather than a gradual tradeoff: past some point the
+   selection deletes genuinely active directions instead of trimming
+   noise. The setpoint that keeps all of them, `R(v,PR) ~= 0.79-0.84`,
+   sits safely above the observed 0.5-0.6 cliff -- consistent with 0.5
+   failing and 0.6+ working.
+
+**Honest scope, stated before anyone builds on this.**
+`neuron_grad_accum` is gradient ACCUMULATED over steps, so this measures
+which neurons receive gradient, not the per-step dy spectrum the kernel
+actually selects on. And it is a 120-step probe on a small model, not the
+100k-step wide-288 run where the cliff was measured. So this EXPLAINS and
+PREDICTS the cliff; it does not establish that k = PR fixes it. Owed: wire
+r_target per layer from measured PR (EMA'd, since it is per-row per-step)
+and re-run the wide curriculum against the hand-tuned baseline.
+
+Natural Bend law for this one, not yet written: for m equal nonzero
+entries, `(sum v^2)^2 == m * (sum v^4)` -- PR = m without needing
+division, provable over Nat by induction on m, confirming PR is exact on
+the case where the answer is unambiguous.
