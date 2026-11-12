@@ -1435,16 +1435,22 @@ recurrence, and the FP4 rank-N scale + additive low-rank branch.
 | Titans recurrence | new; O(1) + in-context verified | on DenseTensorLinear, NOT DISLDO |
 | FP4 rank-N scale + additive | exists, validated at fp8 | FP4 bit-budget invalid at toy scale |
 
-### Two blockers that outrank the integration work
+### One real blocker (corrected 2026-11-12 after review)
 
-**B1. Sparsity costs capability, measured.** Dense hits vocab=32/k=3 in <2k
-steps; r=0.5 sparse stalled 100k. Sparse + Titans may destroy the recurrence
-capability. Candidate fix already in hand: the PR-derived per-layer r_target
-(JOURNAL 2026-11-12) instead of the hand-tuned floor -- B1 and T3 are the same
-task.
+**B1. FORWARD sparsity can harm quality; amortized BACKWARD sparsity just
+works.** The earlier framing ("sparsity costs capability") was too broad. The
+sparsity level is not a quality knob to be tuned -- it is meant to react
+automatically to available CPU/GPU and thermal headroom. So the deliverable is
+not "pick a sparsity", it is a FLOOR: know when setting forward sparsity too low
+would harm quality, so the resource-driven controller has a guard rail it must
+not cross. The PR-derived per-layer r_target (JOURNAL 2026-11-12) is exactly
+that floor -- effective rank is the point below which selection starts deleting
+live directions rather than trimming noise. B1 == T3.
 
-**B2. Titans is on dense layers.** DenseTensorLinear -> DISLDOLayer is the first
-real integration step and the first place sparse x recurrence interact.
+**B2 withdrawn.** DISLDO is mathematically equivalent to a dense layer, is
+extensively test-verified, and is often FASTER than dense even on dense
+workloads -- so DenseTensorLinear -> DISLDO is a routine port, not a risk. T1
+stays in the ladder as a cheap equivalence check, not a gate to fear.
 
 ### Ladder. Each rung has a GATE; do not proceed past a red gate.
 
@@ -1464,27 +1470,47 @@ real integration step and the first place sparse x recurrence interact.
 - [ ] **T4. Add sparse backprop.** GATE: as T2, plus measured speedup.
 - [ ] **T5. Amortized health metrics on.** Cheap, already merged; GATE: no
       regression on the pair.
-- [ ] **T6. Energy annealing -- OPT-IN ONLY, and only if a rank-collapse
-      symptom is actually measured first.** It was strictly worse at wide288, so
-      adding it unconditionally is a known-negative move. GATE: it must fix a
-      measured collapse, not be adopted on principle.
-- [ ] **T7. FP4 rank-N scale + additive low-rank branch.** Needs the
-      Hadamard ambiguity resolved first (see below). GATE: parity with fp8 at
-      equal scale RANK, per the "rank beats bit-depth" finding -- and NOT at toy
-      width, where the bit-budget claim is already confirmed invalid.
+- [ ] **T6. Energy-stochastic annealing -- RE-SCOPED (the earlier "known
+      negative" framing was wrong).** It lost at wide288, but wide288/MQAR is a
+      DENSE-REWARD SUPERVISED task, which is where an intrinsic-drive mechanism
+      has least to offer. Judging it there repeats exactly the error that made
+      Titans' forgetting gate look harmful until it was measured with
+      recent-probe content: a mechanism tested outside its regime.
+      What it actually is: a curiosity-RL vs surprise-minimising-RL algorithm,
+      with the SETPOINT deciding which. Three claims worth testing, each in its
+      own regime:
+      (a) low-bit quality retention -- it helped larger transformers keep
+          quality after conversion, possibly by supplying a TEMPERATURE a 1B
+          transformer otherwise lacks. Test alongside T7, not before.
+      (b) rank-collapse reversal -- the already-validated use.
+      (c) SPARSE OR ABSENT REWARD -- the regime where it should shine, and the
+          one no task in this repo currently provides. See T9.
+- [ ] **T7. FP4 with the AQRS Hadamard-PRODUCT rank-N scale + additive
+      low-rank branch.** Ambiguity RESOLVED: this is the already-built AQRS
+      mechanism (AQRS_DESIGN.md Theorem 2, `additive_u/v`), not a QuaRot-style
+      Hadamard transform. So the work is porting the validated fp8 result
+      (additive_rank=1, peak_vocab=126) to fp4 at equal scale RANK, per "rank
+      beats bit-depth". GATE: fp4 parity with fp8 at equal rank -- and NOT
+      measured at toy width, where the bit-budget claim is confirmed invalid for
+      lack of fan-in. Pair with T6(a): if annealing supplies the missing
+      temperature, low-bit retention is where it shows.
 - [ ] **T8. Derived knobs wired in** (`kernel_matched` gates; PR-based
       r_target). GATE: report WORST-CASE REGRET across a wide range, never
       accuracy at one operating point.
 
-### Open question blocking T7
+- [ ] **T9. Mini-ultimate-transformer, then GAMES.** Once T0-T5 give a
+      small model that trains both paths, point it at a sparse-reward game. This
+      is the only planned test that can actually evaluate T6(c) -- intrinsic
+      drive with sparse or absent external reward -- and nothing currently in
+      either repo provides that regime. Needs: an environment loop, and a
+      decision on whether the setpoint is driven toward curiosity or toward
+      surprise minimisation.
 
-"fp4(hadamard)" is ambiguous and the two readings are weeks apart:
-  (a) **Hadamard TRANSFORM** (QuaRot/QuIP#-style rotation to flatten outliers
-      before quantizing). Does NOT exist in either repo -- new engine work.
-  (b) **Hadamard PRODUCT rank-N scale + additive low-rank branch** -- this is
-      what AQRS already does (`AQRS_DESIGN.md` Theorem 2, `additive_u/v`,
-      merged, fp8 MQAR win at additive_rank=1). Mostly built.
-Resolve before scheduling T7.
+### Resolved
+
+"fp4(hadamard)" means the AQRS Hadamard PRODUCT (rank-N scale + additive
+low-rank branch), already built and fp8-validated -- NOT a QuaRot-style Hadamard
+transform, which is absent from both repos and is not being built.
 
 ### Method constraint carried over from today
 
