@@ -1,45 +1,22 @@
 """Minimal memory-as-context Titans: window attention + a Titans LMM, sized for
 verification rather than capability.
 
-GOAL. A transformer with real trainable recurrence whose per-step backward cost
-is CONSTANT in the horizon, so it can run in real time: read a page in context
-while remembering the book title from far earlier, or watch a screen in context
-while remembering earlier frames.
+Target: real trainable recurrence whose per-step BACKWARD is constant in the
+horizon, so it can run in real time -- a page in context, the book title in
+recurrent memory.
 
-WHY THIS IS CONSTANT TIME. The memory WRITE (arXiv:2501.00663 eqs 10-13) is a
-delta rule evaluated entirely in the forward pass, so storing costs no gradient
-through time. Three parameter groups then have three different credit costs:
+The write (eqs 10-13) is a delta rule in the forward pass, so storing needs no
+gradient through time. That splits the parameters by credit cost: the READ side
+(W_Q, attention, head) gets exact gradient from the current tick at O(1); M is
+not a parameter at all; only the WRITE side (W_K, W_V) acts through later reads
+and so needs an approximation. Hence the modes -- "none" (control), "frozen"
+(write side random+frozen, O(1) with no approximation anywhere), "trace" (write
+side from an eligibility trace, still O(1); S_t already is such a trace, and
+bend_proofs/synaptic_hold_bptt_approximation bounds the error by the number of
+ACTIVE ticks, never the horizon).
 
-  read side  (W_Q, attention, lm_head) -- q_t is computed at THIS tick, so the
-             current loss gives exact gradient. O(1), nothing special needed.
-  write side (W_K, W_V) -- their effect only surfaces in LATER reads, so exact
-             credit is BPTT. This is the only group that needs an approximation.
-  memory M   -- not a parameter. Written by the local rule, never by gradient.
-
-So the write side is the whole difficulty, and `MODE` selects how it is paid for:
-
-  "none"     no memory at all. The control: must score well in-context and at
-             chance on recurrent questions, or the task is not measuring what it
-             claims.
-  "frozen"   memory on, write side left random and frozen. Still trains the READ
-             side exactly, so recurrence is trainable and strictly O(1) with no
-             approximation anywhere. Worth testing first because Gate A showed
-             the LMM reaches 0.9975 recall with random frozen projections -- if
-             this already lifts recurrent accuracy without costing in-context
-             accuracy, the engineering goal is met with no BPTT at all.
-  "trace"    write side trained from an eligibility trace, still O(1). S_t in
-             eq 10 already IS such a trace, and
-             bend_proofs/synaptic_hold_bptt_approximation bounds the error:
-             exact when intermediate ticks are inactive, and dependent only on
-             the number of ACTIVE ticks, never on the horizon.
-
-The LMM dimension is tied to `hidden` so a memory read can be injected as one
-extra attention row -- that is what "memory as context" means, and MAC is the
-variant the paper finds best on needle-in-a-haystack.
-
-Read-then-write ordering is load-bearing: a query token's own value is derived
-from its key, so writing first would let a tick corrupt the association it is
-about to retrieve.
+Measured O(1): see scripts/measure_constant_time_backward.py. Rationale, bug
+history and results: JOURNAL.md 2026-11-12.
 """
 
 from __future__ import annotations
@@ -61,6 +38,7 @@ class TitansMAC:
         *,
         mode: str = "frozen",
         n_layers: int = 2,
+        sigma_init: float | None = None,
         mem_lr: float = 0.5,
         trace_beta: float = 0.9,
         num_cpus: int = 2,
@@ -99,7 +77,16 @@ class TitansMAC:
         # One center/sigma PER ATTENTION ROW, matching ToyTileRecurrence. A
         # single shared pair yields NaN, since the kernel indexes these per row.
         self.centers = Tensor(np.array([i + 0.5 for i in range(self.n_rows)], dtype=np.float32))
-        self.log_sigmas = Tensor(np.zeros(self.n_rows, dtype=np.float32))
+        # sigma is a Gaussian POSITIONAL prior and its unit is TOKENS, so it has
+        # to match the distance over which a match must be found. sigma=1
+        # (log_sigmas=0) confines every row to its neighbours and suppresses the
+        # content matching induction needs: measured page accuracy 0.147 at
+        # sigma=1 vs 0.256 at sigma=4. But the window width is NOT the right
+        # scale either (0.206 at sigma=16) -- the query key recurs within its own
+        # page, so the required reach is the page length, not the context length.
+        # Default to a small multiple of that; override per task.
+        sig = 4.0 if sigma_init is None else float(sigma_init)
+        self.log_sigmas = Tensor(np.full(self.n_rows, np.log(sig), dtype=np.float32))
 
         # Memory read side trains exactly; write side depends on mode.
         self.W_Q_mem = DenseTensorLinear(hidden, hidden, scale=s)
