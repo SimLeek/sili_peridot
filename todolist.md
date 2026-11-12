@@ -1414,3 +1414,81 @@ deferred list — do not chase these for v1)
   redesign, `compact()`/`expand_headroom()` auto-handling — pre-existing
   `sili__new` backlog items, only touch if they concretely block this
   conversion.
+
+---
+
+## "Ultimate transformer" integration ladder (2026-11-12)
+
+Goal: ONE model combining sparse forward, sparse backprop, energy-stochastic
+annealing, amortized health metrics, adaptive (derived) hyperparameters, Titans
+recurrence, and the FP4 rank-N scale + additive low-rank branch.
+
+**Not started as a combined thing.** Component status verified, not recalled:
+
+| piece | state | risk |
+|---|---|---|
+| sparse forward (`x_r_target`) | merged, speedup validated | quality cost @288 |
+| sparse backprop (`dy_r_target`) | merged, speedup validated | same |
+| energy-stochastic annealing | built | NEGATIVE @wide288; wins only on rank collapse |
+| amortized health metrics | merged | ok |
+| adaptive hyperparameters | partial (AQRS merged; derived knobs unwired) | — |
+| Titans recurrence | new; O(1) + in-context verified | on DenseTensorLinear, NOT DISLDO |
+| FP4 rank-N scale + additive | exists, validated at fp8 | FP4 bit-budget invalid at toy scale |
+
+### Two blockers that outrank the integration work
+
+**B1. Sparsity costs capability, measured.** Dense hits vocab=32/k=3 in <2k
+steps; r=0.5 sparse stalled 100k. Sparse + Titans may destroy the recurrence
+capability. Candidate fix already in hand: the PR-derived per-layer r_target
+(JOURNAL 2026-11-12) instead of the hand-tuned floor -- B1 and T3 are the same
+task.
+
+**B2. Titans is on dense layers.** DenseTensorLinear -> DISLDOLayer is the first
+real integration step and the first place sparse x recurrence interact.
+
+### Ladder. Each rung has a GATE; do not proceed past a red gate.
+
+- [ ] **T0. Finish the Titans verification.** 3-arm dual-path run (in flight).
+      GATE: recurrent score above chance AND in-context not below the `none`
+      control (ceiling measured at page 0.906). If `frozen` is flat, that is
+      informative about the write side, not about Titans.
+- [ ] **T1. Titans on DISLDO, dense settings.** Swap the 4 projections to
+      `disldo_cls`, sparsity OFF. GATE: reproduce T0's pair within noise. This
+      isolates "DISLDO works here" from "sparsity works here".
+- [ ] **T2. Add sparse forward only.** GATE: in-context within noise of T1.
+      Expect trouble -- this is B1's first appearance.
+- [ ] **T3. Derive r_target per layer from PR** (replaces the hand-tuned floor;
+      this IS the B1 fix). GATE: beats the best hand-tuned constant on the pair,
+      and worst-case regret across widths < the constant's. Owed from
+      JOURNAL 2026-11-12.
+- [ ] **T4. Add sparse backprop.** GATE: as T2, plus measured speedup.
+- [ ] **T5. Amortized health metrics on.** Cheap, already merged; GATE: no
+      regression on the pair.
+- [ ] **T6. Energy annealing -- OPT-IN ONLY, and only if a rank-collapse
+      symptom is actually measured first.** It was strictly worse at wide288, so
+      adding it unconditionally is a known-negative move. GATE: it must fix a
+      measured collapse, not be adopted on principle.
+- [ ] **T7. FP4 rank-N scale + additive low-rank branch.** Needs the
+      Hadamard ambiguity resolved first (see below). GATE: parity with fp8 at
+      equal scale RANK, per the "rank beats bit-depth" finding -- and NOT at toy
+      width, where the bit-budget claim is already confirmed invalid.
+- [ ] **T8. Derived knobs wired in** (`kernel_matched` gates; PR-based
+      r_target). GATE: report WORST-CASE REGRET across a wide range, never
+      accuracy at one operating point.
+
+### Open question blocking T7
+
+"fp4(hadamard)" is ambiguous and the two readings are weeks apart:
+  (a) **Hadamard TRANSFORM** (QuaRot/QuIP#-style rotation to flatten outliers
+      before quantizing). Does NOT exist in either repo -- new engine work.
+  (b) **Hadamard PRODUCT rank-N scale + additive low-rank branch** -- this is
+      what AQRS already does (`AQRS_DESIGN.md` Theorem 2, `additive_u/v`,
+      merged, fp8 MQAR win at additive_rank=1). Mostly built.
+Resolve before scheduling T7.
+
+### Method constraint carried over from today
+
+Every rung reports the PAIR (in-context, recurrent) against per-capability
+chance, and any arm comparison first enumerates what ELSE moves with the flag
+(step size, update count, write order). Three separate confounds reversed a
+conclusion in one day; all three were "changed two things, credited one".
