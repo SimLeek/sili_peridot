@@ -322,6 +322,7 @@ def train_curriculum(
     rsm_k_active: int | None = None,
     rsm_refractory_decay: float = 0.7,
     rsm_lr_mult: float = 1.0,
+    rsm_decoder_every_tick: bool = True,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -1073,7 +1074,7 @@ def train_curriculum(
             # rsm_decoder_step_loss's own docstring for why this needs
             # its own backward here, independent of that). No-op unless
             # rsm_memory_write_enable=True.
-            if rsm_memory_write_enable:
+            if rsm_memory_write_enable and (rsm_decoder_every_tick or (i in targets)):
                 _rsm_next_i = i + 1
                 _rsm_next_tok = int(combined_tokens[_rsm_next_i]) if _rsm_next_i < seq_len + offset else None
                 if _rsm_next_tok is not None:

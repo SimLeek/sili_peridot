@@ -11986,6 +11986,117 @@ peak-eligibility-style credit for the recurrent memory's own
 never-cached long-horizon influence, generalized to k-hot per the
 earlier k-hot-generalization instruction.
 
+## 2026-11-12 -- RSM on the real architecture: a correctness fix, a
+self-inflicted confound, and an interaction effect (no positive benefit yet)
+
+Engineering goal, stated directly: get the model to show POSITIVE benefit from
+recurrent tokens. Framed explicitly as engineering, not validation -- the
+validation was the Bend proof (sili__new PR #55). 8h wall-clock budget, one box.
+
+**Instrument.** `recurrent_only_output=True` (the existing RNN-validation
+ablation) value-masks content rows so the attention output can only carry what
+was written to memory at an earlier step. It responds immediately, with no need
+to climb the curriculum to k=6, which makes it far better than the earlier
+attempt to force the recurrent regime by shrinking `num_tiles` -- that conflated
+context-starvation (which handicaps any context-dependent task) with
+recurrence-noise. Config: `embed_width=12` (~34k params), `num_tiles=16`
+(full context, unshrunk), `num_memory_slots=16` => write_width 16*96 = 1536.
+Chance at vocab=16 is 0.0625. Baseline (RSM off) scores **0.401**.
+
+Incidental confirmation of an earlier hypothesis: on the baseline, memory-only
+(0.385-0.401) BEATS full-context (0.193). Having content values available
+actively hurts at this size -- "normal context confounds the recurrent context,
+good-and-bad context competing vs decision paralysis."
+
+**Finding 1 (real bug, found by measurement in minutes).** `rmsnorm` was
+defeating the sparse write entirely. `memory_new = rmsnorm(memory_prev + write)`
+renormalizes the whole tensor, so a few large writes shift the RMS and perturb
+every unit: measured **97.7% of memory entries changing per tick at
+k_active=25%, and 31.9% at 2%**, instead of 25%/2%. That broke exactly the
+precondition the mechanism's own proof requires (`all_inactive_is_exact`:
+inactive units must not change), so no amount of k_active/refractory tuning
+could ever have worked. Fixed via `_memory_residual_update`, which holds
+unselected units at their previous value exactly while still letting rmsnorm
+stabilize the written ones. Post-fix the changed-fraction equals k_active
+exactly (2.0% / 25.0%) and per-tick relative state churn drops 1.09 -> 0.24
+(2%) / 0.49 (25%), i.e. memory now actually persists. Committed as a
+correctness fix independent of RSM's empirical fate. **This was invisible to
+accuracy sweeps** -- hours of overnight k_active/threshold/inhibition sweeps
+never found it; one direct measurement of per-tick state change did.
+
+**Finding 2 (self-inflicted confound; retires a lot of earlier data).** Turning
+on `rsm_memory_write_enable` silently changed the TRAINING SCHEDULE: the
+curriculum fired the decoder loss's backward plus an extra `opt.step()` at
+EVERY token position (requires_grad was made unconditional for the flag),
+whereas the baseline updates only at target positions. Because DISLDOLayer does
+its inline weight update with the lr captured at FORWARD time, that backward
+drove full-lr updates into `o_proj`/`q,k,v_proj` every tick regardless of any
+decoder-lr scaling. Decisive evidence: at `k_active=100%` the mask is all-ones,
+so the forward path is mathematically identical to RSM off, yet it scored 0.110
+vs 0.435 for the same config with the decoder loss dropped. Every result before
+that discovery (the k_active sweep, the filler sweep, the decoder-lr sweep) was
+dominated by this confound equally, which is exactly why they were all FLAT.
+Added `rsm_decoder_every_tick` (default True = prior behavior) and
+`rsm_lr_mult`, plus `num_memory_slots` as a real `train_curriculum` parameter.
+
+**Valid results, after removing the confound** (memory-only, predictable
+"count" filler, 3000 steps, 2 seeds, mean acc_tail):
+
+| condition | mean |
+|---|---|
+| baseline, RSM off | 0.401 |
+| no-op mask (k=1536), decoder dropped -- harness check | 0.435 |
+| sparse write only, 25% | 0.385 |
+| sparse write only, 2% | 0.333 (high variance: 0.388/0.278) |
+| decoder only (target-position schedule), no-op mask | 0.383 |
+| **sparse write 25% + decoder together** | **0.151** |
+
+**Finding 3 (interaction effect).** Each half is ~neutral on its own (0.385,
+0.383) but together they collapse to 0.151 -- not additive. Mechanism: the
+decoder reads `_rsm_last_write`, the MASKED write. With a no-op mask it sees the
+full write consistently; with a sparse mask plus refractory rotation it sees a
+DIFFERENT ~25% subset every tick, so the gradient it pushes back through the
+straight-through mask into `o_proj` targets moving coordinates and the updates
+contradict each other across ticks. In RSM proper the decoder reads `y^G`, the
+layer's entire (sparse) representation -- a consistently-defined object -- not a
+rotating slice of a dense residual delta.
+
+**Honest bottom line: no positive benefit from RSM achieved.** The sparse
+write + refractory half is roughly neutral (slightly negative at aggressive
+sparsity); the self-supervised decoder half is neutral alone and destructive in
+combination. Two things were nonetheless established: a real correctness bug in
+the memory update is fixed, and the measurement harness is now validated (the
+no-op-mask control reproduces baseline).
+
+**Also falsified along the way.** The "RSM's objective is misaligned with MQAR"
+hypothesis looked compelling -- MQAR's filler is literally
+`rng.randint(0, vocab_size)`, uniform noise, and the task's own
+`_build_targets` skips the filler region for that exact reason, while RSM's
+benchmarks (Embedded Reber Grammar, bouncing-balls video, maze) are tasks where
+next-input prediction IS the objective. But making the filler learnable changed
+nothing: RSM scored 0.146 (Champernowne counter digits, predictable only by
+carrying a position counter), 0.134 (ramp, predictable from the previous token
+alone), 0.140 (random) -- invariant. The confound dominated all three. Separately,
+"next-step target on every position" HURT the baseline (0.304 vs 0.401).
+
+**What I would do next**, in priority order:
+1. Make the decoder read a consistently-defined object -- the accumulated memory
+   state (or a fixed projection of it), not the per-tick rotating masked delta.
+   That directly targets Finding 3 and is the closest thing to RSM's actual `y^G`.
+2. Restore depth-2 fidelity: leaf-wrap `attn_mem`, replay norm+mask+decoder on
+   the leaf, push `leaf.grad` into `o_proj` only via `o_proj._c.backward_dense`
+   (the Mechanism-A idiom in `model/tile_cache_credit.py`), so the decoder
+   gradient never reaches `gaussian_attention`/`q,k,v_proj`.
+3. Per-slot top-k instead of flat global top-k, matching RSM's two-level
+   competition (exactly 1 winner per group, then top-k groups) so no memory slot
+   is starved.
+4. Re-check `rsm_refractory_decay` (0.7, untuned) only after 1-3 -- it is a
+   collision/timing axis and was never the binding constraint.
+Methodological note worth keeping: both real findings this session came from
+directly measuring the mechanism (per-tick state change; no-op-mask control),
+not from sweeping hyperparameters. The sweeps were uniformly flat precisely
+because a confound dominated them.
+
 ## 2026-11-10 -- Mechanism B: formal proof, 5 negative self-supervised
 attempts, 1 validated win (RSM-inspired sparse memory + local loss)
 
