@@ -24,6 +24,23 @@ recall lands BELOW chance. Pass const_* to pin them when the projections are
 frozen; const_theta=None uses the normalized delta-rule step 1/||k||^2, which
 stores one pair in one shot.
 
+A CONSTANT gate is a different mechanism, not a weaker learned one: one constant
+alpha decays must-keep and junk writes at the same rate, so no value of it can be
+right. `adaptive_gates=True` recovers the data-dependence with no outer loop and
+no oracle, from forward-pass statistics -- alpha on memory saturation (no decay
+until full), eta on agreement between the new gradient and the stored trace (so
+a transient spike resets it instead of smearing in). `retrieval_gated_forget`
+decays each column of M in inverse proportion to query traffic, a
+use-it-or-lose-it rule the paper lacks (their alpha is input-driven, never
+read-driven).
+
+Measured verdict, 4 regimes x 6 arms: NO setting of forgetting or momentum beats
+having neither, because a delta rule already carries implicit recency -- each
+write overwrites the directions it touches. The gates' win is landing on the
+right value unprompted (eta self-selects 0.003 where a 14-cell grid found 0), not
+a higher number. See JOURNAL.md 2026-11-12 for the full table and the two
+remaining infidelities (linear vs deep memory; scale).
+
 Ablation flags momentum/forget are the paper's own Table 5 rungs; its published
 ordering is weight decay (forgetting) > momentum > convolution > persistent
 memory. Reproducing that ORDERING is a scale-free validation gate -- their
@@ -59,6 +76,13 @@ class TitansMemory:
         const_alpha: float | None = 0.0,
         const_eta: float | None = 0.9,
         const_theta: float | None = None,
+        adaptive_gates: bool = False,
+        alpha_max: float = 0.1,
+        eta_max: float = 0.9,
+        u_target: float = 1.0,
+        gamma: float = 8.0,
+        retrieval_gated_forget: bool = False,
+        read_decay: float = 0.9,
         tie_query_to_key: bool = True,
         rng: np.random.Generator | None = None,
     ):
@@ -68,6 +92,12 @@ class TitansMemory:
         self.momentum, self.forget = momentum, forget
         self.theta_scale, self.alpha_scale = theta_scale, alpha_scale
         self.const_alpha, self.const_eta, self.const_theta = const_alpha, const_eta, const_theta
+        self.adaptive_gates = adaptive_gates
+        self.alpha_max, self.eta_max = alpha_max, eta_max
+        self.u_target, self.gamma = u_target, gamma
+        self.retrieval_gated_forget = retrieval_gated_forget
+        self.read_decay = read_decay
+        self.read_usage = np.zeros(d, dtype=np.float32)
 
         s = 1.0 / np.sqrt(d_in)
         self.W_K = (rng.standard_normal((d_in, d)) * s).astype(np.float32)
@@ -89,10 +119,72 @@ class TitansMemory:
         """Clear memory and surprise momentum. Call at every sequence boundary."""
         self.M[:] = 0.0
         self.S[:] = 0.0
+        self.read_usage[:] = 0.0
+
+    def _adaptive_alpha(self) -> float:
+        """Forget only once there is a shortage of room: alpha stays ~0 until
+        ||M|| reaches the capacity budget, then rises toward alpha_max."""
+        u = float(np.linalg.norm(self.M)) / np.sqrt(self.d)
+        return float(self.alpha_max * _sigmoid(self.gamma * (u / self.u_target - 1.0)))
+
+    def _adaptive_eta(self, grad: np.ndarray) -> float:
+        """Accumulate the surprise trace only while the new gradient agrees with
+        it, so a transient spike resets the trace instead of smearing into it."""
+        s_n = float(np.linalg.norm(self.S))
+        g_n = float(np.linalg.norm(grad))
+        if s_n < 1e-8 or g_n < 1e-8:
+            return 0.0
+        cos = float(np.sum(self.S * -grad)) / (s_n * g_n)
+        return float(self.eta_max * max(0.0, cos))
+
+    def _decayed(self, alpha: float) -> np.ndarray:
+        """(1 - alpha) * M_{t-1}, the eq-13 decay -- except that retrieval-gated
+        forgetting spares the columns queries actually read. Column j of M is the
+        one key component j drives, so usage is tracked per query component."""
+        if alpha <= 0.0:
+            return self.M
+        if not self.retrieval_gated_forget:
+            return (1.0 - alpha) * self.M
+        peak = float(self.read_usage.max())
+        spare = self.read_usage / peak if peak > 0.0 else np.zeros(self.d, dtype=np.float32)
+        return self.M * (1.0 - alpha * (1.0 - spare)).astype(np.float32)
+
+    def _gates(self, grad: np.ndarray, *, x: np.ndarray | None = None) -> tuple[float, float]:
+        """Resolve (alpha_t, eta_t) for this step. Precedence: the ablation
+        switches win, then intrinsic adaptation, then a pinned constant, then the
+        paper's learned projections (only meaningful once those are trained)."""
+        if not self.forget:
+            alpha = 0.0
+        elif self.adaptive_gates:
+            alpha = self._adaptive_alpha()
+        elif self.const_alpha is not None:
+            alpha = self.const_alpha
+        elif x is not None:
+            alpha = float(self.alpha_scale * _sigmoid(x @ self.w_alpha))
+        else:
+            alpha = 0.0
+
+        if not self.momentum:
+            eta = 0.0
+        elif self.adaptive_gates:
+            eta = self._adaptive_eta(grad)
+        elif self.const_eta is not None:
+            eta = self.const_eta
+        elif x is not None:
+            eta = float(_sigmoid(x @ self.w_eta))
+        else:
+            eta = 0.9
+        return float(alpha), float(eta)
+
+    def _note_read(self, q: np.ndarray) -> None:
+        self.read_usage *= self.read_decay
+        self.read_usage += q * q
 
     def read(self, x: np.ndarray) -> np.ndarray:
-        """y_t = M*(q_t), eq 15. Pure forward pass, no state change."""
-        return self.M @ (x.astype(np.float32) @ self.W_Q)
+        """y_t = M*(q_t), eq 15. Forward pass only; records retrieval traffic."""
+        q = x.astype(np.float32) @ self.W_Q
+        self._note_read(q)
+        return self.M @ q
 
     def write(self, x: np.ndarray, *, theta: float | None = None) -> dict:
         """One inner-loop step: eqs 10-13. `theta` overrides the data-dependent
@@ -101,20 +193,6 @@ class TitansMemory:
         x = x.astype(np.float32)
         k = x @ self.W_K
         v = x @ self.W_V
-
-        if not self.forget:
-            alpha = 0.0
-        elif self.const_alpha is not None:
-            alpha = self.const_alpha
-        else:
-            alpha = self.alpha_scale * _sigmoid(x @ self.w_alpha)
-
-        if not self.momentum:
-            eta = 0.0
-        elif self.const_eta is not None:
-            eta = self.const_eta
-        else:
-            eta = _sigmoid(x @ self.w_eta)
 
         if theta is not None:
             th = theta
@@ -126,8 +204,9 @@ class TitansMemory:
 
         err = self.M @ k - v
         grad = 2.0 * np.outer(err, k)  # grad_M ||Mk - v||^2, closed form
+        alpha, eta = self._gates(grad, x=x)
         self.S = eta * self.S - th * grad
-        self.M = (1.0 - alpha) * self.M + self.S
+        self.M = self._decayed(alpha) + self.S
 
         self.last = {
             "surprise": float(np.linalg.norm(err)),
@@ -151,8 +230,6 @@ class TitansMemory:
         the memory update itself from that binding problem."""
         k = k.astype(np.float32)
         v = v.astype(np.float32)
-        alpha = (self.const_alpha if self.const_alpha is not None else 0.0) if self.forget else 0.0
-        eta = (self.const_eta if self.const_eta is not None else 0.9) if self.momentum else 0.0
         if theta is not None:
             th = theta
         elif self.const_theta is not None:
@@ -161,8 +238,9 @@ class TitansMemory:
             th = 0.5 / (float(k @ k) + 1e-6)
         err = self.M @ k - v
         grad = 2.0 * np.outer(err, k)
+        alpha, eta = self._gates(grad)
         self.S = eta * self.S - th * grad
-        self.M = (1.0 - alpha) * self.M + self.S
+        self.M = self._decayed(alpha) + self.S
         self.last = {
             "surprise": float(np.linalg.norm(err)),
             "alpha": float(alpha),
@@ -174,7 +252,9 @@ class TitansMemory:
 
     def read_q(self, q: np.ndarray) -> np.ndarray:
         """y = M q for an explicit query vector (eq 15, projections bypassed)."""
-        return self.M @ q.astype(np.float32)
+        q = q.astype(np.float32)
+        self._note_read(q)
+        return self.M @ q
 
     def step(self, x: np.ndarray, *, write: bool = True, theta: float | None = None) -> np.ndarray:
         """Read-then-write, so `y` reflects only the PAST (strictly causal). This

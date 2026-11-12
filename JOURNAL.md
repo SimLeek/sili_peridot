@@ -12404,3 +12404,168 @@ code's cross-time credit breaks down past a certain horizon) remains a
 real, not-yet-understood limitation worth its own investigation before
 trusting this at longer horizons -- likely relevant to how far the
 real MQAR validation above should expect this to hold up too.
+
+## 2026-11-12 (later) -- Titans ported and validated; its two gates
+## measured net-negative here, with a mechanical reason
+
+RSM measured neutral-to-negative across every axis tried and has ~4
+citations, all from one lab, with no independent replication -- so
+there was no verified reference to ablate *from*. Redirected to Titans
+(arXiv:2501.00663), the validated descendant of the same
+write-on-surprise idea: implement it, show it works, *then* ablate
+toward RSM, so each dropped feature is informative.
+
+**The port** (`model/titans_memory.py`): eqs 10-15 with a
+matrix-valued memory. The inner gradient is closed form,
+`grad_M ||Mk - v||^2 = 2(Mk - v)k^T` -- a delta-rule outer-product
+update computed entirely in the forward pass. No autograd, no BPTT.
+`S_t` with its `eta_t` momentum is literally an eligibility trace over
+surprise, which is the same object the Bend proof
+(`bend_proofs/synaptic_hold_bptt_approximation`) is about.
+
+**Structural finding en route, worth keeping**: eq 11 derives `k_t`
+AND `v_t` from the *same* `x_t`, so feeding a key token stores
+key->key and recall is exactly 0.000. The LMM is NOT a standalone
+associative memory over raw tokens. In a real Titans `x_t` is a hidden
+state that has *already attended over context*, so the attention Core
+does the key/value binding and the memory only stores it. This is why
+Titans is a hybrid and why MAC (memory-as-context) wins on NIAH. Added
+`write_kv`/`read_q` to isolate the memory update from that binding
+problem. An earlier symptom of the same confusion: untrained gates give
+`alpha ~= sigmoid(0) ~= 0.5`, halving memory every step
+(`0.5^32 ~= 2e-10`) and landing *below* chance.
+
+**GATE A -- PASSED.** Explicit (k,v) pairs, chance 0.031: 1.0000 at 1
+and 4 pairs with no gap, 0.9975 across gaps of 32 and 128. First
+unambiguous positive of the whole investigation, and being a
+*mechanism* validation it is immune to the seed-variance problem that
+made every RSM benchmark unmeasurable.
+
+**GATE B -- FAILED.** Their published ablation ordering is weight decay
+(forgetting) > momentum. Measured at the interference point (4 pairs,
+64 novel filler writes, 500 episodes x 3 seeds, chance 0.0156), with
+constant gates:
+
+```
+ alpha (forget)  eta=0 (no mom)   eta=0.9 (mom)
+            0.0          0.3600          0.1553
+           0.01          0.1653          0.1527
+           0.05          0.0120          0.1307
+            0.2          0.0193          0.0313
+```
+
+Best is alpha=0, eta=0 -- *both mechanisms off*. Forgetting degrades
+monotonically; momentum costs more than half the recall. Opposite of
+the paper. One real secondary effect: momentum **buffers** aggressive
+forgetting (at eta=0, alpha 0->0.1 collapses 0.360->0.013; at eta=0.9
+the same sweep only drops 0.155->0.105), consistent with the two being
+co-designed.
+
+**Why the constant-gate result is not a verdict on Titans.** A constant
+gate is a *different* mechanism, not a weaker learned one. The task
+mixes 4 must-keep pairs with 64 junk writes, so one constant alpha
+decays both at the same rate and no value of it can be right. The
+paper states the premise directly: "a data-dependent eta can control
+if memory needs to: (1) ignore the last surprise ... or (2) fully
+incorporate the last surprise." The *dependence* is the mechanism.
+
+**Recovering the dependence intrinsically** (no outer loop, no oracle,
+`adaptive_gates=True`), from statistics the memory already computes:
+
+```
+alpha_t = alpha_max * sigmoid(gamma * (||M||_F/sqrt(d) / u_target - 1))
+eta_t   = eta_max * max(0, cos(S_{t-1}, -grad_t))
+```
+
+Forgetting exists to make room, so gate it on *saturation* rather than
+elapsed time: no decay until the memory is actually full. Momentum
+helps while surprise persists and hurts on a transient spike, so the
+trace accumulates only while the new gradient agrees with it, and
+self-resets on a direction change.
+
+Plus a rule the paper does not have: **retrieval-gated forgetting**.
+Against iid random junk NO intrinsic signal separates "novel junk" from
+"novel important" -- both are unrelatable noise. What *is* separable is
+recurrence and retrieval traffic: a direction that gets *read* is
+demonstrably worth keeping. So decay column j of M in inverse
+proportion to how much it has been queried. Queries come from the input
+stream, so this is environment-supplied, not an oracle label on which
+keys matter. (Their alpha is input-driven only, never read-driven.)
+
+Results, `scripts/prototype_titans_adaptive_gates.py`, 500 eps x 3
+seeds, chance 0.0156:
+
+```
+                          arm      novel  repeated  novel+rd   stale  <alpha>  <eta>
+         const best (a=0,e=0)     0.2247    0.9997    0.2247  0.9798   0.0000  0.0000
+ const paper-ish (a=.01,e=.9)     0.1147    0.1120    0.1147  0.0110   0.0100  0.9000
+               adaptive gates     0.1448    0.9997    0.1448  0.9728   0.0062  0.0031
+      adaptive, alpha_max=0.3     0.0925    0.9993    0.0925  0.9670   0.0118  0.0030
+   adaptive + retrieval-gated     0.0925    0.9993    0.1262  0.9670   0.0118  0.0030
+ retrieval-gated only (a=.05)     0.0187    0.0558    0.0277  0.8783   0.0500  0.0000
+```
+
+**(1) Redundancy is the whole capacity story.** 64 *repeated* filler
+writes are essentially FREE (0.9997); 64 *novel* ones cost 4x
+(0.2247). Capacity pressure is a property of whether the encoder has
+learned to collapse redundancy, not of the memory rule -- "novel" lives
+in the *representation*, not the input. A trained encoder maps
+semantically-redundant content to nearby keys, so writes collide and
+overwrite instead of each claiming fresh directions. These two columns
+bracket trained vs untrained; 0.163/0.2247 is the *untrained-encoder
+floor*, not Titans' capacity. (This is the user's bird-at-window
+intuition, confirmed quantitatively: ~99% of a video's frames are
+near-identical and should cost almost nothing to hold.)
+
+**(2) eta adaptation works in the sense that matters**: mean eta =
+0.003. The agreement rule *rediscovers* eta~=0 on iid junk, which the
+constant grid needed 14 cells to find. Consecutive random gradients are
+near-orthogonal, so it correctly refuses to accumulate a trace over
+noise. That is the non-oracle property we wanted -- it lands on the
+right value without being told the data.
+
+**(3) alpha adaptation fails, and the reason is general**: saturation
+tells you there is *no room*; it never tells you *what to evict*. Mean
+alpha of 0.006 still costs 8 recall points, because when ||M|| crosses
+the budget the decay lands on the 4 pairs and the 64 junk writes alike.
+
+**(4) Retrieval gating works once it has signal.** With reads
+interleaved into the filler phase, 0.0925 -> 0.1262 (+36% relative),
+and 0.0187 -> 0.0277 (+48%) for the isolated rule -- while the
+non-gated arms are *bit-identical* under the same added reads, so the
+gain is the rule and not the reads. Methodological note: in the
+original design all reads happened *after* all writes, so `read_usage`
+was identically zero through the write phase and the gating degenerated
+to uniform decay. The two arms coming out bit-identical was the tell
+that the hypothesis had gone untested, not that it had failed.
+
+**(5) The stale-content column, a wrong prediction worth recording.**
+Predicted forgetting must win once old content goes obsolete (16 pairs
+written, only the last 4 probed), since the main task cannot *possibly*
+reward eviction -- every pair there is wanted at the final probe. It
+still lost: 0.9798 with no forgetting vs 0.9670 with it. Reason: **a
+delta rule already carries implicit recency.** Each write overwrites
+the directions it touches, so recent pairs dominate the readout
+automatically and old content fades with nobody decaying it. Explicit
+alpha is *redundant with the update rule itself*, which is why it can
+only subtract.
+
+**Verdict across 4 regimes x 6 arms: no setting of forgetting or
+momentum beats having neither.** Momentum is the worse of the two,
+catastrophic in the stale column (0.0110, at chance). Best everywhere
+is plain delta-rule storage.
+
+**Two remaining infidelities, ranked** -- this is a verdict on *this
+port in this harness*, not on Titans:
+1. **Linear memory instead of deep.** "Deep > linear" is one of their
+   own ablation findings, and this is exactly where it could bite: an
+   MLP memory has *no* implicit recency, so alpha would finally have
+   something to buy. Lead hypothesis.
+2. **Scale.** 68 writes per episode vs millions of tokens; ||M||
+   divergence may only become a real problem over far longer streams,
+   which is also the only regime where a saturation-driven alpha has
+   room to act.
+
+Outer-loop learning of `W_K`/`W_V`/`W_Q` and the gate projections is a
+third difference, but note Gate A passes with *random frozen*
+projections, so the memory update itself does not need it.
