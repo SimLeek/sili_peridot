@@ -290,6 +290,7 @@ def train_curriculum(
     peak_lr: float,
     num_tiles: int,
     k_max: int,
+    num_memory_slots: int = NUM_MEMORY_SLOTS,
     log_every: int = 200,
     log_fn=None,
     additive_rank: int = 1,
@@ -320,6 +321,7 @@ def train_curriculum(
     rsm_memory_write_enable: bool = False,
     rsm_k_active: int | None = None,
     rsm_refractory_decay: float = 0.7,
+    rsm_lr_mult: float = 1.0,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -729,7 +731,7 @@ def train_curriculum(
         embed_width,
         COLUMN_NEURONS,
         num_tiles,
-        NUM_MEMORY_SLOTS,
+        num_memory_slots,
         MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS,
         disldo_cls=disldo_cls,
@@ -779,6 +781,7 @@ def train_curriculum(
         rsm_memory_write_enable=rsm_memory_write_enable,
         rsm_k_active=rsm_k_active,
         rsm_refractory_decay=rsm_refractory_decay,
+        rsm_lr_mult=rsm_lr_mult,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -1005,7 +1008,7 @@ def train_curriculum(
         query_positions = {pos + offset for pos in query_positions}
         new_vocab_query_positions = {pos + offset for pos in new_vocab_query_positions}
 
-        memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
+        memory = np.zeros((num_memory_slots, state_width), dtype=np.float32)
         tile_cache = None  # reset every sequence, same as memory
         if rsm_memory_write_enable:
             model.rsm_reset_sequence()  # reset the refractory trace, same cadence as memory
@@ -1036,9 +1039,9 @@ def train_curriculum(
                 # 3-tuples (k_row, v_row, x_normed_row) -- must match
                 # step_cached()'s own tile_cache tuple shape exactly, see
                 # model/tile_cache_credit.py.
-                k_content = model.last_debug["k"][NUM_MEMORY_SLOTS:]
-                v_content = model.last_debug["v"][NUM_MEMORY_SLOTS:]
-                x_content = model.last_debug["x_normed"][NUM_MEMORY_SLOTS:]
+                k_content = model.last_debug["k"][num_memory_slots:]
+                v_content = model.last_debug["v"][num_memory_slots:]
+                x_content = model.last_debug["x_normed"][num_memory_slots:]
                 tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), x_content[1:].copy(), strict=False))
             elif use_tile_cache:
                 new_embed = embed_table[combined_tokens[i]]

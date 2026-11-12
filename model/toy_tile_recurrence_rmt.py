@@ -127,6 +127,7 @@ class ToyTileRecurrenceRMT:
         rsm_memory_write_enable: bool = False,
         rsm_k_active: int | None = None,
         rsm_refractory_decay: float = 0.7,
+        rsm_lr_mult: float = 1.0,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -267,8 +268,9 @@ class ToyTileRecurrenceRMT:
             (toy-scale validated, NOT yet at this scale). Winner-take-
             all + refractory inhibition on the flattened PASS-1 write;
             rsm_k_active = survivors (None: 25%, untuned). Caller calls
-            rsm_reset_sequence() at sequence boundaries. No-op unless
-            True."""
+            rsm_reset_sequence() at sequence boundaries. rsm_lr_mult
+            scales the decoder path's own learning rate only. No-op
+            unless True."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -357,10 +359,12 @@ class ToyTileRecurrenceRMT:
         # See __init__'s own rsm_memory_write_enable docstring above.
         self.rsm_memory_write_enable = rsm_memory_write_enable
         self.rsm_refractory_decay = rsm_refractory_decay
+        self.rsm_lr_mult = rsm_lr_mult
         self._rsm_write_width = self.num_memory_slots * self.state_width
         self.rsm_k_active = rsm_k_active if rsm_k_active is not None else max(1, round(0.25 * self._rsm_write_width))
         self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
         self._rsm_last_write: Tensor | None = None  # LIVE Tensor (not detached) -- see rsm_decoder_step_loss
+        self._rsm_last_mask: np.ndarray | None = None  # see _memory_residual_update
         self.rsm_decoder = None  # constructed below, after rng is guaranteed non-None
 
         state_width = self.state_width
@@ -1592,10 +1596,24 @@ class ToyTileRecurrenceRMT:
         mask = np.zeros_like(flat)
         mask[top_idx] = 1.0
         self._rsm_phi = np.maximum(self._rsm_phi * self.rsm_refractory_decay, mask)
-        mask_t = Tensor(mask.reshape(attn_mem_n.data.shape))
-        sparse = attn_mem_n * mask_t
+        mask2d = mask.reshape(attn_mem_n.data.shape)
+        self._rsm_last_mask = mask2d
+        sparse = attn_mem_n * Tensor(mask2d)
         self._rsm_last_write = sparse
         return sparse
+
+    def _memory_residual_update(self, memory_prev_t: Tensor, attn_mem_n: Tensor) -> Tensor:
+        """memory_new = rmsnorm(prev + write), except under RSM the
+        UNSELECTED units keep prev exactly. rmsnorm otherwise rescales
+        every unit on every tick (a few large writes move the RMS), so
+        a sparse write still churns the whole state -- measured 97.7%
+        of entries changing at k_active=25%, 31.9% at 2% -- defeating
+        the sparsity and breaking the "inactive units don't change"
+        precondition the mechanism's proof needs."""
+        normed = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
+        if not self.rsm_memory_write_enable or self._rsm_last_mask is None:
+            return normed
+        return normed * Tensor(self._rsm_last_mask) + memory_prev_t * Tensor(1.0 - self._rsm_last_mask)
 
     def rsm_decoder_step_loss(self, next_token_id: int, learning_rate: float) -> Tensor | None:
         """Shallow local self-supervised loss, JOURNAL.md 2026-11-10.
@@ -1603,7 +1621,7 @@ class ToyTileRecurrenceRMT:
         if self.rsm_decoder is None or self._rsm_last_write is None:
             return None
         write = self._rsm_last_write.reshape((1, self._rsm_write_width))
-        logits = self.rsm_decoder.forward(write, learning_rate)
+        logits = self.rsm_decoder.forward(write, learning_rate * self.rsm_lr_mult)
         return cross_entropy_sum(logits, [(0, next_token_id)])
 
     def _apply_energy(self, x: Tensor, region: str) -> Tensor:
@@ -1892,6 +1910,7 @@ class ToyTileRecurrenceRMT:
         self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
         self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
         self._rsm_last_write = None  # see _rsm_sparsify_write's own docstring
+        self._rsm_last_mask = None
 
         if content_dy_sparsity_schedule is not None:
             if len(content_dy_sparsity_schedule) != n_content:
@@ -2045,7 +2064,7 @@ class ToyTileRecurrenceRMT:
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
         if self.rsm_memory_write_enable:
             attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
+        memory_new_t = self._memory_residual_update(memory_prev_t, attn_mem_n)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, against the FRESH memory_new_t, not stale
@@ -2320,6 +2339,7 @@ class ToyTileRecurrenceRMT:
         self._sleep_aux_loss = None
         self._balance_aux_loss = None
         self._rsm_last_write = None
+        self._rsm_last_mask = None
 
         new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
         new_embed_t = Tensor(new_embed_2d)
@@ -2462,7 +2482,7 @@ class ToyTileRecurrenceRMT:
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
         if self.rsm_memory_write_enable:
             attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
+        memory_new_t = self._memory_residual_update(memory_prev_t, attn_mem_n)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, only the newest content row's own query ---
