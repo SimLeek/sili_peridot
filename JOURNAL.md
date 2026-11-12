@@ -12682,3 +12682,96 @@ investigation was "changed two things, credited one": RSM's schedule
 probed-content write position. Before reporting ANY arm comparison here,
 enumerate what else moves with the flag -- step size, update count, write
 order.
+
+## 2026-11-12 (later) -- a KNOB-FREE gate rule, derived from the kernel
+## proof, with 3.4x lower worst-case regret than the best constant
+
+Goal stated directly: use proofs to find a system that needs no
+hyperparameter, or at least adapts well over a very large range, instead
+of tuning finicky constants. This is the first worked instance.
+
+**Correction to the previous entry.** It claimed Law 2 means the gates are
+"one effective degree of freedom". Wrong. `w` is the complete homogeneous
+symmetric polynomial `h_n(b, eta)`, so it depends on the gates only
+through their SYMMETRIC FUNCTIONS: they are INTERCHANGEABLE but NOT
+REDUNDANT -- 2 DOF with the labeling removed, not 1. Check: `b=1,
+eta=0.95` is equivalent to `b=0.95, eta=1`, i.e. `alpha=0.05` *with*
+`eta=1`, not `alpha=0.05` with `eta=0`. So the big measured gap between
+those two settings is real and consistent with Law 2.
+
+That correction is what opened the route, because it pointed at the
+DIAGONAL `b = eta`, which the wrong reading would have dismissed as
+redundant.
+
+**Bend Law 5** (`kernel_diagonal`, now checked): `w(b,b,n) == (n+1) b^n`.
+The only setting with an INTERIOR PEAK -- either gate alone merely rises
+and saturates (Law 4) or merely decays, so neither can express "weight
+writes of age ~L most heavily". The diagonal peaks at
+`n* = -1/ln b - 1 ~= 1/(1-b)`, which makes it INVERTIBLE against a
+measured lag `L`. Verified numerically: closed form matches to 1e-15 and
+`argmax_n` lands at `L` for L in {2,4,8,16,32,64}.
+
+**The derived rule** (`kernel_matched=True`), zero knobs:
+```
+eta   = 1 - 1/L        peak at the measured retrieval lag
+theta *= (1 - eta)     cancel Law 3's TRACE mass only
+alpha = 0              (see caveat)
+```
+`L` is the mean age of the writes the stream's own queries land on, so
+every term is measured, not tuned.
+
+**Results.** vs the per-regime TUNED constant:
+```
+ order    zero-knob   best tuned      L    eta*
+ random     0.8639      0.8706     33.3   0.971
+ first      0.9803      0.7475     65.5   0.985   <- beats the tuned ref
+ last       1.0000      1.0000      1.47  0.322
+```
+Generalization across a 32x range of filler gap, the real test:
+```
+  gap     L   eta*  ZERO-KNOB  eta=0.0  eta=0.7  eta=0.9  eta=.95  eta=.99
+    8   5.6  0.820    0.9761   1.0000   0.9961   0.9428   0.9078   0.8817
+   16   8.9  0.888    0.9478   0.9928   0.9889   0.9361   0.8878   0.8372
+   32  16.9  0.939    0.9100   0.9250   0.9561   0.9456   0.8989   0.8100
+   64  35.0  0.972    0.8522   0.6461   0.6794   0.7894   0.8689   0.7750
+  128  64.3  0.985    0.6939   0.3661   0.3894   0.4361   0.5133   0.7128
+  256  89.8  0.989    0.3539   0.2011   0.2139   0.2350   0.2550   0.3739
+  WORST REGRET        0.0461   0.3467   0.3233   0.2767   0.1994   0.1556
+```
+**3.4x lower worst-case regret than the best fixed eta, 7.5x lower than
+eta=0**, tracking `eta*` from 0.820 to 0.989 unaided. Every fixed value is
+excellent at one end of the range and poor at the other.
+
+**Why the predecessor knob was finicky, and why this one is not.** The
+`lag_horizon` controller used `eta = eta_max * clip(L/horizon)`, and
+horizon 16 -> 48 swung recall 0.86 -> 0.45. Law 3 makes `1/(1-eta)` a TIME
+CONSTANT, so all the dynamic range sits near `eta = 1` and a LINEAR map
+into it is badly conditioned by construction. `eta = 1 - 1/L` is the
+correctly conditioned inverse, which removed the knob and the sensitivity
+together. General lesson: the proof supplies the units the knob should
+have been measured in, and in those units there is no knob.
+
+**Caveat, an honest limit of Law 5.** `alpha = 1/L` -- the actual diagonal
+-- measured WORSE than `alpha = 0` (0.8269 vs 0.8639 uniform; 0.8550 vs
+1.0000 recent-probe). Nothing in these tasks becomes obsolete, so
+sharpening toward recent can only discard something still wanted. Law 5's
+role is to supply the INVERTIBLE FORM, not to assert the diagonal is the
+right operating point; `alpha` has to be earned by measured obsolescence,
+which this harness does not provide.
+
+**A bug worth recording, because it was confound 1 recurring in new
+code.** The first `kernel_matched` run scored 0.0258 vs 0.8706 and I
+diagnosed it as the theta normalization. That diagnosis was WRONG. A
+`str.replace` patch had silently failed to match its anchor, so the theta
+scaling never applied at all: theta stayed at exactly 0.5 while eta rose
+to 0.97, amplifying the effective step 34x and diverging the memory to
+||M|| = 11774. The tell was there in the trace (constant theta, ||M|| in
+the thousands) and is the exact signature already characterized earlier
+the same day. Two process fixes: ASSERT that a scripted patch matched
+before trusting it, and when two implementations of one rule disagree by
+30x, debug the discrepancy before diagnosing the mechanism.
+
+Separately corrected: `theta` cancels only the TRACE mass `1/(1-eta)`
+(Law 3). `alpha` attenuates already-stored content -- retention shape, not
+step magnitude -- so cancelling the full kernel mass
+`1/((1-b)(1-eta))` conflates the two.

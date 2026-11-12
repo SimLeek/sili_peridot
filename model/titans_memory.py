@@ -34,12 +34,23 @@ decays each column of M in inverse proportion to query traffic, a
 use-it-or-lose-it rule the paper lacks (their alpha is input-driven, never
 read-driven).
 
-Measured verdict, 4 regimes x 6 arms: NO setting of forgetting or momentum beats
-having neither, because a delta rule already carries implicit recency -- each
-write overwrites the directions it touches. The gates' win is landing on the
-right value unprompted (eta self-selects 0.003 where a 14-cell grid found 0), not
-a higher number. See JOURNAL.md 2026-11-12 for the full table and the two
-remaining infidelities (linear vs deep memory; scale).
+RETRACTED, and kept here because the mistake recurs: an earlier verdict that "no
+setting of forgetting or momentum beats having neither" was a STEP-SIZE
+confound. eta multiplies the effective step by 1/(1-eta), so varying eta at
+fixed theta varies the learning rate too -- 20x at eta=0.95, which diverged the
+memory to ||M||=11093. With theta *= (1-eta) the sign flips and both gates are
+positive, each in the regime it targets: momentum broadens retention (0.665 ->
+0.871 with probes spread uniformly), forgetting sharpens it toward recent (0.387
+-> 0.879 with probes recent). That trade-off along the temporal axis is why the
+paper ranks weight decay above momentum -- language modelling is recency-
+weighted. Also retracted: an "adaptive" eta rule that selected 0.003 and looked
+like a success, when the true optimum is 0.95.
+
+`kernel_matched=True` is the knob-free consequence, derived in
+bend_proofs/titans_gate_retention_kernel: on the diagonal b = eta the retention
+kernel is (n+1) b^n (Law 5), the only form with an interior peak, sitting at
+~1/(1-b). Inverting that against the measured retrieval lag L fixes every gate
+with nothing left to tune -- alpha = 1/L, eta = 1 - 1/L, theta *= (1-eta).
 
 Ablation flags momentum/forget are the paper's own Table 5 rungs; its published
 ordering is weight decay (forgetting) > momentum > convolution > persistent
@@ -84,6 +95,7 @@ class TitansMemory:
         retrieval_gated_forget: bool = False,
         read_decay: float = 0.9,
         lag_adaptive: bool = False,
+        kernel_matched: bool = False,
         lag_horizon: float = 48.0,
         lag_beta: float = 0.02,
         lag_buffer: int = 192,
@@ -103,6 +115,7 @@ class TitansMemory:
         self.read_decay = read_decay
         self.read_usage = np.zeros(d, dtype=np.float32)
         self.lag_adaptive = lag_adaptive
+        self.kernel_matched = kernel_matched
         self.lag_horizon, self.lag_beta, self.lag_buffer = lag_horizon, lag_beta, lag_buffer
         self.lag_ema = 0.0
         self._tick = 0
@@ -164,6 +177,9 @@ class TitansMemory:
         """Resolve (alpha_t, eta_t) for this step. Precedence: the ablation
         switches win, then intrinsic adaptation, then a pinned constant, then the
         paper's learned projections (only meaningful once those are trained)."""
+        if self.kernel_matched:
+            a_km, e_km = self._kernel_matched_gates()
+            return (a_km if self.forget else 0.0), (e_km if self.momentum else 0.0)
         if self.lag_adaptive:
             a_lag, e_lag = self._lag_gates()
             return (a_lag if self.forget else 0.0), (e_lag if self.momentum else 0.0)
@@ -193,7 +209,7 @@ class TitansMemory:
     def _note_read(self, q: np.ndarray) -> None:
         self.read_usage *= self.read_decay
         self.read_usage += q * q
-        if not self.lag_adaptive or not self._kbuf:
+        if not (self.lag_adaptive or self.kernel_matched) or not self._kbuf:
             return
         # How far back is this query reaching? Match it against the keys the
         # stream itself wrote; the lag of the best match is the task's retrieval
@@ -207,6 +223,25 @@ class TitansMemory:
         if best > 0.5:
             lag = float(self._tick - tick)
             self.lag_ema += self.lag_beta * (lag - self.lag_ema)
+
+    def _kernel_matched_gates(self) -> tuple[float, float]:
+        """Gates with NO free knob, derived from the retention kernel itself.
+
+        On the diagonal b = eta the kernel collapses to w(n) = (n+1) b^n (see
+        bend_proofs/titans_gate_retention_kernel, Law 5), which is the only
+        setting with an INTERIOR peak -- either gate alone merely rises and
+        saturates or decays. That peak sits at n* = -1/ln b - 1 ~= 1/(1-b), so
+        inverting it against the measured mean retrieval lag L gives
+
+            b = eta = 1 - 1/L      =>  alpha = 1/L
+            theta step cancellation = (1 - eta) = 1/L   (Law 3's trace mass)
+
+        Every term comes from L, which the input stream supplies. There is no
+        horizon hyperparameter to tune, which is the point: the earlier
+        lag_horizon version traded two tuned gates for one tuned horizon."""
+        lag = max(1.0, float(self.lag_ema))
+        b = 1.0 - 1.0 / lag
+        return 1.0 / lag, b
 
     def _lag_gates(self) -> tuple[float, float]:
         """Queries reaching deep call for a BROAD retention profile (high eta);
@@ -275,8 +310,14 @@ class TitansMemory:
         err = self.M @ k - v
         grad = 2.0 * np.outer(err, k)
         alpha, eta = self._gates(grad)
-        if self.lag_adaptive and theta is None and self.const_theta is None:
-            th *= 1.0 - eta  # hold the EFFECTIVE step fixed as eta varies
+        if (self.lag_adaptive or self.kernel_matched) and theta is None and self.const_theta is None:
+            # Cancel ONLY the momentum amplification. Law 3 gives the trace's
+            # mass as 1/(1-eta), which is a real multiplier on the effective
+            # step, so (1-eta) holds that step fixed as eta moves. alpha is
+            # deliberately NOT cancelled here: it attenuates already-stored
+            # content, which is retention SHAPE, not step magnitude. Cancelling
+            # the full kernel mass 1/((1-b)(1-eta)) conflates the two.
+            th *= 1.0 - eta
         self.S = eta * self.S - th * grad
         self.M = self._decayed(alpha) + self.S
         self._note_write(k)
@@ -292,7 +333,7 @@ class TitansMemory:
 
     def _note_write(self, k: np.ndarray) -> None:
         self._tick += 1
-        if not self.lag_adaptive:
+        if not (self.lag_adaptive or self.kernel_matched):
             return
         n = float(np.linalg.norm(k))
         if n > 1e-8:
