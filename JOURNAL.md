@@ -12569,3 +12569,116 @@ port in this harness*, not on Titans:
 Outer-loop learning of `W_K`/`W_V`/`W_Q` and the gate projections is a
 third difference, but note Gate A passes with *random frozen*
 projections, so the memory update itself does not need it.
+
+## 2026-11-12 (later still) -- RETRACTION: both Titans gates are
+## positive, each in its own regime. Two confounds, now proved.
+
+**Retracting the previous entry's momentum verdict.** It said "no setting
+of forgetting or momentum beats having neither." That was wrong, and
+wrong twice over for the same reason: changing two things and crediting
+one (`feedback_do_science_correctly`). Both confounds are now machine-
+checked in `sili__new/bend_proofs/titans_gate_retention_kernel`.
+
+**The object.** Unrolling eqs 10/13 with `b = 1 - alpha` gives
+`M_T = -theta * SUM_i w(T-i) g_i` with
+`w(n) = SUM_{u=0..n} b^(n-u) eta^u`. The whole temporal behaviour of the
+gate pair is one kernel `w`: the weight on a gradient written `n` ticks
+ago. Verified against the real update to ~1e-16 relative error before
+proving anything about it.
+
+**Confound 1, hidden learning rate (Bend Law 3).** At `alpha=0` the
+kernel is exactly the geometric sum in `eta`, total mass `1/(1-eta)`. So
+`eta` multiplies the EFFECTIVE STEP, and comparing `eta` at fixed `theta`
+compares learning rates, not momenta -- 20x at `eta=0.95`. The high-`eta`
+cells were not learning, they were diverging: `||M||` reached 11093 and
+end-of-stream surprise 19.2 against 1.16 at `eta=0`. Holding
+`theta*(1-eta)` fixed REVERSES the sign:
+
+```
+matrix L=1, alpha=0   eta 0.0/0.5/0.9/0.95 -> 0.2261/0.2400/0.3972/0.7400
+deep   L=2, alpha=0   eta 0.0/0.5/0.9/0.95 -> 0.0881/0.0953/0.1350/0.2783
+```
+
+**Confound 2, write position (Bend Law 4).** At `alpha=0` the kernel is
+non-decreasing in age, increment exactly `eta^(n+1)`: momentum alone is a
+low-pass filter weighting OLD writes more, so `alpha` is the pair's only
+source of recency bias. The task wrote its probed pairs FIRST, handing
+momentum free credit. Fixed by scattering probes uniformly
+(`scripts/prototype_titans_gate_regimes.py`), keeping first/last as
+controls. Note the three orders are NOT three samples of one quantity: a
+pair at position `p` has `T-p` subsequent interfering writes (~64 first,
+~2 last, ~34 random), so `random` can exceed both controls.
+
+```
+ alpha   eta    RANDOM     first      last
+   0.0   0.0    0.6650    0.2258    1.0000
+   0.0   0.9    0.7925    0.3983    0.3865
+   0.0  0.95    0.8706    0.7475    0.1192
+  0.01   0.9    0.7152    0.1819    0.5031
+   0.1   0.9    0.4198    0.0144    0.8785
+```
+
+**Both gates are positive, each in its own regime.** Momentum survives
+the position-neutral test (0.665 -> 0.871, +31%), and the controls show
+the mechanism: at `eta=0` the memory is sharply recency-biased (first
+0.23, last 1.00) and momentum BROADENS that profile. Forgetting more than
+doubles recall when probes are recent (`last` column, 0.387 -> 0.879)
+while hurting monotonically when probes are uniform. So the two trade off
+along the TEMPORAL axis -- momentum broadens, decay sharpens -- and that
+explains the paper's published ordering (weight decay > momentum, their
+Table 5): language modelling is heavily recency-weighted, the regime
+where decay dominates. A single-regime sweep will always call one of them
+harmful.
+
+**Also retracted: the adaptive-eta rule.** The cosine-agreement rule
+selected `eta ~ 0.003` and I called that a success for "rediscovering
+eta~=0 without a sweep". But `eta~=0` was only right INSIDE the broken
+measurement; the true optimum is 0.95, so the rule lands at the opposite
+end of the range. Refusing to accumulate a trace over near-orthogonal
+gradients is exactly the wrong instinct -- broadening retention across
+uncorrelated writes is what momentum is FOR.
+
+**What replaced it.** `lag_adaptive` sets the gates from how far back the
+stream's own queries reach (matching each query against the keys the
+stream wrote; the lag of the best match drives `eta` up and `alpha`
+down). One config, told nothing about the regime, matches the per-regime
+best constant within 1%:
+
+```
+ order    adaptive(h=16)  best const  lag_ema   eta*   alpha*
+ random      0.8623         0.8706      32.9    0.95   0.00
+ first       0.7410         0.7475      65.5    0.95   0.00
+ last        1.0000         1.0000       1.47   0.03   0.097
+```
+
+Not degenerate -- it discriminates the recent-probe regime rather than
+always picking high `eta`. Caveat: `lag_horizon=16` was found by
+sweeping, so one tuned knob replaced two.
+
+**Bend Law 2, the main theorem, constrains what a controller should do.**
+`w(b,eta,n) == w(eta,b,n)`: the retention kernel is SYMMETRIC in
+`1-alpha` and `eta`. The two gates are the same knob for temporal
+profile, contributing ONE effective degree of freedom, not two. So a
+controller should sense one quantity (retrieval depth) and spend it on
+the pair jointly. Open: Law 2 is for the linearized kernel, and the real
+`g_i` depends on `M`, so whether the measured asymmetry is fully
+explained by that nonlinearity plus the current-write term is unsettled.
+
+**Also from the paper (their Table 5, 400M params / 15B tokens).** Our
+matrix memory IS their "Linear Memory" ablation row, which costs 7.34
+long-context points (92.68 -> 85.34), the largest single drop in that
+column and ~tied with removing weight decay (85.60). Their base memory is
+an MLP with `L_M >= 2`. So the earlier gate sweep stacked one ablation on
+another. `TitansDeepMemory` now ports the deep form; the normalized
+delta-rule step generalizes exactly as `th = 2||err||^2/||g||^2` summed
+over layers, which reduces to `0.5/||k||^2` at L=1 (verified: residual
+0.00000, theta 0.5000, i.e. it reproduces the validated matrix path).
+Deep memory is NOT a one-shot store -- one Gauss-Newton step cannot fit a
+nonlinear map -- but that does not hurt recall@1 over a value pool.
+
+**Standing lesson, now three for three.** Every confound in this
+investigation was "changed two things, credited one": RSM's schedule
+(backward/opt-step count per arm), momentum's learning-rate coupling, and
+probed-content write position. Before reporting ANY arm comparison here,
+enumerate what else moves with the flag -- step size, update count, write
+order.
