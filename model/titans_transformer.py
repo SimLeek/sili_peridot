@@ -86,6 +86,7 @@ class TitansMAC:
         # One center/sigma PER ATTENTION ROW, matching ToyTileRecurrence. A
         # single shared pair yields NaN, since the kernel indexes these per row.
         self.centers = Tensor(np.array([i + 0.5 for i in range(self.n_rows)], dtype=np.float32))
+        self.centers_content = Tensor(np.array([i + 0.5 for i in range(window)], dtype=np.float32))
         # sigma is a Gaussian POSITIONAL prior and its unit is TOKENS, so it has
         # to match the distance over which a match must be found. sigma=1
         # (log_sigmas=0) confines every row to its neighbours and suppresses the
@@ -96,6 +97,9 @@ class TitansMAC:
         # Default to a small multiple of that; override per task.
         sig = 4.0 if sigma_init is None else float(sigma_init)
         self.log_sigmas = Tensor(np.full(self.n_rows, np.log(sig), dtype=np.float32))
+        # Layer 1 attends over CONTENT rows only (no memory row), so it needs its
+        # own sigmas of length `window` rather than n_rows.
+        self.log_sigmas_content = Tensor(np.full(window, np.log(sig), dtype=np.float32))
 
         # Memory read side trains exactly; write side depends on mode.
         self.W_Q_mem = DenseTensorLinear(hidden, hidden, scale=s)
@@ -135,6 +139,7 @@ class TitansMAC:
         """Only Tensors here. W_K/W_V are numpy and updated out-of-band (frozen,
         or by the trace rule), which is exactly why the backward stays O(1)."""
         params = [self.embed, self.input_ln, self.post_ln, self.centers, self.log_sigmas]
+        params += [self.centers_content, self.log_sigmas_content]
         for blk in self.blocks:
             params.append(blk["ln"])
             for key in ("q", "k", "v", "o"):
@@ -159,58 +164,78 @@ class TitansMAC:
         return ids.astype(np.int64)
 
     def step(self, tokens: np.ndarray, i: int) -> Tensor:
-        """Logits for position i. Builds the window, reads memory as an extra
-        context row, then writes. Returns [vocab] logits as a 1-row Tensor."""
+        """Logits for position i. MEMORY SITS BETWEEN LAYERS: layer 1 runs first,
+        then k/v/q are ALL taken from layer 1's output, then the memory read is
+        injected as an extra row for layer 2.
+
+        This matters and was got wrong before. eq 11 derives k_t, v_t AND q_t from
+        the SAME x_t, where x_t is the LAYER INPUT -- already processed by earlier
+        layers. An earlier version wrote the key from the post-attention state of
+        the same layer while querying from the raw embedding, so retrieval needed
+        W_Q.embed ~= W_K.attention.embed, a cross-PATHWAY alignment. Measured
+        consequence: an EXACT untruncated gradient still sat at chance, because
+        the problem was never credit assignment. With all three projections on one
+        representation the alignment is available by construction (W_K ~= W_Q),
+        and the binding comes from layer 1's attention rather than this layer's.
+        """
         ids = self._window_ids(tokens, i)
         x = _gather_rows(self.embed, ids, self.hidden)
-        x_n = rmsnorm_tensor(x, self.input_ln, self.rms_eps)
+        h = rmsnorm_tensor(x, self.input_ln, self.rms_eps)
+        sigmas = exp(self.log_sigmas)
+
+        blk = self.blocks[0]
+        hn = rmsnorm_tensor(h, blk["ln"], self.rms_eps)
+        attn = gaussian_attention(
+            blk["q"].forward(hn),
+            blk["k"].forward(hn),
+            blk["v"].forward(hn),
+            self.centers_content,
+            exp(self.log_sigmas_content),
+            num_cpus=self.num_cpus,
+            causal=False,
+        )
+        h1 = h + blk["o"].forward(attn)  # layer-1 output: the shared x_t
 
         if self.mode == "none":
-            rows = x_n
+            rows = h1
         else:
-            # READ FIRST (causality): q from the newest token's embedding.
-            cur = _gather_rows(self.embed, ids[-1:], self.hidden)
-            q_mem = self.W_Q_mem.forward(rmsnorm_tensor(cur, self.input_ln, self.rms_eps))
+            last = np.zeros((1, self.window), dtype=np.float32)
+            last[0, -1] = 1.0
+            x_t = Tensor(last) @ h1  # [1, hidden]; the ONE representation
+            q_mem = self.W_Q_mem.forward(x_t)
             mem_src = self.M_t if self.mode == "tbptt" else Tensor(self.M)
-            read = mem_src @ q_mem.reshape((self.hidden, 1))
-            read = read.reshape((1, self.hidden))
-            # kept so the trainer can recover the gradient that ARRIVES at the
-            # memory-read row after backward; that gradient is what the
-            # write-side trace is charged against.
+            read = (mem_src @ q_mem.reshape((self.hidden, 1))).reshape((1, self.hidden))
             self._last_read = read
             self._last_q = q_mem.data.ravel().astype(np.float32).copy()
-            rows = _concat_rows(read, x_n)
+            rows = _concat_rows(read, h1)
+            self._x_t = x_t
 
-        sigmas = exp(self.log_sigmas)
-        h = rows
-        for blk in self.blocks:
-            hn = rmsnorm_tensor(h, blk["ln"], self.rms_eps)
-            attn = gaussian_attention(
-                blk["q"].forward(hn),
-                blk["k"].forward(hn),
-                blk["v"].forward(hn),
-                self.centers,
-                sigmas,
-                num_cpus=self.num_cpus,
-                causal=False,
-            )
-            h = h + blk["o"].forward(attn)  # residual, so depth composes
-        h = rmsnorm_tensor(h, self.post_ln, self.rms_eps)
-        logits = self.lm_head.forward(h)
+        blk2 = self.blocks[1] if len(self.blocks) > 1 else self.blocks[0]
+        hn2 = rmsnorm_tensor(rows, blk2["ln"], self.rms_eps)
+        attn2 = gaussian_attention(
+            blk2["q"].forward(hn2),
+            blk2["k"].forward(hn2),
+            blk2["v"].forward(hn2),
+            self.centers,
+            sigmas,
+            num_cpus=self.num_cpus,
+            causal=False,
+        )
+        h2 = rows + blk2["o"].forward(attn2)
+        h2 = rmsnorm_tensor(h2, self.post_ln, self.rms_eps)
+        logits = self.lm_head.forward(h2)
 
         if self.mode == "tbptt":
-            self._write_t(h, self.n_rows - 1)
+            self._write_t(self._x_t)
         elif self.mode != "none":
-            self._write(h.data[-1])
+            self._write(self._x_t.data.ravel())
         return logits.reshape((self.n_rows, self.vocab))
 
-    def _write_t(self, h_all: Tensor, row: int) -> None:
+    def _write_t(self, x_t: Tensor) -> None:
         """Differentiable delta-rule write (eqs 11-13, alpha=eta=0), built from
         Tensor ops so autograd supplies the exact gradient within the window."""
         d = self.hidden
-        sel = np.zeros((1, self.n_rows), dtype=np.float32)
-        sel[0, row] = 1.0
-        h = Tensor(sel) @ h_all  # [1, d], stays in the graph
+        h = x_t  # the SAME representation the query came from
         k = h @ self.W_K_t  # [1, d]
         v = h @ self.W_V_t  # [1, d]
         kk = reduce_sum(k * k, axis=-1).reshape((1, 1))  # [1,1]
