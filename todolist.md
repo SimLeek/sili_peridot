@@ -1718,6 +1718,28 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
           multi-GPU. Only if profiling still shows launch/sync dominating is a
           true persistent/fused megakernel justified.
 
+      **PCIe 1x / mining-rig viability -- worth designing FOR, with one
+      distinction.** PIPELINE parallelism over 1x is fine; TENSOR parallelism is
+      not. A pipeline boundary carries one activation vector per token: at
+      hidden ~5120 that is ~10KB fp16 or ~2.5KB fp4, so four GPUs at 30 tok/s is
+      ~900 KB/s against PCIe 3.0 x1's ~1 GB/s. Trivially within budget, and
+      sparse IO (sending only nonzeros plus indices) cuts it further -- which is
+      why mining rigs really do work for multi-GPU LLM inference. Tensor
+      parallelism is the opposite case: splitting a single matmul needs a full
+      activation all-reduce every layer, and 1x would strangle it. So if the rig
+      route is taken, shard BY LAYER GROUP, never within a matmul.
+      (hidden ~5120 is an ASSUMPTION for a 27B model -- confirm from Qwen's
+      config.json, see the target note at the top.)
+
+      Caveat that matters for the 60Hz goal: multi-GPU over 1x buys CAPACITY,
+      not LATENCY. A single-stream pipeline's latency is the sum of all stages,
+      so it does not speed up one token; it lets a bigger model fit. It converts
+      to real throughput only when there are microbatches to fill the pipeline
+      -- and PARALLEL GAME ENVIRONMENTS (T9) are exactly that, so the RL work is
+      where a rig pays off, not single-stream inference.
+      One-time cost to keep in mind: loading ~13.5GB of fp4 weights per card
+      over 1x at ~1 GB/s is ~3-4 minutes per card.
+
       Staging: T11 correctness-first port -> CUDA Graphs -> measure -> fuse only
       the hot path that profiling implicates -> multi-GPU last.
       GATE at each stage: output parity per T11's tolerance spec, and a measured
