@@ -1494,6 +1494,59 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       measured at toy width, where the bit-budget claim is confirmed invalid for
       lack of fan-in. Pair with T6(a): if annealing supplies the missing
       temperature, low-bit retention is where it shows.
+- [ ] **T7b. FP4 CONSOLIDATION ("offload and compact") -- offline, between
+      T7 and T8.** Push the work accumulated in the low-rank branches DOWN into
+      the fp4 base and reduce their rank, at equal accuracy. The effective
+      weight is
+
+          W_eff = S (had) quant_fp4  +  SUM_k u_k v_k^T
+                  rank-N scale          additive low-rank
+
+      and the fp4 base has per-element freedom, so it can absorb most of what
+      the branches hold: choose a lower-rank S', set
+      quant' = round_fp4(W_eff / S'), then fit the residual at reduced additive
+      rank. Fit S' in the LOG DOMAIN -- the Hadamard scale is multiplicative, so
+      log turns a rank-N product into a rank-N sum and ordinary low-rank fitting
+      applies. Residual then by truncated SVD.
+
+      MUST RUN OFFLINE (learning frozen). This is a REPRESENTATION change that
+      is supposed to preserve the function exactly, so concurrent learning would
+      make before/after incomparable -- the weights have to be literally the
+      same tensor before and after for the check to mean anything.
+
+      GATE, and it can be much stronger than "accuracy barely moved":
+        (a) FUNCTION PRESERVATION -- ||W_eff' - W_eff|| per layer, plus task
+            accuracy before vs after within eval noise. Report the norm, not
+            just the accuracy: accuracy can survive a representation that has
+            drifted, and the drift is what accumulates over cycles.
+        (b) RANK FREED at that fidelity -- the actual win. Report rank freed per
+            unit accuracy lost, so it is a curve and not one operating point.
+      Cheap pre-check before building the fitter: measure how much of W_eff the
+      branches currently carry. If the additive branch holds little, there is
+      nothing to offload and this rung is premature.
+
+- [ ] **T7c. Re-check health metrics after consolidation, and settle whether
+      the fp4-fix <-> annealing cycle is OPTIONAL or REQUIRED.** The honest
+      answer is unknown; there is a concrete reason it might be required, and it
+      is testable rather than philosophical.
+
+      Hypothesis: the low-rank branches have BOUNDED rank capacity. Learning
+      spends rank; if it is spent faster than consolidation frees it, rank
+      saturates and further learning is blocked or the orthogonality penalty
+      starts fighting it. Existing evidence this is real, not hypothetical:
+      AQRS telemetry already shows MUTATION RATE NEAR THE COOLDOWN CEILING (see
+      [[project-aqrs-rank-control-real-deployment-bugs]]), i.e. rank control is
+      already running close to saturation, and the channel-orthogonality penalty
+      exists precisely because rank channels duplicate.
+
+      If that holds, the CONSOLIDATION PERIOD is not a free parameter -- it is
+      set by rank-consumption rate vs available rank headroom, exactly the
+      derive-don't-tune pattern from 2026-11-12. Measure consumption rate first,
+      then derive the interval; do not sweep it.
+      GATE: show rank headroom actually recovering across a cycle, and show
+      learning progressing afterwards that had stalled before. "Sleep-like
+      cycling" is only justified if a measured ceiling is being hit.
+
 - [ ] **T8. Derived knobs wired in** (`kernel_matched` gates; PR-based
       r_target). GATE: report WORST-CASE REGRET across a wide range, never
       accuracy at one operating point.
