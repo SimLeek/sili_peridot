@@ -13124,21 +13124,36 @@ buffer, so the replay set stays small while spanning unbounded age. The
 gate stops being a performance tweak and becomes the buffer's admission
 policy.
 
-**THE DISCRIMINATING TEST (user's, and it is the right one): can it learn
-a dependency LONGER than the BPTT window?**
-  * plain TBPTT -- provably cannot. Zero gradient beyond k. NEGATIVE
-    CONTROL.
-  * forward-accumulated blame -- should, since the buffer holds the write
-    regardless of age.
-A method that only matches TBPTT inside the window has demonstrated
-nothing.
+**THE DISCRIMINATING TEST -- CORRECTED (user, 2026-11-13).** My first
+version asked "can TBPTT at k < gap learn at all?" and treated failure as
+the negative control. That is WRONG: k < gap very likely learns
+eventually, just slowly, because the write rule still receives credit from
+writes INSIDE the window and transfers via shared weights, plus random
+drift. A binary pass/fail discriminator would therefore be worthless, and
+endpoint accuracy at a fixed episode count would be actively misleading --
+it would report wherever each arm happened to sit on its own curve.
+
+So the claim must be about **SAMPLE EFFICIENCY or ASYMPTOTE**, measured as
+a LEARNING CURVE:
+  * metric: EPISODES-TO-THRESHOLD (e.g. first episode at which eval
+    exceeds 2x chance, and again at 50%), plus the final asymptote.
+  * TBPTT at k < gap is the baseline to BEAT, not a control expected to
+    fail.
+  * replay must learn FASTER or reach HIGHER. "Also eventually learns" is
+    not a result.
+Cost consequence: learning speed is noisy, so this needs several seeds AND
+runs long enough for the slow path to actually get there -- which may mean
+deliberately shrinking the task (fewer keys/values, shorter gap) so the
+slow baseline completes in affordable time. Size that before launching,
+rather than discovering it after hours.
 
 **Order, and nothing is skipped this time:**
   a. EXACT-gradient baseline (`tbptt_k` >= episode length, no truncation
      at all) on long-term MQAR. Establishes the architecture CAN express
      the task and that only credit was ever broken. RUNNING.
-  b. Truncate to k < gap. Confirm it FAILS -- that is the negative control
-     and it must actually fail, or the discriminator is meaningless.
+  b. Truncate to k < gap and MEASURE ITS LEARNING CURVE (episodes-to-
+     threshold, multi-seed). This is the baseline to beat, not a control
+     expected to fail.
   c. Add the replay buffer + synthetic aggregate; test at gap >> k.
   d. Mixed-gap training to test the shared-weight transfer argument
      separately from (c).
