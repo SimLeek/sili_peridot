@@ -41,6 +41,7 @@ class TitansMAC:
         sigma_init: float | None = None,
         mem_lr: float = 0.5,
         trace_beta: float = 0.9,
+        grad_clip: float = 1.0,
         num_cpus: int = 2,
         rms_eps: float = 1e-6,
         rng: np.random.Generator | None = None,
@@ -50,6 +51,7 @@ class TitansMAC:
         rng = rng or np.random.default_rng()
         self.vocab, self.hidden, self.window = vocab, hidden, window
         self.mode, self.mem_lr, self.trace_beta = mode, mem_lr, trace_beta
+        self.grad_clip = grad_clip
         self.num_cpus, self.rms_eps = num_cpus, rms_eps
         self.n_rows = window + (0 if mode == "none" else 1)
 
@@ -97,6 +99,10 @@ class TitansMAC:
         self._tr_K = np.zeros_like(self.W_K_mem)
         self._tr_V = np.zeros_like(self.W_V_mem)
         self._last_read = None
+        self._last_q = None
+        self._adam_t = 0
+        self._adam_m = {"K": np.zeros_like(self.W_K_mem), "V": np.zeros_like(self.W_V_mem)}
+        self._adam_v = {"K": np.zeros_like(self.W_K_mem), "V": np.zeros_like(self.W_V_mem)}
         self.last = {}
 
     def read_grad(self):
@@ -150,6 +156,7 @@ class TitansMAC:
             # memory-read row after backward; that gradient is what the
             # write-side trace is charged against.
             self._last_read = read
+            self._last_q = q_mem.data.ravel().astype(np.float32).copy()
             rows = _concat_rows(read, x_n)
 
         sigmas = exp(self.log_sigmas)
@@ -190,11 +197,17 @@ class TitansMAC:
         th = self.mem_lr / (kk + 1e-6)
         self.M = self.M - th * 2.0 * np.outer(err, k)
         if self.mode == "trace":
-            # Eligibility trace over the write side: accumulate the outer
-            # products that WOULD carry credit, so a later read can be charged
-            # against them in O(1) instead of unrolling. cf. the Bend proof.
-            self._tr_K = self.trace_beta * self._tr_K + np.outer(h, k)
-            self._tr_V = self.trace_beta * self._tr_V + np.outer(h, v)
+            # DERIVED eligibility traces (see JOURNAL 2026-11-13). With
+            # dL/dM = outer(g, q) at the read and M accumulating
+            # -2 theta_s err_s k_s^T from each write, holding err fixed:
+            #   dL/dW_K = -2 SUM_s theta_s (err_s . g) h_s (x) q
+            #   dL/dW_V = +2 SUM_s theta_s (k_s . q)   h_s (x) g
+            # so the traces that must be carried are h (x) err and h (x) k.
+            # An earlier version stored h (x) k for BOTH and then dropped the
+            # g/q contraction entirely, which left a monotone drift rather than
+            # a gradient -- it moved |dW_K| by 0.545 and learned nothing.
+            self._tr_K = self.trace_beta * self._tr_K + th * np.outer(h, err)
+            self._tr_V = self.trace_beta * self._tr_V + th * np.outer(h, k)
         self.last = {
             "surprise": float(np.linalg.norm(err)),
             "mem_norm": float(np.linalg.norm(self.M)),
@@ -214,16 +227,36 @@ class TitansMAC:
         # Project the read gradient onto the stored traces. The traces hold the
         # outer products that WOULD have carried credit, so one trace-weighted
         # step charges the whole history in O(1) instead of unrolling it.
-        # HEURISTIC, NOT DERIVED: magnitude tracks how hard the read pulls on
-        # M, direction is just the trace. Enough to test whether trace-shaped
-        # credit helps; NOT enough to claim the e-prop approximation was tested.
-        # Derivation owed -- see JOURNAL.md 2026-11-13.
-        gn = float(np.linalg.norm(g)) + 1e-8
-        pull = float(np.linalg.norm((g / gn) @ self.M))
-        k_n = float(np.linalg.norm(self._tr_K)) + 1e-8
-        v_n = float(np.linalg.norm(self._tr_V)) + 1e-8
-        self.W_K_mem -= (lr * pull / k_n) * self._tr_K
-        self.W_V_mem -= (lr * pull / v_n) * self._tr_V
+        q = self._last_q
+        if q is None:
+            return
+        # The derived contraction. Direction comes from g and q; the traces
+        # supply the accumulated history in O(1), with no unrolling.
+        d_WK = -2.0 * np.outer(self._tr_K @ g, q)
+        d_WV = 2.0 * np.outer(self._tr_V @ q, g)
+        # ADAM, not raw SGD. Every Tensor parameter here is trained by
+        # AdamOptimizer, and the write side was the only group getting plain SGD
+        # -- with a derived gradient of order 1e-4, lr=0.003 moved |dW_K| by
+        # 9.29e-04 over ~24k updates, i.e. the write side was effectively frozen
+        # and learned nothing. Adam's 1/sqrt(v) scaling makes the effective step
+        # ~lr regardless of gradient scale, which is the actual mismatch; it is
+        # the same treatment the rest of the model already gets rather than a
+        # hand-picked write-side learning rate.
+        self._adam_t += 1
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for name, d in (("K", d_WK), ("V", d_WV)):
+            m_, v_ = self._adam_m[name], self._adam_v[name]
+            m_ *= b1
+            m_ += (1.0 - b1) * d
+            v_ *= b2
+            v_ += (1.0 - b2) * (d * d)
+            mhat = m_ / (1.0 - b1**self._adam_t)
+            vhat = v_ / (1.0 - b2**self._adam_t)
+            step = lr * mhat / (np.sqrt(vhat) + eps)
+            if name == "K":
+                self.W_K_mem -= step
+            else:
+                self.W_V_mem -= step
 
 
 def _gather_rows(table: Tensor, ids: np.ndarray, width: int) -> Tensor:

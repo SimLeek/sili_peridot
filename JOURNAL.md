@@ -12900,3 +12900,77 @@ at all; it does NOT test the e-prop approximation. Deriving the real
 contraction, and bounding its error the way
 `bend_proofs/synaptic_hold_bptt_approximation` bounds the generic case,
 is owed before any positive result here is called an e-prop result.
+
+## 2026-11-13 (later) -- write-side credit: four attempts, all at chance.
+## Stopping on the mechanism; the task is now the suspect.
+
+Four attempts at making the Titans write side (`W_K`/`W_V`) learn, each
+fixing a real and distinct defect in the previous one:
+
+| attempt            | max abs dW_K | title    | in-context |
+|--------------------|--------------|----------|------------|
+| never wired        | 0            | chance   | fine       |
+| heuristic drift    | 5.4e-01      | chance   | fine       |
+| derived + clip     | 9.3e-04      | chance   | fine       |
+| derived + Adam     | 1.2e+00      | chance   | DESTROYED  |
+
+(chance title = 0.1250; control 0.1187-0.1217; all four arms 0.10-0.13.)
+
+**This is not a step-size problem.** Title never leaves chance across
+three orders of magnitude of write-side movement, and the largest
+movement actively destroyed in-context accuracy (0.2191 vs 0.8831
+control). So the credit DIRECTION is not useful on this task. Stopping
+here deliberately: a fifth mechanism fix would be fitting the method to
+a hoped-for answer, which is the exact failure mode this investigation
+kept correcting.
+
+**The Adam attempt was architecturally wrong anyway** (user correction).
+sili's core layers carry ONE optimizer state variable (importance), not
+Adam's two, specifically so the state fits the memory budget -- that is
+the same 2xFP4 = 1 byte/synapse accounting the Qwen sizing depends on.
+Adam's m and v would make it four values per synapse. So even a
+SUCCESSFUL Adam result would have been unshippable. **Any real write-side
+credit rule must be single-state, importance-style**, like
+[[feedback-importance-is-already-the-optimizer]] already says for
+DISLDOLayer. Recorded as a hard design constraint, not retried here.
+
+**The derivation itself still looks right** and should be kept. With
+`dL/dM = outer(g, q)` at the read and `M` accumulating
+`-2 theta_s err_s k_s^T` per write, holding `err_s` fixed (the e-prop
+approximation):
+```
+dL/dW_K = -2 SUM_s theta_s (err_s . g) h_s (x) q   => trace = h (x) err
+dL/dW_V = +2 SUM_s theta_s (k_s . q)   h_s (x) g   => trace = h (x) k
+```
+Two earlier bugs this exposed and fixed: the `W_K` trace had stored
+`h (x) k` (wrong quantity), and the `g`/`q` contraction -- where all the
+DIRECTION lives -- was missing entirely, leaving a monotone drift.
+
+**Why the TASK is now the suspect.** Retrieval here requires matching a
+query derived from the `Q_TITLE` token's hidden state against a key
+derived from the TITLE token's hidden state. Those are different tokens,
+so the memory must learn a CROSS-TOKEN key/query alignment inside a
+single 32x32 matrix, using one delta-rule step per write. That is a much
+harder ask than storing and retrieving the same cue, and it may simply
+exceed this verification scale.
+
+**Next experiment (do this before any more mechanism work)**: a task
+where the CUE IS THE WRITTEN TOKEN, so key and query align by
+construction. That isolates "does trace credit make the write side
+useful" from "can it also learn an alignment". If credit works there and
+not here, the alignment is the barrier and the fix is architectural (e.g.
+a learned query/key tie, or writing the cue rather than the content). If
+it fails there too, the credit rule is wrong and the derivation needs
+checking against a finite-difference gradient -- which, note, is the one
+check never run on it.
+
+**What stands regardless** (all measured, none affected by the above):
+  * in-context accuracy is NOT harmed by adding the memory -- 0.9344
+    (none) vs 0.9244 (trace), inside se ~= 0.010;
+  * the control does NOT leak -- title 0.1217 vs 0.1250 chance;
+  * per-step backward cost is FLAT across a 512-step horizon
+    (3.48/3.40/2.88/3.15/3.62 ms at lengths 32-512), so the O(1) property
+    the real-time goal needs is real;
+  * `frozen` gives no recurrent benefit (0.1169 vs 0.1164), so the write
+    side genuinely needs credit and Gate A's random-projection result
+    does not carry here.
