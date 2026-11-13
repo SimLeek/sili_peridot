@@ -143,3 +143,43 @@ def _self_test():
 
 if __name__ == "__main__":
     _self_test()
+
+
+def report(preds, answers, label: str = "") -> dict:
+    """STANDING DIAGNOSTICS. Print these next to every accuracy number.
+
+    Each line corresponds to a failure that actually cost hours on this task:
+      * distinct predictions -- a model emitting ONE token for every query scores
+        the max-class frequency and looks like it is learning. Measured: 1
+        distinct prediction across 200 queries while the quoted "chance" was
+        1/N_VALS.
+      * baseline -- a collapsed model scores MAX-CLASS FREQUENCY, not 1/N_VALS.
+        Quoting the latter overstated by 1.44x here.
+      * eval sd -- binomial sampling error. If it exceeds the between-seed sd,
+        the seed number is measuring noise and no MDE can be read from it.
+    """
+    from collections import Counter
+
+    preds = [int(p) for p in preds]
+    answers = [int(a) for a in answers]
+    n = len(answers)
+    acc = sum(p == a for p, a in zip(preds, answers, strict=False)) / max(1, n)
+    base = constant_predictor_baseline(answers)
+    c = Counter(preds)
+    eval_sd = float(np.sqrt(max(acc * (1 - acc), 1e-12) / max(1, n)))
+    out = {
+        "acc": acc,
+        "baseline": base,
+        "over_baseline": acc - base,
+        "distinct_preds": len(c),
+        "top_pred_share": c.most_common(1)[0][1] / max(1, n) if c else 0.0,
+        "eval_sd": eval_sd,
+        "n": n,
+    }
+    flag = "  <-- COLLAPSED" if len(c) <= 2 else ""
+    print(
+        f"{label:>10} acc={acc:.4f} base={base:.4f} over={acc - base:+.4f} "
+        f"distinct={len(c)} top_share={out['top_pred_share']:.2f} "
+        f"eval_sd={eval_sd:.4f}{flag}"
+    )
+    return out
