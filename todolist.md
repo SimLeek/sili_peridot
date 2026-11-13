@@ -20,12 +20,26 @@ until that link is up the Qwen track cannot start.
 
 MEMORY BUDGET -- and note this is TRAINING, not inference-only, with sili's
 2xFP4 layout: every synapse carries BOTH a weight and an importance at fp4, so
-**1 byte per synapse**, not 4 bits. For 27B that is ~27GB dense-equivalent (NOT
-13.5GB). Against 24GB of P40 VRAM that does not fit dense -- so what makes it fit
-on GPU is **SPARSITY, not bit depth**: at ~30% density it is ~8GB and fits
-easily. In the remote box's ~96GB system RAM, ~27GB fits comfortably even dense,
-so the realistic FIRST path stays CPU-side, with GPU/CUDA buying speed rather
-than feasibility.
+**1 byte per synapse**, not 4 bits. For 27B that is ~27GB (NOT 13.5GB).
+
+**WEIGHT SPARSITY IS NOT A MEMORY LEVER -- correction, 2026-11-12.** An earlier
+version of this note claimed ~30% density would shrink 27GB to ~8GB and fit the
+P40. That conflated two different mechanisms the project otherwise keeps apart:
+  * **IO sparsity** (`x_r_target`, `dy_r_target`, nucleus top-k, the PR work) is
+    sparsity on ACTIVATIONS AND GRADIENTS. It is what is validated here, it buys
+    speed, and it does NOT reduce stored weight memory at all.
+  * **WEIGHT sparsity** (density of the stored CSR) is what would reduce memory,
+    and it carries a real quality cost -- pruning already measured as hurting
+    standalone (see [[project-sili-synaptogenesis-pruning-testing]]). Quantizing
+    to fp4 AND pruning to 30% and still having a working model is not a bet
+    worth making.
+
+So ~27GB has to be SHARDED. The P40's 24GB cannot hold it, and P40 + 2060 is
+~30GB -- barely over, so realistically 3+ cards. **MULTI-GPU IS THEREFORE A
+PREREQUISITE for GPU-side Qwen, not a final optimisation**, which promotes the
+multi-GPU half of T11b ahead of the fusion work. The ~96GB system RAM still
+holds ~27GB comfortably, so the CPU-first path remains the way to get Qwen
+RUNNING; multi-GPU is what makes it FAST.
 
 Two training-specific consequences, both favourable:
   * **No optimizer-state overhead.** importance IS the optimizer here (see
@@ -1758,8 +1772,10 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       reason beyond activation all-reduce: data-parallel replication would
       require gradient all-reduce, which 1x cannot carry. Pipeline only.
 
-      Staging: T11 correctness-first port -> CUDA Graphs -> measure -> fuse only
-      the hot path that profiling implicates -> multi-GPU last.
+      Staging (REVISED -- multi-GPU is no longer last): T11 correctness-first
+      port -> CUDA Graphs -> measure -> **multi-GPU pipeline sharding, since 27B
+      at 2xFP4 cannot fit one card and weight sparsity is not an acceptable way
+      to make it fit** -> fuse only the hot path that profiling implicates.
       GATE at each stage: output parity per T11's tolerance spec, and a measured
       speedup over the previous stage. No fusion without a profile pointing at it.
 
