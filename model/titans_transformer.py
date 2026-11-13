@@ -100,9 +100,8 @@ class TitansMAC:
         self._tr_V = np.zeros_like(self.W_V_mem)
         self._last_read = None
         self._last_q = None
-        self._adam_t = 0
-        self._adam_m = {"K": np.zeros_like(self.W_K_mem), "V": np.zeros_like(self.W_V_mem)}
-        self._adam_v = {"K": np.zeros_like(self.W_K_mem), "V": np.zeros_like(self.W_V_mem)}
+        # ONE accumulator per write-side matrix (not Adam's two).
+        self._imp = {"K": np.zeros_like(self.W_K_mem), "V": np.zeros_like(self.W_V_mem)}
         self.last = {}
 
     def read_grad(self):
@@ -197,15 +196,10 @@ class TitansMAC:
         th = self.mem_lr / (kk + 1e-6)
         self.M = self.M - th * 2.0 * np.outer(err, k)
         if self.mode == "trace":
-            # DERIVED eligibility traces (see JOURNAL 2026-11-13). With
-            # dL/dM = outer(g, q) at the read and M accumulating
-            # -2 theta_s err_s k_s^T from each write, holding err fixed:
-            #   dL/dW_K = -2 SUM_s theta_s (err_s . g) h_s (x) q
-            #   dL/dW_V = +2 SUM_s theta_s (k_s . q)   h_s (x) g
-            # so the traces that must be carried are h (x) err and h (x) k.
-            # An earlier version stored h (x) k for BOTH and then dropped the
-            # g/q contraction entirely, which left a monotone drift rather than
-            # a gradient -- it moved |dW_K| by 0.545 and learned nothing.
+            # Eligibility traces h (x) err and h (x) k. WARNING: the gradient
+            # built from these FAILS a finite-difference check (cos ~ 0.13, and
+            # -0.25 at beta=0.9) -- it is near-orthogonal to the true gradient.
+            # Do not train on it until re-derived. JOURNAL 2026-11-13.
             self._tr_K = self.trace_beta * self._tr_K + th * np.outer(h, err)
             self._tr_V = self.trace_beta * self._tr_V + th * np.outer(h, k)
         self.last = {
@@ -234,25 +228,15 @@ class TitansMAC:
         # supply the accumulated history in O(1), with no unrolling.
         d_WK = -2.0 * np.outer(self._tr_K @ g, q)
         d_WV = 2.0 * np.outer(self._tr_V @ q, g)
-        # ADAM, not raw SGD. Every Tensor parameter here is trained by
-        # AdamOptimizer, and the write side was the only group getting plain SGD
-        # -- with a derived gradient of order 1e-4, lr=0.003 moved |dW_K| by
-        # 9.29e-04 over ~24k updates, i.e. the write side was effectively frozen
-        # and learned nothing. Adam's 1/sqrt(v) scaling makes the effective step
-        # ~lr regardless of gradient scale, which is the actual mismatch; it is
-        # the same treatment the rest of the model already gets rather than a
-        # hand-picked write-side learning rate.
-        self._adam_t += 1
-        b1, b2, eps = 0.9, 0.999, 1e-8
+        # SINGLE-STATE adaptive step, not Adam: sili's layers carry ONE
+        # optimizer variable so per-synapse state stays at 1 byte at fp4.
+        # cf. feedback_importance_is_already_the_optimizer; JOURNAL 2026-11-13.
+        beta = 0.99
         for name, d in (("K", d_WK), ("V", d_WV)):
-            m_, v_ = self._adam_m[name], self._adam_v[name]
-            m_ *= b1
-            m_ += (1.0 - b1) * d
-            v_ *= b2
-            v_ += (1.0 - b2) * (d * d)
-            mhat = m_ / (1.0 - b1**self._adam_t)
-            vhat = v_ / (1.0 - b2**self._adam_t)
-            step = lr * mhat / (np.sqrt(vhat) + eps)
+            imp = self._imp[name]
+            imp *= beta
+            imp += (1.0 - beta) * (d * d)
+            step = lr * d / (np.sqrt(imp) + 1e-8)
             if name == "K":
                 self.W_K_mem -= step
             else:

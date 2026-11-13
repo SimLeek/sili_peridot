@@ -12974,3 +12974,59 @@ check never run on it.
   * `frozen` gives no recurrent benefit (0.1169 vs 0.1164), so the write
     side genuinely needs credit and Gate A's random-projection result
     does not carry here.
+
+## 2026-11-13 (later) -- finite-difference check: the derived write-side
+## gradient is WRONG. Retracting "the derivation looks right".
+
+Ran the one check never run on it, and it is decisive:
+
+```
+ trace_beta  cos(analytic, finite-diff)   |analytic|/|FD|
+        0.9                     -0.2526             0.000
+        1.0                     +0.1313             0.000
+```
+
+**cos ~ 0.13 at best, and NEGATIVE (-0.25) at beta=0.9** -- the analytic
+"gradient" is near-orthogonal to the true one and partly points UPHILL,
+with a magnitude ratio of ~0. That single measurement explains all four
+failed credit attempts at once: the direction was wrong, so no step size
+and no optimizer could have fixed it. **Retracts this JOURNAL's earlier
+claim that "the derivation itself still looks right".**
+
+Cost of not checking first: ~5 hours of compute across four credit
+variants, plus a task redesign, all chasing a direction that carries no
+signal. A 10-minute finite-difference check up front would have
+prevented every one of those runs. **New standing rule: any hand-derived
+gradient gets an FD check BEFORE it is used to train anything.**
+
+**The task redesign was still worth it and is independently confirmed
+good.** On long-term-only MQAR -- one pair, cue = the written token, blank
+gap, memory the only path -- `none` 0.0950, `frozen` 0.0850, `trace`
+0.0875 against chance 0.0833. So the earlier failures were NOT the
+cross-token alignment I had blamed; even the most favourable possible
+task gives chance, which correctly localises the fault to the credit
+rule. The instrument is sound and should be kept.
+
+**Two candidate causes, both unverified:**
+1. The approximation that drops `d err_s/dW_K`. `err_s = M_{s-1} k_s -
+   v_s` depends on `k_s = h_s W_K` directly, AND `M_{s-1}` depends on
+   every earlier `W_K`. Holding `err` fixed is the e-prop step, but here
+   it may be the dominant term rather than a correction.
+2. **The memory writes UNCONDITIONALLY at every tick, including all 16
+   blanks after the pair.** There is no surprise gate: alpha=eta=0 and
+   theta is constant, so each blank tick runs a full delta-rule write.
+   Even a correct gradient would be fighting 16 overwrites. This is
+   exactly the problem the RSM/surprise-gating work was about -- do not
+   write when nothing happened -- and it is absent from this port.
+
+**Next, in this order (cheap first, and no training until the gradient
+passes FD):**
+  a. Re-derive with the `d err/dW_K` term included; FD-check it.
+  b. If that passes, add a surprise gate to the write so blanks do not
+     overwrite, then FD-check again (the gate changes the gradient).
+  c. Only then train.
+
+**Unchanged and still standing**: in-context unharmed by the memory,
+control does not leak, per-step backward flat across a 512-step horizon,
+`frozen` establishes the write side needs credit, and the new long-term
+MQAR instrument with its two assertions.
