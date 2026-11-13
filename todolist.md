@@ -1523,9 +1523,24 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       GATE: recurrent score above chance AND in-context not below the `none`
       control (ceiling measured at page 0.906). If `frozen` is flat, that is
       informative about the write side, not about Titans.
-- [ ] **T1. Titans on DISLDO, dense settings.** Swap the 4 projections to
-      `disldo_cls`, sparsity OFF. GATE: reproduce T0's pair within noise. This
-      isolates "DISLDO works here" from "sparsity works here".
+- [ ] **T1. Titans on DISLDO, dense settings. PROMOTED -- now on T0's
+      critical path, not after it.** Swap the projections to `disldo_cls`,
+      sparsity OFF. GATE: reproduce T0's pair within noise, isolating "DISLDO
+      works here" from "sparsity works here".
+
+      WHY IT MOVED. T0's remaining blocker is OPTIMISATION, not expressivity:
+      the linear-realizability test showed retrieval IS achievable from the
+      model's own representations (matching cos 0.9824 vs mismatched 0.3181),
+      but the write-tick representation is dominated by the VALUE token
+      (between/within key ratio 0.97), so the key signal is present yet weak and
+      badly conditioned. That is exactly the regime the project's own machinery
+      exists for -- amortized importance/L2 decay, ci_renorm/weight_renorm,
+      plasticity_reset, AQRS rank control, and energy-stochastic annealing as a
+      temperature to escape a stuck region. Reaching for Adam instead was
+      reinventing a worse version of it (and broke the 1-byte/synapse budget).
+      All of that machinery lives on DISLDO layers, while TitansMAC is built on
+      DenseTensorLinear -- so the port is what makes those tools available at
+      all. T0 may simply not be finishable without it.
 - [ ] **T2. Add sparse forward only.** GATE: in-context within noise of T1.
       Expect trouble -- this is B1's first appearance.
 - [ ] **T3. Derive r_target per layer from PR** (replaces the hand-tuned floor;

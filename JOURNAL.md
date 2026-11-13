@@ -13165,3 +13165,51 @@ no hand-derived gradient, no separate accumulator, no extra per-synapse
 state, which is what the Adam detour and the single-state rewrite were
 both working around. Verified: `W_K_t` receives gradient 1.06e-03 and all
 19 parameters are covered.
+
+## 2026-11-13 -- expressivity RULED OUT; the blocker is optimisation, and
+## the project already owns the tools for it
+
+Two confident diagnoses in a row failed to fix long-term recall: the
+credit rule (FD-confirmed wrong, fixing it did not help) and key/query
+pathway misalignment (real structural observation, moving the memory
+between layers did not help). So I stopped diagnosing and measured
+EXPRESSIVITY directly, with no training:
+
+```
+x_query (query tick):  between-key 8.83, within-key 0.0000  -> separable
+x_write (value tick):  between-key 5.73, within-key 5.89    -> ratio 0.97
+linear map x_write -> x_query:
+   MATCHING    cos 0.9824 +- 0.030
+   MISMATCHED  cos 0.3181 +- 0.277      separation 0.664
+```
+
+**Retrieval IS linearly realizable from the representations the model
+actually has**, so expressivity is not the problem and the failure is
+OPTIMISATION. The mechanism is visible in the same numbers: raw distances
+say the write-tick representation barely distinguishes keys (ratio 0.97)
+because it is dominated by the VALUE token, yet a linear map recovers the
+key cleanly. So the key signal is PRESENT BUT WEAK, extractable only by a
+projection that cancels the value component -- hard for gradient descent
+to find, which predicts slow learning rather than no learning.
+
+**User's point, and it redirects the fix.** If Adam looks "needed"
+because optimizer state is badly scaled or conditioned, that is precisely
+what the amortized neural health metrics and stochastic annealing are
+for. The project already owns: amortized importance/L2 decay,
+ci_renorm/weight_renorm, plasticity_reset, AQRS dynamic rank control, and
+energy-stochastic annealing as a TEMPERATURE for escaping stuck regions
+(and [[project-energy-sleep-annealing-finding]] already validates it
+against rank collapse). My Adam detour was reinventing a worse version of
+that stack, and it broke the 1-byte/synapse budget on the way.
+
+**Consequence for the ladder: T1 (DISLDO port) is PROMOTED onto T0's
+critical path.** All of that machinery lives on DISLDO layers, while
+TitansMAC is built on DenseTensorLinear, so the port is what makes the
+tools available at all. T0 may not be finishable without it -- which
+inverts my earlier framing of T1 as a routine post-T0 equivalence check.
+
+Still running: 40k-episode learning curves for `none` vs `tbptt`, to
+separate "slow" from "stuck" before reaching for any of the above.
+Precedent for caution: earlier today I called a 0.147 plateau a capacity
+limit and it reached 0.88 by episode 3750, so long-term recall judged at
+4000 episodes was likely premature.
