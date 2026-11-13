@@ -1,12 +1,37 @@
 # sili_peridot todolist
 
-**TWO TARGETS, IN ORDER (2026-11-12).** MiniCPM5-1B is NOT superseded -- it is
-the EARLIER rung, and it is the right model for the game/RL work because it is
-small enough to train and test against. Qwen2.8-27B comes AFTER the game,
-intrinsic-RL and CUDA work. So: MiniCPM5-1B -> frame tokenization -> games/RL ->
-CUDA -> Qwen2.8-27B. The target changes again once recurrence, intrinsic RL and
-continual training land, so treat it as a parameter of the pipeline rather than
-a fixed endpoint. On Qwen specifically, NOTE: I do not have reliable
+**TWO TARGETS, IN PARALLEL, ON TWO MACHINES (2026-11-12).** MiniCPM5-1B on this
+laptop, Qwen2.8-27B on the remote arch-sandbox box. Both get converted, both get
+frame tokenization. Games and intrinsic RL are then run and TUNED on MiniCPM
+here (small and fast enough to iterate), and only once that yields settled
+settings does Qwen get run and tuned remotely with them. Order:
+
+    T9a MiniCPM5-1B  ||  T9a' Qwen2.8-27B      (parallel, two machines)
+                   -> T9b frame tokenization (BOTH)
+                   -> T11/T11b CUDA kernels (runtime speed)
+                   -> T9  games + intrinsic RL, tuned on MiniCPM/laptop
+                   -> T9c transfer settings to Qwen on the remote box
+
+HARD PREREQUISITE for the Qwen track: the remote box's ethernet is not connected
+yet. There is an existing direct-link setup (see
+[[reference-arch-sandbox-direct-link-ip]] -- local enp2s0 can revert off
+10.0.0.2/24 after a reboot, so ping before assuming the remote is down), but
+until that link is up the Qwen track cannot start.
+
+MEMORY BUDGET, which decides where Qwen can run at all. 27B weights: ~54GB at
+fp16, ~27GB at fp8, ~13.5GB at fp4. The remote P40 has 24GB VRAM, so ONLY ~fp4
+fits on the GPU -- fp16 and fp8 do not. But arch-sandbox has ~96GB system RAM and
+sili is CPU-first, so the realistic FIRST path for Qwen is CPU-side on the remote
+box, where both fp8 and fp4 fit comfortably; GPU/CUDA then buys speed rather than
+feasibility. Consequence for sequencing: fp4 (T7) is NOT on the critical path to
+get Qwen running, but IS a hard requirement before Qwen can ever sit on the P40.
+Also note the dual-CCX thread wall on that box -- num_cpus <= 4 for
+disldo_backward (see [[project-sili-arch-sandbox-ccx-topology-thread-wall]]) --
+so Qwen-side timing must not be benchmarked at high thread counts.
+
+The target changes again once recurrence, intrinsic RL and continual training
+land, so treat it as a parameter of the pipeline rather than a fixed endpoint.
+On Qwen specifically, NOTE: I do not have reliable
 architecture details for Qwen2.8-27B; read its `config.json` and record the
 same facts captured for MiniCPM5 (layer count, hidden, intermediate, heads vs
 kv_heads/GQA, head_dim, vocab, rope_theta, rms_norm_eps, tied embeddings,
@@ -1606,15 +1631,27 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       decision on whether the setpoint is driven toward curiosity or toward
       surprise minimisation.
 
-- [ ] **T10. Convert Qwen2.8-27B to run/train entirely on sili. FINAL RUNG --
-      after T9 (games/RL) and T11/T11b (CUDA), not before.** The terminal model
-      task; MiniCPM5-1B (T9a) carries the earlier work. Read `config.json` first and record the architecture
+- [ ] **T9a'. Convert Qwen2.8-27B to run/train entirely on sili -- IN PARALLEL
+      with T9a, on the REMOTE box.** Blocked until that machine's ethernet is
+      connected. Runs CPU-side first (96GB RAM holds fp8/fp4; the 24GB P40 holds
+      only ~fp4). Not the final rung any more -- the final rung is T9c, tuning
+      Qwen with settings transferred from the MiniCPM/laptop RL work. Read `config.json` first and record the architecture
       facts (see the target note at the top) -- nothing here should be sized
       against assumed dimensions. At 27B the new questions MiniCPM5 never
       raised: weight memory budget, whether the fold-into-one-sparse-layer
       recurrence trick still applies at this depth, and sharding across the
       available VRAM. Depends on T0-T8 for the model side and T11 for it to be
       runnable at all at this scale.
+
+- [ ] **T9c. Transfer the tuned RL/exploration settings to Qwen on the remote
+      box. FINAL RUNG.** Everything in T9 is tuned on MiniCPM here because it
+      iterates fast; this rung asks whether those settings carry to a ~27x
+      larger model. GATE: state up front which settings are expected to be
+      SCALE-FREE and which are not. Today's derived-knob work is the reason to
+      care -- a knob that was tuned at 1B is exactly the kind of thing that does
+      not survive a 27x jump, whereas a rule derived from a measured quantity
+      (retrieval lag, participation ratio) should. If the transferred settings
+      fail, prefer deriving the quantity at the new scale over re-sweeping.
 
 - [ ] **T11. CUDA kernels, output-identical to the CPU path.** Already recorded
       as ELEVATED/next for the block4+plasticity work (`sili__new/TODO.md`), but
