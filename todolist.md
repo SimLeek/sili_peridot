@@ -1653,6 +1653,25 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
           whether 27B must shard across cards, because that decision bounds how
           much fusion is even possible.
 
+          On inter-GPU transport specifically: **GPUDirect P2P over PCIe does
+          bypass the CPU** -- GPU A writes straight into GPU B's VRAM with no
+          host staging. It requires both GPUs on the same root complex (or a
+          switch supporting it), ACS/IOMMU not redirecting traffic, and driver
+          permission -- and NVIDIA gates that last part BY PRODUCT LINE:
+          Tesla/Quadro keep P2P, GeForce largely does not. So the P40 (Tesla,
+          P2P yes) + RTX 2060 (GeForce, typically no) pair likely falls back to
+          host-staged copies, and the 2060 is the display card regardless.
+          Neither card has NVLink (that is P100/V100) or any other fast
+          interconnect. VERIFY rather than assume: `nvidia-smi topo -m` plus
+          `cudaDeviceCanAccessPeer` on the actual box before designing around
+          it.
+
+          And even when P2P works it is PCIe bandwidth (~16-32 GB/s) against P40
+          VRAM bandwidth (~350 GB/s) -- a 10-20x gap. Crossing devices
+          mid-forward is therefore expensive whether or not the CPU is involved,
+          which independently argues for FEW crossings and one megakernel per
+          device.
+
       (b) **PCIe is probably not the thing to fix first.** Kernel launches do
           not move tensor data over PCIe if the tensors already live in VRAM;
           the costs are launch latency and host synchronisation. So the
