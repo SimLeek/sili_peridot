@@ -1,11 +1,12 @@
 # sili_peridot todolist
 
-**TARGET CHANGED (2026-11-12): `Qwen2.8-27B`, not MiniCPM5-1B.** MiniCPM5
-remains the worked example below (its exact architecture is already recorded,
-and the conversion machinery/order is unchanged), but the model to actually
-convert is now Qwen2.8-27B -- and that will change again once recurrence,
-intrinsic RL and continual training are in, so treat the target as a parameter
-of the pipeline rather than a fixed endpoint. NOTE: I do not have reliable
+**TWO TARGETS, IN ORDER (2026-11-12).** MiniCPM5-1B is NOT superseded -- it is
+the EARLIER rung, and it is the right model for the game/RL work because it is
+small enough to train and test against. Qwen2.8-27B comes AFTER the game,
+intrinsic-RL and CUDA work. So: MiniCPM5-1B -> frame tokenization -> games/RL ->
+CUDA -> Qwen2.8-27B. The target changes again once recurrence, intrinsic RL and
+continual training land, so treat it as a parameter of the pipeline rather than
+a fixed endpoint. On Qwen specifically, NOTE: I do not have reliable
 architecture details for Qwen2.8-27B; read its `config.json` and record the
 same facts captured for MiniCPM5 (layer count, hidden, intermediate, heads vs
 kv_heads/GQA, head_dim, vocab, rope_theta, rms_norm_eps, tied embeddings,
@@ -1563,16 +1564,51 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       r_target). GATE: report WORST-CASE REGRET across a wide range, never
       accuracy at one operating point.
 
-- [ ] **T9. Mini-ultimate-transformer, then GAMES.** Once T0-T5 give a
-      small model that trains both paths, point it at a sparse-reward game. This
+- [ ] **T9a. Convert MiniCPM5-1B** (the machinery already scoped in this
+      file's Phase A-D). Comes BEFORE games/RL/CUDA: it is small enough to train
+      and test against, which is exactly what the exploration work needs. Its
+      architecture is already fully recorded, so this is execution, not design.
+
+- [ ] **T9b. Frame tokenization for Atari/NES -- a PREREQUISITE for T6(c), not
+      cosmetics.** MiniCPM5 is a text model; Atari/NES screens come in as image
+      patch tokens, which are maximally out-of-distribution for a text
+      embedding. That matters for a specific reason:
+
+      **A curiosity / surprise-minimising agent needs input that is LEARNABLY
+      PREDICTABLE.** If frame tokens are maximally surprising, surprise
+      saturates high and stays there, the intrinsic reward carries no gradient,
+      and T6(c) cannot be tested at all -- the mechanism would look broken when
+      the representation is what is broken. So "frame tokens shouldn't be too
+      surprising or too hard to predict" is a hard requirement on the
+      conversion, not a quality preference.
+
+      Cheapest credible option: EXTEND the vocabulary with frame-patch tokens
+      and train only those embeddings, leaving the rest of the model untouched
+      (a VQ codebook over patches, one token per code). Avoids needing paired
+      image/text data, which a LLaVA-style projector would.
+      GATE: measured surprise on frame tokens must be (i) well below saturation
+      and (ii) DECREASING with exposure. A flat-high surprise curve means the
+      intrinsic signal is dead and T6(c) is untestable -- check this before
+      building any RL loop on top.
+
+      Favourable property worth exploiting: Atari/NES frames are ~99% identical
+      between steps, which is precisely the redundancy regime already measured
+      -- repeated filler cost almost nothing (0.9997) where novel filler
+      consumed capacity (0.2247). Redundant frames should be nearly free for the
+      Titans memory to hold, so this is the natural task for it, not a stretch.
+
+- [ ] **T9. Games + intrinsic RL. DEPENDS ON T9a AND T9b.** Once T0-T5 give a
+      model that trains both paths and T9a/T9b give it a game-legible input,
+      point it at a sparse-reward game. This
       is the only planned test that can actually evaluate T6(c) -- intrinsic
       drive with sparse or absent external reward -- and nothing currently in
       either repo provides that regime. Needs: an environment loop, and a
       decision on whether the setpoint is driven toward curiosity or toward
       surprise minimisation.
 
-- [ ] **T10. Convert Qwen2.8-27B to run/train entirely on sili.** The
-      terminal model task. Read `config.json` first and record the architecture
+- [ ] **T10. Convert Qwen2.8-27B to run/train entirely on sili. FINAL RUNG --
+      after T9 (games/RL) and T11/T11b (CUDA), not before.** The terminal model
+      task; MiniCPM5-1B (T9a) carries the earlier work. Read `config.json` first and record the architecture
       facts (see the target note at the top) -- nothing here should be sized
       against assumed dimensions. At 27B the new questions MiniCPM5 never
       raised: weight memory budget, whether the fold-into-one-sparse-layer
