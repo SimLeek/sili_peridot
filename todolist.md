@@ -18,13 +18,26 @@ yet. There is an existing direct-link setup (see
 10.0.0.2/24 after a reboot, so ping before assuming the remote is down), but
 until that link is up the Qwen track cannot start.
 
-MEMORY BUDGET, which decides where Qwen can run at all. 27B weights: ~54GB at
-fp16, ~27GB at fp8, ~13.5GB at fp4. The remote P40 has 24GB VRAM, so ONLY ~fp4
-fits on the GPU -- fp16 and fp8 do not. But arch-sandbox has ~96GB system RAM and
-sili is CPU-first, so the realistic FIRST path for Qwen is CPU-side on the remote
-box, where both fp8 and fp4 fit comfortably; GPU/CUDA then buys speed rather than
-feasibility. Consequence for sequencing: fp4 (T7) is NOT on the critical path to
-get Qwen running, but IS a hard requirement before Qwen can ever sit on the P40.
+MEMORY BUDGET -- and note this is TRAINING, not inference-only, with sili's
+2xFP4 layout: every synapse carries BOTH a weight and an importance at fp4, so
+**1 byte per synapse**, not 4 bits. For 27B that is ~27GB dense-equivalent (NOT
+13.5GB). Against 24GB of P40 VRAM that does not fit dense -- so what makes it fit
+on GPU is **SPARSITY, not bit depth**: at ~30% density it is ~8GB and fits
+easily. In the remote box's ~96GB system RAM, ~27GB fits comfortably even dense,
+so the realistic FIRST path stays CPU-side, with GPU/CUDA buying speed rather
+than feasibility.
+
+Two training-specific consequences, both favourable:
+  * **No optimizer-state overhead.** importance IS the optimizer here (see
+    [[feedback-importance-is-already-the-optimizer]] -- do not add Adam moments),
+    so training memory is weights + importance and nothing else. That skips the
+    usual 2-3x optimizer blowup conventional training pays at this scale.
+  * **Pipeline parallelism dodges the bandwidth killer.** Training adds a
+    backward crossing, so ~2x boundary traffic -- still trivial on PCIe 1x. But
+    DATA-parallel training would need gradient all-reduce, which WOULD strangle
+    1x. Pipeline-parallel keeps each layer group's weights and importance local
+    to its card, so there is nothing to all-reduce. Sharding must therefore be
+    pipeline -- not data-parallel, not tensor-parallel.
 Also note the dual-CCX thread wall on that box -- num_cpus <= 4 for
 disldo_backward (see [[project-sili-arch-sandbox-ccx-topology-thread-wall]]) --
 so Qwen-side timing must not be benchmarked at high thread counts.
@@ -1737,8 +1750,13 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       to real throughput only when there are microbatches to fill the pipeline
       -- and PARALLEL GAME ENVIRONMENTS (T9) are exactly that, so the RL work is
       where a rig pays off, not single-stream inference.
-      One-time cost to keep in mind: loading ~13.5GB of fp4 weights per card
-      over 1x at ~1 GB/s is ~3-4 minutes per card.
+      One-time cost to keep in mind: at sili's 2xFP4 (weight + importance =
+      1 byte/synapse), a card holding ~8GB of a sparse shard loads over 1x at
+      ~1 GB/s in ~8 seconds; a dense 27GB model would be ~27s per card. Either
+      way negligible, and it is a one-time cost.
+      Note also that TENSOR-parallel is excluded for training for a second
+      reason beyond activation all-reduce: data-parallel replication would
+      require gradient all-reduce, which 1x cannot carry. Pipeline only.
 
       Staging: T11 correctness-first port -> CUDA Graphs -> measure -> fuse only
       the hot path that profiling implicates -> multi-GPU last.
