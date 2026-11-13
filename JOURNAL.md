@@ -13213,3 +13213,62 @@ separate "slow" from "stuck" before reaching for any of the above.
 Precedent for caution: earlier today I called a 0.147 plateau a capacity
 limit and it reached 0.88 by episode 3750, so long-term recall judged at
 4000 episodes was likely premature.
+
+## 2026-11-13 -- TWO MEASUREMENT BUGS: prediction collapse, and a wrong
+## chance baseline. Every "x chance" number in this task was overstated.
+
+The 40k-episode curves are FLAT for both arms -- so "slow vs stuck"
+resolves to **stuck**, not undertraining. But the scores were IDENTICAL
+at 5 of 9 checkpoints (0.1700/0.1700, 0.0700/0.0700, 0.0700/0.0700,
+0.0750/0.0750, 0.1050/0.1050), and with a 200-episode eval the odds of
+five exact matches between independent arms are ~1e-5. That signature led
+to two real bugs:
+
+**BUG 1 -- PREDICTION COLLAPSE.**
+```
+  none: acc=0.1650  distinct predictions=3  top=[(18,146),(21,35),(17,19)]
+ tbptt: acc=0.1700  distinct predictions=1  top=[(18,200)]
+        answer distribution distinct=12
+```
+`tbptt` emits ONE token for all 200 queries. So every negative result in
+this thread was measuring a DEGENERATE OPTIMUM, not credit assignment,
+not architecture, not expressivity. Likely cause: ONE gradient signal per
+19-tick episode, at a position whose answer is unpredictable until the
+memory already works. The only accessible descent direction is "predict
+the marginal mode and ignore the input" -- a chicken-and-egg where the
+sole supervision presupposes the capability being learned.
+
+**BUG 2 -- THE CHANCE BASELINE WAS WRONG.** A collapsed model scores the
+MAX-CLASS FREQUENCY, not 1/N_VALS. And the eval set was built with a
+FRESH `default_rng(70000 + e)` per episode; sequential seeds correlate
+the first draws and inflate that frequency:
+```
+sequential per-episode seeds: max-class 34/200 = 0.1700
+            single generator: max-class 24/200 = 0.1200
+                     uniform:                  = 0.0833
+```
+So the quoted baseline was too low by 1.4-2.0x, and **every "1.0-2.0x
+chance" reported for this task was actually AT OR BELOW the
+constant-predictor baseline.** The tbptt run at 0.1700 was not slightly
+above chance; it was exactly the collapsed baseline.
+
+Both fixed in the task: `constant_predictor_baseline()` is now the quoted
+figure, `eval_episodes()` builds the set from ONE generator, and the
+self-test prints how much quoting 1/N_VALS would overstate things.
+
+**What this retracts.** Not just this thread's conclusions -- the
+*diagnoses* too. Credit rule, pathway alignment, exact gradients,
+optimizer class, surprise gate, 40k training: all were applied to a model
+sitting in a constant-output optimum, where none of them could have
+mattered. The only findings that survive are the ones that were direct
+measurements: the FD check (cos ~0.13, the rule really was wrong), the
+linear-realizability test (retrieval IS expressible), and the oracle
+delta-rule test (the primitive works, cos 1.0000).
+
+**NEXT, and it is about SUPERVISION, not mechanism.** Give the model a
+signal that does not presuppose the memory: also supervise predicting `v`
+immediately after `k` at the pair position, which is answerable IN-WINDOW
+by induction. That teaches the key->value association first, so the
+memory has something real to store before being asked to retrieve it
+across a gap. Curriculum, not credit. And re-baseline every number
+against `constant_predictor_baseline()`.

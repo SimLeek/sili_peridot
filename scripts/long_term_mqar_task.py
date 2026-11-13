@@ -78,13 +78,42 @@ def assert_window_is_information_free(tokens, qpos, window):
 
 
 def chance() -> float:
+    """Uniform-guess rate. NOT the right baseline for this task -- see
+    constant_predictor_baseline(), which is what a collapsed model scores."""
     return 1.0 / N_VALS
+
+
+def constant_predictor_baseline(answers) -> float:
+    """THE baseline to beat: the max-class frequency in the eval set.
+
+    A model that collapses to one constant output scores this, not 1/N_VALS, so
+    quoting 1/N_VALS makes a collapsed model look like it is learning. Measured:
+    tbptt predicted a single token for all 200 queries and scored 0.1700 against
+    a quoted 'chance' of 0.0833 -- apparently 2x chance, actually total collapse.
+
+    Also build the eval set from ONE generator, never a fresh
+    default_rng(base + e) per episode: sequential seeds correlate the first draws
+    and inflated the max-class frequency from 0.1200 to 0.1700 here."""
+    from collections import Counter
+
+    c = Counter(int(a) for a in answers)
+    return max(c.values()) / max(1, len(list(answers)))
+
+
+def eval_episodes(n: int, n_pairs: int, window: int, seed: int = 12345):
+    """Fixed eval set from a SINGLE generator (see the warning above)."""
+    rng = np.random.default_rng(seed)
+    return [make_episode(rng, n_pairs, window) for _ in range(n)]
 
 
 def _self_test():
     rng = np.random.default_rng(0)
     W = 16
     print(f"vocab={VOCAB} keys={N_KEYS} vals={N_VALS} BLANK={BLANK} chance={chance():.4f}")
+    eps = eval_episodes(200, 1, W)
+    base = constant_predictor_baseline([a for _t, _q, a in eps])
+    print(f"constant-predictor baseline on a 200-episode eval set: {base:.4f}")
+    print(f"  (quoting chance={chance():.4f} instead would overstate by {base / chance():.2f}x)")
     for n_pairs in (1, 2, 4):
         lens = []
         for _ in range(300):
