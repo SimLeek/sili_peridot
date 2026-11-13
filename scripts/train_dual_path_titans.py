@@ -63,6 +63,7 @@ def run_arm(mode: str, episodes: int, seed: int) -> dict:
         rng=np.random.default_rng(seed + 7),
     )
     opt = AdamOptimizer()
+    w_k0 = model.W_K_mem.copy()
     t0 = time.time()
     n_backward = 0
 
@@ -80,7 +81,13 @@ def run_arm(mode: str, episodes: int, seed: int) -> dict:
             n_backward += 1
             clip_grad_norm_(model.parameters(), 1.0)
             opt.step(model.parameters(), lr=PEAK_LR)
+            # Absence of THIS call made `trace` identical to `frozen` for two
+            # whole comparison runs; see JOURNAL.md 2026-11-13.
+            grad = model.read_grad()
+            if grad is not None:
+                model.apply_trace_credit(grad, PEAK_LR)
     train_s = time.time() - t0
+    w_moved = float(np.abs(model.W_K_mem - w_k0).max())
 
     hits = {"page": [0, 0], "title": [0, 0]}
     for e in range(EVAL_EPISODES):
@@ -104,6 +111,7 @@ def run_arm(mode: str, episodes: int, seed: int) -> dict:
         "n_title": hits["title"][1],
         "n_backward": n_backward,
         "train_s": train_s,
+        "w_moved": w_moved,
     }
 
 
@@ -132,9 +140,17 @@ def main() -> None:
         print(
             f"{mode:>8} {pg.mean():>7.4f} sd{s_pg:.4f}/ev{ev_pg:.4f} "
             f"{ti.mean():>7.4f} sd{s_ti:.4f}/ev{ev_ti:.4f} "
-            f"{np.mean([r['train_s'] for r in rows]) / 60:>6.1f}m",
+            f"{np.mean([r['train_s'] for r in rows]) / 60:>6.1f}m"
+            f" wK{rows[0]['w_moved']:.2e}",
             flush=True,
         )
+        # Arms must be DISTINGUISHABLE: the write side is frozen in none/frozen
+        # and must actually move in trace. Without this, trace silently equals
+        # frozen -- which already happened.
+        if mode == "trace" and rows[0]["w_moved"] == 0.0:
+            raise AssertionError("trace arm: W_K never moved -- credit not wired")
+        if mode in ("none", "frozen") and rows[0]["w_moved"] != 0.0:
+            raise AssertionError(f"{mode} arm: W_K moved -- arms are not isolated")
     print(f"\neval targets per arm: page={rows[0]['n_page']} title={rows[0]['n_title']}")
 
 

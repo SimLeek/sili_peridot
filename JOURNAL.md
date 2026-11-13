@@ -12837,3 +12837,66 @@ Natural Bend law for this one, not yet written: for m equal nonzero
 entries, `(sum v^2)^2 == m * (sum v^4)` -- PR = m without needing
 division, provable over Nat by induction on m, confirming PR is exact on
 the case where the answer is unambiguous.
+
+## 2026-11-13 -- the trace arm was never wired: two comparison runs
+## measured the control twice
+
+`TitansMAC.apply_trace_credit()` existed, was documented as "called by the
+trainer after backward", and **was never called**. So the `trace` arm was
+functionally identical to `frozen`: `W_K_mem`/`W_V_mem` stayed frozen in
+every arm and the accumulated eligibility traces were never used for
+anything.
+
+Cost: the 3-arm run (2h) and the 8-seed follow-up (80min) both measured
+the control twice. I was one message away from reporting "Titans
+recurrence does not learn to use its memory" on that basis. The 0/8
+"did not fire" result says nothing whatever about the credit rule.
+
+**Why the existing safeguard missed it.** There IS an assert that every
+parameter receives gradient. But `W_K_mem`/`W_V_mem` are numpy, not
+Tensors -- deliberately outside autograd, because that is exactly what
+keeps the backward O(1). *The design choice that buys constant-time
+credit is the same one that hid the missing wiring.* An autograd-based
+check structurally cannot see the one parameter group whose whole point
+is to live outside autograd.
+
+**Structural fix, so it cannot recur**: each arm now records
+`max|dW_K|` over training and the run FAILS if `trace`'s write side never
+moved, or if `none`/`frozen`'s write side did. Verified frozen 0.00e+00
+vs trace 9.74e-02. The general lesson is that "every arm must be
+DISTINGUISHABLE at runtime" needs its own assertion -- it does not follow
+from the flags being different, and three of this investigation's
+confounds were arms that differed less (or more) than intended.
+
+**What the earlier 0.3042 was.** One seed of three in a frozen-equivalent
+arm, i.e. noise. Not reproducible: 0/8 fresh seeds exceeded 0.20, mean
+title 0.1265 against chance 0.125. Also worth keeping: seed 2004 scored
+page 0.3102 where every other seed reached 0.90+, so that arm
+occasionally destabilised in-context training too -- though with the
+write side frozen, that instability cannot be attributed to the credit
+rule either.
+
+**What DID survive from those runs** (they were valid measurements of
+`none` and `frozen`, just not of `trace`):
+  * **In-context is not harmed by adding the memory**: page 0.9263
+    (none) vs 0.9294 (frozen), inside se ~= 0.010. The original
+    engineering criterion holds.
+  * **The control does NOT leak**: title 0.1164 against chance 0.1250,
+    slightly below. The earlier 0.1467 suspicion was eval noise, as the
+    larger eval set confirmed.
+  * **`frozen` gives no recurrent benefit at all** (0.1169 vs 0.1164).
+    A trained read side over a random write side stores nothing useful,
+    so the write side genuinely needs credit. Gate A's random-projection
+    result does not carry here.
+
+**The credit rule now wired is HEURISTIC and labelled as such.** The
+principled form is `dL/dW_K = SUM_t (dL/dM_t) . (dM_t/dW_K)`, with
+`dL/dM = outer(g, q)` at the read and `dM/dW_K` following from
+`k = h W_K` through the delta-rule write; the trace is meant to stand in
+for the accumulated `dM_t/dW_K`. What is implemented is a trace-weighted
+step whose magnitude tracks how hard the read pulls on `M` and whose
+direction is just the trace. That tests whether trace-shaped credit helps
+at all; it does NOT test the e-prop approximation. Deriving the real
+contraction, and bounding its error the way
+`bend_proofs/synaptic_hold_bptt_approximation` bounds the generic case,
+is owed before any positive result here is called an e-prop result.

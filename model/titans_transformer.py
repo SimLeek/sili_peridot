@@ -96,7 +96,15 @@ class TitansMAC:
         # eligibility traces for the write side, same shapes as W_K/W_V
         self._tr_K = np.zeros_like(self.W_K_mem)
         self._tr_V = np.zeros_like(self.W_V_mem)
+        self._last_read = None
         self.last = {}
+
+    def read_grad(self):
+        """Gradient arriving at the memory-read row, or None. The trainer feeds
+        this to apply_trace_credit; without that call `trace` is byte-identical
+        to `frozen`, which is a bug that already cost two full comparison runs."""
+        r = self._last_read
+        return None if r is None else getattr(r, "grad", None)
 
     def parameters(self) -> list[Tensor]:
         """Only Tensors here. W_K/W_V are numpy and updated out-of-band (frozen,
@@ -138,6 +146,10 @@ class TitansMAC:
             q_mem = self.W_Q_mem.forward(rmsnorm_tensor(cur, self.input_ln, self.rms_eps))
             read = Tensor(self.M) @ q_mem.reshape((self.hidden, 1))
             read = read.reshape((1, self.hidden))
+            # kept so the trainer can recover the gradient that ARRIVES at the
+            # memory-read row after backward; that gradient is what the
+            # write-side trace is charged against.
+            self._last_read = read
             rows = _concat_rows(read, x_n)
 
         sigmas = exp(self.log_sigmas)
@@ -199,9 +211,19 @@ class TitansMAC:
         g = np.asarray(read_grad, dtype=np.float32).ravel()
         if g.size != self.hidden or not np.any(g):
             return
-        scale = lr / (float(np.linalg.norm(g)) + 1e-8)
-        self.W_K_mem -= scale * self._tr_K * float(np.dot(g, g)) ** 0.5
-        self.W_V_mem += scale * self._tr_V * float(np.dot(g, g)) ** 0.5
+        # Project the read gradient onto the stored traces. The traces hold the
+        # outer products that WOULD have carried credit, so one trace-weighted
+        # step charges the whole history in O(1) instead of unrolling it.
+        # HEURISTIC, NOT DERIVED: magnitude tracks how hard the read pulls on
+        # M, direction is just the trace. Enough to test whether trace-shaped
+        # credit helps; NOT enough to claim the e-prop approximation was tested.
+        # Derivation owed -- see JOURNAL.md 2026-11-13.
+        gn = float(np.linalg.norm(g)) + 1e-8
+        pull = float(np.linalg.norm((g / gn) @ self.M))
+        k_n = float(np.linalg.norm(self._tr_K)) + 1e-8
+        v_n = float(np.linalg.norm(self._tr_V)) + 1e-8
+        self.W_K_mem -= (lr * pull / k_n) * self._tr_K
+        self.W_V_mem -= (lr * pull / v_n) * self._tr_V
 
 
 def _gather_rows(table: Tensor, ids: np.ndarray, width: int) -> Tensor:
