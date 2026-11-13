@@ -13030,3 +13030,63 @@ passes FD):**
 control does not leak, per-step backward flat across a 512-step horizon,
 `frozen` establishes the write side needs credit, and the new long-term
 MQAR instrument with its two assertions.
+
+## 2026-11-13 (later) -- the surprise gate does NOT fix the gradient; the
+## formula drops dominant terms. Hand-derivation has failed twice.
+
+Tested the prediction from `all_inactive_is_exact` that the trace gradient
+should become accurate as active ticks vanish:
+
+```
+ write_gate   active  cos(analytic, FD)  |analytic|/|FD|
+       None     100%            -0.0576           0.0000
+       0.05      74%            -0.1875           0.0000
+        0.2      32%            -0.0912           0.0000
+        0.5      26%            +0.1293           0.0000
+```
+
+**Not confirmed.** cos stays near zero at every activity level, so the gate
+is not the problem. `|an|/|FD| ~ 0.0000` throughout is the diagnostic: the
+TRUE gradient is orders of magnitude larger than the analytic one, i.e. a
+small sub-term was kept and the dominant ones dropped.
+
+**What was dropped, now identified precisely.** With `k_s = h_s W_K`,
+`err_s = M_{s-1} k_s - v_s`, `theta_s = mem_lr/(k_s.k_s)`:
+ 1. `d err_s/dW_K` includes `M_{s-1}[:,b] h_s[a]` -- O(||M||), and it GROWS
+    as the memory fills. Omitted entirely.
+ 2. `d theta_s/dW_K = -2 mem_lr k_s[b] h_s[a] / ||k_s||^4` -- O(1). theta
+    was treated as a constant; it is not, it is `0.5/||k||^2` and so depends
+    on W_K directly.
+ 3. the recursion `d M_{s-1}/dW_K` -- the term e-prop is MEANT to
+    approximate, and the only one that was actually modelled.
+
+So the "derivation" kept (3)'s approximation and silently assumed (1) and
+(2) away. The gate cannot rescue that, because (1) and (2) are not
+Jacobian-product terms at all.
+
+**Note the gate is still probably wanted for other reasons** (not writing
+on uninformative ticks is the RSM/surprise idea, and it does cut writes
+from 100% to 26% here) -- it is just not the fix for this bug.
+
+**DECISION POINT, for the user.** Hand-deriving this has now failed twice,
+and the goal was never e-prop specifically -- it was CONSTANT-TIME
+backprop for real-time use. Options:
+  (A) **Truncated BPTT over a fixed k-step window.** Cost O(k) per step,
+      therefore O(1) in the horizon, and the gradient is CORRECT (merely
+      truncated) because autograd computes it instead of me deriving it.
+      Achieves the actual goal without a hand-derived approximation.
+      Downside: keeps k steps of graph, so memory is O(k) not O(1), and it
+      cannot capture dependencies longer than k without the e-prop trick.
+  (B) **Derive the full e-prop rule properly**, including terms (1) and (2),
+      with symbolic verification (sympy, or Bend) rather than by hand, then
+      FD-check. Higher effort, and the payoff over (A) is only for
+      dependencies longer than k.
+  (C) Keep the memory write ungradient-ed (the `frozen` arm) and accept
+      that the memory stores whatever random projections give. Already
+      measured: no recurrent benefit, so this is not viable alone.
+
+Recommendation: (A) first, because it is the shortest path to a VERIFIED
+constant-time gradient, and it gives a correct-gradient baseline that any
+later e-prop rule from (B) must match. Without such a baseline there is no
+way to tell an approximation error from an implementation error -- which is
+exactly the hole the last two days fell into.

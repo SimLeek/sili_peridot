@@ -42,6 +42,7 @@ class TitansMAC:
         mem_lr: float = 0.5,
         trace_beta: float = 0.9,
         grad_clip: float = 1.0,
+        write_gate: float | None = None,
         num_cpus: int = 2,
         rms_eps: float = 1e-6,
         rng: np.random.Generator | None = None,
@@ -52,6 +53,10 @@ class TitansMAC:
         self.vocab, self.hidden, self.window = vocab, hidden, window
         self.mode, self.mem_lr, self.trace_beta = mode, mem_lr, trace_beta
         self.grad_clip = grad_clip
+        # Relative-surprise threshold below which a tick does not write.
+        self.write_gate = write_gate
+        self.n_writes = 0
+        self.n_ticks = 0
         self.num_cpus, self.rms_eps = num_cpus, rms_eps
         self.n_rows = window + (0 if mode == "none" else 1)
 
@@ -190,9 +195,18 @@ class TitansMAC:
         k = h @ self.W_K_mem
         v = h @ self.W_V_mem
         kk = float(k @ k)
+        self.n_ticks += 1
         if kk < 1e-8:
             return
         err = self.M @ k - v
+        # Surprise gate: skip uninformative ticks (the RSM idea). Measured to
+        # cut writes 100% -> 26% here. NOTE it does NOT fix the trace gradient
+        # -- FD cos stayed ~0 at every activity level. JOURNAL 2026-11-13.
+        if self.write_gate is not None:
+            rel = float(np.linalg.norm(err)) / (float(np.linalg.norm(v)) + 1e-8)
+            if rel < self.write_gate:
+                return
+        self.n_writes += 1
         th = self.mem_lr / (kk + 1e-6)
         self.M = self.M - th * 2.0 * np.outer(err, k)
         if self.mode == "trace":
