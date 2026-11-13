@@ -13090,3 +13090,63 @@ constant-time gradient, and it gives a correct-gradient baseline that any
 later e-prop rule from (B) must match. Without such a baseline there is no
 way to tell an approximation error from an implementation error -- which is
 exactly the hole the last two days fell into.
+
+## 2026-11-13 -- design: forward-accumulated blame with a replay buffer
+## (user proposal), and why autograd should compute it
+
+Plain truncated BPTT cuts the gradient dead at k steps. Shared weights
+still make it useful -- `W_K` is the SAME matrix at every tick, so a write
+rule credited inside the window governs writes at ANY distance, and the
+persistent state carries content forward indefinitely. Reach is infinite
+through the STATE, not through the gradient path. But it cannot learn a
+dependency that only ever appears at range > k, because no example of it
+ever receives credit.
+
+**User's proposal, which is stronger.** Save states as needed and
+construct a synthetic aggregate: if 500 writes have run and step 501 has
+a strong use for that memory, backprop ONCE into the "fake combined
+state" -- the accumulated blame of the whole history. Valid because the
+writing layer changes slowly, so blame computed against saved states is
+still approximately right. That quasi-stationarity assumption is exactly
+e-prop's, with one decisive practical difference:
+
+**AUTOGRAD computes it instead of me deriving it.** Implementation shape:
+keep a bounded buffer of the `h_s` for past writes; when a strong
+gradient arrives, replay those saved writes as a short synthetic sequence
+and backprop through it. Cost O(buffer), i.e. O(1) in the horizon, and
+the gradient within the replayed set is EXACT rather than a dropped-term
+approximation. Two hand-derivations already failed (JOURNAL above); this
+route removes the step that keeps going wrong.
+
+**The surprise gate becomes load-bearing again, for a new reason**: it
+decides WHAT IS WORTH SAVING. Only writes that pass the gate enter the
+buffer, so the replay set stays small while spanning unbounded age. The
+gate stops being a performance tweak and becomes the buffer's admission
+policy.
+
+**THE DISCRIMINATING TEST (user's, and it is the right one): can it learn
+a dependency LONGER than the BPTT window?**
+  * plain TBPTT -- provably cannot. Zero gradient beyond k. NEGATIVE
+    CONTROL.
+  * forward-accumulated blame -- should, since the buffer holds the write
+    regardless of age.
+A method that only matches TBPTT inside the window has demonstrated
+nothing.
+
+**Order, and nothing is skipped this time:**
+  a. EXACT-gradient baseline (`tbptt_k` >= episode length, no truncation
+     at all) on long-term MQAR. Establishes the architecture CAN express
+     the task and that only credit was ever broken. RUNNING.
+  b. Truncate to k < gap. Confirm it FAILS -- that is the negative control
+     and it must actually fail, or the discriminator is meaningless.
+  c. Add the replay buffer + synthetic aggregate; test at gap >> k.
+  d. Mixed-gap training to test the shared-weight transfer argument
+     separately from (c).
+
+`tbptt` mode is implemented: the write is built from Tensor ops so
+`W_K`/`W_V` are ORDINARY parameters trained by the same optimizer as
+everything else. That also dissolves the write-side optimizer question --
+no hand-derived gradient, no separate accumulator, no extra per-synapse
+state, which is what the Adam detour and the single-state rewrite were
+both working around. Verified: `W_K_t` receives gradient 1.06e-03 and all
+19 parameters are covered.

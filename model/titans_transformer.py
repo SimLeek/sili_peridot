@@ -22,11 +22,11 @@ history and results: JOURNAL.md 2026-11-12.
 from __future__ import annotations
 
 import numpy as np
-from sili.tensor import Tensor, exp, gather, gaussian_attention
+from sili.tensor import Tensor, exp, gather, gaussian_attention, reduce_sum
 
 from model.toy_recall_models import DenseTensorLinear, rmsnorm_tensor
 
-MODES = ("none", "frozen", "trace")
+MODES = ("none", "frozen", "trace", "tbptt")
 
 
 class TitansMAC:
@@ -43,6 +43,7 @@ class TitansMAC:
         trace_beta: float = 0.9,
         grad_clip: float = 1.0,
         write_gate: float | None = None,
+        tbptt_k: int = 8,
         num_cpus: int = 2,
         rms_eps: float = 1e-6,
         rng: np.random.Generator | None = None,
@@ -55,6 +56,7 @@ class TitansMAC:
         self.grad_clip = grad_clip
         # Relative-surprise threshold below which a tick does not write.
         self.write_gate = write_gate
+        self.tbptt_k = tbptt_k
         self.n_writes = 0
         self.n_ticks = 0
         self.num_cpus, self.rms_eps = num_cpus, rms_eps
@@ -100,6 +102,19 @@ class TitansMAC:
         self.W_K_mem = (rng.standard_normal((hidden, hidden)) * s).astype(np.float32)
         self.W_V_mem = (rng.standard_normal((hidden, hidden)) * s).astype(np.float32)
         self.M = np.zeros((hidden, hidden), dtype=np.float32)
+        # TBPTT: the write becomes DIFFERENTIABLE, so W_K/W_V are ordinary
+        # Tensor parameters trained by the same optimizer as everything else.
+        # No hand-derived gradient, no separate write-side optimizer, and no
+        # extra per-synapse state -- which is what two failed derivations and an
+        # Adam detour were trying to work around. Memory stays in the graph for
+        # tbptt_k steps then detaches, so per-step backward is O(k) = O(1) in
+        # the horizon. Reach is infinite via the PERSISTENT STATE, not via the
+        # gradient path: W_K is shared across ticks, so a write rule credited
+        # inside the window governs writes at any distance.
+        self.W_K_t = Tensor(self.W_K_mem.copy()) if mode == "tbptt" else None
+        self.W_V_t = Tensor(self.W_V_mem.copy()) if mode == "tbptt" else None
+        self.M_t = Tensor(np.zeros((hidden, hidden), dtype=np.float32)) if mode == "tbptt" else None
+        self._since_detach = 0
         # eligibility traces for the write side, same shapes as W_K/W_V
         self._tr_K = np.zeros_like(self.W_K_mem)
         self._tr_V = np.zeros_like(self.W_V_mem)
@@ -127,6 +142,8 @@ class TitansMAC:
         params += self.lm_head.parameters()
         if self.mode != "none":
             params += self.W_Q_mem.parameters()
+        if self.mode == "tbptt":
+            params += [self.W_K_t, self.W_V_t]
         return params
 
     def reset(self) -> None:
@@ -154,7 +171,8 @@ class TitansMAC:
             # READ FIRST (causality): q from the newest token's embedding.
             cur = _gather_rows(self.embed, ids[-1:], self.hidden)
             q_mem = self.W_Q_mem.forward(rmsnorm_tensor(cur, self.input_ln, self.rms_eps))
-            read = Tensor(self.M) @ q_mem.reshape((self.hidden, 1))
+            mem_src = self.M_t if self.mode == "tbptt" else Tensor(self.M)
+            read = mem_src @ q_mem.reshape((self.hidden, 1))
             read = read.reshape((1, self.hidden))
             # kept so the trainer can recover the gradient that ARRIVES at the
             # memory-read row after backward; that gradient is what the
@@ -180,9 +198,34 @@ class TitansMAC:
         h = rmsnorm_tensor(h, self.post_ln, self.rms_eps)
         logits = self.lm_head.forward(h)
 
-        if self.mode != "none":
+        if self.mode == "tbptt":
+            self._write_t(h, self.n_rows - 1)
+        elif self.mode != "none":
             self._write(h.data[-1])
         return logits.reshape((self.n_rows, self.vocab))
+
+    def _write_t(self, h_all: Tensor, row: int) -> None:
+        """Differentiable delta-rule write (eqs 11-13, alpha=eta=0), built from
+        Tensor ops so autograd supplies the exact gradient within the window."""
+        d = self.hidden
+        sel = np.zeros((1, self.n_rows), dtype=np.float32)
+        sel[0, row] = 1.0
+        h = Tensor(sel) @ h_all  # [1, d], stays in the graph
+        k = h @ self.W_K_t  # [1, d]
+        v = h @ self.W_V_t  # [1, d]
+        kk = reduce_sum(k * k, axis=-1).reshape((1, 1))  # [1,1]
+        kt = k.reshape((d, 1))
+        err = self.M_t @ kt - v.reshape((d, 1))  # [d,1]
+        upd = (err @ k) * (self.mem_lr / (kk + 1e-6))  # [d,d]
+        self.M_t = self.M_t - upd * 2.0
+        self.n_ticks += 1
+        self.n_writes += 1
+        self._since_detach += 1
+        if self._since_detach >= self.tbptt_k:
+            # TRUNCATION: drop the graph beyond k steps. Cost per step stays
+            # O(k); the memory CONTENT survives, only the gradient path is cut.
+            self.M_t = Tensor(self.M_t.data.copy())
+            self._since_detach = 0
 
     def _write(self, h_last: np.ndarray) -> None:
         """One delta-rule write, forward pass only (eqs 11-13 with alpha=eta=0).
