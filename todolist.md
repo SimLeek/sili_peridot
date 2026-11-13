@@ -1,6 +1,18 @@
 # sili_peridot todolist
 
-Goal: convert `MiniCPM5-1B-Base` (standard `LlamaForCausalLM`, 24 layers,
+**TARGET CHANGED (2026-11-12): `Qwen2.8-27B`, not MiniCPM5-1B.** MiniCPM5
+remains the worked example below (its exact architecture is already recorded,
+and the conversion machinery/order is unchanged), but the model to actually
+convert is now Qwen2.8-27B -- and that will change again once recurrence,
+intrinsic RL and continual training are in, so treat the target as a parameter
+of the pipeline rather than a fixed endpoint. NOTE: I do not have reliable
+architecture details for Qwen2.8-27B; read its `config.json` and record the
+same facts captured for MiniCPM5 (layer count, hidden, intermediate, heads vs
+kv_heads/GQA, head_dim, vocab, rope_theta, rms_norm_eps, tied embeddings,
+biases, qk-norm, MoE) BEFORE sizing any of this. 27B vs 1B is a ~27x parameter
+jump, so memory budget and sharding are new questions MiniCPM5 never raised.
+
+Goal (machinery, unchanged): convert `MiniCPM5-1B-Base` (standard `LlamaForCausalLM`, 24 layers,
 hidden=1536, intermediate=4608, heads=16, kv_heads=2 GQA, head_dim=128,
 vocab=130560, rope_theta=5e6, rms_norm_eps=1e-6, untied embeddings, no
 biases, no qk-norm, no MoE/vision) into a model that runs and trains
@@ -1558,6 +1570,66 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       either repo provides that regime. Needs: an environment loop, and a
       decision on whether the setpoint is driven toward curiosity or toward
       surprise minimisation.
+
+- [ ] **T10. Convert Qwen2.8-27B to run/train entirely on sili.** The
+      terminal model task. Read `config.json` first and record the architecture
+      facts (see the target note at the top) -- nothing here should be sized
+      against assumed dimensions. At 27B the new questions MiniCPM5 never
+      raised: weight memory budget, whether the fold-into-one-sparse-layer
+      recurrence trick still applies at this depth, and sharding across the
+      available VRAM. Depends on T0-T8 for the model side and T11 for it to be
+      runnable at all at this scale.
+
+- [ ] **T11. CUDA kernels, output-identical to the CPU path.** Already recorded
+      as ELEVATED/next for the block4+plasticity work (`sili__new/TODO.md`), but
+      that entry frames it as "iterate ablations faster". It is also the
+      terminal deployment task, with these added requirements:
+
+      **CUDA for now** (not Vulkan/Kompute) as the simplest path. Hardware
+      reality to design against: arch-sandbox is a P40 (sm_61 Pascal, 24GB, the
+      compute card) plus an RTX 2060 (sm_75 Turing, display); the laptop is a
+      GTX 1660 Ti (sm_75). MIXED ARCHITECTURES and NO NVLINK -- so peer access
+      is PCIe P2P at best, and one binary cannot be uniformly optimal across
+      sm_61 and sm_75.
+
+      **"Same output as the current kernels" needs a tolerance spec, not just
+      the word "same".** Bit-exact is achievable for elementwise and fp4/fp8
+      paths and should be REQUIRED there. It is NOT achievable for parallel
+      reductions -- different summation order changes fp32 results -- so those
+      need a documented tolerance plus an order-stable reference. The stochastic
+      quantize path needs seeded-RNG parity, per
+      [[feedback-block4-compression-verification]] (verify against the real
+      stochastic quantize, not deterministic reasoning).
+
+      **Expect the win to come from coalescing, not FLOPs.** The scattered CSR
+      path is gather/scatter-bound rather than SIMD-bound on CPU, and that
+      property carries to GPU: a naive port will be bandwidth-bound and may not
+      beat CPU. Profile before optimizing.
+
+- [ ] **T11b. Megakernel / launch-overhead reduction -- staged, because the
+      strong form has a hard limit.** Two corrections to the framing worth
+      having up front:
+
+      (a) **A single CUDA kernel cannot span multiple GPUs.** So "one megakernel
+          that only returns when needed" and "use VRAM from several GPUs" are in
+          direct tension: the best available shape is ONE megakernel PER DEVICE
+          with explicit boundaries where data crosses. Worth deciding early
+          whether 27B must shard across cards, because that decision bounds how
+          much fusion is even possible.
+
+      (b) **PCIe is probably not the thing to fix first.** Kernel launches do
+          not move tensor data over PCIe if the tensors already live in VRAM;
+          the costs are launch latency and host synchronisation. So the
+          first-order fix is **CUDA Graphs** -- capture the whole step once and
+          replay it, which removes per-launch overhead and host round-trips, is
+          far less work than a persistent megakernel, and composes with
+          multi-GPU. Only if profiling still shows launch/sync dominating is a
+          true persistent/fused megakernel justified.
+
+      Staging: T11 correctness-first port -> CUDA Graphs -> measure -> fuse only
+      the hot path that profiling implicates -> multi-GPU last.
+      GATE at each stage: output parity per T11's tolerance spec, and a measured
+      speedup over the previous stage. No fusion without a profile pointing at it.
 
 ### Resolved
 
