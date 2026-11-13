@@ -36,13 +36,32 @@ from scripts.dual_path_recall_task import (
 )
 
 HIDDEN, WINDOW, N_PAGES = 32, 16, 9
-PEAK_LR = 0.01
-EVAL_EPISODES = 60
+PEAK_LR = 0.003
+SIGMA_INIT = 4.0
+# EVAL SET MUST OUT-RESOLVE THE EFFECT. At 60 episodes the eval sets were 540
+# page / 180 title targets, whose BINOMIAL sampling sd (0.0128 page) EXCEEDED the
+# between-seed sd (0.0080) -- so "seed variance" was mostly eval noise and any
+# MDE derived from it was meaningless. Sized so eval sd is ~0.004 page /
+# ~0.009 title, well under the effects worth detecting. Eval is forward-only, so
+# this costs ~90s per arm-seed.
+EVAL_EPISODES = 400
+# 8000 training episodes: induction forms as a PHASE TRANSITION around ep
+# 3000-4000, so shorter runs measure "has the circuit formed yet" (bimodal,
+# sd 0.43) rather than arm quality.
+TRAIN_EPISODES = 8000
 
 
 def run_arm(mode: str, episodes: int, seed: int) -> dict:
     rng = np.random.default_rng(seed)
-    model = TitansMAC(VOCAB, hidden=HIDDEN, window=WINDOW, mode=mode, rng=np.random.default_rng(seed + 7))
+    model = TitansMAC(
+        VOCAB,
+        hidden=HIDDEN,
+        window=WINDOW,
+        mode=mode,
+        n_layers=2,
+        sigma_init=SIGMA_INIT,
+        rng=np.random.default_rng(seed + 7),
+    )
     opt = AdamOptimizer()
     t0 = time.time()
     n_backward = 0
@@ -89,22 +108,31 @@ def run_arm(mode: str, episodes: int, seed: int) -> dict:
 
 
 def main() -> None:
-    episodes = int(sys.argv[1]) if len(sys.argv) > 1 else 400
+    episodes = int(sys.argv[1]) if len(sys.argv) > 1 else TRAIN_EPISODES
     n_seeds = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     ch = chance_levels()
     print(f"hidden={HIDDEN} window={WINDOW} pages={N_PAGES} vocab={VOCAB}")
     print(f"episodes={episodes} seeds={n_seeds}  chance: page={ch['page']:.4f} title={ch['title']:.4f}")
     print("\nin-context (page) must NOT drop when memory is added; recurrent")
     print("(title) must rise above chance. Both, or it does not count.\n")
-    print(f"{'mode':>8} {'page':>16} {'title':>16} {'n_bwd':>7} {'train_s':>8}")
+    print(f"{'mode':>8} {'page  sd/evalsd':>24} {'title  sd/evalsd':>24} {'train':>7}")
+    print("sd = between-seed; ev = binomial eval sd. If ev >= sd, the seed")
+    print("number is measuring eval noise and no MDE can be read from it.\n")
     for mode in ("none", "frozen", "trace"):
         rows = [run_arm(mode, episodes, 1000 + s) for s in range(n_seeds)]
         pg = np.array([r["page"] for r in rows])
         ti = np.array([r["title"] for r in rows])
+        n_pg, n_ti = rows[0]["n_page"], rows[0]["n_title"]
+        # eval (binomial) sd at the observed rate, for comparison with seed sd:
+        # if eval sd is the larger of the two, the seed sd is measuring noise.
+        ev_pg = float(np.sqrt(max(pg.mean() * (1 - pg.mean()), 1e-9) / n_pg))
+        ev_ti = float(np.sqrt(max(ti.mean() * (1 - ti.mean()), 1e-9) / n_ti))
+        s_pg = pg.std(ddof=1) if len(pg) > 1 else 0.0
+        s_ti = ti.std(ddof=1) if len(ti) > 1 else 0.0
         print(
-            f"{mode:>8} {pg.mean():>9.4f}+-{pg.std(ddof=1) if len(pg) > 1 else 0:.3f} "
-            f"{ti.mean():>9.4f}+-{ti.std(ddof=1) if len(ti) > 1 else 0:.3f} "
-            f"{rows[0]['n_backward']:>7} {np.mean([r['train_s'] for r in rows]):>8.1f}",
+            f"{mode:>8} {pg.mean():>7.4f} sd{s_pg:.4f}/ev{ev_pg:.4f} "
+            f"{ti.mean():>7.4f} sd{s_ti:.4f}/ev{ev_ti:.4f} "
+            f"{np.mean([r['train_s'] for r in rows]) / 60:>6.1f}m",
             flush=True,
         )
     print(f"\neval targets per arm: page={rows[0]['n_page']} title={rows[0]['n_title']}")
