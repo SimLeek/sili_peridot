@@ -1,38 +1,30 @@
-"""The measuring instrument for "trains in-context AND recurrent" -- built
-before any model change, because every wrong conclusion in this investigation
-came from sweeping before the instrument existed.
+"""The measuring instrument for "trains in-context AND recurrent".
 
-THE SHAPE OF THE TARGET USE CASE. A model reads a page of a paper in context and
-remembers the book title from far earlier; or watches a screen in context and
-remembers earlier frames. Those are two different capabilities with two different
-failure modes, and a single accuracy number cannot tell them apart -- which is
-exactly how the earlier MQAR work got stuck. So this task emits TWO scores:
+Built before any model change: a single accuracy number cannot separate the
+two capabilities, which is how the earlier MQAR work got stuck. So two
+scores, always reported together with their per-capability chance levels
+(which differ):
 
-  IN-CONTEXT  questions answerable from the current attention window alone.
-  RECURRENT   questions whose answer appeared ONCE, before the window, and is
-              therefore unreachable except through persistent state.
+  IN-CONTEXT  answerable from the current attention window alone.
+  RECURRENT   the answer appeared ONCE before the window, so it is
+              unreachable except through persistent state.
 
-The engineering criterion the user set earlier still governs: adding recurrence
-must not HARM the in-context score. A recurrent win paid for by an in-context
-loss is not a win, so both numbers are always reported together, plus the
-per-capability chance level (they differ, so a single chance line would mislead).
+Standing criterion: adding recurrence must not HARM the in-context score.
 
-STRUCTURE of one episode, with window W and title vocabulary T:
-  tick 0            TITLE token t* (drawn from the title vocab)
-  then, repeating:  PAGE of `page_len` content tokens, each page containing a
-                    local (key, value) pair; a PAGE QUERY re-presents that key
+One episode, window W:
+  tick 0            TITLE token t*
+  then, repeating:  PAGE of `page_len` tokens containing a local (key,
+                    value) pair; a PAGE QUERY re-presents that key
   interleaved:      TITLE QUERY, a reserved token asking for t*
 
-A title query is placed only after the title has left the window (position >
-W), so it cannot be answered by attention -- verified by `assert_unreachable()`
-rather than assumed, since "the gap was inside the window" is precisely the
-mistake that made an earlier MQAR run look adversarial when it was mis-sized.
+Title queries are placed only after the title has left the window
+(position > W), checked by `assert_unreachable()` rather than assumed --
+mis-sizing that gap is what once made an MQAR run look adversarial.
 
-Vocabulary layout is disjoint so the two scores cannot contaminate each other:
-titles, content/values, and the two query markers occupy separate id ranges, and
-a title can never be produced as a page answer or vice versa.
+Vocabulary ranges are disjoint (titles / content / the two query markers),
+so a title can never be produced as a page answer or vice versa.
 
-Run: python -m scripts.dual_path_recall_task   (self-test of the task itself)
+Run: python -m scripts.dual_path_recall_task   (self-test of the task)
 """
 
 import numpy as np
