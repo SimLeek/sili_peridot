@@ -13425,3 +13425,33 @@ Testing now: long-gap ONLY with fix A, all three arms. If that works, the
 follow-up is re-adding short-gap and verifying the memory path is retained
 rather than being abandoned the moment attention can cover part of the
 load.
+
+## 2026-11-13 -- FIRST above-baseline long-gap result: frozen + fix A +
+## long-gap-only. Removing the distraction worked.
+
+```
+--- none ---    long 0.0960  over -0.0160  distinct=1   COLLAPSED
+--- frozen ---  long 0.1920  over +0.0800  distinct=2   eval_sd 0.0249
+--- tbptt ---   long 0.1040  over -0.0080  distinct=2   COLLAPSED
+```
+
+`frozen` is **+0.0800 over baseline, ~3.2 eval-sd** -- the first real
+long-gap signal in this entire thread, and it only appears once the
+short-gap "distraction" is removed, exactly as the curriculum-inversion
+note predicted.
+
+**The winning arm is the one with the LEAST trainable machinery.** `frozen`
+has a random, untrained `W_V` and learns only the readout -- which is
+precisely what the decodability measurement said would suffice (held-out
+linear probe 1.0000 with an untrained write projection). `tbptt`, which
+also trains the write side, did WORSE: plausibly because a moving write
+target keeps shifting what the readout is trying to decode. More
+trainable machinery was actively counterproductive here, which is worth
+remembering before adding any.
+
+**Not oversold**: 0.1920 against a 1.0 ceiling is PARTIAL, distinct=2 with
+top_share 0.54 means it is still largely collapsed onto two tokens, and
+this is one seed. A signal, not a solved task.
+
+Running: frozen + fix A + long-only to 60k episodes, 2 seeds, with a
+learning curve, to tell "learning slowly" from "stuck at 2 tokens".
