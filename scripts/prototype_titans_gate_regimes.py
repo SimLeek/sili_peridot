@@ -1,49 +1,19 @@
 """Titans' two gates, each measured in the regime it actually targets.
 
-This supersedes the gate numbers in `prototype_titans_adaptive_gates.py`, which
-were confounded twice over. Recording both confounds here because each one
-individually reversed the conclusion, and both are the same mistake -- changing
-two things and crediting one (cf. feedback_do_science_correctly):
+Supersedes the gate numbers in `prototype_titans_adaptive_gates.py`, which
+were confounded twice: eta also scaled the effective step by 1/(1-eta)
+(fixed with theta_scale = 1-eta), and the task wrote probed pairs FIRST,
+which high eta privileges. Both confounds, the derivation, and the regime
+results are in JOURNAL.md 2026-11-14.
 
-CONFOUND 1, hidden learning rate. eta does not only set the surprise trace, it
-multiplies the EFFECTIVE step by 1/(1-eta): at eta=0.9 the memory takes a 10x
-larger step than at eta=0. The high-eta cells were not learning, they were
-diverging -- ||M|| reached 11093 for the matrix memory and end-of-stream surprise
-19.2 vs 1.16 at eta=0. Fix: theta_scale = 1-eta, so eta changes only the trace.
-With that, ||M|| stays ~5-8 and momentum's sign flips from negative to positive.
+Results (matrix memory, 400 eps x 3 seeds, chance 0.0156): momentum helps
+when probes are uniform (0.665 -> 0.871 as eta 0 -> 0.95); forgetting
+helps when they are recent (the "last" column runs 0.387 -> 0.879 down the
+alpha rows at eta=0.9, while uniform falls 0.793 -> 0.420). The gates
+trade off along the temporal axis, so neither is universally good.
 
-CONFOUND 2, write position. With theta ~ (1-eta), a write at time i contributes
-~ grad_i * (1 - eta^(T-i)): ~1 for EARLY writes, ~(T-i)(1-eta) for recent ones.
-So high eta is a low-pass filter privileging early content -- and the original
-task wrote the probed pairs FIRST, handing momentum free credit. The opposite
-regime confirmed it: with probes written LAST, eta=0.95 dropped to 0.818 from
-0.980. Fix: scatter the probed pairs UNIFORMLY (order="random"), so no temporal
-position is systematically rewarded, and keep first/last as explicit controls.
-
-The three orders are NOT three samples of one quantity. A pair at position p has
-(T - p) subsequent interfering writes: ~64 under "first", ~2 under "last", ~34
-under "random". They measure different interference loads, which is why "random"
-can exceed both controls rather than falling between them.
-
-WHAT THE REGIMES SHOW (matrix memory, 400 eps x 3 seeds, chance 0.0156):
-  * Momentum helps where probes are uniform: 0.665 -> 0.871 as eta 0 -> 0.95,
-    with no positional bias available to it. Mechanism is visible in the
-    controls: at eta=0 the memory is sharply recency-biased (first 0.23, last
-    1.00), and momentum BROADENS that profile by re-injecting each write over
-    later ticks. A broader profile beats a sharply recent one when probes are
-    spread out.
-  * Forgetting helps where probes are RECENT: down the alpha rows at eta=0.9 the
-    "last" column runs 0.387 -> 0.451 -> 0.503 -> 0.749 -> 0.879, more than
-    doubling, while the uniform column falls 0.793 -> 0.420. Decay only pays
-    when old content is genuinely obsolete, and a uniform regime has nothing
-    obsolete in it by construction.
-
-So the gates trade off along the TEMPORAL axis -- momentum broadens retention,
-weight decay sharpens it toward recent -- and that explains the paper's
-published ordering (weight decay > momentum, Table 5): language modelling is
-heavily recency-weighted, the regime where decay dominates. Neither gate is
-universally good, which is why a single-regime sweep will always call one of
-them harmful.
+order=first/last/random are different INTERFERENCE LOADS, not three
+samples of one quantity -- so "random" can exceed both controls.
 
 Run: python -m scripts.prototype_titans_gate_regimes
 """

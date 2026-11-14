@@ -1,33 +1,15 @@
-"""Is the per-step backward actually O(1) in the horizon, or do I only believe it?
+"""Is the per-step backward O(1) in the horizon, or do I only believe it?
 
-This is the claim that matters for running the model in real time, and it is a
-structural claim, so it should be measured rather than asserted. Two arms on the
-SAME model and the same work:
+Two arms on the same model and the same work:
+  per-step   backward at every position. Measured flat (1.00-1.19x across
+             positions 0-512), so O(1) holds.
+  deferred   one backward at episode end. A LEAK DETECTOR, not a BPTT
+             baseline -- nothing spans steps, so it cannot grow; if it
+             did, a graph would be crossing step boundaries. See
+             JOURNAL.md 2026-11-14 for why the BPTT framing was wrong.
 
-  per-step   backward called at every position. The memory crossing a step
-             boundary is detached numpy, so no graph spans steps and the cost of
-             step t should not depend on t. MEASURED: 1.00x -> 1.19x across
-             positions 0-512, and 3.48/3.40/2.88/3.15/3.62 ms/step at lengths
-             32/64/128/256/512 -- no trend, so O(1) holds.
-  deferred   losses summed across the episode and ONE backward at the end.
-
-CORRECTION TO AN EARLIER FRAMING: `deferred` was described as a BPTT baseline
-that should grow super-linearly. It does not, and the premise was wrong -- the
-memory crossing a step boundary is detached numpy, so NO graph spans steps and
-deferring merely batches independent graphs (measured 1.47-1.88 ms/step, flat).
-So this arm is not a BPTT cost model; it is a LEAK DETECTOR. If any graph were
-silently spanning steps, its backward would grow with length, and it doesn't.
-A real BPTT contrast would need a variant holding M as a Tensor across steps,
-which this file deliberately does not build.
-
-What would falsify the claim: per-step time rising with position. That would mean
-something is silently retaining the graph across steps -- which is exactly the
-bug class that detaching is supposed to prevent, and worth catching here rather
-than discovering on a long stream.
-
-Reported per position bucket, so a trend is visible rather than averaged away.
-Wall-clock on one machine is noisy; the SHAPE (flat vs rising) is the result, not
-the absolute microseconds.
+Falsified by: per-step time rising with position. Reported per bucket so a
+trend stays visible. The shape matters, not the absolute microseconds.
 
 Run: python -m scripts.measure_constant_time_backward
 """

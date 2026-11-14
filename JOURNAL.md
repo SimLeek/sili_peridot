@@ -13878,3 +13878,45 @@ refuses to run if temperature cannot be read, rather than running blind.
 Verified all three paths: normal completion passes the exit code through,
 threshold crossing SIGTERMs the whole process group then SIGKILLs after
 15s and exits 2, and an unreadable GPU exits 3 without launching anything.
+
+## 2026-11-14 -- ported from a docstring: the `deferred` arm is a leak
+## detector, not a BPTT baseline
+
+`scripts/measure_constant_time_backward.py` originally described its
+`deferred` arm as a BPTT cost model that should grow super-linearly with
+episode length. That premise was wrong. The memory crossing a step
+boundary is detached numpy, so NO graph spans steps, and deferring the
+backward merely batches independent graphs -- measured 1.47-1.88 ms/step,
+flat. So the arm cannot grow by construction, and its real value is as a
+LEAK DETECTOR: if any graph were silently spanning step boundaries, its
+backward WOULD grow with length, and it does not. A genuine BPTT contrast
+would need a variant holding M as a Tensor across steps, which that file
+deliberately does not build.
+
+The O(1) claim itself measured flat: 1.00x -> 1.19x across positions
+0-512, and 3.48/3.40/2.88/3.15/3.62 ms/step at lengths 32/64/128/256/512.
+Wall-clock on one machine is noisy, so the SHAPE (flat vs rising) is the
+result, not the absolute microseconds.
+
+## 2026-11-14 -- ported from a docstring: the three write orders measure
+## different interference loads, not three samples of one quantity
+
+`scripts/prototype_titans_gate_regimes.py` sweeps write order
+first/last/random. Those are NOT three samples of one quantity: a pair at
+position p has (T - p) subsequent interfering writes -- about 64 under
+"first", about 2 under "last", about 34 under "random". They measure
+different interference loads, which is why "random" can EXCEED both
+controls rather than falling between them. Worth stating because a reader
+who assumes they bracket the same quantity will read the random column as
+impossible.
+
+The write-position confound itself (already recorded above) was confirmed
+by the opposite regime: with probes written LAST instead of first,
+eta=0.95 dropped to 0.818 from 0.980.
+
+Conclusion the regimes support: the two gates trade off along the TEMPORAL
+axis -- momentum BROADENS retention, weight decay SHARPENS it toward
+recent. That explains the paper's published ordering (weight decay >
+momentum, Table 5): language modelling is heavily recency-weighted, the
+regime where decay dominates. Neither gate is universally good, so a
+single-regime sweep will always call one of them harmful.
