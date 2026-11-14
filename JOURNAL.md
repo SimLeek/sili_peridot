@@ -13344,3 +13344,59 @@ from x_t -- so a consecutive (key, value) pair is stored as such by
 construction, with no component-separation to learn. That is what an
 associative memory over adjacent tokens actually needs, and it is a
 deliberate deviation from eq 11 justified by the missing depth.
+
+## 2026-11-13 -- the full information chain now HOLDS, and the remaining
+## failure is genuinely credit. Three measured links, two real fixes.
+
+Three separate things had to be true for the memory to be usable, and
+each was invisible to accuracy alone. All three are now measured:
+
+| link          | before      | after        | fix                          |
+|---------------|-------------|--------------|------------------------------|
+| retention     | 0.139       | 0.803        | key from x_{t-1} (fix A)     |
+| reachability  | 3.4e-04     | 0.969        | memory row adjacent to output|
+| decodability  | 0.450       | **1.0000**   | (follows from fix A)         |
+
+* **retention** = cos between the read at the query tick and the value
+  that should have been stored. Confirmed 0.81 in the tbptt write path
+  too, so both write implementations agree.
+* **reachability** = the Gaussian positional weight from the output row to
+  the memory row. The memory read was row 0 while logits come from the
+  LAST row, 16 positions away, and at the measured-best sigma=4 that is
+  3.355e-04 -- suppressed ~3000x. Raising sigma was not an option
+  (sigma=4 beat sigma=16 for the content induction, 0.256 vs 0.206), so
+  the row moved instead.
+* **decodability** = held-out accuracy of a LINEAR probe from the read row
+  to the answer token. **1.0000 against chance 0.0833** -- and that was
+  measured in `frozen` mode with a RANDOM, UNTRAINED W_V, so even an
+  untrained write projection preserves the answer perfectly.
+
+**Which fix did what.** Of the two candidates for the key/value-source
+root cause: fix A (key from the previous tick) raised retention 5.8x and
+decodability from 0.45 to 1.0. Fix B (more depth before the memory, the
+FAITHFUL reading of eq 11) barely moved retention, 0.139 -> 0.184, and
+combining them was WORSE than A alone (0.60 vs 0.80) -- extra pre-memory
+mixing makes x_{t-1} a muddier key. So depth does not substitute for the
+source split at this scale. Fix A is a deliberate deviation from eq 11,
+earned by that measurement; at real scale the paper's version may well be
+correct and fix A unnecessary.
+
+**AND IT STILL COLLAPSES.** Mixed-gap, 12k episodes, with all three links
+holding: short 1.0000 (+0.8880 over baseline, 12 distinct) and long 0.0800
+with ONE distinct prediction, BELOW baseline. So everything the task needs
+is present, a linear readout would solve it perfectly, and SGD does not
+find it.
+
+**This is finally a real credit/optimisation finding** rather than an
+inferred one -- every earlier version of this claim was downstream of
+information that was being destroyed, suppressed, or undecodable. The
+likely mechanism: the model learns short-gap first via attention,
+converges, and constant-output on long-gap is a stable local optimum with
+no pressure to grow the memory row's attention weight.
+
+Next, cheap and well-targeted now that the information is known to be
+present: train LONG-GAP ONLY so attention cannot provide an escape. That
+configuration failed before, but that was before the information was
+actually there. Also worth noting `frozen` should now be able to solve it,
+since decodability was 1.0 with an untrained W_V -- only the readout needs
+to learn.
