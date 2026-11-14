@@ -13773,3 +13773,108 @@ sigma re-sweep is folded into the scale-up rather than run here.
 properly-seeded baseline solved 1/4. skip+eps fixed seed 1001 completely,
 but the remaining three seeds are still running, so the solve RATE under
 the fixes is unknown. Do not report a rate until all four land.
+
+## 2026-11-14 -- v7 (percentile-derived gate k) FINAL: raw numbers, no verdict
+
+The third attempt at `select_by_deviation`'s gate completed its full
+100k steps. Raw result, stated without a keep/prune judgement:
+
+| arm | gate k | peak | final | steps/sec |
+|-----|--------|------|-------|-----------|
+| v5  | fixed k=1.0 | vocab=16/k=3 | vocab=16/k=3 | -- |
+| v6  | EVT-derived sqrt(2 ln N) | vocab=64/k=3 | vocab=64/k=3 | -- |
+| v7  | percentile-derived | vocab=32/k=3 | vocab=32/k=3 | 8.43 |
+
+v7: `FINAL final_vocab=32 final_k=3 final_phase=kcycle steps_per_sec=8.43
+(11856s)`, `PEAK peak_vocab=32 peak_k=3`, three level_ups (steps 1990,
+4337, 4998) and then flat for the remaining 95,000 steps,
+loss_ema ~2.97, acc_ema ~0.02 at the end.
+
+Context for why v7 existed at all, recorded here because the script that
+established it is being retired per the one-off-script convention:
+`scripts/analyze_v6_stall.py` replayed v6's own recorded per-cycle column
+snapshots and found v6's EVT-derived gate was a PERMANENT NO-OP -- open
+0.000% of the time across the whole run -- so v6's vocab=64/k=3 was
+reached with the mechanism effectively absent. The percentile-derived k
+was chosen because the same replay showed it would open 47-100% of the
+time on that identical recorded data. It did open, and the outcome was
+vocab=32/k=3, i.e. BELOW the run where the gate never fired.
+
+So the three arms do not order as "better gate -> better result", and the
+one arm that reached vocab=64 is the one whose gate was dormant. Not
+drawing a conclusion from that here; it is three single-seed runs, and
+per the project's own standing note a flip between runs needs more seeds
+rather than an explanation.
+
+## 2026-11-14 -- GPU environment brought up; the CUDA toolchain was BROKEN
+## and is now verified end to end. New `gpu_env/` folder outside both repos.
+
+The kernel downgrade restored the driver (570.86.16, CUDA 12.8, nvcc
+12.8), but three further things were wrong, and two of them would have
+been discovered mid-port rather than before it.
+
+**1. torch had the wrong CUDA build.** Three installs existed, none
+working: system python 3.14 had no torch; `python-pytorch-opt-cuda 2.6.0-8`
+was installed into a python 3.13 tree with no 3.13 interpreter left on the
+machine (orphaned by an OS upgrade); and the venv had torch 2.14.0+cu130,
+which needs driver r580+ and so failed with "driver is too old (found
+version 12080)" while still reporting `device_count() == 1`. Replaced with
+2.14.1+cu126. Measured: **4.19 TFLOP/s fp32 on 2048^3** against the
+2.9 GFLOP/s numpy baseline recorded for this laptop, and gpu-vs-cpu
+matmul max abs diff 4.77e-05.
+
+**2. CUDA 12.8 could not compile anything at all.** glibc 2.41 added the
+C23 `rsqrt`/`rsqrtf` as `noexcept`; CUDA 12.8 declares the same two names
+without it, so every `.cu` dies in system headers before any project code
+is parsed. Measured on glibc 2.44. `-ccbin gcc-13` does NOT fix it (it is
+a declaration clash, not the `__GNUC__ > 14` host-compiler guard), and the
+glibc declaration is gated on `__USE_GNU`, which g++ defines
+unconditionally in C++ mode, so no feature macro can switch it off. Fixed
+with a two-line `noexcept (true)` patch to CUDA's header
+(`gpu_env/patch_cuda_glibc.sh`, idempotent, keeps a `.orig.bak`, must be
+re-run after any cuda package reinstall). A fat binary for sm_61+sm_75 now
+compiles, `cuobjdump` confirms both arches are in the ELF, and it RUNS
+correctly on the 1660 Ti.
+
+**3. The toolchain version is forced, not chosen.** CUDA 13.0 removed
+offline compilation and library support for Maxwell/Pascal/Volta; sm_75 is
+its floor. The P40 is sm_61, so CUDA 13 cannot build for the only 24GB
+compute card we own -- and arch-sandbox's repo offers only cuda 13.3.1, so
+the obvious `pacman -S cuda` there produces exactly that unusable
+toolchain. The same cliff hits the parity reference one level up: torch
+deleted Maxwell/Pascal/Volta from its cu128/cu129 builds
+(pytorch/pytorch#157517). cu126's arch list is
+`sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90` -- no sm_61, but sm_60 should
+cover the P40 through CUDA's minor-revision binary compatibility. NOT yet
+confirmed on the actual card.
+
+**Remote box reached and provisioned.** The direct link needed no local
+reconfiguration (NetworkManager restored 10.0.0.2/24 on cable insert); the
+remote side needed a gateway and DNS, which it had never had. This laptop
+now NATs 10.0.0.0/24 out through its wifi via ufw, matching `! -o enp2s0`
+rather than the wifi interface by name because wifi names are not stable
+across reboots here. `DEFAULT_FORWARD_POLICY` stays DROP, with forwarding
+granted only to traffic entering the link. One real bug found and fixed
+while testing idempotency: `ufw reload` re-applies `before.rules` but
+never flushes the nat table, so each run appended another MASQUERADE rule
+(measured one extra per reload) -- the script now deletes its own rule by
+exact match first, and fails loudly if duplicates survive.
+
+Inventory: Tesla P40 (sm_61, 24GB) + RTX 2060 (sm_75) on driver
+580.178.04, Ryzen 7 3800XT/16 threads, 94GB RAM. Direct link measured at
+110 MB/s, which is how the pinned cuda 12.8 package moved across in 24s
+instead of being rebuilt or re-downloaded. Two architectures behind one
+driver is what makes the port's cross-architecture parity claim testable
+instead of theoretical. The driver split between machines (570 here, 580
+there) is deliberate and must be maintained, not normalized.
+
+**The P40 needs a guard, not trust.** It is passively cooled off a small
+external blower and the driver cannot see that blower at all --
+`fan.speed` reports `[N/A]`. Measured firmware limits: slowdown 92C,
+shutdown 95C, power limit adjustable 125-250W and sitting at the full
+250W default. Those are last-resort numbers, so `gpu_env/gpu_guard.sh`
+wraps a workload, polls temperature, and aborts at 80C by default; it also
+refuses to run if temperature cannot be read, rather than running blind.
+Verified all three paths: normal completion passes the exit code through,
+threshold crossing SIGTERMs the whole process group then SIGKILLs after
+15s and exits 2, and an unreadable GPU exits 3 without launching anything.
