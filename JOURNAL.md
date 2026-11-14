@@ -13400,3 +13400,28 @@ configuration failed before, but that was before the information was
 actually there. Also worth noting `frozen` should now be able to solve it,
 since decodability was 1.0 with an untrained W_V -- only the readout needs
 to learn.
+
+## 2026-11-13 -- curriculum note: the easy path is a COMPETING SOLUTION,
+## not a stepping stone (user framing: "it has adhd, remove the
+## distractions, at least while it's still this early in training")
+
+Conventional curriculum wisdom is easy-first. That is WRONG here, and the
+50/50 mixed-gap result shows why: short-gap 1.0000 while long-gap kept
+ONE distinct prediction. Attention solves short-gap completely, so it
+covers every episode it is capable of covering and there is no residual
+pressure to build the memory path. The easy path is not a stepping stone
+toward the hard one -- it is a SUBSTITUTE that competes for the same
+output, and learning it first can permanently prevent the harder path
+from developing at all.
+
+**Generalises: when two mechanisms solve OVERLAPPING SUBSETS of a task,
+curriculum order matters in the opposite of the usual direction.** Train
+the hard path first (or alone) while the model is still plastic, then
+reintroduce the easy one and check the hard path SURVIVES -- which is the
+same "must not harm" criterion used for the in-context score, applied to
+curriculum order instead of to arms.
+
+Testing now: long-gap ONLY with fix A, all three arms. If that works, the
+follow-up is re-adding short-gap and verifying the memory path is retained
+rather than being abandoned the moment attention can cover part of the
+load.
