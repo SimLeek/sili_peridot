@@ -42,6 +42,8 @@ class TitansMAC:
         tbptt_k: int = 8,
         tie_mem_qk: bool = True,
         mem_horizon: float | None = None,
+        write_key_from_prev: bool = False,
+        mem_after_layer: int = 1,
         num_cpus: int = 2,
         rms_eps: float = 1e-6,
         rng: np.random.Generator | None = None,
@@ -65,6 +67,15 @@ class TitansMAC:
         #                    does not change with eta
         # See bend_proofs/titans_gate_retention_kernel.
         self.mem_horizon = mem_horizon
+        # FIX A: take the write's KEY from the PREVIOUS tick and its VALUE from
+        # the current one, so an adjacent (key, value) pair is stored as such by
+        # construction. Deviates from eq 11, which takes both from one x_t.
+        self.write_key_from_prev = write_key_from_prev
+        # FIX B: how many layers run BEFORE the memory. eq 11 assumes x_t already
+        # carries the binding from earlier layers, so more depth here is the
+        # FAITHFUL fix rather than a deviation.
+        self.mem_after_layer = max(1, int(mem_after_layer))
+        self._x_prev = None
         self.n_writes = 0
         self.n_ticks = 0
         self.num_cpus, self.rms_eps = num_cpus, rms_eps
@@ -206,62 +217,68 @@ class TitansMAC:
         ids = self._window_ids(tokens, i)
         x = _gather_rows(self.embed, ids, self.hidden)
         h = rmsnorm_tensor(x, self.input_ln, self.rms_eps)
-        sigmas = exp(self.log_sigmas)
+        sig_c = exp(self.log_sigmas_content)
+        sig_f = exp(self.log_sigmas)
 
-        blk = self.blocks[0]
-        hn = rmsnorm_tensor(h, blk["ln"], self.rms_eps)
-        attn = gaussian_attention(
-            blk["q"].forward(hn),
-            blk["k"].forward(hn),
-            blk["v"].forward(hn),
-            self.centers_content,
-            exp(self.log_sigmas_content),
-            num_cpus=self.num_cpus,
-            causal=False,
-        )
-        h1 = h + blk["o"].forward(attn)  # layer-1 output: the shared x_t
+        n_pre = min(self.mem_after_layer, len(self.blocks))
+        for blk in self.blocks[:n_pre]:
+            hn = rmsnorm_tensor(h, blk["ln"], self.rms_eps)
+            attn = gaussian_attention(
+                blk["q"].forward(hn),
+                blk["k"].forward(hn),
+                blk["v"].forward(hn),
+                self.centers_content,
+                sig_c,
+                num_cpus=self.num_cpus,
+                causal=False,
+            )
+            h = h + blk["o"].forward(attn)
 
         if self.mode == "none":
-            rows = h1
+            rows = h
         else:
             last = np.zeros((1, self.window), dtype=np.float32)
             last[0, -1] = 1.0
-            x_t = Tensor(last) @ h1  # [1, hidden]; the ONE representation
+            x_t = Tensor(last) @ h
             q_mem = self.W_Q_mem.forward(x_t)
             mem_src = self.M_t if self.mode == "tbptt" else Tensor(self.M)
             read = (mem_src @ q_mem.reshape((self.hidden, 1))).reshape((1, self.hidden))
             self._last_read = read
             self._last_q = q_mem.data.ravel().astype(np.float32).copy()
-            rows = _concat_rows(read, h1)
+            rows = _concat_rows(read, h)
             self._x_t = x_t
 
-        blk2 = self.blocks[1] if len(self.blocks) > 1 else self.blocks[0]
-        hn2 = rmsnorm_tensor(rows, blk2["ln"], self.rms_eps)
-        attn2 = gaussian_attention(
-            blk2["q"].forward(hn2),
-            blk2["k"].forward(hn2),
-            blk2["v"].forward(hn2),
-            self.centers,
-            sigmas,
-            num_cpus=self.num_cpus,
-            causal=False,
-        )
-        h2 = rows + blk2["o"].forward(attn2)
-        h2 = rmsnorm_tensor(h2, self.post_ln, self.rms_eps)
+        post = self.blocks[n_pre:] or self.blocks[-1:]
+        for blk in post:
+            hn = rmsnorm_tensor(rows, blk["ln"], self.rms_eps)
+            attn = gaussian_attention(
+                blk["q"].forward(hn),
+                blk["k"].forward(hn),
+                blk["v"].forward(hn),
+                self.centers if self.mode != "none" else self.centers_content,
+                sig_f if self.mode != "none" else sig_c,
+                num_cpus=self.num_cpus,
+                causal=False,
+            )
+            rows = rows + blk["o"].forward(attn)
+        h2 = rmsnorm_tensor(rows, self.post_ln, self.rms_eps)
         logits = self.lm_head.forward(h2)
 
-        if self.mode == "tbptt":
-            self._write_t(self._x_t)
-        elif self.mode != "none":
-            self._write(self._x_t.data.ravel())
+        if self.mode != "none":
+            k_src = self._x_prev if (self.write_key_from_prev and self._x_prev is not None) else self._x_t
+            if self.mode == "tbptt":
+                self._write_t(self._x_t, k_src)
+            else:
+                self._write(self._x_t.data.ravel(), k_src.data.ravel())
+            self._x_prev = self._x_t
         return logits.reshape((self.n_rows, self.vocab))
 
-    def _write_t(self, x_t: Tensor) -> None:
+    def _write_t(self, x_t: Tensor, k_src: Tensor) -> None:
         """Differentiable delta-rule write (eqs 11-13, alpha=eta=0), built from
         Tensor ops so autograd supplies the exact gradient within the window."""
         d = self.hidden
-        h = x_t  # the SAME representation the query came from
-        k = h @ self.W_K_t  # [1, d]
+        h = x_t
+        k = k_src @ self.W_K_t  # key may come from the PREVIOUS tick (fix A)
         v = h @ self.W_V_t  # [1, d]
         kk = reduce_sum(k * k, axis=-1).reshape((1, 1))  # [1,1]
         kt = k.reshape((d, 1))
@@ -282,7 +299,7 @@ class TitansMAC:
             self.M_t = Tensor(self.M_t.data.copy())
             self._since_detach = 0
 
-    def _write(self, h_last: np.ndarray) -> None:
+    def _write(self, h_last: np.ndarray, k_src: np.ndarray | None = None) -> None:
         """One delta-rule write, forward pass only (eqs 11-13 with alpha=eta=0).
 
         h_last is the POST-ATTENTION hidden state, not a raw embedding: eq 11
@@ -290,7 +307,7 @@ class TitansMAC:
         and recall exactly nothing. The attention core has to do the binding
         first -- that is why Titans is a hybrid."""
         h = h_last.astype(np.float32)
-        k = h @ self.W_K_mem
+        k = (h if k_src is None else k_src.astype(np.float32)) @ self.W_K_mem
         v = h @ self.W_V_mem
         kk = float(k @ k)
         self.n_ticks += 1
