@@ -13547,3 +13547,134 @@ before.
     6.5 -> 525 driven by |W_Q| 5.6 -> 16.1 while |M| stayed ~2, and the
     memory-row center did NOT drift, ruling out my prediction), but it was
     measured on one unseeded init and the magnitudes need re-measuring.
+
+## 2026-11-13 -- TRAINING DESTROYS THE RETRIEVAL ALIGNMENT. A parameter
+## curriculum, not a tied projection, is the general fix.
+
+```
+     ep  cos(W_Q,W_K)  |W_Q|/|W_K|  retr_cos
+      0        1.0000        1.000    0.7563
+   2500        0.7824        1.200    0.0391
+   5000        0.7863        1.203    0.0208
+   7500        0.7925        1.224   -0.1957
+```
+Retrieval quality starts at 0.7563 (from tie-at-init plus fix A) and
+COLLAPSES to -0.1957. `W_Q` only rotates to cos 0.78 and rescales by
+1.22x, so a MODEST drift is enough to destroy retrieval completely --
+content addressing needs tight alignment and 0.78 is not close enough.
+
+**Mechanism, and it explains several earlier observations at once.** Early
+in training the memory read is useless noise, because the readout has not
+yet learned to decode it. So there is no gradient pressure on `W_Q` to
+PRESERVE alignment; it drifts toward whatever reduces loss, which early on
+means suppressing the memory. By the time the readout could benefit,
+retrieval is already gone. This explains:
+  * the severe INIT SENSITIVITY (one init reached 1.0000 by ep10k, another
+    0.73 after 60k) -- it is a race between the readout learning to use
+    the memory and the drift destroying it;
+  * why `frozen` beat `tbptt` -- fewer trainable parameters means less to
+    drift;
+  * why the earlier "instability after the peak" looked inconsistent --
+    different inits sit at different points in that race.
+
+**Rejected: tying W_Q to W_K permanently** (user push-back, correct).
+Q != K in attention for a real reason -- matching is ASYMMETRIC ("what I
+look for" vs "what I offer"), which is exactly what induction needs, and
+tying makes it a symmetric similarity. It only looks safe here because
+MQAR's query token IS the stored key; in language the cue is usually
+RELATED to the key, not identical, and learning that relation is what the
+separate projections are for. Likewise `W_V = identity` was rejected: V
+selects WHAT to store, and identity stores everything, wasting capacity.
+The probe hitting 1.0000 with a random W_V means V is not doing useful
+selection YET, not that it should not.
+
+**General fix instead: a PARAMETER curriculum.** Freeze `W_Q` (and the
+memory path's projections) for the first N episodes so the readout can
+learn to exploit a WORKING memory, then release them. Nothing permanent is
+imposed, so Q and K stay free to specialize once the path exists. This is
+the same principle as the data curriculum -- remove the distraction while
+the model is still plastic -- applied to WHICH WEIGHTS MAY MOVE rather
+than which episodes are shown.
+
+To test as ABLATIONS (not merges): tied W_Q=W_K, W_V=identity, and the
+staged unfreeze. The first two are diagnostics to localize whether those
+maps are the bottleneck; only the staged unfreeze is a candidate to keep.
+
+## 2026-11-14 -- init fragility quantified (1/4 solve), and the cause of
+## alignment loss found: ADAM MOVES PARAMETERS ON ZERO GRADIENTS
+
+**Properly-seeded distribution** (the first valid one -- everything before
+the DenseTensorLinear rng fix had a different init per run):
+```
+  seed    peak   at_ep   final  distinct_f
+  1001  0.5250   36000  0.3000          11
+  1002  1.0000    4000  1.0000          12   <- solved, fast, STABLE
+  1003  0.1050    8000  0.0850           1   <- total collapse
+  1004  0.5750   28000  0.4300          12
+peak mean 0.5513 sd 0.3660   solved (peak>0.9) in 1/4
+```
+So the method is NOT reliable: one clean solve that reaches 1.0000 at
+ep4000 and HOLDS it (final == peak), two partials near 0.5, one total
+collapse to a single token. Direct answer to the user's question -- yes,
+bad initialisations still land in bad states. Also note 1002 being stable
+means the earlier "decay after the peak" was init-specific too, not a
+property of the method.
+
+**RETRACTION**: two turns earlier I wrote that the capability "stands" and
+"cannot be luck". The capability IS real (1002 is a clean stable solve),
+but the specific claim that it reliably solves the task was wrong, and it
+was wrong because I carried a headline number forward from runs I had
+just finished showing were invalidated by the unseeded init.
+
+**CAUSE OF THE ALIGNMENT LOSS, measured.** Retrieval quality starts at
+0.7563 and collapses to -0.1957 by ep7500, and the reason is not a
+systematic pull toward suppressing the memory:
+```
+     ep        u    |g_read|    |g_Wq|   cos(Wq,Wk)
+      0   0.0000     0.0001    0.0000       0.9999
+   3000   0.0000     0.0000    0.0000       0.8137   <- drifted on ZERO gradient
+   6000   0.1902     0.1045    0.6602       0.3575
+```
+`cos(W_Q, W_K)` falls 0.9999 -> 0.8137 while the measured gradient is
+0.0000. **Adam's step is lr*m/(sqrt(v)+eps), so with g ~ 1e-5 you get
+sqrt(v) ~ 1e-5, and against eps=1e-8 the ratio is ~1 -- a FULL-SIZE lr
+step driven by numerical noise.** Adam normalises away exactly the
+magnitude information that says "this path is disconnected, hold still".
+
+Confirmed by sweeping eps (6k episodes):
+```
+  adam eps  cos(Wq,Wk)  retr_cos     acc
+     1e-08      0.8000    0.2888  0.0500
+     1e-04      1.0000    0.5497  0.0500
+     1e-02      1.0000    0.2700  0.1200
+```
+eps >= 1e-4 holds the alignment at EXACTLY 1.0000 and roughly doubles
+retrieval. It did NOT lift accuracy at 6k, but 6k is short -- the one
+clean solve needed 4k and the partials were still climbing at 28-36k.
+
+**The pair, which is why this is a mechanism and not just a bug.** Adam
+RESCUED the write-side credit gradient earlier (tiny but REAL, ~1e-4,
+where plain SGD moved nothing) and DESTROYS the query alignment here
+(tiny and MEANINGLESS, ~1e-5). Same normalisation, opposite outcome, and
+`eps` is the only thing distinguishing them -- so eps is a DEADBAND and
+belongs at the gradient noise floor, which is measurable (read off the
+gradient a disconnected path produces) rather than tuned.
+**Check the project's single-state importance optimizer for the same
+problem before any of this ships**: it normalises too, and at Qwen scale a
+3000-step alignment decay driven by noise would be undiagnosable.
+
+**REJECTED along the way** (both user push-back, both correct):
+  * tying W_Q = W_K permanently -- Q != K in attention because matching is
+    ASYMMETRIC, which is what induction needs; tying only looks safe
+    because MQAR's query token IS the stored key.
+  * W_V = identity -- V selects WHAT to store; identity stores everything.
+  * freezing W_Q for N episodes -- an ORACLE fix, since N encodes
+    knowledge of when the readout starts working.
+The non-oracle form of the last one is a CONDITION not a schedule: gate
+W_Q's update on u = |g_read| / (|g_read| + |g_other|), which is 0.0000
+while the readout ignores the memory and rises to 0.19 as it starts using
+it -- measured, so the gate has real signal to ride.
+
+RUNNING: the same 4 seeds at eps=1e-4, to see whether the solve RATE moves
+off 1/4. The 1/4 figure was measured at the default eps=1e-8, i.e. with
+the alignment-destroying bug still active.
