@@ -13455,3 +13455,50 @@ this is one seed. A signal, not a solved task.
 
 Running: frozen + fix A + long-only to 60k episodes, 2 seeds, with a
 learning curve, to tell "learning slowly" from "stuck at 2 tokens".
+
+## 2026-11-13 -- LONG-GAP RECALL SOLVED (1.0000), but UNSTABLE after the
+## peak. T0's recurrent half finally passes.
+
+frozen + fix A + long-gap-only, 60k episodes, 2 seeds, baseline 0.1120:
+```
+seed 1001  ep0 0.0400  10k 0.9880  20k 1.0000  30k 0.9120  40k 0.9280  50k 0.8920  60k 0.5720
+seed 1002  ep0 0.0200  10k 0.9960  20k 0.9800  30k 0.9200  40k 0.9160  50k 0.1480  60k 1.0000
+```
+**Both seeds reach ~1.0000 with distinct=12 and top_share ~0.11** -- all
+twelve values in use, genuinely not collapsed. This is recall THROUGH THE
+MEMORY across a 16-tick blank gap where attention provably cannot help
+(the window is asserted information-free at the query). First positive
+result for the recurrent path in the whole investigation.
+
+**What it took, all four measured rather than guessed:**
+  1. retention  0.139 -> 0.803   key from x_{t-1} (fix A)
+  2. reachability 3.4e-04 -> 0.969  memory row adjacent to the output
+  3. decodability 0.450 -> 1.0000   (follows from fix A)
+  4. curriculum: long-gap ONLY. The easy path COMPETES rather than
+     scaffolds, so mixing in short-gap episodes kept it collapsed.
+None of these were credit-assignment fixes. Four earlier mechanism
+interventions (theta, surprise gate, Law-5 horizon, query/key tie) moved
+nothing, and the FD check showed the hand-derived credit rule was wrong
+anyway -- but the rule was never the blocker.
+
+**The winning arm has the LEAST trainable machinery.** `frozen` (random
+untrained W_V, only the readout learns) solved it; `tbptt` (write side
+also trained) did NOT, scoring 0.1040. Consistent with decodability being
+1.0000 under a random write projection: the write side never needed to
+learn, and training it kept moving the readout's target.
+
+**NEW PROBLEM: instability after the peak.** Seed 1001 decays
+1.0000 -> 0.5720; seed 1002 crashes to 0.1480 at 50k then recovers to
+1.0000. So the capability is reached fast (10-20k) and not HELD. The peak
+is real and reproducible; the end state is not. Candidates, in order of
+how cheap they are to test:
+  * lr decay -- a constant 0.003 well past convergence is the obvious
+    suspect, and this is the one-line test.
+  * the amortized health metrics / stochastic annealing stack, which is
+    exactly what the project has for keeping a converged network healthy
+    (see [[feedback-importance-is-already-the-optimizer]] and the T1
+    promotion note in todolist.md).
+  * regularisation on the readout.
+Report EARLY-STOPPED peak and final separately from now on -- a single
+end-of-training number would have reported 0.5720 and missed that the
+task is solved.
