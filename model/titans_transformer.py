@@ -91,15 +91,15 @@ class TitansMAC:
         self.n_layers = n_layers
         self.blocks = [
             {
-                "q": DenseTensorLinear(hidden, hidden, scale=s),
-                "k": DenseTensorLinear(hidden, hidden, scale=s),
-                "v": DenseTensorLinear(hidden, hidden, scale=s),
-                "o": DenseTensorLinear(hidden, hidden, scale=s),
+                "q": DenseTensorLinear(hidden, hidden, scale=s, rng=rng),
+                "k": DenseTensorLinear(hidden, hidden, scale=s, rng=rng),
+                "v": DenseTensorLinear(hidden, hidden, scale=s, rng=rng),
+                "o": DenseTensorLinear(hidden, hidden, scale=s, rng=rng),
                 "ln": Tensor(np.ones(hidden, dtype=np.float32)),
             }
             for _ in range(n_layers)
         ]
-        self.lm_head = DenseTensorLinear(hidden, vocab, scale=s)
+        self.lm_head = DenseTensorLinear(hidden, vocab, scale=s, rng=rng)
         # One center/sigma PER ATTENTION ROW, matching ToyTileRecurrence. A
         # single shared pair yields NaN, since the kernel indexes these per row.
         # Memory row sits positionally ADJACENT to the output. At row 0 it was
@@ -120,7 +120,7 @@ class TitansMAC:
         self.log_sigmas_content = Tensor(np.full(window, np.log(sig), dtype=np.float32))
 
         # Memory read side trains exactly; write side depends on mode.
-        self.W_Q_mem = DenseTensorLinear(hidden, hidden, scale=s)
+        self.W_Q_mem = DenseTensorLinear(hidden, hidden, scale=s, rng=rng)
         self.W_K_mem = (rng.standard_normal((hidden, hidden)) * s).astype(np.float32)
         self.W_V_mem = (rng.standard_normal((hidden, hidden)) * s).astype(np.float32)
         self.M = np.zeros((hidden, hidden), dtype=np.float32)

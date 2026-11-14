@@ -13502,3 +13502,48 @@ how cheap they are to test:
 Report EARLY-STOPPED peak and final separately from now on -- a single
 end-of-training number would have reported 0.5720 and missed that the
 task is solved.
+
+## 2026-11-13 -- REPRODUCIBILITY BUG: DenseTensorLinear drew from the
+## UNSEEDED GLOBAL numpy RNG. Single-seed results here were unreliable.
+
+Chasing a 16x discrepancy (the same config and seeds gave ep10k accuracy
+0.9880 in one script and 0.0600 in another) found that the model was not
+reproducible AT ALL, even at num_cpus=1:
+```
+three "identical" runs, |lm_head| = 5.79075241 / 5.76603699 / 6.14874506
+```
+Cause: `DenseTensorLinear.__init__` used `np.random.randn`, i.e. the
+UNSEEDED GLOBAL numpy RNG. The `rng` passed to TitansMAC only ever
+controlled `embed`, `W_K_mem` and `W_V_mem`; all four projections per
+block plus `lm_head` and `W_Q_mem` were drawing from the global stream.
+So "seed" controlled a minority of the parameters and every run had a
+different init.
+
+This is a KNOWN failure class in this project -- see
+[[feedback-seed-stochastic-rng-for-comparisons]], which says exactly that
+construction sites defaulting to unseeded RNG falsify single-seed sweeps.
+I walked into it anyway.
+
+**Fixed**: `DenseTensorLinear` takes an optional `rng`, TitansMAC threads
+its own into all six call sites, and the docstring warns that leaving it
+None is unreproducible. Residual nondeterminism after the fix is ~1e-8
+relative at both num_cpus=1 and 2 (float accumulation order; the known C++
+threading nondeterminism shows up here only at that scale), versus ~6%
+before.
+
+**What this does and does not invalidate.**
+  * STILL STANDS: the capability. Two independent runs reached 0.9880 and
+    0.9960 by ep10k with distinct=12 and top_share ~0.11 on a 12-way task
+    where the window is asserted information-free. That cannot be luck,
+    and the three measured links (retention 0.803, reachability 0.969,
+    decodability 1.0000) are single-model measurements unaffected by init
+    variance across runs.
+  * INVALIDATED: every multi-"seed" comparison, including frozen (0.1920)
+    vs tbptt (0.1040) and the none/frozen/tbptt arm table. Those differed
+    by init, not by arm. Also the instability characterisation -- decay
+    from 1.0000 to 0.5720 is within a single run so it is real, but its
+    reproducibility across inits is now unknown.
+  * The drift diagnosis is still informative as a mechanism (|read|
+    6.5 -> 525 driven by |W_Q| 5.6 -> 16.1 while |M| stayed ~2, and the
+    memory-row center did NOT drift, ruling out my prediction), but it was
+    measured on one unseeded init and the magnitudes need re-measuring.

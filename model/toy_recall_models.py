@@ -27,8 +27,17 @@ class DenseTensorLinear:
     trains via AdamOptimizer.step().
     See docs/research/toy_recall_models.rst:optimizer_choice_isolation_controls."""
 
-    def __init__(self, in_features: int, out_features: int, scale: float = 0.1):
-        self.weight = Tensor((np.random.randn(in_features, out_features) * scale).astype(np.float32))
+    def __init__(self, in_features: int, out_features: int, scale: float = 0.1, rng=None):
+        # `rng` is optional ONLY for backward compatibility. Leaving it None draws
+        # from the UNSEEDED GLOBAL numpy RNG, which makes a model unreproducible
+        # even at a fixed seed and silently falsifies single-seed comparisons --
+        # measured: three "identical" runs gave |lm_head| 5.79/5.77/6.15.
+        # Always pass one from a new call site.
+        # cf. feedback_seed_stochastic_rng_for_comparisons
+        shape = (in_features, out_features)
+        # np.random.randn takes varargs; Generator.standard_normal takes a size.
+        vals = np.random.randn(*shape) if rng is None else rng.standard_normal(shape)
+        self.weight = Tensor((vals * scale).astype(np.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         return x @ self.weight
