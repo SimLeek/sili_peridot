@@ -13272,3 +13272,75 @@ by induction. That teaches the key->value association first, so the
 memory has something real to store before being asked to retrieve it
 across a gap. Curriculum, not credit. And re-baseline every number
 against `constant_predictor_baseline()`.
+
+## 2026-11-13 -- long-gap root cause, measured in layers. Four mechanism
+## interventions had NO effect; the write's key/value SOURCE is the issue.
+
+**Mixed-gap training settles the big question.** 50% short (pair in-window)
+/ 50% long (memory-only), 12k episodes:
+```
+--- none ---   short acc=1.0000 over=+0.8880 distinct=12
+               long  acc=0.0800 over=-0.0320 distinct=1   COLLAPSED
+--- tbptt ---  short acc=1.0000 over=+0.8880 distinct=12
+               long  acc=0.0960 over=-0.0160 distinct=1   COLLAPSED
+```
+**Short-gap is SOLVED PERFECTLY by both arms.** So the architecture, the
+optimizer, the task and 12k episodes are all fine, and the key->value
+induction circuit is fully learned. Only the memory-mediated path fails.
+
+**Four mechanism interventions, none of which moved retention** (measured
+as cos between the read at the query tick and the value that should have
+been stored):
+  * write strength `theta` swept 0.5 -> 0.01: 0.1544/0.1260/0.1246/
+    0.2374/0.1110/0.1328. No trend. **My hypothesis was wrong** -- theta
+    scales the pair's write and the blanks' writes EQUALLY, so lowering it
+    weakens storage exactly as much as it weakens interference and the
+    ratio is unchanged.
+  * surprise gate: 0.0133 -> 0.1559 at 34% writes. Helps, nowhere near
+    enough. (Also found: a threshold of 1.0 silences EVERY write including
+    the pair, since the first write has rel-surprise exactly 1.0.)
+  * retention horizon (alpha=1/L, eta=1-1/L from Law 5, oracle L=17):
+    0.1508/0.1202/0.2127/0.1881/0.1427/0.1846 across L in
+    None/4/8/17/32/64. No trend, no peak at the oracle horizon. **Found
+    en route that TitansMAC had NO alpha and NO eta at all** -- both write
+    paths hardcoded alpha=eta=0, so there had never been any horizon
+    control. Now wired from a single `mem_horizon`.
+  * tying the memory query to the key: no effect, and my reasoning for it
+    was wrong. With a single write from M=0 the delta rule gives
+    M = v k^T/(k.k), which is RANK-1 with column space spanned by v -- so
+    `M q` points along v for ANY query. Key matching is irrelevant at one
+    pair. (Verified: retrieval cos 1.0000 both tied and untied.)
+    For reference, random 32-d vectors give cos ~0 +- 0.18, so every
+    number above is essentially noise.
+
+**The isolation that actually localised it.** Suppress all writes after
+the pair:
+```
+ ticks 0-1 only (pair)   cos=+0.4226 +- 0.4311
+ ticks 0-5               cos=+0.4025 +- 0.3852
+ all ticks               cos=+0.1176 +- 0.2599
+```
+Interference is real (0.42 -> 0.12), but even with NO interference
+retention is only 0.42 +- 0.43 -- so the path does not work cleanly
+either, and the large sd means it succeeds on some episodes and fails
+completely on others.
+
+**ROOT CAUSE: each write derives KEY AND VALUE FROM THE SAME x_t.** Tick 0
+(the key token) stores key0->value0; tick 1 (the value token) stores
+key1->value1. **Neither stores "key token -> value token"**, which is what
+the task needs. Getting it requires W_K to extract the key component and
+W_V the value component from a MIXED x_1 -- learnable in principle (the
+linear-realizability test confirmed the key information is present and
+linearly extractable) but far harder than it appears, and nothing to do
+with credit assignment.
+
+This is also why eq 11 works in the paper and not here: it assumes x_t
+already carries the binding from EARLIER LAYERS. At 2 layers and 32 dims
+it does not.
+
+**Proposed next change (architectural, small, principled): let the write
+take its key and value from DIFFERENT sources** -- key from x_{t-1}, value
+from x_t -- so a consecutive (key, value) pair is stored as such by
+construction, with no component-separation to learn. That is what an
+associative memory over adjacent tokens actually needs, and it is a
+deliberate deviation from eq 11 justified by the missing depth.

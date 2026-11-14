@@ -1,22 +1,18 @@
 """Minimal memory-as-context Titans: window attention + a Titans LMM, sized for
 verification rather than capability.
 
-Target: real trainable recurrence whose per-step BACKWARD is constant in the
-horizon, so it can run in real time -- a page in context, the book title in
-recurrent memory.
+Target: trainable recurrence whose per-step BACKWARD is constant in the horizon.
 
-The write (eqs 10-13) is a delta rule in the forward pass, so storing needs no
-gradient through time. That splits the parameters by credit cost: the READ side
-(W_Q, attention, head) gets exact gradient from the current tick at O(1); M is
-not a parameter at all; only the WRITE side (W_K, W_V) acts through later reads
-and so needs an approximation. Hence the modes -- "none" (control), "frozen"
-(write side random+frozen, O(1) with no approximation anywhere), "trace" (write
-side from an eligibility trace, still O(1); S_t already is such a trace, and
-bend_proofs/synaptic_hold_bptt_approximation bounds the error by the number of
-ACTIVE ticks, never the horizon).
+Modes: "none" (control), "frozen" (write side random+frozen), "trace" (write side
+from an eligibility trace -- NOTE its gradient fails an FD check), "tbptt"
+(differentiable write, autograd supplies the gradient, O(k) per step).
 
-Measured O(1): see scripts/measure_constant_time_backward.py. Rationale, bug
-history and results: JOURNAL.md 2026-11-12.
+STATUS: short-gap recall is solved (1.0000); long-gap COLLAPSES in every arm.
+Root cause measured -- each write takes key AND value from the same x_t, so no
+tick stores "key token -> value token". Four mechanism interventions (theta, the
+surprise gate, the Law-5 horizon, query/key tying) moved retention not at all.
+Measured O(1): scripts/measure_constant_time_backward.py. Full history, numbers
+and retractions: JOURNAL.md 2026-11-12 and 2026-11-13.
 """
 
 from __future__ import annotations
@@ -44,6 +40,8 @@ class TitansMAC:
         grad_clip: float = 1.0,
         write_gate: float | None = None,
         tbptt_k: int = 8,
+        tie_mem_qk: bool = True,
+        mem_horizon: float | None = None,
         num_cpus: int = 2,
         rms_eps: float = 1e-6,
         rng: np.random.Generator | None = None,
@@ -57,6 +55,16 @@ class TitansMAC:
         # Relative-surprise threshold below which a tick does not write.
         self.write_gate = write_gate
         self.tbptt_k = tbptt_k
+        self.tie_mem_qk = tie_mem_qk
+        # RETENTION HORIZON in ticks. None reproduces the old alpha=eta=0 (no
+        # horizon control at all, which is what every earlier run used). Given L,
+        # the gates follow the Law 5 derivation rather than being tuned:
+        #   eta = 1 - 1/L   puts the kernel peak at age L
+        #   alpha = 1/L     the diagonal that makes the peak exist
+        #   theta *= (1-eta) cancels Law 3's trace mass so the effective step
+        #                    does not change with eta
+        # See bend_proofs/titans_gate_retention_kernel.
+        self.mem_horizon = mem_horizon
         self.n_writes = 0
         self.n_ticks = 0
         self.num_cpus, self.rms_eps = num_cpus, rms_eps
@@ -106,15 +114,24 @@ class TitansMAC:
         self.W_K_mem = (rng.standard_normal((hidden, hidden)) * s).astype(np.float32)
         self.W_V_mem = (rng.standard_normal((hidden, hidden)) * s).astype(np.float32)
         self.M = np.zeros((hidden, hidden), dtype=np.float32)
-        # TBPTT: the write becomes DIFFERENTIABLE, so W_K/W_V are ordinary
-        # Tensor parameters trained by the same optimizer as everything else.
-        # No hand-derived gradient, no separate write-side optimizer, and no
-        # extra per-synapse state -- which is what two failed derivations and an
-        # Adam detour were trying to work around. Memory stays in the graph for
-        # tbptt_k steps then detaches, so per-step backward is O(k) = O(1) in
-        # the horizon. Reach is infinite via the PERSISTENT STATE, not via the
-        # gradient path: W_K is shared across ticks, so a write rule credited
-        # inside the window governs writes at any distance.
+        # Surprise trace for the numpy write path (eq 10's S_t).
+        self.S = np.zeros((hidden, hidden), dtype=np.float32)
+        self.S_t = None
+        # TBPTT: differentiable write, so W_K/W_V are ordinary parameters on the
+        # normal optimizer -- no hand-derived gradient, no extra per-synapse
+        # state. Graph detaches every tbptt_k steps: O(k) per step, and reach is
+        # infinite via the PERSISTENT STATE (shared W_K), not the gradient path.
+        # TIE THE MEMORY QUERY TO THE KEY. The memory is CONTENT-ADDRESSED, so
+        # the query and the key are the same function of x_t and should start
+        # identical -- otherwise retrieval needs W_Q, W_K and W_V to align
+        # SIMULTANEOUSLY from random init, which earns nothing for partial
+        # progress and leaves the memory path a flat region with no gradient
+        # slope toward it. Measured consequence of leaving them independent:
+        # short-gap recall 1.0000 (attention solves it) while long-gap COLLAPSED
+        # to a single token in every arm. TitansMemory already had
+        # tie_query_to_key for this exact reason; TitansMAC did not use it.
+        if tie_mem_qk:
+            self.W_Q_mem.weight = Tensor(self.W_K_mem.copy())
         self.W_K_t = Tensor(self.W_K_mem.copy()) if mode == "tbptt" else None
         self.W_V_t = Tensor(self.W_V_mem.copy()) if mode == "tbptt" else None
         self.M_t = Tensor(np.zeros((hidden, hidden), dtype=np.float32)) if mode == "tbptt" else None
@@ -127,6 +144,14 @@ class TitansMAC:
         # ONE accumulator per write-side matrix (not Adam's two).
         self._imp = {"K": np.zeros_like(self.W_K_mem), "V": np.zeros_like(self.W_V_mem)}
         self.last = {}
+
+    def _horizon_gates(self) -> tuple[float, float, float]:
+        """(alpha, eta, theta_scale) from the retention horizon."""
+        if self.mem_horizon is None:
+            return 0.0, 0.0, 1.0
+        lag = max(1.0, float(self.mem_horizon))
+        eta = 1.0 - 1.0 / lag
+        return 1.0 / lag, eta, 1.0 - eta
 
     def read_grad(self):
         """Gradient arriving at the memory-read row, or None. The trainer feeds
@@ -241,12 +266,17 @@ class TitansMAC:
         kk = reduce_sum(k * k, axis=-1).reshape((1, 1))  # [1,1]
         kt = k.reshape((d, 1))
         err = self.M_t @ kt - v.reshape((d, 1))  # [d,1]
-        upd = (err @ k) * (self.mem_lr / (kk + 1e-6))  # [d,d]
-        self.M_t = self.M_t - upd * 2.0
+        alpha, eta, th_scale = self._horizon_gates()
+        upd = (err @ k) * (self.mem_lr * th_scale / (kk + 1e-6))  # [d,d]
+        if self.S_t is None:
+            self.S_t = Tensor(np.zeros((d, d), dtype=np.float32))
+        self.S_t = self.S_t * eta - upd * 2.0
+        self.M_t = self.M_t * (1.0 - alpha) + self.S_t
         self.n_ticks += 1
         self.n_writes += 1
         self._since_detach += 1
         if self._since_detach >= self.tbptt_k:
+            self.S_t = Tensor(self.S_t.data.copy())
             # TRUNCATION: drop the graph beyond k steps. Cost per step stays
             # O(k); the memory CONTENT survives, only the gradient path is cut.
             self.M_t = Tensor(self.M_t.data.copy())
@@ -267,6 +297,7 @@ class TitansMAC:
         if kk < 1e-8:
             return
         err = self.M @ k - v
+        alpha, eta, th_scale = self._horizon_gates()
         # Surprise gate: skip uninformative ticks (the RSM idea). Measured to
         # cut writes 100% -> 26% here. NOTE it does NOT fix the trace gradient
         # -- FD cos stayed ~0 at every activity level. JOURNAL 2026-11-13.
@@ -276,7 +307,8 @@ class TitansMAC:
                 return
         self.n_writes += 1
         th = self.mem_lr / (kk + 1e-6)
-        self.M = self.M - th * 2.0 * np.outer(err, k)
+        self.S = eta * self.S - (th * th_scale) * 2.0 * np.outer(err, k)
+        self.M = (1.0 - alpha) * self.M + self.S
         if self.mode == "trace":
             # Eligibility traces h (x) err and h (x) k. WARNING: the gradient
             # built from these FAILS a finite-difference check (cos ~ 0.13, and
