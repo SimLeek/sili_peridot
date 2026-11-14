@@ -13720,3 +13720,56 @@ every Adam-flavoured tuning result here is off-target. That is a third
 independent reason T1 (Titans on DISLDO) belongs on T0's critical path,
 alongside "the health-metrics and annealing stack lives there" and "the
 sparsity floor needs it".
+
+## 2026-11-14 -- WRAP-UP of the toy-scale recurrence work. Two fixes are
+## COMPLEMENTARY; scale is the remaining issue; CUDA moves next.
+
+**The two fixes do different jobs and compose.** Seed 1001, which the
+baseline took to peak 0.5250 / final 0.3000:
+```
+config              peak                final    distinct
+baseline            0.5250              0.3000   11
+eps=1e-4 only       0.1200              0.1100    1   <- WORSE
+skip only           1.0000 @ep4000      0.5800   12   <- solves, decays
+skip + eps=1e-4     1.0000 @ep4000      1.0000   12   <- solves AND stable
+```
+Exactly the predicted mechanism: the SKIP enables the solve (it connects
+the path so it can learn at all), and EPS makes it stable (it stops the
+noise-driven drift afterwards). eps ALONE is actively harmful, because
+without the skip the path is still disconnected and a large deadband just
+freezes everything including the useful learning. (3 seeds pending.)
+
+**WHAT CARRIES FORWARD -- reusable, scale-independent:**
+  1. The three-link DIAGNOSTIC TOOLKIT, which found every real cause here
+     and costs seconds rather than a training run:
+       retention   = cos(read at query, value that should be stored)
+       reachability= positional weight from the output row to the memory row
+       decodability= held-out linear probe from the read row to the answer
+  2. The STANDING DIAGNOSTICS in long_term_mqar_task.report(): distinct-
+     prediction count with a COLLAPSED flag, the CONSTANT-PREDICTOR
+     baseline (not 1/N, which overstated by 1.44x), the margin over it,
+     and the binomial eval sd next to the between-seed sd.
+  3. ARM DIFFERENTIATION asserts (max|dW_K| per arm) -- `trace` was
+     byte-identical to `frozen` for 3.5 hours of compute without them.
+  4. The REPRODUCIBILITY fix (DenseTensorLinear now takes an rng) and the
+     lesson that a partially-seeded model silently falsifies every
+     single-seed comparison.
+  5. The task itself: long-gap MQAR with an ASSERTED information-free
+     window, plus the short-gap control in the same family.
+  6. The NORMALISING-OPTIMIZER DEADBAND principle -- Adam rescued a tiny
+     REAL gradient and destroyed alignment on a tiny MEANINGLESS one, same
+     normalisation, opposite outcome. Adam cannot ship, so the deliverable
+     is checking the single-state importance update for the same problem.
+
+**WHAT IS PARKED, and why:** further mechanism hunting at 32 dims. Four of
+the five blockers were scale artifacts (depth, the hand-set narrow
+positional prior, parameter count, and a readout losing a race it would
+win with capacity). gaussian_attention is already FULL attention with a
+learnable additive bias, so large sigma recovers plain Q.K for free and
+~21% faster -- but at scale one would use learned positions anyway, so the
+sigma re-sweep is folded into the scale-up rather than run here.
+
+**WHAT IS UNRESOLVED and should not be claimed:** reliability. The
+properly-seeded baseline solved 1/4. skip+eps fixed seed 1001 completely,
+but the remaining three seeds are still running, so the solve RATE under
+the fixes is unknown. Do not report a rate until all four land.

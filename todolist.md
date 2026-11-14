@@ -1482,6 +1482,58 @@ deferred list — do not chase these for v1)
 
 ---
 
+## SCHEDULE CHANGE (2026-11-14): CUDA moves to IMMEDIATELY NEXT
+
+**Why.** Four of the five problems blocking the recurrent path at toy scale
+turned out to be SCALE ARTIFACTS, not mechanism failures -- too few layers, a
+hand-set narrow positional prior where real models use learned/RoPE positions,
+too few parameters, and a readout that loses a race it would win trivially with
+more capacity. Chasing the fifth at 32 dims is lower value than making 256 dims
+runnable.
+
+**And the larger version is simply not reachable on CPU.** Measured per-step cost
+(load-inflated ~20-40%, but the scaling holds):
+
+| hidden | window | layers | ms/step | params |
+|--------|--------|--------|---------|--------|
+| 32     | 16     | 2      | 4.40    | 11k    |
+| 128    | 64     | 6      | 99.54   | 417k   |
+| 256    | 128    | 8      | 884.66  | 2.2M   |
+
+0.88 s/token at 2.2M params is ~13 days for 10k episodes of ~130 ticks, 53 days
+for 40k. Even the 417k config is ~19 hours.
+
+**It is COMPUTE-bound, so the port will actually pay** (I first assumed overhead
+and was wrong): raw numpy matmul [129x256]@[256x256] runs at 2.90 GFLOP/s and the
+same op through the Tensor autograd at 2.72 GFLOP/s -- only 1.1x overhead -- and
+105 such ops account for 611 of the 884 ms, i.e. 69% is arithmetic. The 2.9
+GFLOP/s is this laptop's known half-rate AVX2 (Zen+). One step is ~1.77 GFLOP, so:
+
+| platform                              | per step | 10k episodes |
+|---------------------------------------|----------|--------------|
+| this laptop, 2.9 GFLOP/s              | 884 ms   | ~13 days     |
+| GPU at ~2 TFLOP/s effective           | ~1 ms    | ~25 min      |
+| GPU, launch-latency bound (~105 x 5us)| ~1-5 ms  | ~45 min-3 hr |
+
+So 200-900x, and the autograd layer does NOT need replacing -- the port is just
+the kernels. Caveat: 129x256x256 matmuls are SMALL for a GPU, so this will be
+launch-latency bound, which is exactly where CUDA Graphs / the megakernel work
+earns its place rather than being optional polish.
+
+**THE LAPTOP HAS A GPU, so this is no longer gated on the remote box.** GTX 1660
+Ti, 6GB, sm_75 -- which holds a 2.2M-param model trivially. Develop here, deploy
+to the P40 (sm_61, 24GB) later; compile for both.
+
+**PREREQUISITE, user action (needs sudo + reboot).** The driver is currently
+broken: `nvidia 570.86.16-7` is installed but NO nvidia.ko exists for the running
+kernel 7.1.9-arch1-2 (only `i2c_nvidia_gpu` is loaded, which is a trivial I2C bus
+driver), and nvidia-smi reports it cannot communicate with the driver. nvcc 12.8
+IS present. The kernel moved and the module was not rebuilt. Fix is `nvidia-dkms`
+so it rebuilds for any kernel -- but PIN IT at 570.86.16, because this file's own
+hardware notes warn that upgrading can lose 1660 Ti support.
+
+---
+
 ## "Ultimate transformer" integration ladder (2026-11-12)
 
 Goal: ONE model combining sparse forward, sparse backprop, energy-stochastic
