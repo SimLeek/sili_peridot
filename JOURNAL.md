@@ -11774,3 +11774,2002 @@ diagnostic's 6 layer pools; the remaining ~99 chunks per pool are
 intact. Lesson applied going forward: audit any file for real
 output-path side effects BEFORE executing it for verification, not just
 cap the step count.
+
+## 2026-11-10 -- KV-cache synaptic hold/credit: use_tile_cache's real
+bugs, the free-gradient discovery, a validated budgeted-credit
+mechanism, and a runtime-tunable dial
+
+PR #26 merged, unholding this work. Direct question that started it:
+"do we have everything needed for transformer kv-cache and one-hot or
+k-hot synapse storing for 1-backprop instead of context_len-backprop."
+
+**Two real pre-existing bugs found, unrelated to anything this session
+changed.** (1) `use_tile_cache`/`sleep_enable` were hard-guarded mutually
+exclusive with no stated rationale -- root cause: `step_cached()` never
+called `_accumulate_sleep_energy()` anywhere and never reset/folded
+`_energy_aux_loss`/`_sleep_aux_loss`/`_balance_aux_loss` the way `step()`
+does, so sleep's forced-firing aux loss could never reach its caller.
+Fixed by mirroring `step()`'s exact 8 call sites plus its reset/fold
+pattern; guard removed. (2) `use_tile_cache` crashed on literally its
+first query step, 100% of the time, independent of sleep:
+`DISLDOLayer32` (the only layer class `ToyTileRecurrenceRMT` uses) never
+had the `dy_sparsity_schedule` kwarg its query-step fallback
+unconditionally passes -- `DISLDOLayer.forward` (scattered) had it,
+`DISLDOLayer32.forward` (dense) didn't. Fixed upstream in `sili__new`
+(PR #55): ported the exact same `_graded_top_k_csr`-backed branch,
+same priority order relative to `dy_r_target`/`dy_sparsity_p`, below
+the DISLDOLayer32-only `dy_gate_mask`.
+
+**The free-gradient discovery.** `Tensor` has no `requires_grad` gate at
+all -- `_acc()` accumulates `.grad` on ANY node a backward chain
+reaches, cached-and-detached or not. Confirmed directly (toy script,
+then inside a real `step_cached()` call via a monkeypatch spy): when
+`use_tile_cache_at_query=True` wraps a cached row's k/v as a fresh
+`Tensor` and feeds it through `gaussian_attention`, that attention
+call's real backward populates the EXACT per-row gradient on it anyway
+-- previously silently discarded, at zero marginal compute cost to
+recover. `step_cached()` now also remembers each cached row's
+pre-k/v-projection input (`x_normed_row`, extending `tile_cache`'s
+tuple to `(k_row, v_row, x_normed_row)`) and stashes the live
+`cache_k_tensor`/`cache_v_tensor` objects (not just `.data`) in
+`last_debug`, so a caller can read `.grad` off them after its own
+`loss.backward()`.
+
+**Mechanism A: `model/tile_cache_credit.py`.**
+`apply_tile_cache_exact_credit(model, lr, k_rows)` uses that free
+gradient plus the remembered exact input to fire a direct
+`layer._c.backward(x_row, dy_row, lr, ...)` correction into
+`k_proj`/`v_proj` for a small, budgeted number of cached rows per query
+step -- no decay, no substitution, because for a row still sitting in
+the cache nothing has actually been lost yet (unlike the older,
+differently-scoped peak-eligibility idea, which exists for rows ALREADY
+evicted / the recurrent memory's own never-cached long-horizon
+influence -- still future work, see below). Selection is **blind
+round-robin**, not gradient-magnitude-ranked: project memory
+`project_dense_vs_sparse_mqar_confusion_matrix` found magnitude-guided
+selection loses to Arm C's blind time-gate every time tried in this
+codebase, so this doesn't re-try that losing pattern -- a fixed
+rotation through live cached positions gives each an equal, periodic
+shot at correction instead.
+
+**Validation history, in order (the direction flipped once, and the
+flip itself is the real finding):**
+- First smoke test (1 seed, 300k params, 300-500 steps):
+  `use_tile_cache_at_query` (zero credit) nominally beat plain `step()`.
+  Surprising -- directly contradicted the motivating hypothesis.
+- 3-seed, then 10-seed replication (still 300k params): zero-credit
+  "beating" dense held up at n=10 (paired t-test p=0.032) -- looked
+  like a real, if backwards, effect.
+- Direct instruction to distrust this rather than accept it ("if the
+  paper says 2+2=5, the paper is wrong") led to two checks: (a) a
+  formal Bend 2 proof (see `sili__new/bend_proofs/
+  tile_cache_gradient_routing/`, `ALL PROOFS CHECK`) that concat/split
+  routes gradient to the exact right rows -- ruled out a routing bug;
+  (b) a direct, cheap (no training) measurement of the real staleness
+  gap (cached k/v computed with weights as of cache-time vs. current
+  weights for the same remembered input): mean gap ~0.04-0.07% of
+  typical k/v magnitude over 2.16M real comparisons, max ~2% -- ruled
+  out staleness as a confound in either direction.
+- Scaled DOWN instead (not up) for iteration speed: `embed_width=12`
+  (~34k params) runs ~6-7x faster per step than the 300k config and
+  still shows real learning (confirmed before trusting any comparison
+  at this size). With n=40 seeds (cheap enough now to actually afford),
+  the result **flipped back** to the originally-expected direction:
+  zero-credit is significantly WORSE than dense (p<0.0001) -- the
+  n=10/300k result was an underpowered fluke, not a real reversal.
+- Fraction-budget dose-response sweep (n=40 seeds, same 34k/500-step
+  config, 8-way parallel via separate `num_cpus=1` OS processes rather
+  than one process's own threading, since every run is already
+  single-threaded for determinism): plain=0.2332, zero-credit=0.1761
+  (p<0.0001 vs plain), 25% cache coverage=0.2004 (p=0.0056 better than
+  zero-credit), 50%=0.2166 (p=0.036 vs plain, borderline), 100%=0.2181
+  (p=0.069 vs plain, no longer significant). Monotonic, and 100%
+  coverage closing the gap to dense almost entirely is exactly the
+  sanity check a real implementation should pass -- confirms the
+  mechanism itself is correct, not just under-budgeted. Strongly
+  diminishing returns past 50% (25%->50% gains +0.016 accuracy,
+  50%->100% only +0.0015), so a sweet spot well under 100% should
+  recover most of the benefit at a fraction of the cost.
+
+**Runtime-tunable dial.** `tile_cache_credit_fraction` scales `k_rows`
+to the cache's own size (`num_tiles - 1`), not a fixed absolute count --
+a constant `k_rows` covers a shrinking fraction of the cache as context
+grows, so the right scaling axis is context length, not model width
+(width changes cost per row, not how many rows need covering). Default
+changed to 0.5 (was off) given the validated sweep above. Added
+`tile_cache_credit_fraction_fn` (same pattern as this file's existing
+`lr_override_fn`): called with the current step each query step, so
+the correction budget can change mid-run, not just at construction --
+direct motivation: these amortized-backprop dials (this one, and
+sleep's own cadence) should be externally responsive to real-world
+events ("sleep nightly instead of every minute" for an online/embodied
+deployment), not fixed hyperparameters. Demonstrated end-to-end in
+`tests/test_tile_cache_credit.py`'s runtime-dial test.
+
+**Open question, resolved as "easy, just not built yet," not acted
+on**: `dy_sparsity_schedule`/`dy_r_target`/`dy_sparsity_p` are wired as
+mutually exclusive via an `if/elif` chain in both `DISLDOLayer.forward`
+and `DISLDOLayer32.forward`'s `_bwd()`, but the underlying methods are
+NOT fundamentally exclusive -- confirmed by reading the actual kernels:
+`_graded_top_k_csr(dy2d, k_per_row, num_cpus)` is the real generic
+mechanism underneath both `dy_sparsity_schedule` (caller-given
+`k_per_row`) AND `dy_sparsity_p` (`np.full(n_rows, k_dy)` -- a uniform
+scalar is just this same kernel's degenerate case). `dy_r_target`'s
+nucleus selection (`_nucleus_top_k_csr`/`_cpu.dense_to_nucleus_top_k_csr`)
+is a structurally parallel kernel producing the same SHAPE of output (a
+per-row `k`), just derived from each row's own gradient-energy profile
+instead of handed in externally. Composing "n tokens (rows) selected by
+a schedule, m neurons (columns) within those rows selected by the
+nucleus criterion instead of a fixed schedule value" is architecturally
+straightforward -- combine the schedule's row-eligibility with a
+nucleus-derived per-row k for eligible rows, feed the result into
+`_graded_top_k_csr`. The `if/elif` is a caller-side wiring choice in
+`_bwd()`, not an algorithmic conflict. Still not implemented -- noted
+for whenever this becomes the actual bottleneck.
+
+**Explicitly deferred, unchanged from the original plan**: Mechanism B
+(ported peak-eligibility for rows already evicted from `tile_cache`,
+and the recurrent memory's own never-cached long-horizon credit) --
+queued as the next piece, after this round's testing is fully wrapped
+up. The memory-snapshot-cache "combined" case and Part 3's N-D
+generalization remain deferred as before.
+
+## 2026-11-11 -- Per-token magnitude selection re-confirmed losing;
+REM-fired-row cache retention (opt-in)
+
+Two quick, separate follow-ups before moving on to recurrent-memory
+credit, clarified as genuinely distinct tasks (previously conflated in
+this session's own discussion): (1) does magnitude-guided SELECTION of
+which cached rows get Mechanism A's correction beat blind round-robin,
+per-TOKEN this time, not per-neuron/column as previously tested; (2) a
+separate, unrelated idea -- tokens that trigger sleep's forced-firing
+should also get a better shot at staying in context, not just at being
+trained on.
+
+**(1) Per-token magnitude ranking, re-confirmed losing.** Same 40-seed,
+~34k-param sweep setup as the dose-response run, same 50% budget,
+comparing blind round-robin (already validated) against ranking live
+cached rows by `|cache_k_tensor.grad|+|cache_v_tensor.grad|` each
+query step instead. Blind round-robin (0.2166) edged out
+magnitude-ranked (0.2120), not significant (paired t-test p=0.0951,
+n=40) but directionally consistent with Arm C's precedent
+(`project_dense_vs_sparse_mqar_confusion_matrix`) now confirmed on this
+axis too, not just the column axis. Not pursued further; blind
+round-robin stays the real mechanism.
+
+**(2) REM-fired-row retention, opt-in (`retain_fired_rows`, default
+False).** Clarified during discussion: this is NOT about selecting
+backprop targets by importance (that's (1), and the general
+magnitude-guided pattern is the thing already shown losing) -- it's
+about keeping a token in context a little longer when it happens to be
+the one sleep's forced-firing picked that tick, as a side effect
+independent of training it. `EnergyDynamics.kept_indices` ("the gate
+decision energy already made") already exposes exactly this: for
+`step_cached()`'s single new content row through
+`_accumulate_sleep_energy(x_wide_new, "input_proj")`, `kept_indices`
+non-empty means THIS row fired. New `_row_fired_this_tick()` reads
+that; `tile_cache`'s tuple extends again, to `(k_row, v_row,
+x_normed_row, fired)`; `step_cached()`'s eviction, when
+`retain_fired_rows=True`, prefers dropping non-fired rows (then oldest)
+over fired ones, instead of strict FIFO -- still hard-bounded at
+`n_content-1`, no window growth, so if everything left is fired the
+oldest fired ones go too. Confirmed directly (grep): sleep was never
+discarding the tokens it processes from the cache at all -- `in_sleep`
+only ever gates `requires_grad`/which loss backprops, never skips a
+cache update -- so this is a pure, new addition, not a bug fix for an
+existing discard.
+
+**Known approximation, not solved here**: `gaussian_attention`'s
+`centers`/`sigmas` bias attention by a row's ARRAY POSITION in the
+reassembled K/V, which normally equals true age. Skip-evicting a
+middle row to protect a fired one breaks that equivalence -- the
+retained row ends up at a slot-position that no longer matches its
+true age. Same spirit as the already-accepted "stale cached weights"
+approximation (drift is small and bounded in practice), but a real,
+distinct approximation worth naming rather than silently introducing.
+Fixing it properly would mean tracking true age through the attention
+bias itself, or bounding how far retention can skip -- bigger scope
+than this pass.
+
+**Explicitly opt-in, not default**: direct instruction -- the quality
+effect of this retention policy is genuinely untested, so it must not
+silently change behavior for any existing `sleep_enable=True` run
+(e.g. `train_peridot_main.py`'s winning recipe). Smoke-tested only
+(no crash, sane finite output, a direct unit test of the eviction
+priority itself with a controlled fire sequence) -- no dose-response
+validation attempted, unlike Mechanism A, since this is a much smaller,
+qualitatively different change (retention policy, not a new credit
+mechanism) and wasn't asked to be validated to that same bar yet.
+
+Next: recurrent state token credit hold/assign (Mechanism B) --
+peak-eligibility-style credit for the recurrent memory's own
+never-cached long-horizon influence, generalized to k-hot per the
+earlier k-hot-generalization instruction.
+
+## 2026-11-12 -- RSM on the real architecture: a correctness fix, a
+self-inflicted confound, and an interaction effect (no positive benefit yet)
+
+Engineering goal, stated directly: get the model to show POSITIVE benefit from
+recurrent tokens. Framed explicitly as engineering, not validation -- the
+validation was the Bend proof (sili__new PR #55). 8h wall-clock budget, one box.
+
+**Instrument.** `recurrent_only_output=True` (the existing RNN-validation
+ablation) value-masks content rows so the attention output can only carry what
+was written to memory at an earlier step. It responds immediately, with no need
+to climb the curriculum to k=6, which makes it far better than the earlier
+attempt to force the recurrent regime by shrinking `num_tiles` -- that conflated
+context-starvation (which handicaps any context-dependent task) with
+recurrence-noise. Config: `embed_width=12` (~34k params), `num_tiles=16`
+(full context, unshrunk), `num_memory_slots=16` => write_width 16*96 = 1536.
+Chance at vocab=16 is 0.0625. Baseline (RSM off) scores **0.401**.
+
+Incidental confirmation of an earlier hypothesis: on the baseline, memory-only
+(0.385-0.401) BEATS full-context (0.193). Having content values available
+actively hurts at this size -- "normal context confounds the recurrent context,
+good-and-bad context competing vs decision paralysis."
+
+**Finding 1 (real bug, found by measurement in minutes).** `rmsnorm` was
+defeating the sparse write entirely. `memory_new = rmsnorm(memory_prev + write)`
+renormalizes the whole tensor, so a few large writes shift the RMS and perturb
+every unit: measured **97.7% of memory entries changing per tick at
+k_active=25%, and 31.9% at 2%**, instead of 25%/2%. That broke exactly the
+precondition the mechanism's own proof requires (`all_inactive_is_exact`:
+inactive units must not change), so no amount of k_active/refractory tuning
+could ever have worked. Fixed via `_memory_residual_update`, which holds
+unselected units at their previous value exactly while still letting rmsnorm
+stabilize the written ones. Post-fix the changed-fraction equals k_active
+exactly (2.0% / 25.0%) and per-tick relative state churn drops 1.09 -> 0.24
+(2%) / 0.49 (25%), i.e. memory now actually persists. Committed as a
+correctness fix independent of RSM's empirical fate. **This was invisible to
+accuracy sweeps** -- hours of overnight k_active/threshold/inhibition sweeps
+never found it; one direct measurement of per-tick state change did.
+
+**Finding 2 (self-inflicted confound; retires a lot of earlier data).** Turning
+on `rsm_memory_write_enable` silently changed the TRAINING SCHEDULE: the
+curriculum fired the decoder loss's backward plus an extra `opt.step()` at
+EVERY token position (requires_grad was made unconditional for the flag),
+whereas the baseline updates only at target positions. Because DISLDOLayer does
+its inline weight update with the lr captured at FORWARD time, that backward
+drove full-lr updates into `o_proj`/`q,k,v_proj` every tick regardless of any
+decoder-lr scaling. Decisive evidence: at `k_active=100%` the mask is all-ones,
+so the forward path is mathematically identical to RSM off, yet it scored 0.110
+vs 0.435 for the same config with the decoder loss dropped. Every result before
+that discovery (the k_active sweep, the filler sweep, the decoder-lr sweep) was
+dominated by this confound equally, which is exactly why they were all FLAT.
+Added `rsm_decoder_every_tick` (default True = prior behavior) and
+`rsm_lr_mult`, plus `num_memory_slots` as a real `train_curriculum` parameter.
+
+**Valid results, after removing the confound** (memory-only, predictable
+"count" filler, 3000 steps, 2 seeds, mean acc_tail):
+
+| condition | mean |
+|---|---|
+| baseline, RSM off | 0.401 |
+| no-op mask (k=1536), decoder dropped -- harness check | 0.435 |
+| sparse write only, 25% | 0.385 |
+| sparse write only, 2% | 0.333 (high variance: 0.388/0.278) |
+| decoder only (target-position schedule), no-op mask | 0.383 |
+| **sparse write 25% + decoder together** | **0.151** |
+
+**Finding 3 (interaction effect).** Each half is ~neutral on its own (0.385,
+0.383) but together they collapse to 0.151 -- not additive. Mechanism: the
+decoder reads `_rsm_last_write`, the MASKED write. With a no-op mask it sees the
+full write consistently; with a sparse mask plus refractory rotation it sees a
+DIFFERENT ~25% subset every tick, so the gradient it pushes back through the
+straight-through mask into `o_proj` targets moving coordinates and the updates
+contradict each other across ticks. In RSM proper the decoder reads `y^G`, the
+layer's entire (sparse) representation -- a consistently-defined object -- not a
+rotating slice of a dense residual delta.
+
+**Honest bottom line: no positive benefit from RSM achieved.** The sparse
+write + refractory half is roughly neutral (slightly negative at aggressive
+sparsity); the self-supervised decoder half is neutral alone and destructive in
+combination. Two things were nonetheless established: a real correctness bug in
+the memory update is fixed, and the measurement harness is now validated (the
+no-op-mask control reproduces baseline).
+
+**A hypothesis I wrongly reported as falsified (corrected 2026-11-12, direct
+user pushback).** I claimed "RSM's objective is misaligned with this task" was
+falsified because making the filler learnable changed nothing: 0.146
+(Champernowne counter digits), 0.134 (ramp), 0.140 (random) -- invariant. That
+test was INVALID. All three filler modes change the token at EVERY step, so
+temporal redundancy is ~0% in every condition; I varied PREDICTABILITY while
+holding REDUNDANCY pinned at zero, then drew a conclusion about a hypothesis
+that is actually about redundancy. RSM's domain is near-stationary streams --
+successive frames of a video are ~99% identical -- which is the opposite end of
+that axis, not a nearby point on it.
+
+This matters because of the proof. `all_inactive_is_exact` makes the
+eligibility-trace approximation EXACT when intermediate ticks are inactive. In a
+99%-redundant stream most ticks genuinely are near-inactive, which is also where
+winner-take-all + refractory inhibition has a job to do (the same small cell set
+holds persistent content; new cells recruit only on change). In MQAR every tick
+delivers a brand-new token, so every tick is active and the proof's favorable
+regime never occurs. The mechanism was being tested in exactly the regime its own
+theory predicts no advantage.
+
+Related architectural error: RSM's role is to maintain a compressed long-horizon
+history over a redundant stream, which a separate recall-capable readout then
+queries. In this port the decoder instead competed with the task head over shared
+projections, and the task head read the attention output rather than any stable
+RSM code -- so even in a favorable regime the benefit could not have shown up.
+
+Separately and still valid: "next-step target on every position" HURT the
+baseline (0.304 vs 0.401).
+
+**What I would do next**, in priority order:
+0. Test in a REDUNDANT regime, which is the one the proof and the mechanism
+   actually favor: give filler a run length R (same token repeated R times) so
+   redundancy sweeps 0% -> ~88% (R=8) -> ~97% (R=32), holding content fixed.
+   Measure write magnitude on redundant vs changing ticks, not just accuracy --
+   confirm the "inactive tick" precondition is finally satisfied before trusting
+   any accuracy number. Note a fixed-k top-k always selects exactly k units, so
+   inactivity must come from small write MAGNITUDE, not from the mask.
+1. Make the decoder read a consistently-defined object -- the accumulated memory
+   state (or a fixed projection of it), not the per-tick rotating masked delta.
+   That directly targets Finding 3 and is the closest thing to RSM's actual `y^G`.
+2. Restore depth-2 fidelity: leaf-wrap `attn_mem`, replay norm+mask+decoder on
+   the leaf, push `leaf.grad` into `o_proj` only via `o_proj._c.backward_dense`
+   (the Mechanism-A idiom in `model/tile_cache_credit.py`), so the decoder
+   gradient never reaches `gaussian_attention`/`q,k,v_proj`.
+3. Per-slot top-k instead of flat global top-k, matching RSM's two-level
+   competition (exactly 1 winner per group, then top-k groups) so no memory slot
+   is starved.
+4. Re-check `rsm_refractory_decay` (0.7, untuned) only after 1-3 -- it is a
+   collision/timing axis and was never the binding constraint.
+Methodological note worth keeping: both real findings this session came from
+directly measuring the mechanism (per-tick state change; no-op-mask control),
+not from sweeping hyperparameters. The sweeps were uniformly flat precisely
+because a confound dominated them.
+
+**Corrections and literature check, same day (2026-11-12, both from direct user
+pushback).**
+
+*(a) The MQAR runs never reached the regime where memory is required.*
+`seq_len_for_k(k) = 4k` and every run stalled at `peak_k=2-3`, so sequences were
+8-12 tokens -- entirely inside the 16-tile window. Key and query were never
+separated by more than the window, so long-term storage was never exercised;
+`recurrent_only_output` forced the readout through memory (which is why memory
+mattered at all) but information only had to survive a few ticks. `rep:32`
+filler on an 8-token sequence is also a single run, so the redundancy never
+materialised either. The "MQAR is adversarial" framing was therefore premature:
+the literature points below still stand, but insufficient GAP was the binding
+constraint in our runs, not those. A purpose-built long-gap probe
+(`[k1,v1,k2,v2, filler*32, kq] -> vq`, gap 32 >> window 16) was then written and
+run, and came back UNINFORMATIVE rather than negative -- all arms at chance
+including baseline, because 600 train steps / 40 eval episodes gives a standard
+error of ~0.038 at p=0.0625, wider than any effect worth detecting. An
+experimental-sizing error, recorded as such.
+
+*(b) RSM has essentially no external adoption, and the idea's validated
+descendant is Titans.* Semantic Scholar lists FOUR citations of arXiv:1905.11589
+in ~7 years, effectively all from the same lab lineage (Cerenaut /
+Rawlinson-Kowadlo) or adjacent self-organizing-map work -- no transformer follow-up,
+no independent replication. Meanwhile the same core idea (write to memory on
+surprise, forget otherwise) was independently reinvented and validated at scale
+as Titans (arXiv:2501.00663, Google Research 2025; follow-up MIRAS), whose
+surprise signal is better specified than ours: GRADIENT-based (the memory
+module's own error) with MOMENTUM over past surprise -- and that momentum term is
+an eligibility trace, so it matches this project's own Bend proof's delta-based
+credit far better than the EMA-of-input-distance gate built here. Titans' Core +
+Long-Term Memory + persistent-memory structure is also close to what
+`ToyTileRecurrenceRMT` already is.
+
+Notably the gradient-surprise ingredient ALREADY EXISTS in this repo:
+`_update_layer_surprise` computes `E_t = ||dy_t||^2` with an EMA -- per-layer
+gradient-energy surprise with momentum -- currently wired to modulate
+`dy_r_target` (backward sparsity) rather than to gate the memory write.
+
+**Revised recommendation:** stop porting RSM (single-lab, unreplicated) and
+instead walk the implementation toward Titans one feature at a time, testing each
+step against the current best. Ordered ladder, smallest/highest-fidelity first:
+(1) replace input-distance novelty with gradient-based surprise, reusing
+`_update_layer_surprise`; (2) two-timescale momentum over surprise (momentary +
+past); (3) adaptive forgetting/decay on memory rather than pure additive
+accumulation; (4) keep the decoder loss OFF (already shown harmful here);
+(5) persistent (data-independent) memory tokens; (6) the MAC/MAG/MAL question of
+how memory combines with attention. Prerequisite before running that ladder:
+establish ONE adequately-powered standing benchmark and hold the update schedule
+constant across arms -- the two failure modes that wasted most of this
+investigation were an under-powered/confounded harness and sweeping before
+measuring.
+
+## 2026-11-10 -- Mechanism B: formal proof, 5 negative self-supervised
+attempts, 1 validated win (RSM-inspired sparse memory + local loss)
+
+Direct instruction before any further Python work: formally prove, in
+Bend (not Lean -- see `tile_cache_gradient_routing`'s own README for
+why), that synaptic-hold/e-prop credit (1) genuinely approximates true
+BPTT's cross-time credit signal, (2) is cheaper than literal BPTT, (3)
+approximates it increasingly well -- ideally exactly -- as activity
+sparsifies. Done: `sili__new/bend_proofs/synaptic_hold_bptt_approximation/`
+(PR #55), `ALL PROOFS CHECK`. For a residual update `h_t = h_{t-1} +
+D_t`, the identity-trace approximation's error vs true BPTT's full
+Jacobian product is, by the standard distributive/powerset expansion, a
+sum over subsets of ONLY the ticks with nonzero `D_t` ("active" ticks)
+-- independent of how many inactive ticks sit in between. `n`
+consecutive fully-inactive ticks give EXACTLY zero error, for any `n`,
+not asymptotically (`all_inactive_is_exact`). This settles the math;
+it says nothing about whether any given selection mechanism correctly
+classifies ticks as active/inactive, or whether a real model's
+Jacobians are well-approximated by the proof's scalar model -- those
+are the empirical questions the rest of this entry is about.
+
+**Toy-scale empirical setup** (not the real `ToyTileRecurrenceRMT` --
+see "next" below): `model/toy_beyond_context_task.py`'s
+`generate_deviation_sequence` -- a periodic body (`DEVIATION_BASE_
+PATTERN`, period 3) with AT MOST ONE deviating position, answer = did
+a deviation occur. A single `DISLDOLayer` cell + head, `M_prev` reset
+to zero each sequence, trained with `lr_schedule`/curriculum matching
+`prototype_peak_synapse_learning_comparison.py`'s existing harness.
+`no_memory` (forces `M_prev=0` always) is PROVABLY bound at the task
+prior (0.5) by construction -- `QUERY_TOKEN` is a fixed constant
+unconditional on the answer, so a deterministic net fed an identical
+query input must produce an identical output distribution. All
+comparisons below are against this real floor and against `plain`
+(real memory, zero cross-time credit -- sometimes scores at or below
+`no_memory` itself, confirming there is no "baseline that already uses
+memory well" to amplify; any working mechanism has to add a genuinely
+new signal, not improve an existing one).
+
+**Oracle version, validated.** `scripts/prototype_surprise_gated_exact_
+credit.py`: a hard (binary) gate on the state update, `surprise = (tok
+!= expected_tok(pos))` read directly off `DEVIATION_BASE_PATTERN` --
+forces the update to be EXACTLY zero on every regular tick, matching
+`all_inactive_is_exact`'s precondition literally, not approximately.
+Since the task guarantees <=1 active tick ever, the identity-trace
+credit (held row -> query-time gradient, coefficient 1, zero decay) is
+not just a good approximation, it is mathematically exactly equal to
+true BPTT for this task. Measured: **0.90-0.99 mean accuracy across
+n_bits in {2,3,4,6}, p<0.0001 vs every baseline, 50 seeds, full
+6000-step training** (one side-finding, unrelated to the mechanism
+itself: ~2/5 seeds showed a full-accuracy regression at this longer
+training length that didn't appear at 1000-1500 steps -- a real,
+separate training-instability issue, not chased further this session).
+This empirically confirms the proof's mechanism works, given a correct
+activity signal. The remaining, much harder problem: getting that
+signal without reading the answer key.
+
+**Five negative results, self-supervised (no oracle access to
+DEVIATION_BASE_PATTERN anywhere), each confirmed at real statistical
+power after at least one earlier false-positive wash-out:**
+
+1. **Soft/continuous surprise gate**
+   (`scripts/prototype_selfsup_eprop_credit.py`): a small predictor
+   (own `DISLDOLayer`, own next-token cross-entropy loss) reads `M_
+   prev`, its own prediction error gates the state update
+   multiplicatively, its own gradient w.r.t. `M_prev` (a real, local,
+   one-step BPTT target -- NOT a reattached cross-tick graph, still
+   O(1)/step) is routed via the held-row trace into the cell's weights
+   EVERY tick. Result (50 seeds, full 6000 steps): significantly
+   **worse** than `no_memory` at nearly every n_bits (e.g. n=4:
+   0.341 vs 0.492, p=0.0006) -- not a failure to help, active harm.
+2. **Lateral inhibition** ("don't fire next to me" -- a soft,
+   Gaussian-by-index-distance local-max penalty reusing
+   `gaussian_attention`'s own weighting idea, reused for intra-layer
+   unit competition instead of cross-token attention; rejected doing
+   real KL/variational sparsity per direct instruction -- "gross
+   statistics embedded in the activation," and it would also force
+   one-concept-per-unit rather than allowing distributed/redundant
+   codes). Applied independently to the cell's delta, the predictor's
+   output, and `M_prev` itself
+   (`scripts/prototype_lateral_inhibition_eprop_credit.py`). An
+   apparent win at 10 seeds did NOT replicate at 50 (all 8 arms
+   statistically tied with the no-inhibition baseline at n>=4,
+   p>0.1).
+3. **Hard-thresholded gate** (0.3/0.5/0.7, same self-supervised
+   surprise signal, binary instead of continuous --
+   `scripts/prototype_lateral_inhibition_eprop_credit.py`'s
+   `HardGateEPropCell` equivalent): no threshold beat `no_memory` or
+   the soft-gate baseline at n>=4; one result significant in the
+   WRONG direction (n=6, p=0.0058, worse).
+4. **Explicit step-index feature** for the predictor (not oracle
+   access to the pattern's period or values -- just "how far into
+   this sequence am I," the same category of information any real
+   sequence model gets from positional encoding): a marginal win at
+   20 seeds (n=6, p=0.0038 vs the no-feature baseline) flipped to
+   significantly WORSE than `no_memory` at 50 seeds (n=3 p=0.0042, n=6
+   p=0.0135).
+5. **Gating-only, no per-tick crediting** -- isolates whether the
+   per-tick noisy crediting itself (vs. the surprise signal's
+   quality) was the harm source: keep the self-supervised predictor
+   purely as a gate, credit the cell ONLY once at the rare query event
+   (matching the oracle's own schedule exactly). Result: no longer
+   significantly worse than `no_memory` (p=0.39-0.81) -- confirms
+   per-tick crediting WAS part of the harm -- but also no better
+   (tied with the already-harmful dense-crediting baseline too,
+   p=0.26-0.41). Removing the harm doesn't produce a rescue; the
+   self-supervised surprise signal itself was never better than
+   random at picking the informative tick.
+
+**Direct instruction after (5)'s negative conclusion**: research
+whether this is a solved problem in the literature before declaring
+the hypothesis space exhausted. Found Srivastava/Van Hoesel/Hawkins-
+style "Recurrent Sparse Memory" (RSM, arXiv:1905.11589, "Learning
+distant cause and effect using only local and immediate credit
+assignment") -- a genuinely different approach from everything above:
+no held-row credit routing, no separate surprise predictor, no
+query-time correction hack at all. Instead the memory's OWN
+representation is made combinatorially sparse via winner-take-all +
+REFRACTORY SELF-INHIBITION (a temporal analog of the lateral-inhibition
+idea above -- competition across TIME via a per-unit decaying
+refractory trace, not across space via a Gaussian neighborhood), and
+the whole thing is trained with only a SHALLOW (backprop depth 2:
+decoder then encoder), purely LOCAL, self-supervised next-token
+prediction loss every tick -- no BPTT, no eligibility trace, nothing
+routed backward in time at all. RSM reports 99.2% on Embedded Reber
+Grammar (near-identical task shape: long-distance signal across random
+distractors) vs LSTM's 100%, Elman RNN's 0%.
+
+**6. RSM-inspired sparse memory + local loss -- VALIDATED, the first
+non-oracle win of this investigation.**
+(`scripts/prototype_rsm_inspired_cell.py`-equivalent in this session's
+scratch work, not yet promoted to a committed script -- see "next"
+below.) Hard top-k winner-take-all on the cell's raw state-update
+magnitude, re-weighted each tick by `(1 - phi)` where `phi` is a
+per-unit refractory trace (`phi <- max(phi * decay, mask)`, reset per
+sequence) -- gradient flows only through the surviving (winning)
+units' values, a standard k-sparse/straight-through mask, not through
+the selection itself. A SEPARATE shallow decoder (own weights) predicts
+the literal next body token from this tick's sparse activity; its
+cross-entropy loss backprops through the decoder and into the cell's
+weights for exactly the surviving units -- backprop depth 2, no
+further. The task's own query-time loss trains the SAME shared cell/
+head weights on top, unchanged from every other arm. Confirmed at 30
+seeds then REPLICATED at 50 seeds, k_active in {3,4,6} (out of
+`STATE_WIDTH=16`), 1500-step budget:
+
+| n_bits | no_memory | plain | rsm_k3 | rsm_k4 | rsm_k6 |
+|---|---|---|---|---|---|
+| 2 (in-ctx) | 0.497 | 0.616 | 0.736 (p<.0001, p=.016) | 0.778 (p<.0001, p=.0015) | 0.701 (p<.0001, p=.025) |
+| 3 (out) | 0.510 | 0.474 | 0.634 (p=.0021, p=.0010) | 0.666 (p=.0001, p<.0001) | 0.648 (p=.0002, p<.0001) |
+| 4 (out) | 0.475 | 0.500 | 0.591 (p=.0048, p=.027) | 0.573 (p=.021, p=.096) | 0.573 (p=.0058, p=.057) |
+| 6 (out) | 0.510 | 0.438 | 0.423 (p=.0082, WORSE) | 0.393 (p=.0008, WORSE) | 0.455 (p=.11, tied) |
+
+(p-values: vs `no_memory`, vs `plain`, paired t-test.) All three
+k-values significantly beat BOTH `no_memory` and `plain` at n=2, n=3,
+and (mostly) n=4 -- n=3/4 are genuinely out-of-context (window=2), so
+this is real cross-time credit, not in-window pattern matching. Honest
+boundary: it does NOT extend to n=6 -- actively worse there for k=3/4,
+tied for k=6. Likely cause, not yet confirmed: a fixed k-sparse code
+over `STATE_WIDTH=16` units probably exhausts its combinatorial
+capacity, or the refractory decay schedule needs horizon-dependent
+tuning, past a certain span. First non-oracle mechanism in this entire
+investigation (toy-scale or otherwise) to show a real, replicated win
+over the "no cross-time credit" baselines.
+
+**Why this works where the predictor-based approaches didn't**: every
+failed attempt (1-5 above) tried to figure out WHICH past ticks to
+credit -- i.e., solve the same selection problem the oracle solved by
+cheating. RSM's insight sidesteps that problem entirely: make the
+representation itself carry a combinatorially distinct code per
+distinct history (via competition, not selection-for-credit), and
+only ever train it with an ordinary, SHALLOW, local loss. There is no
+credit-routing mechanism to get wrong.
+
+**(a) Done this same pass**: promoted the oracle + RSM-inspired cell
+into `scripts/prototype_surprise_gated_exact_credit.py` and
+`scripts/prototype_rsm_inspired_memory_credit.py` (the latter
+reproduces the replicated 50-seed table above); deleted the 3
+negative-result scratch scripts (findings recorded above, nothing left
+to reproduce from them).
+
+**(b) Done this same pass, NOT yet quality-validated**: ported the
+RSM-inspired mechanism onto the REAL `ToyTileRecurrenceRMT`
+architecture's own memory write, as an opt-in mechanism (`rsm_memory_
+write_enable: bool = False`, `rsm_k_active: int | None = None`,
+`rsm_refractory_decay: float = 0.7` -- threaded through
+`train_curriculum()` too). PASS 1's write (`attn_mem_n`, the residual
+term added to `memory_prev`) gets the same hard winner-take-all +
+refractory-self-inhibition sparsification as the toy cell, applied to
+the flattened `num_memory_slots * state_width` write in both `step()`
+and `step_cached()` -- gradient flows through surviving units' values
+only, same straight-through convention. A new `rsm_decoder` layer
+(own weights, lazily constructed only when enabled -- byte-identical
+RNG consumption for every other layer when off) predicts the actual
+next token from that tick's sparse write; `model.rsm_decoder_step_
+loss(next_token_id, lr)` returns that loss for the CALLER to backward
+every tick (deliberately NOT folded into `step()`'s own returned
+`aux_loss`, which is only ever backward'd at target/sleep positions --
+RSM's recipe needs a real backward every tick to train the write
+encoding, not just the rare ones). Backprop depth is bounded by this
+tick's own write-pipeline graph (`rsm_decoder` -> `o_proj`, further if
+`qkvo_norm_enable`/`gaussian_attention` -- all WITHIN one call, never
+crossing a `step()` boundary into a prior tick, since `memory_prev_t`/
+`x_normed` are fresh leaves every call, same "no BPTT" guarantee as
+everything else here).
+
+Smoke-tested only, this pass: constructor + `step()` + `step_cached()`
+run clean (finite output) both with the flag on and off; a 30-step
+`train_curriculum()` run completes with the flag on; a 100-step
+default-flag-off run is unaffected (regression check) -- real,
+measured overhead at this tiny model scale (embed_width=8,
+num_tiles=16): **1.68x slower** (20.7 -> 12.3 steps/sec), expected and
+inherent to forcing a real backward every tick instead of only at
+target/sleep positions, not a bug.
+
+**Explicitly NOT done, the actual open question**: whether this
+mechanism helps real MQAR curriculum progression at all -- the toy
+deviation-detection task's validated win does not transfer by
+assumption. A real decisive comparison (multi-seed, against the
+`plain`/no-RSM baseline, tracking peak_vocab/peak_k reached, matching
+this project's own established validation bar for Mechanism A/B) is
+the next, separate, unstarted step, along with sweeping `rsm_k_active`/
+`rsm_refractory_decay` for this architecture's actual `state_width`
+(untuned, carried over from the toy cell's `STATE_WIDTH=16` scale
+without re-derivation).
+
+**(c) Still open, not investigated**: the n=6 boundary (why the sparse
+code's cross-time credit breaks down past a certain horizon) remains a
+real, not-yet-understood limitation worth its own investigation before
+trusting this at longer horizons -- likely relevant to how far the
+real MQAR validation above should expect this to hold up too.
+
+## 2026-11-12 (later) -- Titans ported and validated; its two gates
+## measured net-negative here, with a mechanical reason
+
+RSM measured neutral-to-negative across every axis tried and has ~4
+citations, all from one lab, with no independent replication -- so
+there was no verified reference to ablate *from*. Redirected to Titans
+(arXiv:2501.00663), the validated descendant of the same
+write-on-surprise idea: implement it, show it works, *then* ablate
+toward RSM, so each dropped feature is informative.
+
+**The port** (`model/titans_memory.py`): eqs 10-15 with a
+matrix-valued memory. The inner gradient is closed form,
+`grad_M ||Mk - v||^2 = 2(Mk - v)k^T` -- a delta-rule outer-product
+update computed entirely in the forward pass. No autograd, no BPTT.
+`S_t` with its `eta_t` momentum is literally an eligibility trace over
+surprise, which is the same object the Bend proof
+(`bend_proofs/synaptic_hold_bptt_approximation`) is about.
+
+**Structural finding en route, worth keeping**: eq 11 derives `k_t`
+AND `v_t` from the *same* `x_t`, so feeding a key token stores
+key->key and recall is exactly 0.000. The LMM is NOT a standalone
+associative memory over raw tokens. In a real Titans `x_t` is a hidden
+state that has *already attended over context*, so the attention Core
+does the key/value binding and the memory only stores it. This is why
+Titans is a hybrid and why MAC (memory-as-context) wins on NIAH. Added
+`write_kv`/`read_q` to isolate the memory update from that binding
+problem. An earlier symptom of the same confusion: untrained gates give
+`alpha ~= sigmoid(0) ~= 0.5`, halving memory every step
+(`0.5^32 ~= 2e-10`) and landing *below* chance.
+
+**GATE A -- PASSED.** Explicit (k,v) pairs, chance 0.031: 1.0000 at 1
+and 4 pairs with no gap, 0.9975 across gaps of 32 and 128. First
+unambiguous positive of the whole investigation, and being a
+*mechanism* validation it is immune to the seed-variance problem that
+made every RSM benchmark unmeasurable.
+
+**GATE B -- FAILED.** Their published ablation ordering is weight decay
+(forgetting) > momentum. Measured at the interference point (4 pairs,
+64 novel filler writes, 500 episodes x 3 seeds, chance 0.0156), with
+constant gates:
+
+```
+ alpha (forget)  eta=0 (no mom)   eta=0.9 (mom)
+            0.0          0.3600          0.1553
+           0.01          0.1653          0.1527
+           0.05          0.0120          0.1307
+            0.2          0.0193          0.0313
+```
+
+Best is alpha=0, eta=0 -- *both mechanisms off*. Forgetting degrades
+monotonically; momentum costs more than half the recall. Opposite of
+the paper. One real secondary effect: momentum **buffers** aggressive
+forgetting (at eta=0, alpha 0->0.1 collapses 0.360->0.013; at eta=0.9
+the same sweep only drops 0.155->0.105), consistent with the two being
+co-designed.
+
+**Why the constant-gate result is not a verdict on Titans.** A constant
+gate is a *different* mechanism, not a weaker learned one. The task
+mixes 4 must-keep pairs with 64 junk writes, so one constant alpha
+decays both at the same rate and no value of it can be right. The
+paper states the premise directly: "a data-dependent eta can control
+if memory needs to: (1) ignore the last surprise ... or (2) fully
+incorporate the last surprise." The *dependence* is the mechanism.
+
+**Recovering the dependence intrinsically** (no outer loop, no oracle,
+`adaptive_gates=True`), from statistics the memory already computes:
+
+```
+alpha_t = alpha_max * sigmoid(gamma * (||M||_F/sqrt(d) / u_target - 1))
+eta_t   = eta_max * max(0, cos(S_{t-1}, -grad_t))
+```
+
+Forgetting exists to make room, so gate it on *saturation* rather than
+elapsed time: no decay until the memory is actually full. Momentum
+helps while surprise persists and hurts on a transient spike, so the
+trace accumulates only while the new gradient agrees with it, and
+self-resets on a direction change.
+
+Plus a rule the paper does not have: **retrieval-gated forgetting**.
+Against iid random junk NO intrinsic signal separates "novel junk" from
+"novel important" -- both are unrelatable noise. What *is* separable is
+recurrence and retrieval traffic: a direction that gets *read* is
+demonstrably worth keeping. So decay column j of M in inverse
+proportion to how much it has been queried. Queries come from the input
+stream, so this is environment-supplied, not an oracle label on which
+keys matter. (Their alpha is input-driven only, never read-driven.)
+
+Results, `scripts/prototype_titans_adaptive_gates.py`, 500 eps x 3
+seeds, chance 0.0156:
+
+```
+                          arm      novel  repeated  novel+rd   stale  <alpha>  <eta>
+         const best (a=0,e=0)     0.2247    0.9997    0.2247  0.9798   0.0000  0.0000
+ const paper-ish (a=.01,e=.9)     0.1147    0.1120    0.1147  0.0110   0.0100  0.9000
+               adaptive gates     0.1448    0.9997    0.1448  0.9728   0.0062  0.0031
+      adaptive, alpha_max=0.3     0.0925    0.9993    0.0925  0.9670   0.0118  0.0030
+   adaptive + retrieval-gated     0.0925    0.9993    0.1262  0.9670   0.0118  0.0030
+ retrieval-gated only (a=.05)     0.0187    0.0558    0.0277  0.8783   0.0500  0.0000
+```
+
+**(1) Redundancy is the whole capacity story.** 64 *repeated* filler
+writes are essentially FREE (0.9997); 64 *novel* ones cost 4x
+(0.2247). Capacity pressure is a property of whether the encoder has
+learned to collapse redundancy, not of the memory rule -- "novel" lives
+in the *representation*, not the input. A trained encoder maps
+semantically-redundant content to nearby keys, so writes collide and
+overwrite instead of each claiming fresh directions. These two columns
+bracket trained vs untrained; 0.163/0.2247 is the *untrained-encoder
+floor*, not Titans' capacity. (This is the user's bird-at-window
+intuition, confirmed quantitatively: ~99% of a video's frames are
+near-identical and should cost almost nothing to hold.)
+
+**(2) eta adaptation works in the sense that matters**: mean eta =
+0.003. The agreement rule *rediscovers* eta~=0 on iid junk, which the
+constant grid needed 14 cells to find. Consecutive random gradients are
+near-orthogonal, so it correctly refuses to accumulate a trace over
+noise. That is the non-oracle property we wanted -- it lands on the
+right value without being told the data.
+
+**(3) alpha adaptation fails, and the reason is general**: saturation
+tells you there is *no room*; it never tells you *what to evict*. Mean
+alpha of 0.006 still costs 8 recall points, because when ||M|| crosses
+the budget the decay lands on the 4 pairs and the 64 junk writes alike.
+
+**(4) Retrieval gating works once it has signal.** With reads
+interleaved into the filler phase, 0.0925 -> 0.1262 (+36% relative),
+and 0.0187 -> 0.0277 (+48%) for the isolated rule -- while the
+non-gated arms are *bit-identical* under the same added reads, so the
+gain is the rule and not the reads. Methodological note: in the
+original design all reads happened *after* all writes, so `read_usage`
+was identically zero through the write phase and the gating degenerated
+to uniform decay. The two arms coming out bit-identical was the tell
+that the hypothesis had gone untested, not that it had failed.
+
+**(5) The stale-content column, a wrong prediction worth recording.**
+Predicted forgetting must win once old content goes obsolete (16 pairs
+written, only the last 4 probed), since the main task cannot *possibly*
+reward eviction -- every pair there is wanted at the final probe. It
+still lost: 0.9798 with no forgetting vs 0.9670 with it. Reason: **a
+delta rule already carries implicit recency.** Each write overwrites
+the directions it touches, so recent pairs dominate the readout
+automatically and old content fades with nobody decaying it. Explicit
+alpha is *redundant with the update rule itself*, which is why it can
+only subtract.
+
+**Verdict across 4 regimes x 6 arms: no setting of forgetting or
+momentum beats having neither.** Momentum is the worse of the two,
+catastrophic in the stale column (0.0110, at chance). Best everywhere
+is plain delta-rule storage.
+
+**Two remaining infidelities, ranked** -- this is a verdict on *this
+port in this harness*, not on Titans:
+1. **Linear memory instead of deep.** "Deep > linear" is one of their
+   own ablation findings, and this is exactly where it could bite: an
+   MLP memory has *no* implicit recency, so alpha would finally have
+   something to buy. Lead hypothesis.
+2. **Scale.** 68 writes per episode vs millions of tokens; ||M||
+   divergence may only become a real problem over far longer streams,
+   which is also the only regime where a saturation-driven alpha has
+   room to act.
+
+Outer-loop learning of `W_K`/`W_V`/`W_Q` and the gate projections is a
+third difference, but note Gate A passes with *random frozen*
+projections, so the memory update itself does not need it.
+
+## 2026-11-12 (later still) -- RETRACTION: both Titans gates are
+## positive, each in its own regime. Two confounds, now proved.
+
+**Retracting the previous entry's momentum verdict.** It said "no setting
+of forgetting or momentum beats having neither." That was wrong, and
+wrong twice over for the same reason: changing two things and crediting
+one (`feedback_do_science_correctly`). Both confounds are now machine-
+checked in `sili__new/bend_proofs/titans_gate_retention_kernel`.
+
+**The object.** Unrolling eqs 10/13 with `b = 1 - alpha` gives
+`M_T = -theta * SUM_i w(T-i) g_i` with
+`w(n) = SUM_{u=0..n} b^(n-u) eta^u`. The whole temporal behaviour of the
+gate pair is one kernel `w`: the weight on a gradient written `n` ticks
+ago. Verified against the real update to ~1e-16 relative error before
+proving anything about it.
+
+**Confound 1, hidden learning rate (Bend Law 3).** At `alpha=0` the
+kernel is exactly the geometric sum in `eta`, total mass `1/(1-eta)`. So
+`eta` multiplies the EFFECTIVE STEP, and comparing `eta` at fixed `theta`
+compares learning rates, not momenta -- 20x at `eta=0.95`. The high-`eta`
+cells were not learning, they were diverging: `||M||` reached 11093 and
+end-of-stream surprise 19.2 against 1.16 at `eta=0`. Holding
+`theta*(1-eta)` fixed REVERSES the sign:
+
+```
+matrix L=1, alpha=0   eta 0.0/0.5/0.9/0.95 -> 0.2261/0.2400/0.3972/0.7400
+deep   L=2, alpha=0   eta 0.0/0.5/0.9/0.95 -> 0.0881/0.0953/0.1350/0.2783
+```
+
+**Confound 2, write position (Bend Law 4).** At `alpha=0` the kernel is
+non-decreasing in age, increment exactly `eta^(n+1)`: momentum alone is a
+low-pass filter weighting OLD writes more, so `alpha` is the pair's only
+source of recency bias. The task wrote its probed pairs FIRST, handing
+momentum free credit. Fixed by scattering probes uniformly
+(`scripts/prototype_titans_gate_regimes.py`), keeping first/last as
+controls. Note the three orders are NOT three samples of one quantity: a
+pair at position `p` has `T-p` subsequent interfering writes (~64 first,
+~2 last, ~34 random), so `random` can exceed both controls.
+
+```
+ alpha   eta    RANDOM     first      last
+   0.0   0.0    0.6650    0.2258    1.0000
+   0.0   0.9    0.7925    0.3983    0.3865
+   0.0  0.95    0.8706    0.7475    0.1192
+  0.01   0.9    0.7152    0.1819    0.5031
+   0.1   0.9    0.4198    0.0144    0.8785
+```
+
+**Both gates are positive, each in its own regime.** Momentum survives
+the position-neutral test (0.665 -> 0.871, +31%), and the controls show
+the mechanism: at `eta=0` the memory is sharply recency-biased (first
+0.23, last 1.00) and momentum BROADENS that profile. Forgetting more than
+doubles recall when probes are recent (`last` column, 0.387 -> 0.879)
+while hurting monotonically when probes are uniform. So the two trade off
+along the TEMPORAL axis -- momentum broadens, decay sharpens -- and that
+explains the paper's published ordering (weight decay > momentum, their
+Table 5): language modelling is heavily recency-weighted, the regime
+where decay dominates. A single-regime sweep will always call one of them
+harmful.
+
+**Also retracted: the adaptive-eta rule.** The cosine-agreement rule
+selected `eta ~ 0.003` and I called that a success for "rediscovering
+eta~=0 without a sweep". But `eta~=0` was only right INSIDE the broken
+measurement; the true optimum is 0.95, so the rule lands at the opposite
+end of the range. Refusing to accumulate a trace over near-orthogonal
+gradients is exactly the wrong instinct -- broadening retention across
+uncorrelated writes is what momentum is FOR.
+
+**What replaced it.** `lag_adaptive` sets the gates from how far back the
+stream's own queries reach (matching each query against the keys the
+stream wrote; the lag of the best match drives `eta` up and `alpha`
+down). One config, told nothing about the regime, matches the per-regime
+best constant within 1%:
+
+```
+ order    adaptive(h=16)  best const  lag_ema   eta*   alpha*
+ random      0.8623         0.8706      32.9    0.95   0.00
+ first       0.7410         0.7475      65.5    0.95   0.00
+ last        1.0000         1.0000       1.47   0.03   0.097
+```
+
+Not degenerate -- it discriminates the recent-probe regime rather than
+always picking high `eta`. Caveat: `lag_horizon=16` was found by
+sweeping, so one tuned knob replaced two.
+
+**Bend Law 2, the main theorem, constrains what a controller should do.**
+`w(b,eta,n) == w(eta,b,n)`: the retention kernel is SYMMETRIC in
+`1-alpha` and `eta`. The two gates are the same knob for temporal
+profile, contributing ONE effective degree of freedom, not two. So a
+controller should sense one quantity (retrieval depth) and spend it on
+the pair jointly. Open: Law 2 is for the linearized kernel, and the real
+`g_i` depends on `M`, so whether the measured asymmetry is fully
+explained by that nonlinearity plus the current-write term is unsettled.
+
+**Also from the paper (their Table 5, 400M params / 15B tokens).** Our
+matrix memory IS their "Linear Memory" ablation row, which costs 7.34
+long-context points (92.68 -> 85.34), the largest single drop in that
+column and ~tied with removing weight decay (85.60). Their base memory is
+an MLP with `L_M >= 2`. So the earlier gate sweep stacked one ablation on
+another. `TitansDeepMemory` now ports the deep form; the normalized
+delta-rule step generalizes exactly as `th = 2||err||^2/||g||^2` summed
+over layers, which reduces to `0.5/||k||^2` at L=1 (verified: residual
+0.00000, theta 0.5000, i.e. it reproduces the validated matrix path).
+Deep memory is NOT a one-shot store -- one Gauss-Newton step cannot fit a
+nonlinear map -- but that does not hurt recall@1 over a value pool.
+
+**Standing lesson, now three for three.** Every confound in this
+investigation was "changed two things, credited one": RSM's schedule
+(backward/opt-step count per arm), momentum's learning-rate coupling, and
+probed-content write position. Before reporting ANY arm comparison here,
+enumerate what else moves with the flag -- step size, update count, write
+order.
+
+## 2026-11-12 (later) -- a KNOB-FREE gate rule, derived from the kernel
+## proof, with 3.4x lower worst-case regret than the best constant
+
+Goal stated directly: use proofs to find a system that needs no
+hyperparameter, or at least adapts well over a very large range, instead
+of tuning finicky constants. This is the first worked instance.
+
+**Correction to the previous entry.** It claimed Law 2 means the gates are
+"one effective degree of freedom". Wrong. `w` is the complete homogeneous
+symmetric polynomial `h_n(b, eta)`, so it depends on the gates only
+through their SYMMETRIC FUNCTIONS: they are INTERCHANGEABLE but NOT
+REDUNDANT -- 2 DOF with the labeling removed, not 1. Check: `b=1,
+eta=0.95` is equivalent to `b=0.95, eta=1`, i.e. `alpha=0.05` *with*
+`eta=1`, not `alpha=0.05` with `eta=0`. So the big measured gap between
+those two settings is real and consistent with Law 2.
+
+That correction is what opened the route, because it pointed at the
+DIAGONAL `b = eta`, which the wrong reading would have dismissed as
+redundant.
+
+**Bend Law 5** (`kernel_diagonal`, now checked): `w(b,b,n) == (n+1) b^n`.
+The only setting with an INTERIOR PEAK -- either gate alone merely rises
+and saturates (Law 4) or merely decays, so neither can express "weight
+writes of age ~L most heavily". The diagonal peaks at
+`n* = -1/ln b - 1 ~= 1/(1-b)`, which makes it INVERTIBLE against a
+measured lag `L`. Verified numerically: closed form matches to 1e-15 and
+`argmax_n` lands at `L` for L in {2,4,8,16,32,64}.
+
+**The derived rule** (`kernel_matched=True`), zero knobs:
+```
+eta   = 1 - 1/L        peak at the measured retrieval lag
+theta *= (1 - eta)     cancel Law 3's TRACE mass only
+alpha = 0              (see caveat)
+```
+`L` is the mean age of the writes the stream's own queries land on, so
+every term is measured, not tuned.
+
+**Results.** vs the per-regime TUNED constant:
+```
+ order    zero-knob   best tuned      L    eta*
+ random     0.8639      0.8706     33.3   0.971
+ first      0.9803      0.7475     65.5   0.985   <- beats the tuned ref
+ last       1.0000      1.0000      1.47  0.322
+```
+Generalization across a 32x range of filler gap, the real test:
+```
+  gap     L   eta*  ZERO-KNOB  eta=0.0  eta=0.7  eta=0.9  eta=.95  eta=.99
+    8   5.6  0.820    0.9761   1.0000   0.9961   0.9428   0.9078   0.8817
+   16   8.9  0.888    0.9478   0.9928   0.9889   0.9361   0.8878   0.8372
+   32  16.9  0.939    0.9100   0.9250   0.9561   0.9456   0.8989   0.8100
+   64  35.0  0.972    0.8522   0.6461   0.6794   0.7894   0.8689   0.7750
+  128  64.3  0.985    0.6939   0.3661   0.3894   0.4361   0.5133   0.7128
+  256  89.8  0.989    0.3539   0.2011   0.2139   0.2350   0.2550   0.3739
+  WORST REGRET        0.0461   0.3467   0.3233   0.2767   0.1994   0.1556
+```
+**3.4x lower worst-case regret than the best fixed eta, 7.5x lower than
+eta=0**, tracking `eta*` from 0.820 to 0.989 unaided. Every fixed value is
+excellent at one end of the range and poor at the other.
+
+**Why the predecessor knob was finicky, and why this one is not.** The
+`lag_horizon` controller used `eta = eta_max * clip(L/horizon)`, and
+horizon 16 -> 48 swung recall 0.86 -> 0.45. Law 3 makes `1/(1-eta)` a TIME
+CONSTANT, so all the dynamic range sits near `eta = 1` and a LINEAR map
+into it is badly conditioned by construction. `eta = 1 - 1/L` is the
+correctly conditioned inverse, which removed the knob and the sensitivity
+together. General lesson: the proof supplies the units the knob should
+have been measured in, and in those units there is no knob.
+
+**Caveat, an honest limit of Law 5.** `alpha = 1/L` -- the actual diagonal
+-- measured WORSE than `alpha = 0` (0.8269 vs 0.8639 uniform; 0.8550 vs
+1.0000 recent-probe). Nothing in these tasks becomes obsolete, so
+sharpening toward recent can only discard something still wanted. Law 5's
+role is to supply the INVERTIBLE FORM, not to assert the diagonal is the
+right operating point; `alpha` has to be earned by measured obsolescence,
+which this harness does not provide.
+
+**A bug worth recording, because it was confound 1 recurring in new
+code.** The first `kernel_matched` run scored 0.0258 vs 0.8706 and I
+diagnosed it as the theta normalization. That diagnosis was WRONG. A
+`str.replace` patch had silently failed to match its anchor, so the theta
+scaling never applied at all: theta stayed at exactly 0.5 while eta rose
+to 0.97, amplifying the effective step 34x and diverging the memory to
+||M|| = 11774. The tell was there in the trace (constant theta, ||M|| in
+the thousands) and is the exact signature already characterized earlier
+the same day. Two process fixes: ASSERT that a scripted patch matched
+before trusting it, and when two implementations of one rule disagree by
+30x, debug the discrepancy before diagnosing the mechanism.
+
+Separately corrected: `theta` cancels only the TRACE mass `1/(1-eta)`
+(Law 3). `alpha` attenuates already-stored content -- retention shape, not
+step magnitude -- so cancelling the full kernel mass
+`1/((1-b)(1-eta))` conflates the two.
+
+## 2026-11-12 (later) -- the r_target_min cliff explained: it is where
+## kept-k falls below the gradient's effective rank
+
+Applying the derive-don't-tune method to the second knob
+(project_sparsity_floor_generalization_scoping: `r_target_min` is
+hand-tuned and needs to scale with model size). Probe:
+`scripts/probe_sparsity_floor_participation_ratio.py`.
+
+**Why the knob has no natural scale.** Nucleus selection keeps the
+smallest top-|v| set with `R(v,k) = sum(v_topk^2)/sum(v^2) >= r_target`,
+so k is a CONSEQUENCE of r_target and the row's spectrum. An energy
+FRACTION is therefore scale-free in the wrong way: across iid gaussian,
+laplace, power-law and lognormal rows at fixed width, the effectively-
+active fraction spans 0.001 to 0.39 -- a 400x range -- while r_target is
+one number.
+
+**The scale-free quantity is the participation ratio**
+`PR(v) = (sum v^2)^2 / sum v^4`, the effective number of active
+components. It is exact on the only unambiguous case: for m equal nonzero
+entries PR = m exactly and the top-m capture R = 1.0, while ANY
+r_target < 1 under-selects and deletes live directions. First check was
+whether `R(v, PR(v))` is a universal constant one could just adopt -- it
+is NOT (0.59 to 1.00 across distributions), so the answer is not a better
+r_target but NO r_target: set k = PR(v) per row, measured.
+
+**Measured on real accumulated gradients, three widths:**
+```
+     layer    PR/n@96  PR/n@192  PR/n@288   r_tgt=0.5 keeps (288)
+input_proj     0.849     0.821     0.342          0.129
+    q_proj     0.544     0.524     0.504          0.191
+    k_proj     0.522     0.537     0.513          0.188
+    v_proj     0.757     0.624     0.262          0.097
+    o_proj     0.715     0.717     0.346          0.125
+```
+1. **PR/n differs 1.6-2.0x BETWEEN LAYERS at every width**, so one shared
+   constant is necessarily wrong for some of them.
+2. **PR/n is not width-invariant**: input_proj 0.85 -> 0.82 -> 0.34 and
+   v_proj 0.76 -> 0.62 -> 0.26 as width grows, while q/k hold near 0.51.
+   That IS the "floor must scale with model size" problem, and PR measures
+   it rather than guessing.
+3. **r_target=0.5 keeps 10-19% where PR says 26-51% are active**, i.e. it
+   discards half to two thirds of the live directions. That is a mechanism
+   for a CLIFF rather than a gradual tradeoff: past some point the
+   selection deletes genuinely active directions instead of trimming
+   noise. The setpoint that keeps all of them, `R(v,PR) ~= 0.79-0.84`,
+   sits safely above the observed 0.5-0.6 cliff -- consistent with 0.5
+   failing and 0.6+ working.
+
+**Honest scope, stated before anyone builds on this.**
+`neuron_grad_accum` is gradient ACCUMULATED over steps, so this measures
+which neurons receive gradient, not the per-step dy spectrum the kernel
+actually selects on. And it is a 120-step probe on a small model, not the
+100k-step wide-288 run where the cliff was measured. So this EXPLAINS and
+PREDICTS the cliff; it does not establish that k = PR fixes it. Owed: wire
+r_target per layer from measured PR (EMA'd, since it is per-row per-step)
+and re-run the wide curriculum against the hand-tuned baseline.
+
+Natural Bend law for this one, not yet written: for m equal nonzero
+entries, `(sum v^2)^2 == m * (sum v^4)` -- PR = m without needing
+division, provable over Nat by induction on m, confirming PR is exact on
+the case where the answer is unambiguous.
+
+## 2026-11-13 -- the trace arm was never wired: two comparison runs
+## measured the control twice
+
+`TitansMAC.apply_trace_credit()` existed, was documented as "called by the
+trainer after backward", and **was never called**. So the `trace` arm was
+functionally identical to `frozen`: `W_K_mem`/`W_V_mem` stayed frozen in
+every arm and the accumulated eligibility traces were never used for
+anything.
+
+Cost: the 3-arm run (2h) and the 8-seed follow-up (80min) both measured
+the control twice. I was one message away from reporting "Titans
+recurrence does not learn to use its memory" on that basis. The 0/8
+"did not fire" result says nothing whatever about the credit rule.
+
+**Why the existing safeguard missed it.** There IS an assert that every
+parameter receives gradient. But `W_K_mem`/`W_V_mem` are numpy, not
+Tensors -- deliberately outside autograd, because that is exactly what
+keeps the backward O(1). *The design choice that buys constant-time
+credit is the same one that hid the missing wiring.* An autograd-based
+check structurally cannot see the one parameter group whose whole point
+is to live outside autograd.
+
+**Structural fix, so it cannot recur**: each arm now records
+`max|dW_K|` over training and the run FAILS if `trace`'s write side never
+moved, or if `none`/`frozen`'s write side did. Verified frozen 0.00e+00
+vs trace 9.74e-02. The general lesson is that "every arm must be
+DISTINGUISHABLE at runtime" needs its own assertion -- it does not follow
+from the flags being different, and three of this investigation's
+confounds were arms that differed less (or more) than intended.
+
+**What the earlier 0.3042 was.** One seed of three in a frozen-equivalent
+arm, i.e. noise. Not reproducible: 0/8 fresh seeds exceeded 0.20, mean
+title 0.1265 against chance 0.125. Also worth keeping: seed 2004 scored
+page 0.3102 where every other seed reached 0.90+, so that arm
+occasionally destabilised in-context training too -- though with the
+write side frozen, that instability cannot be attributed to the credit
+rule either.
+
+**What DID survive from those runs** (they were valid measurements of
+`none` and `frozen`, just not of `trace`):
+  * **In-context is not harmed by adding the memory**: page 0.9263
+    (none) vs 0.9294 (frozen), inside se ~= 0.010. The original
+    engineering criterion holds.
+  * **The control does NOT leak**: title 0.1164 against chance 0.1250,
+    slightly below. The earlier 0.1467 suspicion was eval noise, as the
+    larger eval set confirmed.
+  * **`frozen` gives no recurrent benefit at all** (0.1169 vs 0.1164).
+    A trained read side over a random write side stores nothing useful,
+    so the write side genuinely needs credit. Gate A's random-projection
+    result does not carry here.
+
+**The credit rule now wired is HEURISTIC and labelled as such.** The
+principled form is `dL/dW_K = SUM_t (dL/dM_t) . (dM_t/dW_K)`, with
+`dL/dM = outer(g, q)` at the read and `dM/dW_K` following from
+`k = h W_K` through the delta-rule write; the trace is meant to stand in
+for the accumulated `dM_t/dW_K`. What is implemented is a trace-weighted
+step whose magnitude tracks how hard the read pulls on `M` and whose
+direction is just the trace. That tests whether trace-shaped credit helps
+at all; it does NOT test the e-prop approximation. Deriving the real
+contraction, and bounding its error the way
+`bend_proofs/synaptic_hold_bptt_approximation` bounds the generic case,
+is owed before any positive result here is called an e-prop result.
+
+## 2026-11-13 (later) -- write-side credit: four attempts, all at chance.
+## Stopping on the mechanism; the task is now the suspect.
+
+Four attempts at making the Titans write side (`W_K`/`W_V`) learn, each
+fixing a real and distinct defect in the previous one:
+
+| attempt            | max abs dW_K | title    | in-context |
+|--------------------|--------------|----------|------------|
+| never wired        | 0            | chance   | fine       |
+| heuristic drift    | 5.4e-01      | chance   | fine       |
+| derived + clip     | 9.3e-04      | chance   | fine       |
+| derived + Adam     | 1.2e+00      | chance   | DESTROYED  |
+
+(chance title = 0.1250; control 0.1187-0.1217; all four arms 0.10-0.13.)
+
+**This is not a step-size problem.** Title never leaves chance across
+three orders of magnitude of write-side movement, and the largest
+movement actively destroyed in-context accuracy (0.2191 vs 0.8831
+control). So the credit DIRECTION is not useful on this task. Stopping
+here deliberately: a fifth mechanism fix would be fitting the method to
+a hoped-for answer, which is the exact failure mode this investigation
+kept correcting.
+
+**The Adam attempt was architecturally wrong anyway** (user correction).
+sili's core layers carry ONE optimizer state variable (importance), not
+Adam's two, specifically so the state fits the memory budget -- that is
+the same 2xFP4 = 1 byte/synapse accounting the Qwen sizing depends on.
+Adam's m and v would make it four values per synapse. So even a
+SUCCESSFUL Adam result would have been unshippable. **Any real write-side
+credit rule must be single-state, importance-style**, like
+[[feedback-importance-is-already-the-optimizer]] already says for
+DISLDOLayer. Recorded as a hard design constraint, not retried here.
+
+**The derivation itself still looks right** and should be kept. With
+`dL/dM = outer(g, q)` at the read and `M` accumulating
+`-2 theta_s err_s k_s^T` per write, holding `err_s` fixed (the e-prop
+approximation):
+```
+dL/dW_K = -2 SUM_s theta_s (err_s . g) h_s (x) q   => trace = h (x) err
+dL/dW_V = +2 SUM_s theta_s (k_s . q)   h_s (x) g   => trace = h (x) k
+```
+Two earlier bugs this exposed and fixed: the `W_K` trace had stored
+`h (x) k` (wrong quantity), and the `g`/`q` contraction -- where all the
+DIRECTION lives -- was missing entirely, leaving a monotone drift.
+
+**Why the TASK is now the suspect.** Retrieval here requires matching a
+query derived from the `Q_TITLE` token's hidden state against a key
+derived from the TITLE token's hidden state. Those are different tokens,
+so the memory must learn a CROSS-TOKEN key/query alignment inside a
+single 32x32 matrix, using one delta-rule step per write. That is a much
+harder ask than storing and retrieving the same cue, and it may simply
+exceed this verification scale.
+
+**Next experiment (do this before any more mechanism work)**: a task
+where the CUE IS THE WRITTEN TOKEN, so key and query align by
+construction. That isolates "does trace credit make the write side
+useful" from "can it also learn an alignment". If credit works there and
+not here, the alignment is the barrier and the fix is architectural (e.g.
+a learned query/key tie, or writing the cue rather than the content). If
+it fails there too, the credit rule is wrong and the derivation needs
+checking against a finite-difference gradient -- which, note, is the one
+check never run on it.
+
+**What stands regardless** (all measured, none affected by the above):
+  * in-context accuracy is NOT harmed by adding the memory -- 0.9344
+    (none) vs 0.9244 (trace), inside se ~= 0.010;
+  * the control does NOT leak -- title 0.1217 vs 0.1250 chance;
+  * per-step backward cost is FLAT across a 512-step horizon
+    (3.48/3.40/2.88/3.15/3.62 ms at lengths 32-512), so the O(1) property
+    the real-time goal needs is real;
+  * `frozen` gives no recurrent benefit (0.1169 vs 0.1164), so the write
+    side genuinely needs credit and Gate A's random-projection result
+    does not carry here.
+
+## 2026-11-13 (later) -- finite-difference check: the derived write-side
+## gradient is WRONG. Retracting "the derivation looks right".
+
+Ran the one check never run on it, and it is decisive:
+
+```
+ trace_beta  cos(analytic, finite-diff)   |analytic|/|FD|
+        0.9                     -0.2526             0.000
+        1.0                     +0.1313             0.000
+```
+
+**cos ~ 0.13 at best, and NEGATIVE (-0.25) at beta=0.9** -- the analytic
+"gradient" is near-orthogonal to the true one and partly points UPHILL,
+with a magnitude ratio of ~0. That single measurement explains all four
+failed credit attempts at once: the direction was wrong, so no step size
+and no optimizer could have fixed it. **Retracts this JOURNAL's earlier
+claim that "the derivation itself still looks right".**
+
+Cost of not checking first: ~5 hours of compute across four credit
+variants, plus a task redesign, all chasing a direction that carries no
+signal. A 10-minute finite-difference check up front would have
+prevented every one of those runs. **New standing rule: any hand-derived
+gradient gets an FD check BEFORE it is used to train anything.**
+
+**The task redesign was still worth it and is independently confirmed
+good.** On long-term-only MQAR -- one pair, cue = the written token, blank
+gap, memory the only path -- `none` 0.0950, `frozen` 0.0850, `trace`
+0.0875 against chance 0.0833. So the earlier failures were NOT the
+cross-token alignment I had blamed; even the most favourable possible
+task gives chance, which correctly localises the fault to the credit
+rule. The instrument is sound and should be kept.
+
+**Two candidate causes, both unverified:**
+1. The approximation that drops `d err_s/dW_K`. `err_s = M_{s-1} k_s -
+   v_s` depends on `k_s = h_s W_K` directly, AND `M_{s-1}` depends on
+   every earlier `W_K`. Holding `err` fixed is the e-prop step, but here
+   it may be the dominant term rather than a correction.
+2. **The memory writes UNCONDITIONALLY at every tick, including all 16
+   blanks after the pair.** There is no surprise gate: alpha=eta=0 and
+   theta is constant, so each blank tick runs a full delta-rule write.
+   Even a correct gradient would be fighting 16 overwrites. This is
+   exactly the problem the RSM/surprise-gating work was about -- do not
+   write when nothing happened -- and it is absent from this port.
+
+**Next, in this order (cheap first, and no training until the gradient
+passes FD):**
+  a. Re-derive with the `d err/dW_K` term included; FD-check it.
+  b. If that passes, add a surprise gate to the write so blanks do not
+     overwrite, then FD-check again (the gate changes the gradient).
+  c. Only then train.
+
+**Unchanged and still standing**: in-context unharmed by the memory,
+control does not leak, per-step backward flat across a 512-step horizon,
+`frozen` establishes the write side needs credit, and the new long-term
+MQAR instrument with its two assertions.
+
+## 2026-11-13 (later) -- the surprise gate does NOT fix the gradient; the
+## formula drops dominant terms. Hand-derivation has failed twice.
+
+Tested the prediction from `all_inactive_is_exact` that the trace gradient
+should become accurate as active ticks vanish:
+
+```
+ write_gate   active  cos(analytic, FD)  |analytic|/|FD|
+       None     100%            -0.0576           0.0000
+       0.05      74%            -0.1875           0.0000
+        0.2      32%            -0.0912           0.0000
+        0.5      26%            +0.1293           0.0000
+```
+
+**Not confirmed.** cos stays near zero at every activity level, so the gate
+is not the problem. `|an|/|FD| ~ 0.0000` throughout is the diagnostic: the
+TRUE gradient is orders of magnitude larger than the analytic one, i.e. a
+small sub-term was kept and the dominant ones dropped.
+
+**What was dropped, now identified precisely.** With `k_s = h_s W_K`,
+`err_s = M_{s-1} k_s - v_s`, `theta_s = mem_lr/(k_s.k_s)`:
+ 1. `d err_s/dW_K` includes `M_{s-1}[:,b] h_s[a]` -- O(||M||), and it GROWS
+    as the memory fills. Omitted entirely.
+ 2. `d theta_s/dW_K = -2 mem_lr k_s[b] h_s[a] / ||k_s||^4` -- O(1). theta
+    was treated as a constant; it is not, it is `0.5/||k||^2` and so depends
+    on W_K directly.
+ 3. the recursion `d M_{s-1}/dW_K` -- the term e-prop is MEANT to
+    approximate, and the only one that was actually modelled.
+
+So the "derivation" kept (3)'s approximation and silently assumed (1) and
+(2) away. The gate cannot rescue that, because (1) and (2) are not
+Jacobian-product terms at all.
+
+**Note the gate is still probably wanted for other reasons** (not writing
+on uninformative ticks is the RSM/surprise idea, and it does cut writes
+from 100% to 26% here) -- it is just not the fix for this bug.
+
+**DECISION POINT, for the user.** Hand-deriving this has now failed twice,
+and the goal was never e-prop specifically -- it was CONSTANT-TIME
+backprop for real-time use. Options:
+  (A) **Truncated BPTT over a fixed k-step window.** Cost O(k) per step,
+      therefore O(1) in the horizon, and the gradient is CORRECT (merely
+      truncated) because autograd computes it instead of me deriving it.
+      Achieves the actual goal without a hand-derived approximation.
+      Downside: keeps k steps of graph, so memory is O(k) not O(1), and it
+      cannot capture dependencies longer than k without the e-prop trick.
+  (B) **Derive the full e-prop rule properly**, including terms (1) and (2),
+      with symbolic verification (sympy, or Bend) rather than by hand, then
+      FD-check. Higher effort, and the payoff over (A) is only for
+      dependencies longer than k.
+  (C) Keep the memory write ungradient-ed (the `frozen` arm) and accept
+      that the memory stores whatever random projections give. Already
+      measured: no recurrent benefit, so this is not viable alone.
+
+Recommendation: (A) first, because it is the shortest path to a VERIFIED
+constant-time gradient, and it gives a correct-gradient baseline that any
+later e-prop rule from (B) must match. Without such a baseline there is no
+way to tell an approximation error from an implementation error -- which is
+exactly the hole the last two days fell into.
+
+## 2026-11-13 -- design: forward-accumulated blame with a replay buffer
+## (user proposal), and why autograd should compute it
+
+Plain truncated BPTT cuts the gradient dead at k steps. Shared weights
+still make it useful -- `W_K` is the SAME matrix at every tick, so a write
+rule credited inside the window governs writes at ANY distance, and the
+persistent state carries content forward indefinitely. Reach is infinite
+through the STATE, not through the gradient path. But it cannot learn a
+dependency that only ever appears at range > k, because no example of it
+ever receives credit.
+
+**User's proposal, which is stronger.** Save states as needed and
+construct a synthetic aggregate: if 500 writes have run and step 501 has
+a strong use for that memory, backprop ONCE into the "fake combined
+state" -- the accumulated blame of the whole history. Valid because the
+writing layer changes slowly, so blame computed against saved states is
+still approximately right. That quasi-stationarity assumption is exactly
+e-prop's, with one decisive practical difference:
+
+**AUTOGRAD computes it instead of me deriving it.** Implementation shape:
+keep a bounded buffer of the `h_s` for past writes; when a strong
+gradient arrives, replay those saved writes as a short synthetic sequence
+and backprop through it. Cost O(buffer), i.e. O(1) in the horizon, and
+the gradient within the replayed set is EXACT rather than a dropped-term
+approximation. Two hand-derivations already failed (JOURNAL above); this
+route removes the step that keeps going wrong.
+
+**The surprise gate becomes load-bearing again, for a new reason**: it
+decides WHAT IS WORTH SAVING. Only writes that pass the gate enter the
+buffer, so the replay set stays small while spanning unbounded age. The
+gate stops being a performance tweak and becomes the buffer's admission
+policy.
+
+**THE DISCRIMINATING TEST -- CORRECTED (user, 2026-11-13).** My first
+version asked "can TBPTT at k < gap learn at all?" and treated failure as
+the negative control. That is WRONG: k < gap very likely learns
+eventually, just slowly, because the write rule still receives credit from
+writes INSIDE the window and transfers via shared weights, plus random
+drift. A binary pass/fail discriminator would therefore be worthless, and
+endpoint accuracy at a fixed episode count would be actively misleading --
+it would report wherever each arm happened to sit on its own curve.
+
+So the claim must be about **SAMPLE EFFICIENCY or ASYMPTOTE**, measured as
+a LEARNING CURVE:
+  * metric: EPISODES-TO-THRESHOLD (e.g. first episode at which eval
+    exceeds 2x chance, and again at 50%), plus the final asymptote.
+  * TBPTT at k < gap is the baseline to BEAT, not a control expected to
+    fail.
+  * replay must learn FASTER or reach HIGHER. "Also eventually learns" is
+    not a result.
+Cost consequence: learning speed is noisy, so this needs several seeds AND
+runs long enough for the slow path to actually get there -- which may mean
+deliberately shrinking the task (fewer keys/values, shorter gap) so the
+slow baseline completes in affordable time. Size that before launching,
+rather than discovering it after hours.
+
+**Order, and nothing is skipped this time:**
+  a. EXACT-gradient baseline (`tbptt_k` >= episode length, no truncation
+     at all) on long-term MQAR. Establishes the architecture CAN express
+     the task and that only credit was ever broken. RUNNING.
+  b. Truncate to k < gap and MEASURE ITS LEARNING CURVE (episodes-to-
+     threshold, multi-seed). This is the baseline to beat, not a control
+     expected to fail.
+  c. Add the replay buffer + synthetic aggregate; test at gap >> k.
+  d. Mixed-gap training to test the shared-weight transfer argument
+     separately from (c).
+
+`tbptt` mode is implemented: the write is built from Tensor ops so
+`W_K`/`W_V` are ORDINARY parameters trained by the same optimizer as
+everything else. That also dissolves the write-side optimizer question --
+no hand-derived gradient, no separate accumulator, no extra per-synapse
+state, which is what the Adam detour and the single-state rewrite were
+both working around. Verified: `W_K_t` receives gradient 1.06e-03 and all
+19 parameters are covered.
+
+## 2026-11-13 -- expressivity RULED OUT; the blocker is optimisation, and
+## the project already owns the tools for it
+
+Two confident diagnoses in a row failed to fix long-term recall: the
+credit rule (FD-confirmed wrong, fixing it did not help) and key/query
+pathway misalignment (real structural observation, moving the memory
+between layers did not help). So I stopped diagnosing and measured
+EXPRESSIVITY directly, with no training:
+
+```
+x_query (query tick):  between-key 8.83, within-key 0.0000  -> separable
+x_write (value tick):  between-key 5.73, within-key 5.89    -> ratio 0.97
+linear map x_write -> x_query:
+   MATCHING    cos 0.9824 +- 0.030
+   MISMATCHED  cos 0.3181 +- 0.277      separation 0.664
+```
+
+**Retrieval IS linearly realizable from the representations the model
+actually has**, so expressivity is not the problem and the failure is
+OPTIMISATION. The mechanism is visible in the same numbers: raw distances
+say the write-tick representation barely distinguishes keys (ratio 0.97)
+because it is dominated by the VALUE token, yet a linear map recovers the
+key cleanly. So the key signal is PRESENT BUT WEAK, extractable only by a
+projection that cancels the value component -- hard for gradient descent
+to find, which predicts slow learning rather than no learning.
+
+**User's point, and it redirects the fix.** If Adam looks "needed"
+because optimizer state is badly scaled or conditioned, that is precisely
+what the amortized neural health metrics and stochastic annealing are
+for. The project already owns: amortized importance/L2 decay,
+ci_renorm/weight_renorm, plasticity_reset, AQRS dynamic rank control, and
+energy-stochastic annealing as a TEMPERATURE for escaping stuck regions
+(and [[project-energy-sleep-annealing-finding]] already validates it
+against rank collapse). My Adam detour was reinventing a worse version of
+that stack, and it broke the 1-byte/synapse budget on the way.
+
+**Consequence for the ladder: T1 (DISLDO port) is PROMOTED onto T0's
+critical path.** All of that machinery lives on DISLDO layers, while
+TitansMAC is built on DenseTensorLinear, so the port is what makes the
+tools available at all. T0 may not be finishable without it -- which
+inverts my earlier framing of T1 as a routine post-T0 equivalence check.
+
+Still running: 40k-episode learning curves for `none` vs `tbptt`, to
+separate "slow" from "stuck" before reaching for any of the above.
+Precedent for caution: earlier today I called a 0.147 plateau a capacity
+limit and it reached 0.88 by episode 3750, so long-term recall judged at
+4000 episodes was likely premature.
+
+## 2026-11-13 -- TWO MEASUREMENT BUGS: prediction collapse, and a wrong
+## chance baseline. Every "x chance" number in this task was overstated.
+
+The 40k-episode curves are FLAT for both arms -- so "slow vs stuck"
+resolves to **stuck**, not undertraining. But the scores were IDENTICAL
+at 5 of 9 checkpoints (0.1700/0.1700, 0.0700/0.0700, 0.0700/0.0700,
+0.0750/0.0750, 0.1050/0.1050), and with a 200-episode eval the odds of
+five exact matches between independent arms are ~1e-5. That signature led
+to two real bugs:
+
+**BUG 1 -- PREDICTION COLLAPSE.**
+```
+  none: acc=0.1650  distinct predictions=3  top=[(18,146),(21,35),(17,19)]
+ tbptt: acc=0.1700  distinct predictions=1  top=[(18,200)]
+        answer distribution distinct=12
+```
+`tbptt` emits ONE token for all 200 queries. So every negative result in
+this thread was measuring a DEGENERATE OPTIMUM, not credit assignment,
+not architecture, not expressivity. Likely cause: ONE gradient signal per
+19-tick episode, at a position whose answer is unpredictable until the
+memory already works. The only accessible descent direction is "predict
+the marginal mode and ignore the input" -- a chicken-and-egg where the
+sole supervision presupposes the capability being learned.
+
+**BUG 2 -- THE CHANCE BASELINE WAS WRONG.** A collapsed model scores the
+MAX-CLASS FREQUENCY, not 1/N_VALS. And the eval set was built with a
+FRESH `default_rng(70000 + e)` per episode; sequential seeds correlate
+the first draws and inflate that frequency:
+```
+sequential per-episode seeds: max-class 34/200 = 0.1700
+            single generator: max-class 24/200 = 0.1200
+                     uniform:                  = 0.0833
+```
+So the quoted baseline was too low by 1.4-2.0x, and **every "1.0-2.0x
+chance" reported for this task was actually AT OR BELOW the
+constant-predictor baseline.** The tbptt run at 0.1700 was not slightly
+above chance; it was exactly the collapsed baseline.
+
+Both fixed in the task: `constant_predictor_baseline()` is now the quoted
+figure, `eval_episodes()` builds the set from ONE generator, and the
+self-test prints how much quoting 1/N_VALS would overstate things.
+
+**What this retracts.** Not just this thread's conclusions -- the
+*diagnoses* too. Credit rule, pathway alignment, exact gradients,
+optimizer class, surprise gate, 40k training: all were applied to a model
+sitting in a constant-output optimum, where none of them could have
+mattered. The only findings that survive are the ones that were direct
+measurements: the FD check (cos ~0.13, the rule really was wrong), the
+linear-realizability test (retrieval IS expressible), and the oracle
+delta-rule test (the primitive works, cos 1.0000).
+
+**NEXT, and it is about SUPERVISION, not mechanism.** Give the model a
+signal that does not presuppose the memory: also supervise predicting `v`
+immediately after `k` at the pair position, which is answerable IN-WINDOW
+by induction. That teaches the key->value association first, so the
+memory has something real to store before being asked to retrieve it
+across a gap. Curriculum, not credit. And re-baseline every number
+against `constant_predictor_baseline()`.
+
+## 2026-11-13 -- long-gap root cause, measured in layers. Four mechanism
+## interventions had NO effect; the write's key/value SOURCE is the issue.
+
+**Mixed-gap training settles the big question.** 50% short (pair in-window)
+/ 50% long (memory-only), 12k episodes:
+```
+--- none ---   short acc=1.0000 over=+0.8880 distinct=12
+               long  acc=0.0800 over=-0.0320 distinct=1   COLLAPSED
+--- tbptt ---  short acc=1.0000 over=+0.8880 distinct=12
+               long  acc=0.0960 over=-0.0160 distinct=1   COLLAPSED
+```
+**Short-gap is SOLVED PERFECTLY by both arms.** So the architecture, the
+optimizer, the task and 12k episodes are all fine, and the key->value
+induction circuit is fully learned. Only the memory-mediated path fails.
+
+**Four mechanism interventions, none of which moved retention** (measured
+as cos between the read at the query tick and the value that should have
+been stored):
+  * write strength `theta` swept 0.5 -> 0.01: 0.1544/0.1260/0.1246/
+    0.2374/0.1110/0.1328. No trend. **My hypothesis was wrong** -- theta
+    scales the pair's write and the blanks' writes EQUALLY, so lowering it
+    weakens storage exactly as much as it weakens interference and the
+    ratio is unchanged.
+  * surprise gate: 0.0133 -> 0.1559 at 34% writes. Helps, nowhere near
+    enough. (Also found: a threshold of 1.0 silences EVERY write including
+    the pair, since the first write has rel-surprise exactly 1.0.)
+  * retention horizon (alpha=1/L, eta=1-1/L from Law 5, oracle L=17):
+    0.1508/0.1202/0.2127/0.1881/0.1427/0.1846 across L in
+    None/4/8/17/32/64. No trend, no peak at the oracle horizon. **Found
+    en route that TitansMAC had NO alpha and NO eta at all** -- both write
+    paths hardcoded alpha=eta=0, so there had never been any horizon
+    control. Now wired from a single `mem_horizon`.
+  * tying the memory query to the key: no effect, and my reasoning for it
+    was wrong. With a single write from M=0 the delta rule gives
+    M = v k^T/(k.k), which is RANK-1 with column space spanned by v -- so
+    `M q` points along v for ANY query. Key matching is irrelevant at one
+    pair. (Verified: retrieval cos 1.0000 both tied and untied.)
+    For reference, random 32-d vectors give cos ~0 +- 0.18, so every
+    number above is essentially noise.
+
+**The isolation that actually localised it.** Suppress all writes after
+the pair:
+```
+ ticks 0-1 only (pair)   cos=+0.4226 +- 0.4311
+ ticks 0-5               cos=+0.4025 +- 0.3852
+ all ticks               cos=+0.1176 +- 0.2599
+```
+Interference is real (0.42 -> 0.12), but even with NO interference
+retention is only 0.42 +- 0.43 -- so the path does not work cleanly
+either, and the large sd means it succeeds on some episodes and fails
+completely on others.
+
+**ROOT CAUSE: each write derives KEY AND VALUE FROM THE SAME x_t.** Tick 0
+(the key token) stores key0->value0; tick 1 (the value token) stores
+key1->value1. **Neither stores "key token -> value token"**, which is what
+the task needs. Getting it requires W_K to extract the key component and
+W_V the value component from a MIXED x_1 -- learnable in principle (the
+linear-realizability test confirmed the key information is present and
+linearly extractable) but far harder than it appears, and nothing to do
+with credit assignment.
+
+This is also why eq 11 works in the paper and not here: it assumes x_t
+already carries the binding from EARLIER LAYERS. At 2 layers and 32 dims
+it does not.
+
+**Proposed next change (architectural, small, principled): let the write
+take its key and value from DIFFERENT sources** -- key from x_{t-1}, value
+from x_t -- so a consecutive (key, value) pair is stored as such by
+construction, with no component-separation to learn. That is what an
+associative memory over adjacent tokens actually needs, and it is a
+deliberate deviation from eq 11 justified by the missing depth.
+
+## 2026-11-13 -- the full information chain now HOLDS, and the remaining
+## failure is genuinely credit. Three measured links, two real fixes.
+
+Three separate things had to be true for the memory to be usable, and
+each was invisible to accuracy alone. All three are now measured:
+
+| link          | before      | after        | fix                          |
+|---------------|-------------|--------------|------------------------------|
+| retention     | 0.139       | 0.803        | key from x_{t-1} (fix A)     |
+| reachability  | 3.4e-04     | 0.969        | memory row adjacent to output|
+| decodability  | 0.450       | **1.0000**   | (follows from fix A)         |
+
+* **retention** = cos between the read at the query tick and the value
+  that should have been stored. Confirmed 0.81 in the tbptt write path
+  too, so both write implementations agree.
+* **reachability** = the Gaussian positional weight from the output row to
+  the memory row. The memory read was row 0 while logits come from the
+  LAST row, 16 positions away, and at the measured-best sigma=4 that is
+  3.355e-04 -- suppressed ~3000x. Raising sigma was not an option
+  (sigma=4 beat sigma=16 for the content induction, 0.256 vs 0.206), so
+  the row moved instead.
+* **decodability** = held-out accuracy of a LINEAR probe from the read row
+  to the answer token. **1.0000 against chance 0.0833** -- and that was
+  measured in `frozen` mode with a RANDOM, UNTRAINED W_V, so even an
+  untrained write projection preserves the answer perfectly.
+
+**Which fix did what.** Of the two candidates for the key/value-source
+root cause: fix A (key from the previous tick) raised retention 5.8x and
+decodability from 0.45 to 1.0. Fix B (more depth before the memory, the
+FAITHFUL reading of eq 11) barely moved retention, 0.139 -> 0.184, and
+combining them was WORSE than A alone (0.60 vs 0.80) -- extra pre-memory
+mixing makes x_{t-1} a muddier key. So depth does not substitute for the
+source split at this scale. Fix A is a deliberate deviation from eq 11,
+earned by that measurement; at real scale the paper's version may well be
+correct and fix A unnecessary.
+
+**AND IT STILL COLLAPSES.** Mixed-gap, 12k episodes, with all three links
+holding: short 1.0000 (+0.8880 over baseline, 12 distinct) and long 0.0800
+with ONE distinct prediction, BELOW baseline. So everything the task needs
+is present, a linear readout would solve it perfectly, and SGD does not
+find it.
+
+**This is finally a real credit/optimisation finding** rather than an
+inferred one -- every earlier version of this claim was downstream of
+information that was being destroyed, suppressed, or undecodable. The
+likely mechanism: the model learns short-gap first via attention,
+converges, and constant-output on long-gap is a stable local optimum with
+no pressure to grow the memory row's attention weight.
+
+Next, cheap and well-targeted now that the information is known to be
+present: train LONG-GAP ONLY so attention cannot provide an escape. That
+configuration failed before, but that was before the information was
+actually there. Also worth noting `frozen` should now be able to solve it,
+since decodability was 1.0 with an untrained W_V -- only the readout needs
+to learn.
+
+## 2026-11-13 -- curriculum note: the easy path is a COMPETING SOLUTION,
+## not a stepping stone (user framing: "it has adhd, remove the
+## distractions, at least while it's still this early in training")
+
+Conventional curriculum wisdom is easy-first. That is WRONG here, and the
+50/50 mixed-gap result shows why: short-gap 1.0000 while long-gap kept
+ONE distinct prediction. Attention solves short-gap completely, so it
+covers every episode it is capable of covering and there is no residual
+pressure to build the memory path. The easy path is not a stepping stone
+toward the hard one -- it is a SUBSTITUTE that competes for the same
+output, and learning it first can permanently prevent the harder path
+from developing at all.
+
+**Generalises: when two mechanisms solve OVERLAPPING SUBSETS of a task,
+curriculum order matters in the opposite of the usual direction.** Train
+the hard path first (or alone) while the model is still plastic, then
+reintroduce the easy one and check the hard path SURVIVES -- which is the
+same "must not harm" criterion used for the in-context score, applied to
+curriculum order instead of to arms.
+
+Testing now: long-gap ONLY with fix A, all three arms. If that works, the
+follow-up is re-adding short-gap and verifying the memory path is retained
+rather than being abandoned the moment attention can cover part of the
+load.
+
+## 2026-11-13 -- FIRST above-baseline long-gap result: frozen + fix A +
+## long-gap-only. Removing the distraction worked.
+
+```
+--- none ---    long 0.0960  over -0.0160  distinct=1   COLLAPSED
+--- frozen ---  long 0.1920  over +0.0800  distinct=2   eval_sd 0.0249
+--- tbptt ---   long 0.1040  over -0.0080  distinct=2   COLLAPSED
+```
+
+`frozen` is **+0.0800 over baseline, ~3.2 eval-sd** -- the first real
+long-gap signal in this entire thread, and it only appears once the
+short-gap "distraction" is removed, exactly as the curriculum-inversion
+note predicted.
+
+**The winning arm is the one with the LEAST trainable machinery.** `frozen`
+has a random, untrained `W_V` and learns only the readout -- which is
+precisely what the decodability measurement said would suffice (held-out
+linear probe 1.0000 with an untrained write projection). `tbptt`, which
+also trains the write side, did WORSE: plausibly because a moving write
+target keeps shifting what the readout is trying to decode. More
+trainable machinery was actively counterproductive here, which is worth
+remembering before adding any.
+
+**Not oversold**: 0.1920 against a 1.0 ceiling is PARTIAL, distinct=2 with
+top_share 0.54 means it is still largely collapsed onto two tokens, and
+this is one seed. A signal, not a solved task.
+
+Running: frozen + fix A + long-only to 60k episodes, 2 seeds, with a
+learning curve, to tell "learning slowly" from "stuck at 2 tokens".
+
+## 2026-11-13 -- LONG-GAP RECALL SOLVED (1.0000), but UNSTABLE after the
+## peak. T0's recurrent half finally passes.
+
+frozen + fix A + long-gap-only, 60k episodes, 2 seeds, baseline 0.1120:
+```
+seed 1001  ep0 0.0400  10k 0.9880  20k 1.0000  30k 0.9120  40k 0.9280  50k 0.8920  60k 0.5720
+seed 1002  ep0 0.0200  10k 0.9960  20k 0.9800  30k 0.9200  40k 0.9160  50k 0.1480  60k 1.0000
+```
+**Both seeds reach ~1.0000 with distinct=12 and top_share ~0.11** -- all
+twelve values in use, genuinely not collapsed. This is recall THROUGH THE
+MEMORY across a 16-tick blank gap where attention provably cannot help
+(the window is asserted information-free at the query). First positive
+result for the recurrent path in the whole investigation.
+
+**What it took, all four measured rather than guessed:**
+  1. retention  0.139 -> 0.803   key from x_{t-1} (fix A)
+  2. reachability 3.4e-04 -> 0.969  memory row adjacent to the output
+  3. decodability 0.450 -> 1.0000   (follows from fix A)
+  4. curriculum: long-gap ONLY. The easy path COMPETES rather than
+     scaffolds, so mixing in short-gap episodes kept it collapsed.
+None of these were credit-assignment fixes. Four earlier mechanism
+interventions (theta, surprise gate, Law-5 horizon, query/key tie) moved
+nothing, and the FD check showed the hand-derived credit rule was wrong
+anyway -- but the rule was never the blocker.
+
+**The winning arm has the LEAST trainable machinery.** `frozen` (random
+untrained W_V, only the readout learns) solved it; `tbptt` (write side
+also trained) did NOT, scoring 0.1040. Consistent with decodability being
+1.0000 under a random write projection: the write side never needed to
+learn, and training it kept moving the readout's target.
+
+**NEW PROBLEM: instability after the peak.** Seed 1001 decays
+1.0000 -> 0.5720; seed 1002 crashes to 0.1480 at 50k then recovers to
+1.0000. So the capability is reached fast (10-20k) and not HELD. The peak
+is real and reproducible; the end state is not. Candidates, in order of
+how cheap they are to test:
+  * lr decay -- a constant 0.003 well past convergence is the obvious
+    suspect, and this is the one-line test.
+  * the amortized health metrics / stochastic annealing stack, which is
+    exactly what the project has for keeping a converged network healthy
+    (see [[feedback-importance-is-already-the-optimizer]] and the T1
+    promotion note in todolist.md).
+  * regularisation on the readout.
+Report EARLY-STOPPED peak and final separately from now on -- a single
+end-of-training number would have reported 0.5720 and missed that the
+task is solved.
+
+## 2026-11-13 -- REPRODUCIBILITY BUG: DenseTensorLinear drew from the
+## UNSEEDED GLOBAL numpy RNG. Single-seed results here were unreliable.
+
+Chasing a 16x discrepancy (the same config and seeds gave ep10k accuracy
+0.9880 in one script and 0.0600 in another) found that the model was not
+reproducible AT ALL, even at num_cpus=1:
+```
+three "identical" runs, |lm_head| = 5.79075241 / 5.76603699 / 6.14874506
+```
+Cause: `DenseTensorLinear.__init__` used `np.random.randn`, i.e. the
+UNSEEDED GLOBAL numpy RNG. The `rng` passed to TitansMAC only ever
+controlled `embed`, `W_K_mem` and `W_V_mem`; all four projections per
+block plus `lm_head` and `W_Q_mem` were drawing from the global stream.
+So "seed" controlled a minority of the parameters and every run had a
+different init.
+
+This is a KNOWN failure class in this project -- see
+[[feedback-seed-stochastic-rng-for-comparisons]], which says exactly that
+construction sites defaulting to unseeded RNG falsify single-seed sweeps.
+I walked into it anyway.
+
+**Fixed**: `DenseTensorLinear` takes an optional `rng`, TitansMAC threads
+its own into all six call sites, and the docstring warns that leaving it
+None is unreproducible. Residual nondeterminism after the fix is ~1e-8
+relative at both num_cpus=1 and 2 (float accumulation order; the known C++
+threading nondeterminism shows up here only at that scale), versus ~6%
+before.
+
+**What this does and does not invalidate.**
+  * STILL STANDS: the capability. Two independent runs reached 0.9880 and
+    0.9960 by ep10k with distinct=12 and top_share ~0.11 on a 12-way task
+    where the window is asserted information-free. That cannot be luck,
+    and the three measured links (retention 0.803, reachability 0.969,
+    decodability 1.0000) are single-model measurements unaffected by init
+    variance across runs.
+  * INVALIDATED: every multi-"seed" comparison, including frozen (0.1920)
+    vs tbptt (0.1040) and the none/frozen/tbptt arm table. Those differed
+    by init, not by arm. Also the instability characterisation -- decay
+    from 1.0000 to 0.5720 is within a single run so it is real, but its
+    reproducibility across inits is now unknown.
+  * The drift diagnosis is still informative as a mechanism (|read|
+    6.5 -> 525 driven by |W_Q| 5.6 -> 16.1 while |M| stayed ~2, and the
+    memory-row center did NOT drift, ruling out my prediction), but it was
+    measured on one unseeded init and the magnitudes need re-measuring.
+
+## 2026-11-13 -- TRAINING DESTROYS THE RETRIEVAL ALIGNMENT. A parameter
+## curriculum, not a tied projection, is the general fix.
+
+```
+     ep  cos(W_Q,W_K)  |W_Q|/|W_K|  retr_cos
+      0        1.0000        1.000    0.7563
+   2500        0.7824        1.200    0.0391
+   5000        0.7863        1.203    0.0208
+   7500        0.7925        1.224   -0.1957
+```
+Retrieval quality starts at 0.7563 (from tie-at-init plus fix A) and
+COLLAPSES to -0.1957. `W_Q` only rotates to cos 0.78 and rescales by
+1.22x, so a MODEST drift is enough to destroy retrieval completely --
+content addressing needs tight alignment and 0.78 is not close enough.
+
+**Mechanism, and it explains several earlier observations at once.** Early
+in training the memory read is useless noise, because the readout has not
+yet learned to decode it. So there is no gradient pressure on `W_Q` to
+PRESERVE alignment; it drifts toward whatever reduces loss, which early on
+means suppressing the memory. By the time the readout could benefit,
+retrieval is already gone. This explains:
+  * the severe INIT SENSITIVITY (one init reached 1.0000 by ep10k, another
+    0.73 after 60k) -- it is a race between the readout learning to use
+    the memory and the drift destroying it;
+  * why `frozen` beat `tbptt` -- fewer trainable parameters means less to
+    drift;
+  * why the earlier "instability after the peak" looked inconsistent --
+    different inits sit at different points in that race.
+
+**Rejected: tying W_Q to W_K permanently** (user push-back, correct).
+Q != K in attention for a real reason -- matching is ASYMMETRIC ("what I
+look for" vs "what I offer"), which is exactly what induction needs, and
+tying makes it a symmetric similarity. It only looks safe here because
+MQAR's query token IS the stored key; in language the cue is usually
+RELATED to the key, not identical, and learning that relation is what the
+separate projections are for. Likewise `W_V = identity` was rejected: V
+selects WHAT to store, and identity stores everything, wasting capacity.
+The probe hitting 1.0000 with a random W_V means V is not doing useful
+selection YET, not that it should not.
+
+**General fix instead: a PARAMETER curriculum.** Freeze `W_Q` (and the
+memory path's projections) for the first N episodes so the readout can
+learn to exploit a WORKING memory, then release them. Nothing permanent is
+imposed, so Q and K stay free to specialize once the path exists. This is
+the same principle as the data curriculum -- remove the distraction while
+the model is still plastic -- applied to WHICH WEIGHTS MAY MOVE rather
+than which episodes are shown.
+
+To test as ABLATIONS (not merges): tied W_Q=W_K, W_V=identity, and the
+staged unfreeze. The first two are diagnostics to localize whether those
+maps are the bottleneck; only the staged unfreeze is a candidate to keep.
+
+## 2026-11-14 -- init fragility quantified (1/4 solve), and the cause of
+## alignment loss found: ADAM MOVES PARAMETERS ON ZERO GRADIENTS
+
+**Properly-seeded distribution** (the first valid one -- everything before
+the DenseTensorLinear rng fix had a different init per run):
+```
+  seed    peak   at_ep   final  distinct_f
+  1001  0.5250   36000  0.3000          11
+  1002  1.0000    4000  1.0000          12   <- solved, fast, STABLE
+  1003  0.1050    8000  0.0850           1   <- total collapse
+  1004  0.5750   28000  0.4300          12
+peak mean 0.5513 sd 0.3660   solved (peak>0.9) in 1/4
+```
+So the method is NOT reliable: one clean solve that reaches 1.0000 at
+ep4000 and HOLDS it (final == peak), two partials near 0.5, one total
+collapse to a single token. Direct answer to the user's question -- yes,
+bad initialisations still land in bad states. Also note 1002 being stable
+means the earlier "decay after the peak" was init-specific too, not a
+property of the method.
+
+**RETRACTION**: two turns earlier I wrote that the capability "stands" and
+"cannot be luck". The capability IS real (1002 is a clean stable solve),
+but the specific claim that it reliably solves the task was wrong, and it
+was wrong because I carried a headline number forward from runs I had
+just finished showing were invalidated by the unseeded init.
+
+**CAUSE OF THE ALIGNMENT LOSS, measured.** Retrieval quality starts at
+0.7563 and collapses to -0.1957 by ep7500, and the reason is not a
+systematic pull toward suppressing the memory:
+```
+     ep        u    |g_read|    |g_Wq|   cos(Wq,Wk)
+      0   0.0000     0.0001    0.0000       0.9999
+   3000   0.0000     0.0000    0.0000       0.8137   <- drifted on ZERO gradient
+   6000   0.1902     0.1045    0.6602       0.3575
+```
+`cos(W_Q, W_K)` falls 0.9999 -> 0.8137 while the measured gradient is
+0.0000. **Adam's step is lr*m/(sqrt(v)+eps), so with g ~ 1e-5 you get
+sqrt(v) ~ 1e-5, and against eps=1e-8 the ratio is ~1 -- a FULL-SIZE lr
+step driven by numerical noise.** Adam normalises away exactly the
+magnitude information that says "this path is disconnected, hold still".
+
+Confirmed by sweeping eps (6k episodes):
+```
+  adam eps  cos(Wq,Wk)  retr_cos     acc
+     1e-08      0.8000    0.2888  0.0500
+     1e-04      1.0000    0.5497  0.0500
+     1e-02      1.0000    0.2700  0.1200
+```
+eps >= 1e-4 holds the alignment at EXACTLY 1.0000 and roughly doubles
+retrieval. It did NOT lift accuracy at 6k, but 6k is short -- the one
+clean solve needed 4k and the partials were still climbing at 28-36k.
+
+**The pair, which is why this is a mechanism and not just a bug.** Adam
+RESCUED the write-side credit gradient earlier (tiny but REAL, ~1e-4,
+where plain SGD moved nothing) and DESTROYS the query alignment here
+(tiny and MEANINGLESS, ~1e-5). Same normalisation, opposite outcome, and
+`eps` is the only thing distinguishing them -- so eps is a DEADBAND and
+belongs at the gradient noise floor, which is measurable (read off the
+gradient a disconnected path produces) rather than tuned.
+**Check the project's single-state importance optimizer for the same
+problem before any of this ships**: it normalises too, and at Qwen scale a
+3000-step alignment decay driven by noise would be undiagnosable.
+
+**REJECTED along the way** (both user push-back, both correct):
+  * tying W_Q = W_K permanently -- Q != K in attention because matching is
+    ASYMMETRIC, which is what induction needs; tying only looks safe
+    because MQAR's query token IS the stored key.
+  * W_V = identity -- V selects WHAT to store; identity stores everything.
+  * freezing W_Q for N episodes -- an ORACLE fix, since N encodes
+    knowledge of when the readout starts working.
+The non-oracle form of the last one is a CONDITION not a schedule: gate
+W_Q's update on u = |g_read| / (|g_read| + |g_other|), which is 0.0000
+while the readout ignores the memory and rises to 0.19 as it starts using
+it -- measured, so the gate has real signal to ride.
+
+RUNNING: the same 4 seeds at eps=1e-4, to see whether the solve RATE moves
+off 1/4. The 1/4 figure was measured at the default eps=1e-8, i.e. with
+the alignment-destroying bug still active.
+
+## 2026-11-14 -- gaussian_attention IS full attention; the narrow sigma was
+## a self-inflicted artifact. And Adam results are diagnostics, not fixes.
+
+**Correction to an assumption both of us were carrying.**
+`gaussian_attention` is documented as "Full (every query x every key)
+attention with a learnable per-query Gaussian log-bias on top of the usual
+Q.K score". It is NOT a restriction or an approximation -- the Gaussian is
+an ADDITIVE BIAS. So:
+  * there is no algorithmic speed to win by replacing it; the kernel does
+    the full T x T product either way, and dropping the bias only saves
+    the centers/sigmas gradient;
+  * "plain attention" is reachable for free by making sigma large enough
+    that the bias is flat. Measured relative weight at distance 16:
+    sigma=4 -> 0.0003, sigma=16 -> 0.6065, sigma=64 -> 0.9692,
+    sigma=256 -> 0.9980. So sigma >= 64 is effectively plain Q.K.
+  * timing: sigma=64 measured 0.0327 ms/call vs 0.0416 at sigma=4, i.e.
+    ~21% FASTER, not slower. Probably softmax numerics rather than a real
+    algorithmic saving, so do not lean on the figure -- but large sigma
+    costs nothing.
+
+**The reason to keep sigma small is now gone.** sigma=4 was chosen because
+it beat sigma=16 on content induction (0.256 vs 0.206) -- but that was
+measured on the OLD dual-path title task, BEFORE fix A and before the
+memory row was moved adjacent to the output. The narrow prior is also
+exactly what caused the reachability bug (relative weight 3.4e-04 on the
+memory row). Queued: re-sweep sigma on the CURRENT task.
+
+**Adam results are DIAGNOSTICS, not fixes (user).** Adam cannot ship --
+its two state arrays break the weight+importance = 1 byte/synapse budget
+that the 27B sizing depends on. So the eps deadband result is not a
+deliverable; what transfers is the PRINCIPLE: any NORMALISING optimizer
+takes full-size steps on near-zero gradients, and importance-scaling
+normalises too. The actionable item is therefore to check whether the
+single-state importance update has the same deadband, NOT to set eps.
+
+**Consequence: I have been optimising against the wrong optimizer.** The
+shipping optimizer is DISLDO's importance-based single-state update, so
+every Adam-flavoured tuning result here is off-target. That is a third
+independent reason T1 (Titans on DISLDO) belongs on T0's critical path,
+alongside "the health-metrics and annealing stack lives there" and "the
+sparsity floor needs it".
+
+## 2026-11-14 -- WRAP-UP of the toy-scale recurrence work. Two fixes are
+## COMPLEMENTARY; scale is the remaining issue; CUDA moves next.
+
+**The two fixes do different jobs and compose.** Seed 1001, which the
+baseline took to peak 0.5250 / final 0.3000:
+```
+config              peak                final    distinct
+baseline            0.5250              0.3000   11
+eps=1e-4 only       0.1200              0.1100    1   <- WORSE
+skip only           1.0000 @ep4000      0.5800   12   <- solves, decays
+skip + eps=1e-4     1.0000 @ep4000      1.0000   12   <- solves AND stable
+```
+Exactly the predicted mechanism: the SKIP enables the solve (it connects
+the path so it can learn at all), and EPS makes it stable (it stops the
+noise-driven drift afterwards). eps ALONE is actively harmful, because
+without the skip the path is still disconnected and a large deadband just
+freezes everything including the useful learning. (3 seeds pending.)
+
+**WHAT CARRIES FORWARD -- reusable, scale-independent:**
+  1. The three-link DIAGNOSTIC TOOLKIT, which found every real cause here
+     and costs seconds rather than a training run:
+       retention   = cos(read at query, value that should be stored)
+       reachability= positional weight from the output row to the memory row
+       decodability= held-out linear probe from the read row to the answer
+  2. The STANDING DIAGNOSTICS in long_term_mqar_task.report(): distinct-
+     prediction count with a COLLAPSED flag, the CONSTANT-PREDICTOR
+     baseline (not 1/N, which overstated by 1.44x), the margin over it,
+     and the binomial eval sd next to the between-seed sd.
+  3. ARM DIFFERENTIATION asserts (max|dW_K| per arm) -- `trace` was
+     byte-identical to `frozen` for 3.5 hours of compute without them.
+  4. The REPRODUCIBILITY fix (DenseTensorLinear now takes an rng) and the
+     lesson that a partially-seeded model silently falsifies every
+     single-seed comparison.
+  5. The task itself: long-gap MQAR with an ASSERTED information-free
+     window, plus the short-gap control in the same family.
+  6. The NORMALISING-OPTIMIZER DEADBAND principle -- Adam rescued a tiny
+     REAL gradient and destroyed alignment on a tiny MEANINGLESS one, same
+     normalisation, opposite outcome. Adam cannot ship, so the deliverable
+     is checking the single-state importance update for the same problem.
+
+**WHAT IS PARKED, and why:** further mechanism hunting at 32 dims. Four of
+the five blockers were scale artifacts (depth, the hand-set narrow
+positional prior, parameter count, and a readout losing a race it would
+win with capacity). gaussian_attention is already FULL attention with a
+learnable additive bias, so large sigma recovers plain Q.K for free and
+~21% faster -- but at scale one would use learned positions anyway, so the
+sigma re-sweep is folded into the scale-up rather than run here.
+
+**WHAT IS UNRESOLVED and should not be claimed:** reliability. The
+properly-seeded baseline solved 1/4. skip+eps fixed seed 1001 completely,
+but the remaining three seeds are still running, so the solve RATE under
+the fixes is unknown. Do not report a rate until all four land.

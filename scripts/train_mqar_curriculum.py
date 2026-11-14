@@ -32,6 +32,7 @@ from sili import _cpu
 from sili.sparse_rnn import DIDLDOLayer32, DISLDOLayer, DISLDOLayer8, DISLDOLayer32
 from sili.tensor import combine_losses
 
+from model.tile_cache_credit import apply_tile_cache_exact_credit
 from model.toy_recall_models import AdamOptimizer, clip_grad_norm_, cross_entropy_sum, predicted_token
 from model.toy_recall_task import generate_mqar_sequence
 from model.toy_tile_recurrence_rmt import ToyTileRecurrenceRMT, spectral_norm_upper_bound
@@ -289,6 +290,7 @@ def train_curriculum(
     peak_lr: float,
     num_tiles: int,
     k_max: int,
+    num_memory_slots: int = NUM_MEMORY_SLOTS,
     log_every: int = 200,
     log_fn=None,
     additive_rank: int = 1,
@@ -311,6 +313,24 @@ def train_curriculum(
     dense: bool = True,
     dy_sparsity_p: float | None = None,
     use_tile_cache: bool = False,
+    use_tile_cache_at_query: bool = False,
+    tile_cache_credit_k_rows: int | None = None,
+    tile_cache_credit_fraction: float | None = 0.5,
+    tile_cache_credit_fraction_fn=None,
+    retain_fired_rows: bool = False,
+    # Off, and should STAY off for MQAR: measured negative across k_active
+    # 2%-100%, filler predictability, decoder lr/schedule, redundancy 6%-97.5%,
+    # and write-gated inactivity. MQAR rewards large precise state (Zoology,
+    # arXiv:2312.04927) while RSM trades state for ~10x less memory, and RSM's
+    # own stated weakness is unseen sequences -- which MQAR draws fresh every
+    # episode. Accuracy here is monotonic in usable state, so sparsifying the
+    # write strictly costs recall. See JOURNAL.md 2026-11-12.
+    rsm_memory_write_enable: bool = False,
+    rsm_k_active: int | None = None,
+    rsm_refractory_decay: float = 0.7,
+    rsm_lr_mult: float = 1.0,
+    rsm_novelty_threshold: float | None = None,
+    rsm_decoder_every_tick: bool = True,
     output_dy_sparsity_p: float | None = None,
     wrong_streak_threshold: int = WRONG_STREAK_THRESHOLD,
     streak_threshold: int = STREAK_THRESHOLD,
@@ -596,7 +616,45 @@ def train_curriculum(
     # JOURNAL.md's 2026-08-30 "backward's real cost profiled to per-synapse
     # update math, not snapshot/merge" entry.
     # use_tile_cache: see docs/research/train_mqar_curriculum.rst:
-    # train_curriculum.use_tile_cache_query_step_fallback.
+    # train_curriculum.use_tile_cache_query_step_fallback. use_tile_cache_at_query
+    # (opt-in, default False -- preserves that documented fallback as the
+    # default): instead of falling back to step()'s full-window recompute
+    # at query steps, call step_cached() there too, reusing the cache's
+    # stored (detached) K/V for older tiles with zero gradient reaching
+    # them -- the TRUE zero-credit scenario, for measuring the real gap a
+    # synaptic-hold/credit mechanism needs to close. See
+    # docs/research/train_mqar_curriculum.rst:train_curriculum.use_tile_cache_at_query.
+    # tile_cache_credit_k_rows (opt-in, default None=off; only meaningful
+    # alongside use_tile_cache_at_query): budgeted exact correction for
+    # that many cached rows per query step, via model/tile_cache_credit.py
+    # -- see docs/research/toy_tile_recurrence_rmt.rst:tile_cache_exact_credit.
+    # tile_cache_credit_fraction: scales k_rows to the cache's own size
+    # (num_tiles - 1) instead of a fixed absolute count -- a constant
+    # k_rows covers a SHRINKING fraction of the cache as context grows
+    # (direct instruction: scale to context, not width -- width changes
+    # cost per row, not how many rows need covering). Takes precedence
+    # over tile_cache_credit_k_rows when both are set; same convention as
+    # this file's other density-fraction params (dy_sparsity_p, etc.),
+    # not a raw count. Defaults to 0.5 (not None/off) -- validated this
+    # session via a 40-seed dose-response sweep: zero credit is
+    # significantly worse than dense (p<0.0001), 50% coverage recovers
+    # most of that gap (only borderline-significant vs. dense, p=0.036),
+    # and 100% coverage closes it almost entirely (p=0.069, matching
+    # dense) -- confirming the mechanism itself is correct, not just
+    # under-budgeted. Pass tile_cache_credit_fraction=None explicitly to
+    # get the old zero-credit diagnostic arm back.
+    # tile_cache_credit_fraction_fn: runtime-tunable override, called
+    # with the current step each query step (same pattern as
+    # lr_override_fn below) -- takes priority over the static fraction
+    # when set, so the correction budget can be changed MID-RUN, not
+    # just configured once upfront. Direct motivation: these amortized-
+    # backprop dials (this one, and sleep's own cadence) are meant to be
+    # externally responsive -- e.g. "sleep nightly instead of every
+    # minute" for an online/embodied deployment -- not fixed
+    # hyperparameters baked in at construction time.
+    # retain_fired_rows: opt-in, default off -- untested effect on
+    # quality, don't silently change existing sleep_enable=True runs.
+    # See ToyTileRecurrenceRMT.__init__'s own docstring.
     # k_first_target/k_first_vocab: see docs/research/train_mqar_curriculum.rst:
     # train_curriculum.k_first_target_odometer_reordering.
     #
@@ -682,7 +740,7 @@ def train_curriculum(
         embed_width,
         COLUMN_NEURONS,
         num_tiles,
-        NUM_MEMORY_SLOTS,
+        num_memory_slots,
         MAX_WEIGHTS_PER_LAYER,
         num_cpus=NUM_CPUS,
         disldo_cls=disldo_cls,
@@ -728,6 +786,12 @@ def train_curriculum(
         use_energy=use_energy,
         energy_kwargs=energy_kwargs,
         sleep_energy_kwargs=sleep_energy_kwargs,
+        retain_fired_rows=retain_fired_rows,
+        rsm_memory_write_enable=rsm_memory_write_enable,
+        rsm_k_active=rsm_k_active,
+        rsm_refractory_decay=rsm_refractory_decay,
+        rsm_lr_mult=rsm_lr_mult,
+        rsm_novelty_threshold=rsm_novelty_threshold,
         rng=model_rng,
     )
     opt = AdamOptimizer()
@@ -849,8 +913,6 @@ def train_curriculum(
             log_fn(step, v, k, ph, "LEVEL_DOWN", loss_ema, acc_ema, ranks=ranks)
 
     if sleep_enable:
-        if use_tile_cache:
-            raise ValueError("sleep_enable is not supported together with use_tile_cache")
         if sleep_energy_kwargs is None:
             raise ValueError("sleep_enable requires sleep_energy_kwargs")
         if sleep_gate_layers:
@@ -956,12 +1018,24 @@ def train_curriculum(
         query_positions = {pos + offset for pos in query_positions}
         new_vocab_query_positions = {pos + offset for pos in new_vocab_query_positions}
 
-        memory = np.zeros((NUM_MEMORY_SLOTS, state_width), dtype=np.float32)
+        memory = np.zeros((num_memory_slots, state_width), dtype=np.float32)
         tile_cache = None  # reset every sequence, same as memory
+        if rsm_memory_write_enable:
+            model.rsm_reset_sequence()  # reset the refractory trace, same cadence as memory
         for i in range(seq_len + offset):
             # See docs/research/train_mqar_curriculum.rst:
             # train_curriculum.use_tile_cache_query_step_fallback.
-            if use_tile_cache and (i in targets):
+            if use_tile_cache and use_tile_cache_at_query and (i in targets):
+                # True zero-credit arm: reuse the cache's stored (detached)
+                # K/V for older tiles even at query time, instead of the
+                # graded-fallback full-window recompute below. See
+                # train_curriculum.use_tile_cache_at_query anchor.
+                new_embed = embed_table[combined_tokens[i]]
+                memory, logits, aux, tile_cache = model.step_cached(
+                    new_embed, memory, lr, tile_cache, requires_grad=True
+                )
+                logit_row = 0  # step_cached returns only the newest position's row
+            elif use_tile_cache and (i in targets):
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
                 memory, logits, aux = model.step(
                     window,
@@ -972,19 +1046,51 @@ def train_curriculum(
                 )
                 logit_row = num_tiles - 1
                 # Cache refresh; see use_tile_cache_query_step_fallback anchor.
-                k_content = model.last_debug["k"][NUM_MEMORY_SLOTS:]
-                v_content = model.last_debug["v"][NUM_MEMORY_SLOTS:]
-                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), strict=False))
+                # 3-tuples (k_row, v_row, x_normed_row) -- must match
+                # step_cached()'s own tile_cache tuple shape exactly, see
+                # model/tile_cache_credit.py.
+                k_content = model.last_debug["k"][num_memory_slots:]
+                v_content = model.last_debug["v"][num_memory_slots:]
+                x_content = model.last_debug["x_normed"][num_memory_slots:]
+                tile_cache = list(zip(k_content[1:].copy(), v_content[1:].copy(), x_content[1:].copy(), strict=False))
             elif use_tile_cache:
                 new_embed = embed_table[combined_tokens[i]]
+                # requires_grad mirrors the plain step() branch below
+                # (restricted to the non-target case, since this elif is
+                # only reached when i is not in targets): no gradient
+                # needed except during sleep, where the forced-firing
+                # aux loss needs a real backward every tick, not just at
+                # query steps. See model/toy_tile_recurrence_rmt.py's
+                # step_cached() sleep-energy accumulation (added to match
+                # step()'s own identical calls -- previously step_cached
+                # never participated in sleep_enable at all, which is why
+                # the two used to be hard-guarded mutually exclusive).
                 memory, logits, aux, tile_cache = model.step_cached(
-                    new_embed, memory, lr, tile_cache, requires_grad=False
+                    new_embed, memory, lr, tile_cache, requires_grad=(in_sleep or rsm_memory_write_enable)
                 )
                 logit_row = 0  # step_cached returns only the newest position's row
             else:
                 window = _build_tile_window(embed_table, combined_tokens, i, num_tiles)
-                memory, logits, aux = model.step(window, memory, lr, requires_grad=((i in targets) or in_sleep))
+                memory, logits, aux = model.step(
+                    window, memory, lr, requires_grad=((i in targets) or in_sleep or rsm_memory_write_enable)
+                )
                 logit_row = num_tiles - 1
+
+            # RSM-inspired sparse memory write (JOURNAL.md 2026-11-10):
+            # shallow, purely local self-supervised next-token loss,
+            # EVERY tick -- not folded into `aux` since that's only ever
+            # backward'd at target/sleep positions (see
+            # rsm_decoder_step_loss's own docstring for why this needs
+            # its own backward here, independent of that). No-op unless
+            # rsm_memory_write_enable=True.
+            if rsm_memory_write_enable and (rsm_decoder_every_tick or (i in targets)):
+                _rsm_next_i = i + 1
+                _rsm_next_tok = int(combined_tokens[_rsm_next_i]) if _rsm_next_i < seq_len + offset else None
+                if _rsm_next_tok is not None:
+                    rsm_loss = model.rsm_decoder_step_loss(_rsm_next_tok, lr)
+                    if rsm_loss is not None:
+                        rsm_loss.backward()
+                        opt.step(model.parameters_for_optimizer(), lr=lr)
             if DEBUG_FINITE_CHECK and use_critic:
                 _check_finite_or_raise(model, logits, step, i, loss_ema)
             if in_sleep:
@@ -1087,6 +1193,18 @@ def train_curriculum(
                     if aux is not None:
                         loss = loss + aux
                     loss.backward()
+                if use_tile_cache_at_query:
+                    _fraction = (
+                        tile_cache_credit_fraction_fn(step)
+                        if tile_cache_credit_fraction_fn is not None
+                        else tile_cache_credit_fraction
+                    )
+                    if _fraction is not None:
+                        _k_rows = max(1, round(_fraction * (num_tiles - 1)))
+                    else:
+                        _k_rows = tile_cache_credit_k_rows
+                    if _k_rows is not None:
+                        apply_tile_cache_exact_credit(model, lr, k_rows=_k_rows)
                 # See docs/research/train_mqar_curriculum.rst:
                 # train_curriculum.embed_learning_rate_scatter_gradient.
                 if embed_learning_rate is not None and not use_tile_cache:
