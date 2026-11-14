@@ -1524,13 +1524,40 @@ earns its place rather than being optional polish.
 Ti, 6GB, sm_75 -- which holds a 2.2M-param model trivially. Develop here, deploy
 to the P40 (sm_61, 24GB) later; compile for both.
 
-**PREREQUISITE, user action (needs sudo + reboot).** The driver is currently
-broken: `nvidia 570.86.16-7` is installed but NO nvidia.ko exists for the running
-kernel 7.1.9-arch1-2 (only `i2c_nvidia_gpu` is loaded, which is a trivial I2C bus
-driver), and nvidia-smi reports it cannot communicate with the driver. nvcc 12.8
-IS present. The kernel moved and the module was not rebuilt. Fix is `nvidia-dkms`
-so it rebuilds for any kernel -- but PIN IT at 570.86.16, because this file's own
-hardware notes warn that upgrading can lose 1660 Ti support.
+**DRIVER PREREQUISITE -- and the fix is a KERNEL downgrade, NOT a driver
+change.** Researched, because `pacman -S nvidia-dkms` would pull the CURRENT
+nvidia version and risks losing 1660 Ti (Turing) support, which this file's own
+hardware notes warn about.
+
+State: `nvidia 570.86.16-7` is installed and its module is built for kernel
+**6.13.4-arch1-1**, but the running kernel is **7.1.9-arch1-2**, so no nvidia.ko
+exists for it (only `i2c_nvidia_gpu`, a trivial I2C bus driver, is loaded) and
+nvidia-smi cannot reach the driver. nvcc 12.8 IS installed and works.
+
+The working module is ALREADY PRESENT and verified:
+`/usr/lib/modules/6.13.4-arch1-1/extramodules/nvidia.ko.zst`, `modinfo` reports
+version 570.86.16. So the kernel simply orphaned a good module. Note that
+`/usr/lib/modules/6.13.4-arch1-1/` now holds ONLY `extramodules` -- the base
+kernel modules went with the package upgrade -- so the linux-6.13.4 package has
+to be reinstalled to restore `kernel/*` and `/boot/vmlinuz-linux`.
+
+    sudo pacman -U /var/cache/pacman/pkg/linux-6.13.4.arch1-1-x86_64.pkg.tar.zst
+    sudo mkinitcpio -P && sudo grub-mkconfig -o /boot/grub/grub.cfg
+    # reboot
+
+REVERSIBLE WITHOUT NETWORK: `linux-7.1.9.arch1-2-x86_64.pkg.tar.zst` is also in
+the local pacman cache, so reverting never needs connectivity.
+
+RISK, not fully cleared: `rtl8821cu-dkms-git` is installed and `wlp4s0f3u3` (the
+USB WiFi) depends on it, so WiFi needs a successful DKMS rebuild for 6.13.4.
+`dkms status` was unreadable as a normal user, so a 6.13.4 build could not be
+confirmed. Mitigations: Realtek out-of-tree drivers break on NEW kernels rather
+than old ones and this one presumably worked on 6.13.4 before; the revert needs
+no network; and `enp2s0` wired is a fallback.
+
+**NOT A BLOCKER FOR STARTING.** nvcc compiles without a driver -- only RUNNING
+kernels needs one. So the correctness-first port can begin immediately and the
+driver fix can wait for a convenient reboot.
 
 ---
 
