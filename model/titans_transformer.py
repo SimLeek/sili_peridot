@@ -85,11 +85,9 @@ class TitansMAC:
         self.embed = Tensor((rng.standard_normal((vocab, hidden)) * 0.3).astype(np.float32))
         self.input_ln = Tensor(np.ones(hidden, dtype=np.float32))
         self.post_ln = Tensor(np.ones(hidden, dtype=np.float32))
-        # TWO LAYERS MINIMUM. Associative recall here is induction -- match the
-        # query key against its earlier occurrence, then emit the token that
-        # FOLLOWED it -- and a single attention layer provably cannot do that: it
-        # needs a previous-token head feeding a match head. A 1-layer version of
-        # this model sat exactly at chance on the in-context score.
+        # TWO LAYERS MINIMUM: this recall is induction (match the key, emit what
+        # FOLLOWED it), which one attention layer provably cannot do. The
+        # 1-layer version sat exactly at chance in-context.
         self.n_layers = n_layers
         self.blocks = [
             {
@@ -104,16 +102,17 @@ class TitansMAC:
         self.lm_head = DenseTensorLinear(hidden, vocab, scale=s)
         # One center/sigma PER ATTENTION ROW, matching ToyTileRecurrence. A
         # single shared pair yields NaN, since the kernel indexes these per row.
-        self.centers = Tensor(np.array([i + 0.5 for i in range(self.n_rows)], dtype=np.float32))
+        # Memory row sits positionally ADJACENT to the output. At row 0 it was
+        # `window` away from the output row, giving it relative weight 3.4e-04 at
+        # the measured-best sigma=4 -- suppressed ~3000x, so the information was
+        # in the row and never reached the logits. JOURNAL 2026-11-13.
+        mem_centers = [window + 0.5] if mode != "none" else []
+        self.centers = Tensor(np.array(mem_centers + [i + 0.5 for i in range(window)], dtype=np.float32))
         self.centers_content = Tensor(np.array([i + 0.5 for i in range(window)], dtype=np.float32))
-        # sigma is a Gaussian POSITIONAL prior and its unit is TOKENS, so it has
-        # to match the distance over which a match must be found. sigma=1
-        # (log_sigmas=0) confines every row to its neighbours and suppresses the
-        # content matching induction needs: measured page accuracy 0.147 at
-        # sigma=1 vs 0.256 at sigma=4. But the window width is NOT the right
-        # scale either (0.206 at sigma=16) -- the query key recurs within its own
-        # page, so the required reach is the page length, not the context length.
-        # Default to a small multiple of that; override per task.
+        # sigma is a Gaussian POSITIONAL prior in TOKENS: it must match the
+        # distance over which a match must be found. Measured page accuracy
+        # 0.147 at sigma=1, 0.256 at sigma=4, 0.206 at sigma=16 -- so the right
+        # scale is the page length, not the context length.
         sig = 4.0 if sigma_init is None else float(sigma_init)
         self.log_sigmas = Tensor(np.full(self.n_rows, np.log(sig), dtype=np.float32))
         # Layer 1 attends over CONTENT rows only (no memory row), so it needs its
@@ -174,8 +173,12 @@ class TitansMAC:
     def parameters(self) -> list[Tensor]:
         """Only Tensors here. W_K/W_V are numpy and updated out-of-band (frozen,
         or by the trace rule), which is exactly why the backward stays O(1)."""
-        params = [self.embed, self.input_ln, self.post_ln, self.centers, self.log_sigmas]
+        params = [self.embed, self.input_ln, self.post_ln]
         params += [self.centers_content, self.log_sigmas_content]
+        if self.mode != "none":
+            # Only the memory-bearing modes run a layer over window+1 rows, so
+            # these are unused (and gradient-free) in the control arm.
+            params += [self.centers, self.log_sigmas]
         for blk in self.blocks:
             params.append(blk["ln"])
             for key in ("q", "k", "v", "o"):
