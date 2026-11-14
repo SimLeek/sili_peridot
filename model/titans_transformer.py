@@ -44,6 +44,7 @@ class TitansMAC:
         mem_horizon: float | None = None,
         write_key_from_prev: bool = False,
         mem_after_layer: int = 1,
+        mem_skip: bool = False,
         num_cpus: int = 2,
         rms_eps: float = 1e-6,
         rng: np.random.Generator | None = None,
@@ -58,23 +59,23 @@ class TitansMAC:
         self.write_gate = write_gate
         self.tbptt_k = tbptt_k
         self.tie_mem_qk = tie_mem_qk
-        # RETENTION HORIZON in ticks. None reproduces the old alpha=eta=0 (no
-        # horizon control at all, which is what every earlier run used). Given L,
-        # the gates follow the Law 5 derivation rather than being tuned:
-        #   eta = 1 - 1/L   puts the kernel peak at age L
-        #   alpha = 1/L     the diagonal that makes the peak exist
-        #   theta *= (1-eta) cancels Law 3's trace mass so the effective step
-        #                    does not change with eta
-        # See bend_proofs/titans_gate_retention_kernel.
+        # Retention horizon in ticks; None = alpha=eta=0. Gates follow the Law 5
+        # derivation: eta=1-1/L, alpha=1/L, theta*=(1-eta). See
+        # bend_proofs/titans_gate_retention_kernel. Measured to have no effect
+        # on retention here (JOURNAL 2026-11-13).
         self.mem_horizon = mem_horizon
         # FIX A: take the write's KEY from the PREVIOUS tick and its VALUE from
         # the current one, so an adjacent (key, value) pair is stored as such by
         # construction. Deviates from eq 11, which takes both from one x_t.
         self.write_key_from_prev = write_key_from_prev
-        # FIX B: how many layers run BEFORE the memory. eq 11 assumes x_t already
-        # carries the binding from earlier layers, so more depth here is the
-        # FAITHFUL fix rather than a deviation.
+        # How many layers run BEFORE the memory (eq 11 assumes x_t already
+        # carries the binding). Measured: barely helps, 0.139 -> 0.184.
         self.mem_after_layer = max(1, int(mem_after_layer))
+        # Skip connection: add the memory read straight into the output position
+        # instead of only offering it as an attention row. Raises the gradient
+        # fraction reaching the memory path from 0.00003 to 0.14979 at step zero,
+        # so it is never vestigial. JOURNAL 2026-11-14.
+        self.mem_skip = mem_skip
         self._x_prev = None
         self.n_writes = 0
         self.n_ticks = 0
@@ -251,6 +252,11 @@ class TitansMAC:
             rows = _concat_rows(read, h)
             self._x_t = x_t
 
+        if self.mem_skip and self.mode != "none":
+            # add the read into the LAST content row (the output position)
+            sel = np.zeros((self.n_rows, 1), dtype=np.float32)
+            sel[-1, 0] = 1.0
+            rows = rows + Tensor(sel) @ read
         post = self.blocks[n_pre:] or self.blocks[-1:]
         for blk in post:
             hn = rmsnorm_tensor(rows, blk["ln"], self.rms_eps)

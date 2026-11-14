@@ -13678,3 +13678,45 @@ it -- measured, so the gate has real signal to ride.
 RUNNING: the same 4 seeds at eps=1e-4, to see whether the solve RATE moves
 off 1/4. The 1/4 figure was measured at the default eps=1e-8, i.e. with
 the alignment-destroying bug still active.
+
+## 2026-11-14 -- gaussian_attention IS full attention; the narrow sigma was
+## a self-inflicted artifact. And Adam results are diagnostics, not fixes.
+
+**Correction to an assumption both of us were carrying.**
+`gaussian_attention` is documented as "Full (every query x every key)
+attention with a learnable per-query Gaussian log-bias on top of the usual
+Q.K score". It is NOT a restriction or an approximation -- the Gaussian is
+an ADDITIVE BIAS. So:
+  * there is no algorithmic speed to win by replacing it; the kernel does
+    the full T x T product either way, and dropping the bias only saves
+    the centers/sigmas gradient;
+  * "plain attention" is reachable for free by making sigma large enough
+    that the bias is flat. Measured relative weight at distance 16:
+    sigma=4 -> 0.0003, sigma=16 -> 0.6065, sigma=64 -> 0.9692,
+    sigma=256 -> 0.9980. So sigma >= 64 is effectively plain Q.K.
+  * timing: sigma=64 measured 0.0327 ms/call vs 0.0416 at sigma=4, i.e.
+    ~21% FASTER, not slower. Probably softmax numerics rather than a real
+    algorithmic saving, so do not lean on the figure -- but large sigma
+    costs nothing.
+
+**The reason to keep sigma small is now gone.** sigma=4 was chosen because
+it beat sigma=16 on content induction (0.256 vs 0.206) -- but that was
+measured on the OLD dual-path title task, BEFORE fix A and before the
+memory row was moved adjacent to the output. The narrow prior is also
+exactly what caused the reachability bug (relative weight 3.4e-04 on the
+memory row). Queued: re-sweep sigma on the CURRENT task.
+
+**Adam results are DIAGNOSTICS, not fixes (user).** Adam cannot ship --
+its two state arrays break the weight+importance = 1 byte/synapse budget
+that the 27B sizing depends on. So the eps deadband result is not a
+deliverable; what transfers is the PRINCIPLE: any NORMALISING optimizer
+takes full-size steps on near-zero gradients, and importance-scaling
+normalises too. The actionable item is therefore to check whether the
+single-state importance update has the same deadband, NOT to set eps.
+
+**Consequence: I have been optimising against the wrong optimizer.** The
+shipping optimizer is DISLDO's importance-based single-state update, so
+every Adam-flavoured tuning result here is off-target. That is a third
+independent reason T1 (Titans on DISLDO) belongs on T0's critical path,
+alongside "the health-metrics and annealing stack lives there" and "the
+sparsity floor needs it".
