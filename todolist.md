@@ -1795,6 +1795,25 @@ stays in the ladder as a cheap equivalence check, not a gate to fear.
       [[feedback-block4-compression-verification]] (verify against the real
       stochastic quantize, not deterministic reasoning).
 
+      **THE TOOLCHAIN IS PINNED TO CUDA 12.8, and this is forced, not a
+      preference.** CUDA 13.0 removed offline compilation and library support
+      for Maxwell, Pascal and Volta; Turing (sm_75) is its floor. The P40 is
+      sm_61, so a CUDA 13 toolchain CANNOT BUILD FOR THE 24GB COMPUTE CARD --
+      the only reason the remote box exists. Verified 2026-11-14: the remote's
+      Arch repo offers only `cuda 13.3.1-1`, so installing the distro package
+      there would silently produce exactly that unusable toolchain. This laptop
+      already has `cuda 12.8.0-1`, and `nvcc --list-gpu-arch` confirms it spans
+      every card we own -- compute_61 (P40) and compute_75 (1660 Ti, 2060) --
+      so ONE fat binary covers all three. The remote needs 12.8 pinned the same
+      way the kernel now is, NOT the repo version.
+
+      Same cliff applies to the torch REFERENCE used for parity: PyTorch
+      deleted Maxwell/Pascal/Volta from its cu128 and cu129 builds
+      (pytorch/pytorch#157517), so cu128 and cu130 wheels cannot drive the P40
+      either. **cu126 is the only variant carrying sm_61**, which is also the
+      newest build available for cp314. Parity numbers must come from a cu126
+      torch or they cannot be reproduced on the compute card at all.
+
       **Expect the win to come from coalescing, not FLOPs.** The scattered CSR
       path is gather/scatter-bound rather than SIMD-bound on CPU, and that
       property carries to GPU: a naive port will be bandwidth-bound and may not
