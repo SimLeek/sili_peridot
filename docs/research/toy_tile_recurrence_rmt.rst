@@ -1503,6 +1503,21 @@ have no bias term, so a zero raw embedding really does propagate to an
 exact zero k/v row, not an approximation). Reset to None/[] at the start of
 each new training sequence, same as ``memory_prev`` gets reset to zeros.
 
+**2026-11-10 addendum**: ``step_cached()`` never called
+``_accumulate_sleep_energy()`` anywhere in its body, and never reset/folded
+``_energy_aux_loss``/``_sleep_aux_loss``/``_balance_aux_loss`` the way
+``step()`` does -- meaning ``sleep_enable``'s forced-firing aux loss (and,
+latently, any stale ``use_energy``/balance aux from a prior ``step()`` call
+in the same run) could never reach ``step_cached()``'s caller. This is the
+real, concrete reason ``use_tile_cache``/``sleep_enable`` were hard-guarded
+mutually exclusive (``train_mqar_curriculum.py``, no stated rationale at
+the time) -- not a vague statistics concern. Fixed by adding the same 8
+``_accumulate_sleep_energy()`` call sites ``step()`` has (mirroring exact
+tensor/placement/pre-clip ordering) plus the same reset-at-start/fold-at-
+return pattern, making ``step_cached()`` a true "one approximation"
+alternative to ``step()`` per this section's own title, not a second,
+narrower one. Guard removed accordingly.
+
 .. _per_layer_learning_rate_polyak:
 
 ``layer_lr_override``/``apply_polyak_lr``: per-layer dynamic LR

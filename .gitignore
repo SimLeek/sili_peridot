@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 logs/
+
+# Claude Code agent worktrees (registered git worktrees, not project code)
+.claude/

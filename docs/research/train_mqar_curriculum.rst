@@ -408,6 +408,40 @@ drop the oldest content row (about to age out of the window on the next
 call) and keep the rest, same append/trim convention ``step_cached()``
 itself uses.
 
+**2026-11-10 addendum**: this fallback's own ``content_dy_sparsity_schedule``
+path was found completely broken -- ``DISLDOLayer32`` (the only layer class
+``ToyTileRecurrenceRMT`` uses) never had a ``dy_sparsity_schedule`` kwarg at
+all (only ``DISLDOLayer``, the scattered arm, did), so ``use_tile_cache``
+crashed with a ``TypeError`` on literally its first query step, 100% of the
+time, independent of anything else (confirmed via direct testing before any
+fix). Fixed by porting the kwarg onto ``DISLDOLayer32.forward`` (same
+``_graded_top_k_csr``/``top_k_csr_graded`` kernel, ``sili__new`` PR #55) --
+this fallback now actually runs as originally designed.
+
+.. _train_curriculum.use_tile_cache_at_query:
+
+``use_tile_cache_at_query``: true cache-at-query, opt-in (default off)
+-----------------------------------------------------------------------------
+
+*ID:* ``train_curriculum.use_tile_cache_at_query``
+
+Direct instruction: the fallback above was a deliberate choice to avoid a
+previously-measured stability concern, not an oversight -- but it also
+means ``use_tile_cache``'s true "zero credit for older rows" scenario
+(``step_cached()`` used even at query time, reusing the cache's detached
+K/V with no gradient reaching older positions) was never actually
+exercisable, which blocks measuring the real size of the credit gap a
+synaptic-hold/credit mechanism is meant to close. This flag adds that path
+as an explicit opt-in (default ``False``, preserving the graded fallback
+above as the unchanged default for every existing caller): when both
+``use_tile_cache`` and ``use_tile_cache_at_query`` are set, query steps call
+``step_cached()`` directly (``logit_row=0``, cache refreshed by
+``step_cached()`` itself) instead of falling back to ``step()``'s
+full-window recompute. Early smoke-testing (200 steps, seed 1001) already
+shows the expected signal: accuracy trails the graded-fallback run
+noticeably (~0.11 vs. ~0.25 at step 200) -- consistent with, not yet
+statistically confirming, the hypothesized credit gap.
+
 .. _train_curriculum.k_first_target_odometer_reordering:
 
 ``k_first_target``: K-then-vocab curriculum order, and the odometer wraparound

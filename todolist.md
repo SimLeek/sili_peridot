@@ -1,6 +1,71 @@
 # sili_peridot todolist
 
-Goal: convert `MiniCPM5-1B-Base` (standard `LlamaForCausalLM`, 24 layers,
+**TWO TARGETS, IN PARALLEL, ON TWO MACHINES (2026-11-12).** MiniCPM5-1B on this
+laptop, Qwen2.8-27B on the remote arch-sandbox box. Both get converted, both get
+frame tokenization. Games and intrinsic RL are then run and TUNED on MiniCPM
+here (small and fast enough to iterate), and only once that yields settled
+settings does Qwen get run and tuned remotely with them. Order:
+
+    T9a MiniCPM5-1B  ||  T9a' Qwen2.8-27B      (parallel, two machines)
+                   -> T9b frame tokenization (BOTH)
+                   -> T11/T11b CUDA kernels (runtime speed)
+                   -> T9  games + intrinsic RL, tuned on MiniCPM/laptop
+                   -> T9c transfer settings to Qwen on the remote box
+
+HARD PREREQUISITE for the Qwen track: the remote box's ethernet is not connected
+yet. There is an existing direct-link setup (see
+[[reference-arch-sandbox-direct-link-ip]] -- local enp2s0 can revert off
+10.0.0.2/24 after a reboot, so ping before assuming the remote is down), but
+until that link is up the Qwen track cannot start.
+
+MEMORY BUDGET -- and note this is TRAINING, not inference-only, with sili's
+2xFP4 layout: every synapse carries BOTH a weight and an importance at fp4, so
+**1 byte per synapse**, not 4 bits. For 27B that is ~27GB (NOT 13.5GB).
+
+**WEIGHT SPARSITY IS NOT A MEMORY LEVER -- correction, 2026-11-12.** An earlier
+version of this note claimed ~30% density would shrink 27GB to ~8GB and fit the
+P40. That conflated two different mechanisms the project otherwise keeps apart:
+  * **IO sparsity** (`x_r_target`, `dy_r_target`, nucleus top-k, the PR work) is
+    sparsity on ACTIVATIONS AND GRADIENTS. It is what is validated here, it buys
+    speed, and it does NOT reduce stored weight memory at all.
+  * **WEIGHT sparsity** (density of the stored CSR) is what would reduce memory,
+    and it carries a real quality cost -- pruning already measured as hurting
+    standalone (see [[project-sili-synaptogenesis-pruning-testing]]). Quantizing
+    to fp4 AND pruning to 30% and still having a working model is not a bet
+    worth making.
+
+So ~27GB has to be SHARDED. The P40's 24GB cannot hold it, and P40 + 2060 is
+~30GB -- barely over, so realistically 3+ cards. **MULTI-GPU IS THEREFORE A
+PREREQUISITE for GPU-side Qwen, not a final optimisation**, which promotes the
+multi-GPU half of T11b ahead of the fusion work. The ~96GB system RAM still
+holds ~27GB comfortably, so the CPU-first path remains the way to get Qwen
+RUNNING; multi-GPU is what makes it FAST.
+
+Two training-specific consequences, both favourable:
+  * **No optimizer-state overhead.** importance IS the optimizer here (see
+    [[feedback-importance-is-already-the-optimizer]] -- do not add Adam moments),
+    so training memory is weights + importance and nothing else. That skips the
+    usual 2-3x optimizer blowup conventional training pays at this scale.
+  * **Pipeline parallelism dodges the bandwidth killer.** Training adds a
+    backward crossing, so ~2x boundary traffic -- still trivial on PCIe 1x. But
+    DATA-parallel training would need gradient all-reduce, which WOULD strangle
+    1x. Pipeline-parallel keeps each layer group's weights and importance local
+    to its card, so there is nothing to all-reduce. Sharding must therefore be
+    pipeline -- not data-parallel, not tensor-parallel.
+Also note the dual-CCX thread wall on that box -- num_cpus <= 4 for
+disldo_backward (see [[project-sili-arch-sandbox-ccx-topology-thread-wall]]) --
+so Qwen-side timing must not be benchmarked at high thread counts.
+
+The target changes again once recurrence, intrinsic RL and continual training
+land, so treat it as a parameter of the pipeline rather than a fixed endpoint.
+On Qwen specifically, NOTE: I do not have reliable
+architecture details for Qwen2.8-27B; read its `config.json` and record the
+same facts captured for MiniCPM5 (layer count, hidden, intermediate, heads vs
+kv_heads/GQA, head_dim, vocab, rope_theta, rms_norm_eps, tied embeddings,
+biases, qk-norm, MoE) BEFORE sizing any of this. 27B vs 1B is a ~27x parameter
+jump, so memory budget and sharding are new questions MiniCPM5 never raised.
+
+Goal (machinery, unchanged): convert `MiniCPM5-1B-Base` (standard `LlamaForCausalLM`, 24 layers,
 hidden=1536, intermediate=4608, heads=16, kv_heads=2 GQA, head_dim=128,
 vocab=130560, rope_theta=5e6, rms_norm_eps=1e-6, untied embeddings, no
 biases, no qk-norm, no MoE/vision) into a model that runs and trains
@@ -1414,3 +1479,428 @@ deferred list — do not chase these for v1)
   redesign, `compact()`/`expand_headroom()` auto-handling — pre-existing
   `sili__new` backlog items, only touch if they concretely block this
   conversion.
+
+---
+
+## SCHEDULE CHANGE (2026-11-14): CUDA moves to IMMEDIATELY NEXT
+
+**Why.** Four of the five problems blocking the recurrent path at toy scale
+turned out to be SCALE ARTIFACTS, not mechanism failures -- too few layers, a
+hand-set narrow positional prior where real models use learned/RoPE positions,
+too few parameters, and a readout that loses a race it would win trivially with
+more capacity. Chasing the fifth at 32 dims is lower value than making 256 dims
+runnable.
+
+**And the larger version is simply not reachable on CPU.** Measured per-step cost
+(load-inflated ~20-40%, but the scaling holds):
+
+| hidden | window | layers | ms/step | params |
+|--------|--------|--------|---------|--------|
+| 32     | 16     | 2      | 4.40    | 11k    |
+| 128    | 64     | 6      | 99.54   | 417k   |
+| 256    | 128    | 8      | 884.66  | 2.2M   |
+
+0.88 s/token at 2.2M params is ~13 days for 10k episodes of ~130 ticks, 53 days
+for 40k. Even the 417k config is ~19 hours.
+
+**It is COMPUTE-bound, so the port will actually pay** (I first assumed overhead
+and was wrong): raw numpy matmul [129x256]@[256x256] runs at 2.90 GFLOP/s and the
+same op through the Tensor autograd at 2.72 GFLOP/s -- only 1.1x overhead -- and
+105 such ops account for 611 of the 884 ms, i.e. 69% is arithmetic. The 2.9
+GFLOP/s is this laptop's known half-rate AVX2 (Zen+). One step is ~1.77 GFLOP, so:
+
+| platform                              | per step | 10k episodes |
+|---------------------------------------|----------|--------------|
+| this laptop, 2.9 GFLOP/s              | 884 ms   | ~13 days     |
+| GPU at ~2 TFLOP/s effective           | ~1 ms    | ~25 min      |
+| GPU, launch-latency bound (~105 x 5us)| ~1-5 ms  | ~45 min-3 hr |
+
+So 200-900x, and the autograd layer does NOT need replacing -- the port is just
+the kernels. Caveat: 129x256x256 matmuls are SMALL for a GPU, so this will be
+launch-latency bound, which is exactly where CUDA Graphs / the megakernel work
+earns its place rather than being optional polish.
+
+**THE LAPTOP HAS A GPU, so this is no longer gated on the remote box.** GTX 1660
+Ti, 6GB, sm_75 -- which holds a 2.2M-param model trivially. Develop here, deploy
+to the P40 (sm_61, 24GB) later; compile for both.
+
+**DRIVER PREREQUISITE -- and the fix is a KERNEL downgrade, NOT a driver
+change.** Researched, because `pacman -S nvidia-dkms` would pull the CURRENT
+nvidia version and risks losing 1660 Ti (Turing) support, which this file's own
+hardware notes warn about.
+
+State: `nvidia 570.86.16-7` is installed and its module is built for kernel
+**6.13.4-arch1-1**, but the running kernel is **7.1.9-arch1-2**, so no nvidia.ko
+exists for it (only `i2c_nvidia_gpu`, a trivial I2C bus driver, is loaded) and
+nvidia-smi cannot reach the driver. nvcc 12.8 IS installed and works.
+
+The working module is ALREADY PRESENT and verified:
+`/usr/lib/modules/6.13.4-arch1-1/extramodules/nvidia.ko.zst`, `modinfo` reports
+version 570.86.16. So the kernel simply orphaned a good module. Note that
+`/usr/lib/modules/6.13.4-arch1-1/` now holds ONLY `extramodules` -- the base
+kernel modules went with the package upgrade -- so the linux-6.13.4 package has
+to be reinstalled to restore `kernel/*` and `/boot/vmlinuz-linux`.
+
+    sudo pacman -U /var/cache/pacman/pkg/linux-6.13.4.arch1-1-x86_64.pkg.tar.zst
+    sudo mkinitcpio -P && sudo grub-mkconfig -o /boot/grub/grub.cfg
+    # reboot
+
+REVERSIBLE WITHOUT NETWORK: `linux-7.1.9.arch1-2-x86_64.pkg.tar.zst` is also in
+the local pacman cache, so reverting never needs connectivity.
+
+RISK, not fully cleared: `rtl8821cu-dkms-git` is installed and `wlp4s0f3u3` (the
+USB WiFi) depends on it, so WiFi needs a successful DKMS rebuild for 6.13.4.
+`dkms status` was unreadable as a normal user, so a 6.13.4 build could not be
+confirmed. Mitigations: Realtek out-of-tree drivers break on NEW kernels rather
+than old ones and this one presumably worked on 6.13.4 before; the revert needs
+no network; and `enp2s0` wired is a fallback.
+
+**NOT A BLOCKER FOR STARTING.** nvcc compiles without a driver -- only RUNNING
+kernels needs one. So the correctness-first port can begin immediately and the
+driver fix can wait for a convenient reboot.
+
+---
+
+## "Ultimate transformer" integration ladder (2026-11-12)
+
+Goal: ONE model combining sparse forward, sparse backprop, energy-stochastic
+annealing, amortized health metrics, adaptive (derived) hyperparameters, Titans
+recurrence, and the FP4 rank-N scale + additive low-rank branch.
+
+**Not started as a combined thing.** Component status verified, not recalled:
+
+| piece | state | risk |
+|---|---|---|
+| sparse forward (`x_r_target`) | merged, speedup validated | quality cost @288 |
+| sparse backprop (`dy_r_target`) | merged, speedup validated | same |
+| energy-stochastic annealing | built | NEGATIVE @wide288; wins only on rank collapse |
+| amortized health metrics | merged | ok |
+| adaptive hyperparameters | partial (AQRS merged; derived knobs unwired) | — |
+| Titans recurrence | new; O(1) + in-context verified | on DenseTensorLinear, NOT DISLDO |
+| FP4 rank-N scale + additive | exists, validated at fp8 | FP4 bit-budget invalid at toy scale |
+
+### One real blocker (corrected 2026-11-12 after review)
+
+**B1. FORWARD sparsity can harm quality; amortized BACKWARD sparsity just
+works.** The earlier framing ("sparsity costs capability") was too broad. The
+sparsity level is not a quality knob to be tuned -- it is meant to react
+automatically to available CPU/GPU and thermal headroom. So the deliverable is
+not "pick a sparsity", it is a FLOOR: know when setting forward sparsity too low
+would harm quality, so the resource-driven controller has a guard rail it must
+not cross. The PR-derived per-layer r_target (JOURNAL 2026-11-12) is exactly
+that floor -- effective rank is the point below which selection starts deleting
+live directions rather than trimming noise. B1 == T3.
+
+**B2 withdrawn.** DISLDO is mathematically equivalent to a dense layer, is
+extensively test-verified, and is often FASTER than dense even on dense
+workloads -- so DenseTensorLinear -> DISLDO is a routine port, not a risk. T1
+stays in the ladder as a cheap equivalence check, not a gate to fear.
+
+### Ladder. Each rung has a GATE; do not proceed past a red gate.
+
+- [ ] **T0. Finish the Titans verification.** 3-arm dual-path run (in flight).
+      GATE: recurrent score above chance AND in-context not below the `none`
+      control (ceiling measured at page 0.906). If `frozen` is flat, that is
+      informative about the write side, not about Titans.
+- [ ] **T1. Titans on DISLDO, dense settings. PROMOTED -- now on T0's
+      critical path, not after it.** Swap the projections to `disldo_cls`,
+      sparsity OFF. GATE: reproduce T0's pair within noise, isolating "DISLDO
+      works here" from "sparsity works here".
+
+      WHY IT MOVED. T0's remaining blocker is OPTIMISATION, not expressivity:
+      the linear-realizability test showed retrieval IS achievable from the
+      model's own representations (matching cos 0.9824 vs mismatched 0.3181),
+      but the write-tick representation is dominated by the VALUE token
+      (between/within key ratio 0.97), so the key signal is present yet weak and
+      badly conditioned. That is exactly the regime the project's own machinery
+      exists for -- amortized importance/L2 decay, ci_renorm/weight_renorm,
+      plasticity_reset, AQRS rank control, and energy-stochastic annealing as a
+      temperature to escape a stuck region. Reaching for Adam instead was
+      reinventing a worse version of it (and broke the 1-byte/synapse budget).
+      All of that machinery lives on DISLDO layers, while TitansMAC is built on
+      DenseTensorLinear -- so the port is what makes those tools available at
+      all. T0 may simply not be finishable without it.
+- [ ] **T2. Add sparse forward only.** GATE: in-context within noise of T1.
+      Expect trouble -- this is B1's first appearance.
+- [ ] **T3. Derive r_target per layer from PR** (replaces the hand-tuned floor;
+      this IS the B1 fix). GATE: beats the best hand-tuned constant on the pair,
+      and worst-case regret across widths < the constant's. Owed from
+      JOURNAL 2026-11-12.
+- [ ] **T4. Add sparse backprop.** GATE: as T2, plus measured speedup.
+- [ ] **T5. Amortized health metrics on.** Cheap, already merged; GATE: no
+      regression on the pair.
+- [ ] **T6. Energy-stochastic annealing -- RE-SCOPED (the earlier "known
+      negative" framing was wrong).** It lost at wide288, but wide288/MQAR is a
+      DENSE-REWARD SUPERVISED task, which is where an intrinsic-drive mechanism
+      has least to offer. Judging it there repeats exactly the error that made
+      Titans' forgetting gate look harmful until it was measured with
+      recent-probe content: a mechanism tested outside its regime.
+      What it actually is: a curiosity-RL vs surprise-minimising-RL algorithm,
+      with the SETPOINT deciding which. Three claims worth testing, each in its
+      own regime:
+      (a) low-bit quality retention -- it helped larger transformers keep
+          quality after conversion, possibly by supplying a TEMPERATURE a 1B
+          transformer otherwise lacks. Test alongside T7, not before.
+      (b) rank-collapse reversal -- the already-validated use.
+      (c) SPARSE OR ABSENT REWARD -- the regime where it should shine, and the
+          one no task in this repo currently provides. See T9.
+- [ ] **T7. FP4 with the AQRS Hadamard-PRODUCT rank-N scale + additive
+      low-rank branch.** Ambiguity RESOLVED: this is the already-built AQRS
+      mechanism (AQRS_DESIGN.md Theorem 2, `additive_u/v`), not a QuaRot-style
+      Hadamard transform. So the work is porting the validated fp8 result
+      (additive_rank=1, peak_vocab=126) to fp4 at equal scale RANK, per "rank
+      beats bit-depth". GATE: fp4 parity with fp8 at equal rank -- and NOT
+      measured at toy width, where the bit-budget claim is confirmed invalid for
+      lack of fan-in. Pair with T6(a): if annealing supplies the missing
+      temperature, low-bit retention is where it shows.
+- [ ] **T7b. FP4 CONSOLIDATION ("offload and compact") -- offline, between
+      T7 and T8.** Push the work accumulated in the low-rank branches DOWN into
+      the fp4 base and reduce their rank, at equal accuracy. The effective
+      weight is
+
+          W_eff = S (had) quant_fp4  +  SUM_k u_k v_k^T
+                  rank-N scale          additive low-rank
+
+      and the fp4 base has per-element freedom, so it can absorb most of what
+      the branches hold: choose a lower-rank S', set
+      quant' = round_fp4(W_eff / S'), then fit the residual at reduced additive
+      rank. Fit S' in the LOG DOMAIN -- the Hadamard scale is multiplicative, so
+      log turns a rank-N product into a rank-N sum and ordinary low-rank fitting
+      applies. Residual then by truncated SVD.
+
+      MUST RUN OFFLINE (learning frozen). This is a REPRESENTATION change that
+      is supposed to preserve the function exactly, so concurrent learning would
+      make before/after incomparable -- the weights have to be literally the
+      same tensor before and after for the check to mean anything.
+
+      GATE, and it can be much stronger than "accuracy barely moved":
+        (a) FUNCTION PRESERVATION -- ||W_eff' - W_eff|| per layer, plus task
+            accuracy before vs after within eval noise. Report the norm, not
+            just the accuracy: accuracy can survive a representation that has
+            drifted, and the drift is what accumulates over cycles.
+        (b) RANK FREED at that fidelity -- the actual win. Report rank freed per
+            unit accuracy lost, so it is a curve and not one operating point.
+      Cheap pre-check before building the fitter: measure how much of W_eff the
+      branches currently carry. If the additive branch holds little, there is
+      nothing to offload and this rung is premature.
+
+- [ ] **T7c. Re-check health metrics after consolidation, and settle whether
+      the fp4-fix <-> annealing cycle is OPTIONAL or REQUIRED.** The honest
+      answer is unknown; there is a concrete reason it might be required, and it
+      is testable rather than philosophical.
+
+      Hypothesis: the low-rank branches have BOUNDED rank capacity. Learning
+      spends rank; if it is spent faster than consolidation frees it, rank
+      saturates and further learning is blocked or the orthogonality penalty
+      starts fighting it. Existing evidence this is real, not hypothetical:
+      AQRS telemetry already shows MUTATION RATE NEAR THE COOLDOWN CEILING (see
+      [[project-aqrs-rank-control-real-deployment-bugs]]), i.e. rank control is
+      already running close to saturation, and the channel-orthogonality penalty
+      exists precisely because rank channels duplicate.
+
+      If that holds, the CONSOLIDATION PERIOD is not a free parameter -- it is
+      set by rank-consumption rate vs available rank headroom, exactly the
+      derive-don't-tune pattern from 2026-11-12. Measure consumption rate first,
+      then derive the interval; do not sweep it.
+      GATE: show rank headroom actually recovering across a cycle, and show
+      learning progressing afterwards that had stalled before. "Sleep-like
+      cycling" is only justified if a measured ceiling is being hit.
+
+- [ ] **T8. Derived knobs wired in** (`kernel_matched` gates; PR-based
+      r_target). GATE: report WORST-CASE REGRET across a wide range, never
+      accuracy at one operating point.
+
+- [ ] **T9a. Convert MiniCPM5-1B** (the machinery already scoped in this
+      file's Phase A-D). Comes BEFORE games/RL/CUDA: it is small enough to train
+      and test against, which is exactly what the exploration work needs. Its
+      architecture is already fully recorded, so this is execution, not design.
+
+- [ ] **T9b. Frame tokenization for Atari/NES -- a PREREQUISITE for T6(c), not
+      cosmetics.** MiniCPM5 is a text model; Atari/NES screens come in as image
+      patch tokens, which are maximally out-of-distribution for a text
+      embedding. That matters for a specific reason:
+
+      **A curiosity / surprise-minimising agent needs input that is LEARNABLY
+      PREDICTABLE.** If frame tokens are maximally surprising, surprise
+      saturates high and stays there, the intrinsic reward carries no gradient,
+      and T6(c) cannot be tested at all -- the mechanism would look broken when
+      the representation is what is broken. So "frame tokens shouldn't be too
+      surprising or too hard to predict" is a hard requirement on the
+      conversion, not a quality preference.
+
+      Cheapest credible option: EXTEND the vocabulary with frame-patch tokens
+      and train only those embeddings, leaving the rest of the model untouched
+      (a VQ codebook over patches, one token per code). Avoids needing paired
+      image/text data, which a LLaVA-style projector would.
+      GATE: measured surprise on frame tokens must be (i) well below saturation
+      and (ii) DECREASING with exposure. A flat-high surprise curve means the
+      intrinsic signal is dead and T6(c) is untestable -- check this before
+      building any RL loop on top.
+
+      Favourable property worth exploiting: Atari/NES frames are ~99% identical
+      between steps, which is precisely the redundancy regime already measured
+      -- repeated filler cost almost nothing (0.9997) where novel filler
+      consumed capacity (0.2247). Redundant frames should be nearly free for the
+      Titans memory to hold, so this is the natural task for it, not a stretch.
+
+- [ ] **T9. Games + intrinsic RL. DEPENDS ON T9a AND T9b.** Once T0-T5 give a
+      model that trains both paths and T9a/T9b give it a game-legible input,
+      point it at a sparse-reward game. This
+      is the only planned test that can actually evaluate T6(c) -- intrinsic
+      drive with sparse or absent external reward -- and nothing currently in
+      either repo provides that regime. Needs: an environment loop, and a
+      decision on whether the setpoint is driven toward curiosity or toward
+      surprise minimisation.
+
+- [ ] **T9a'. Convert Qwen2.8-27B to run/train entirely on sili -- IN PARALLEL
+      with T9a, on the REMOTE box.** Blocked until that machine's ethernet is
+      connected. Runs CPU-side first (96GB RAM holds fp8/fp4; the 24GB P40 holds
+      only ~fp4). Not the final rung any more -- the final rung is T9c, tuning
+      Qwen with settings transferred from the MiniCPM/laptop RL work. Read `config.json` first and record the architecture
+      facts (see the target note at the top) -- nothing here should be sized
+      against assumed dimensions. At 27B the new questions MiniCPM5 never
+      raised: weight memory budget, whether the fold-into-one-sparse-layer
+      recurrence trick still applies at this depth, and sharding across the
+      available VRAM. Depends on T0-T8 for the model side and T11 for it to be
+      runnable at all at this scale.
+
+- [ ] **T9c. Transfer the tuned RL/exploration settings to Qwen on the remote
+      box. FINAL RUNG.** Everything in T9 is tuned on MiniCPM here because it
+      iterates fast; this rung asks whether those settings carry to a ~27x
+      larger model. GATE: state up front which settings are expected to be
+      SCALE-FREE and which are not. Today's derived-knob work is the reason to
+      care -- a knob that was tuned at 1B is exactly the kind of thing that does
+      not survive a 27x jump, whereas a rule derived from a measured quantity
+      (retrieval lag, participation ratio) should. If the transferred settings
+      fail, prefer deriving the quantity at the new scale over re-sweeping.
+
+- [ ] **T11. CUDA kernels, output-identical to the CPU path.** Already recorded
+      as ELEVATED/next for the block4+plasticity work (`sili__new/TODO.md`), but
+      that entry frames it as "iterate ablations faster". It is also the
+      terminal deployment task, with these added requirements:
+
+      **CUDA for now** (not Vulkan/Kompute) as the simplest path. Hardware
+      reality to design against: arch-sandbox is a P40 (sm_61 Pascal, 24GB, the
+      compute card) plus an RTX 2060 (sm_75 Turing, display); the laptop is a
+      GTX 1660 Ti (sm_75). MIXED ARCHITECTURES and NO NVLINK -- so peer access
+      is PCIe P2P at best, and one binary cannot be uniformly optimal across
+      sm_61 and sm_75.
+
+      **"Same output as the current kernels" needs a tolerance spec, not just
+      the word "same".** Bit-exact is achievable for elementwise and fp4/fp8
+      paths and should be REQUIRED there. It is NOT achievable for parallel
+      reductions -- different summation order changes fp32 results -- so those
+      need a documented tolerance plus an order-stable reference. The stochastic
+      quantize path needs seeded-RNG parity, per
+      [[feedback-block4-compression-verification]] (verify against the real
+      stochastic quantize, not deterministic reasoning).
+
+      **THE TOOLCHAIN IS PINNED TO CUDA 12.8, and this is forced, not a
+      preference.** CUDA 13.0 removed offline compilation and library support
+      for Maxwell, Pascal and Volta; Turing (sm_75) is its floor. The P40 is
+      sm_61, so a CUDA 13 toolchain CANNOT BUILD FOR THE 24GB COMPUTE CARD --
+      the only reason the remote box exists. Verified 2026-11-14: the remote's
+      Arch repo offers only `cuda 13.3.1-1`, so installing the distro package
+      there would silently produce exactly that unusable toolchain. This laptop
+      already has `cuda 12.8.0-1`, and `nvcc --list-gpu-arch` confirms it spans
+      every card we own -- compute_61 (P40) and compute_75 (1660 Ti, 2060) --
+      so ONE fat binary covers all three. The remote needs 12.8 pinned the same
+      way the kernel now is, NOT the repo version.
+
+      Same cliff applies to the torch REFERENCE used for parity: PyTorch
+      deleted Maxwell/Pascal/Volta from its cu128 and cu129 builds
+      (pytorch/pytorch#157517), so cu128 and cu130 wheels cannot drive the P40
+      either. **cu126 is the only variant carrying sm_61**, which is also the
+      newest build available for cp314. Parity numbers must come from a cu126
+      torch or they cannot be reproduced on the compute card at all.
+
+      **Expect the win to come from coalescing, not FLOPs.** The scattered CSR
+      path is gather/scatter-bound rather than SIMD-bound on CPU, and that
+      property carries to GPU: a naive port will be bandwidth-bound and may not
+      beat CPU. Profile before optimizing.
+
+- [ ] **T11b. Megakernel / launch-overhead reduction -- staged, because the
+      strong form has a hard limit.** Two corrections to the framing worth
+      having up front:
+
+      (a) **A single CUDA kernel cannot span multiple GPUs.** So "one megakernel
+          that only returns when needed" and "use VRAM from several GPUs" are in
+          direct tension: the best available shape is ONE megakernel PER DEVICE
+          with explicit boundaries where data crosses. Worth deciding early
+          whether 27B must shard across cards, because that decision bounds how
+          much fusion is even possible.
+
+          On inter-GPU transport specifically: **GPUDirect P2P over PCIe does
+          bypass the CPU** -- GPU A writes straight into GPU B's VRAM with no
+          host staging. It requires both GPUs on the same root complex (or a
+          switch supporting it), ACS/IOMMU not redirecting traffic, and driver
+          permission -- and NVIDIA gates that last part BY PRODUCT LINE:
+          Tesla/Quadro keep P2P, GeForce largely does not. So the P40 (Tesla,
+          P2P yes) + RTX 2060 (GeForce, typically no) pair likely falls back to
+          host-staged copies, and the 2060 is the display card regardless.
+          Neither card has NVLink (that is P100/V100) or any other fast
+          interconnect. VERIFY rather than assume: `nvidia-smi topo -m` plus
+          `cudaDeviceCanAccessPeer` on the actual box before designing around
+          it.
+
+          And even when P2P works it is PCIe bandwidth (~16-32 GB/s) against P40
+          VRAM bandwidth (~350 GB/s) -- a 10-20x gap. Crossing devices
+          mid-forward is therefore expensive whether or not the CPU is involved,
+          which independently argues for FEW crossings and one megakernel per
+          device.
+
+      (b) **PCIe is probably not the thing to fix first.** Kernel launches do
+          not move tensor data over PCIe if the tensors already live in VRAM;
+          the costs are launch latency and host synchronisation. So the
+          first-order fix is **CUDA Graphs** -- capture the whole step once and
+          replay it, which removes per-launch overhead and host round-trips, is
+          far less work than a persistent megakernel, and composes with
+          multi-GPU. Only if profiling still shows launch/sync dominating is a
+          true persistent/fused megakernel justified.
+
+      **PCIe 1x / mining-rig viability -- worth designing FOR, with one
+      distinction.** PIPELINE parallelism over 1x is fine; TENSOR parallelism is
+      not. A pipeline boundary carries one activation vector per token: at
+      hidden ~5120 that is ~10KB fp16 or ~2.5KB fp4, so four GPUs at 30 tok/s is
+      ~900 KB/s against PCIe 3.0 x1's ~1 GB/s. Trivially within budget, and
+      sparse IO (sending only nonzeros plus indices) cuts it further -- which is
+      why mining rigs really do work for multi-GPU LLM inference. Tensor
+      parallelism is the opposite case: splitting a single matmul needs a full
+      activation all-reduce every layer, and 1x would strangle it. So if the rig
+      route is taken, shard BY LAYER GROUP, never within a matmul.
+      (hidden ~5120 is an ASSUMPTION for a 27B model -- confirm from Qwen's
+      config.json, see the target note at the top.)
+
+      Caveat that matters for the 60Hz goal: multi-GPU over 1x buys CAPACITY,
+      not LATENCY. A single-stream pipeline's latency is the sum of all stages,
+      so it does not speed up one token; it lets a bigger model fit. It converts
+      to real throughput only when there are microbatches to fill the pipeline
+      -- and PARALLEL GAME ENVIRONMENTS (T9) are exactly that, so the RL work is
+      where a rig pays off, not single-stream inference.
+      One-time cost to keep in mind: at sili's 2xFP4 (weight + importance =
+      1 byte/synapse), a card holding ~8GB of a sparse shard loads over 1x at
+      ~1 GB/s in ~8 seconds; a dense 27GB model would be ~27s per card. Either
+      way negligible, and it is a one-time cost.
+      Note also that TENSOR-parallel is excluded for training for a second
+      reason beyond activation all-reduce: data-parallel replication would
+      require gradient all-reduce, which 1x cannot carry. Pipeline only.
+
+      Staging (REVISED -- multi-GPU is no longer last): T11 correctness-first
+      port -> CUDA Graphs -> measure -> **multi-GPU pipeline sharding, since 27B
+      at 2xFP4 cannot fit one card and weight sparsity is not an acceptable way
+      to make it fit** -> fuse only the hot path that profiling implicates.
+      GATE at each stage: output parity per T11's tolerance spec, and a measured
+      speedup over the previous stage. No fusion without a profile pointing at it.
+
+### Resolved
+
+"fp4(hadamard)" means the AQRS Hadamard PRODUCT (rank-N scale + additive
+low-rank branch), already built and fp8-validated -- NOT a QuaRot-style Hadamard
+transform, which is absent from both repos and is not being built.
+
+### Method constraint carried over from today
+
+Every rung reports the PAIR (in-context, recurrent) against per-capability
+chance, and any arm comparison first enumerates what ELSE moves with the flag
+(step size, update count, write order). Three separate confounds reversed a
+conclusion in one day; all three were "changed two things, credited one".

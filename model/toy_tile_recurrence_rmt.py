@@ -9,7 +9,7 @@ from sili.energy import EnergyDynamics, GradSelectionEnergy
 from sili.sparse_rnn import CSR, DISLDOLayer, _nucleus_top_k_csr
 from sili.tensor import Tensor, concat, exp, gather, gaussian_attention, power, reduce_sum, relu, tensor_abs
 
-from .toy_recall_models import rmsnorm_tensor
+from .toy_recall_models import cross_entropy_sum, rmsnorm_tensor
 
 
 def _knee_elbow_r(x2d: np.ndarray) -> float:
@@ -123,6 +123,13 @@ class ToyTileRecurrenceRMT:
         energy_kwargs: dict | None = None,
         sleep_energy_enable: bool = False,
         sleep_energy_kwargs: dict | None = None,
+        retain_fired_rows: bool = False,
+        rsm_memory_write_enable: bool = False,
+        rsm_k_active: int | None = None,
+        rsm_refractory_decay: float = 0.7,
+        rsm_lr_mult: float = 1.0,
+        rsm_novelty_threshold: float | None = None,
+        rsm_novelty_beta: float = 0.9,
         rng: np.random.Generator | None = None,
     ):
         """See docs/research/toy_tile_recurrence_rmt.rst for full param rationale.
@@ -257,7 +264,20 @@ class ToyTileRecurrenceRMT:
             wake_gate_steps -- see JOURNAL.md's 2026-10-03 "energy-driven
             sleep annealing" entry. Keyed by layer name; caller picks
             whether to backward on self._sleep_aux_loss. No-op unless
-            sleep_energy_enable=True."""
+            sleep_energy_enable=True.
+        rsm_* (memory_write_enable, k_active, refractory_decay,
+        novelty_threshold, novelty_beta, lr_mult):
+            RSM-inspired sparse memory write: winner-take-all +
+            refractory inhibition on the flattened PASS-1 write.
+            novelty_threshold adds intrinsic change detection so an
+            unchanged input writes a bit-exact zero. Caller must call
+            rsm_reset_sequence() at sequence boundaries. No-op unless
+            enabled.
+            NOT FOR MQAR: measured negative, and expected to be --
+            recall needs MORE state (Zoology arXiv:2312.04927) while
+            this trades state away. Right regime is a fixed generating
+            process + redundant stream; see JOURNAL.md 2026-11-12 and
+            scripts/prototype_rsm_fixed_process_memory.py."""
         self.embed_width = embed_width
         self.column_neurons = column_neurons
         self.state_width = embed_width * column_neurons
@@ -338,6 +358,25 @@ class ToyTileRecurrenceRMT:
         self.sleep_energy_kwargs = sleep_energy_kwargs or {}
         self._sleep_energy: dict = {}  # call-site key -> EnergyDynamics, lazily built
         self._sleep_aux_loss: Tensor | None = None
+        # Opt-in, default off -- untested effect, don't silently change
+        # existing sleep_enable=True behavior (e.g. train_peridot_main.py's
+        # winning recipe). See step_cached()'s own eviction-priority comment.
+        self.retain_fired_rows = retain_fired_rows
+
+        # See __init__'s own rsm_memory_write_enable docstring above.
+        self.rsm_memory_write_enable = rsm_memory_write_enable
+        self.rsm_refractory_decay = rsm_refractory_decay
+        self.rsm_lr_mult = rsm_lr_mult
+        self.rsm_novelty_threshold = rsm_novelty_threshold
+        self.rsm_novelty_beta = rsm_novelty_beta
+        self._rsm_novelty_trace: np.ndarray | None = None
+        self.last_rsm_gate: float = 1.0  # diagnostic: 0.0 == this tick wrote nothing
+        self._rsm_write_width = self.num_memory_slots * self.state_width
+        self.rsm_k_active = rsm_k_active if rsm_k_active is not None else max(1, round(0.25 * self._rsm_write_width))
+        self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
+        self._rsm_last_write: Tensor | None = None  # LIVE Tensor (not detached) -- see rsm_decoder_step_loss
+        self._rsm_last_mask: np.ndarray | None = None  # see _memory_residual_update
+        self.rsm_decoder = None  # constructed below, after rng is guaranteed non-None
 
         state_width = self.state_width
         if rng is None:
@@ -398,6 +437,20 @@ class ToyTileRecurrenceRMT:
         self.lm_head = disldo_cls(
             embed_width, vocab_size, max_weights, num_cpus, rng=np.random.default_rng(next(layer_seeds)), **layer_kwargs
         )
+
+        # See __init__'s own rsm_memory_write_enable docstring. Only
+        # draws from `rng` (and only constructs this layer) when
+        # enabled -- byte-identical RNG consumption for every existing
+        # layer above when the flag is off, same convention as every
+        # other opt-in mechanism in this constructor.
+        if self.rsm_memory_write_enable:
+            self.rsm_decoder = disldo_cls(
+                self._rsm_write_width,
+                vocab_size,
+                self._rsm_write_width * vocab_size,
+                num_cpus,
+                rng=np.random.default_rng(int(rng.integers(0, 2**31 - 1))),
+            )
 
         # See docs/research/toy_tile_recurrence_rmt.rst:critic_head_design.
         self.use_critic = use_critic
@@ -1539,6 +1592,73 @@ class ToyTileRecurrenceRMT:
                 results[name] = (c.get_scale_rank(), additive_rank)
         return results
 
+    def rsm_reset_sequence(self) -> None:
+        """Reset the RSM refractory trace, same cadence as `memory_prev`."""
+        self._rsm_phi = np.zeros(self._rsm_write_width, dtype=np.float32)
+        self._rsm_novelty_trace = None
+
+    def _rsm_novelty_gate(self, x_newest: np.ndarray) -> float:
+        """Intrinsic change detection: hard threshold on the normalized
+        distance from an EMA trace of recent input. Graded/scale-free
+        comparison (noise-tolerant, no exact match) but binary output, so
+        unchanged input gives a bit-exact zero write -- top-k picks WHICH
+        units, this picks WHETHER to write. No oracle. Returns 1.0/0.0."""
+        if self.rsm_novelty_threshold is None:
+            return 1.0
+        cur = np.asarray(x_newest, dtype=np.float32).reshape(-1)
+        if self._rsm_novelty_trace is None:
+            self._rsm_novelty_trace = cur.copy()
+            return 1.0  # first tick of a sequence has no history to compare to
+        tr = self._rsm_novelty_trace
+        nov = float(np.linalg.norm(cur - tr) / (np.linalg.norm(tr) + 1e-6))
+        b = self.rsm_novelty_beta
+        self._rsm_novelty_trace = b * tr + (1.0 - b) * cur
+        return 1.0 if nov > self.rsm_novelty_threshold else 0.0
+
+    def _rsm_sparsify_write(self, attn_mem_n: Tensor) -> Tensor:
+        """Winner-take-all + refractory inhibition, see __init__'s
+        rsm_memory_write_enable docstring. Straight-through mask."""
+        flat = attn_mem_n.data.reshape(-1).astype(np.float32)
+        activity = np.abs(flat)
+        priority = (1.0 - self._rsm_phi) * activity
+        k = min(self.rsm_k_active, flat.shape[0])
+        top_idx = np.argpartition(priority, -k)[-k:]
+        mask = np.zeros_like(flat)
+        mask[top_idx] = 1.0
+        if self.last_rsm_gate == 0.0:
+            # Genuinely inactive tick: write nothing, and leave the refractory
+            # trace alone (nothing fired, so nothing becomes refractory).
+            mask = np.zeros_like(mask)
+        else:
+            self._rsm_phi = np.maximum(self._rsm_phi * self.rsm_refractory_decay, mask)
+        mask2d = mask.reshape(attn_mem_n.data.shape)
+        self._rsm_last_mask = mask2d
+        sparse = attn_mem_n * Tensor(mask2d)
+        self._rsm_last_write = sparse
+        return sparse
+
+    def _memory_residual_update(self, memory_prev_t: Tensor, attn_mem_n: Tensor) -> Tensor:
+        """memory_new = rmsnorm(prev + write), except under RSM the
+        UNSELECTED units keep prev exactly. rmsnorm otherwise rescales
+        every unit on every tick (a few large writes move the RMS), so
+        a sparse write still churns the whole state -- measured 97.7%
+        of entries changing at k_active=25%, 31.9% at 2% -- defeating
+        the sparsity and breaking the "inactive units don't change"
+        precondition the mechanism's proof needs."""
+        normed = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
+        if not self.rsm_memory_write_enable or self._rsm_last_mask is None:
+            return normed
+        return normed * Tensor(self._rsm_last_mask) + memory_prev_t * Tensor(1.0 - self._rsm_last_mask)
+
+    def rsm_decoder_step_loss(self, next_token_id: int, learning_rate: float) -> Tensor | None:
+        """Shallow local self-supervised loss, JOURNAL.md 2026-11-10.
+        Caller backs this EVERY tick, unlike step()'s own aux_loss."""
+        if self.rsm_decoder is None or self._rsm_last_write is None:
+            return None
+        write = self._rsm_last_write.reshape((1, self._rsm_write_width))
+        logits = self.rsm_decoder.forward(write, learning_rate * self.rsm_lr_mult)
+        return cross_entropy_sum(logits, [(0, next_token_id)])
+
     def _apply_energy(self, x: Tensor, region: str) -> Tensor:
         """Homeostatic energy gating (task #269), applied to a region's
         FULL continuous tensor BEFORE its x_r_target nucleus selection --
@@ -1583,6 +1703,22 @@ class ToyTileRecurrenceRMT:
             self._sleep_energy[key] = ed
         _h_out, aux, _actual_p = ed(x)
         self._sleep_aux_loss = aux if self._sleep_aux_loss is None else self._sleep_aux_loss + aux
+
+    def _row_fired_this_tick(self, layer_name: str, call_site: str | None = None) -> bool:
+        """True if sleep's forced-firing (see _accumulate_sleep_energy
+        above, EnergyDynamics.kept_indices -- "the gate decision energy
+        already made") selected ANY column for the row just passed
+        through that call. Only meaningful right after the matching
+        _accumulate_sleep_energy call on a SINGLE-row tensor (the one
+        content row step_cached() ever processes) -- for a multi-row
+        tensor this would need per-row unraveling, not done here."""
+        if not self.sleep_energy_enable:
+            return False
+        key = layer_name if call_site is None else f"{layer_name}:{call_site}"
+        ed = self._sleep_energy.get(key)
+        if ed is None or ed.kept_indices is None:
+            return False
+        return ed.kept_indices.size > 0
 
     def _to_sparse(self, x: Tensor, layer_name: str) -> Tensor:
         """Sparsity plan Phase 6 helper; no-op unless x_r_target[layer_name]
@@ -1808,6 +1944,8 @@ class ToyTileRecurrenceRMT:
         self._energy_aux_loss = None  # see _apply_energy's own docstring
         self._sleep_aux_loss = None  # see _accumulate_sleep_energy's own docstring
         self._balance_aux_loss = None  # see _accumulate_balance_loss's own docstring
+        self._rsm_last_write = None  # see _rsm_sparsify_write's own docstring
+        self._rsm_last_mask = None
 
         if content_dy_sparsity_schedule is not None:
             if len(content_dy_sparsity_schedule) != n_content:
@@ -1852,6 +1990,7 @@ class ToyTileRecurrenceRMT:
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
         memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
 
+        _rsm_novelty_src = x_normed.data[-1]  # newest content row; see _rsm_novelty_gate
         combined_normed = concat([memory_normed, x_normed], axis=0)  # [total_slots, sw]
         combined_normed = self._apply_energy(combined_normed, "state")
 
@@ -1959,7 +2098,10 @@ class ToyTileRecurrenceRMT:
         self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
+        if self.rsm_memory_write_enable:
+            self.last_rsm_gate = self._rsm_novelty_gate(_rsm_novelty_src)
+            attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
+        memory_new_t = self._memory_residual_update(memory_prev_t, attn_mem_n)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, against the FRESH memory_new_t, not stale
@@ -2063,6 +2205,9 @@ class ToyTileRecurrenceRMT:
             # x_window_t: embedding-learning hook (Tensor, not just .data).
             # See docs/research/toy_tile_recurrence_rmt.rst:write_then_read_pass_design.
             "x_window_t": x_window_t,
+            # x_normed: rebuilds tile_cache's 3-tuples at the cache-refresh
+            # site -- see model/tile_cache_credit.py.
+            "x_normed": x_normed.data,
         }
 
         if self.l1_sparsity_coef > 0.0:
@@ -2226,6 +2371,12 @@ class ToyTileRecurrenceRMT:
         it accepts. See docs/research/toy_tile_recurrence_rmt.rst:step_cached_design."""
         sw = self.state_width
         n_mem, n_content = self.num_memory_slots, self.num_tiles
+        # Same reset step() itself does, see _accumulate_sleep_energy's docstring.
+        self._energy_aux_loss = None
+        self._sleep_aux_loss = None
+        self._balance_aux_loss = None
+        self._rsm_last_write = None
+        self._rsm_last_mask = None
 
         new_embed_2d = np.asarray(new_token_embed, dtype=np.float32).reshape((1, self.embed_width))
         new_embed_t = Tensor(new_embed_2d)
@@ -2239,11 +2390,14 @@ class ToyTileRecurrenceRMT:
             **self.synapse_kwargs,
             **self._wide_extra_kwargs("input_proj"),
         )  # [1, sw]
+        self._accumulate_sleep_energy(x_wide_new, "input_proj")
+        new_row_fired = self._row_fired_this_tick("input_proj")
         x_normed_new = rmsnorm_tensor(x_wide_new, self.input_ln, self.rms_eps)
 
         memory_prev_t = Tensor(memory_prev.astype(np.float32))
         memory_normed = rmsnorm_tensor(memory_prev_t, self.memory_ln, self.rms_eps)
 
+        _rsm_novelty_src = x_normed_new.data.reshape(-1)  # see _rsm_novelty_gate
         combined_normed_step = concat([memory_normed, x_normed_new], axis=0)  # [n_mem+1, sw]
 
         # Separate _to_sparse call per consumer, see step()'s own comment.
@@ -2286,6 +2440,9 @@ class ToyTileRecurrenceRMT:
         _accumulate_penalty(q_step)
         _accumulate_penalty(k_step)
         _accumulate_penalty(v_step)
+        self._accumulate_sleep_energy(q_step, "q_proj")
+        self._accumulate_sleep_energy(k_step, "k_proj", "pass1")
+        self._accumulate_sleep_energy(v_step, "v_proj", "pass1")
 
         q_step.data = np.clip(q_step.data, -self.clip_range, self.clip_range)
         k_step.data = np.clip(k_step.data, -self.clip_range, self.clip_range)
@@ -2312,15 +2469,22 @@ class ToyTileRecurrenceRMT:
 
         # Reassemble FULL [n_content, sw] content k/v: cache (oldest
         # first, zero-padded) plus this step's fresh row at the end.
+        # Tuple is (k_row, v_row, x_normed_row) -- see model/tile_cache_credit.py.
         cache = list(tile_cache) if tile_cache else []
         pad = max(0, (n_content - 1) - len(cache))
         zero_row = np.zeros(sw, dtype=np.float32)
         cache_k_rows = [zero_row] * pad + [row[0] for row in cache[-(n_content - 1) :]] if n_content > 1 else []
         cache_v_rows = [zero_row] * pad + [row[1] for row in cache[-(n_content - 1) :]] if n_content > 1 else []
+        cache_x_rows = [zero_row] * pad + [row[2] for row in cache[-(n_content - 1) :]] if n_content > 1 else []
         cache_k_arr = np.stack(cache_k_rows, axis=0) if cache_k_rows else np.zeros((0, sw), dtype=np.float32)
         cache_v_arr = np.stack(cache_v_rows, axis=0) if cache_v_rows else np.zeros((0, sw), dtype=np.float32)
-        k_content_full = concat([Tensor(cache_k_arr), k_new], axis=0)  # [n_content, sw]
-        v_content_full = concat([Tensor(cache_v_arr), v_new], axis=0)
+        cache_x_arr = np.stack(cache_x_rows, axis=0) if cache_x_rows else np.zeros((0, sw), dtype=np.float32)
+        # Named (not inline): .grad is read back via last_debug after the
+        # caller's own loss.backward() -- see model/tile_cache_credit.py.
+        cache_k_tensor = Tensor(cache_k_arr)
+        cache_v_tensor = Tensor(cache_v_arr)
+        k_content_full = concat([cache_k_tensor, k_new], axis=0)  # [n_content, sw]
+        v_content_full = concat([cache_v_tensor, v_new], axis=0)
 
         k_full = concat([k_mem_from_prev, k_content_full], axis=0)  # [total_slots, sw]
         v_full = concat([v_mem_from_prev, v_content_full], axis=0)
@@ -2351,9 +2515,13 @@ class ToyTileRecurrenceRMT:
             **self._wide_extra_kwargs("o_proj"),
         )
         _accumulate_penalty(attn_mem)
+        self._accumulate_sleep_energy(attn_mem, "o_proj", "mem")
         attn_mem.data = np.clip(attn_mem.data, -self.clip_range, self.clip_range)
         attn_mem_n = self._apply_qkvo_norm(attn_mem, self.o_norm_ln)
-        memory_new_t = rmsnorm_tensor(memory_prev_t + attn_mem_n, self.state_ln, self.rms_eps)
+        if self.rsm_memory_write_enable:
+            self.last_rsm_gate = self._rsm_novelty_gate(_rsm_novelty_src)
+            attn_mem_n = self._rsm_sparsify_write(attn_mem_n)
+        memory_new_t = self._memory_residual_update(memory_prev_t, attn_mem_n)
         memory_new_t.data = np.clip(memory_new_t.data, -self.clip_range, self.clip_range)
 
         # --- PASS 2: READ, only the newest content row's own query ---
@@ -2378,6 +2546,8 @@ class ToyTileRecurrenceRMT:
         )
         _accumulate_penalty(k_mem_fresh)
         _accumulate_penalty(v_mem_fresh)
+        self._accumulate_sleep_energy(k_mem_fresh, "k_proj", "mem")
+        self._accumulate_sleep_energy(v_mem_fresh, "v_proj", "mem")
         k_mem_fresh.data = np.clip(k_mem_fresh.data, -self.clip_range, self.clip_range)
         v_mem_fresh.data = np.clip(v_mem_fresh.data, -self.clip_range, self.clip_range)
         k_mem_fresh_attn = self._apply_qkvo_norm(k_mem_fresh, self.k_norm_ln)
@@ -2425,6 +2595,7 @@ class ToyTileRecurrenceRMT:
             **self._wide_extra_kwargs("o_proj"),
         )
         _accumulate_penalty(attn_content)
+        self._accumulate_sleep_energy(attn_content, "o_proj", "content")
         attn_content.data = np.clip(attn_content.data, -self.clip_range, self.clip_range)
         attn_content_n = self._apply_qkvo_norm(attn_content, self.o_norm_ln)
 
@@ -2444,6 +2615,10 @@ class ToyTileRecurrenceRMT:
             "attn_content": attn_content.data,
             "sigmas": sigmas.data,
             "log_sigmas": self.log_sigmas.data,
+            # Real Tensors, not .data -- see model/tile_cache_credit.py.
+            "cache_k_tensor": cache_k_tensor,
+            "cache_v_tensor": cache_v_tensor,
+            "cache_x_rows": cache_x_arr,
         }
 
         memory_new = memory_new_t.data.copy()
@@ -2557,9 +2732,33 @@ class ToyTileRecurrenceRMT:
         )
 
         new_cache = (list(tile_cache) if tile_cache else []) + [
-            (k_new.data.copy().reshape(sw), v_new.data.copy().reshape(sw))
+            (
+                k_new.data.copy().reshape(sw),
+                v_new.data.copy().reshape(sw),
+                x_normed_new.data.copy().reshape(sw),
+                new_row_fired,
+            )
         ]
         if len(new_cache) > (n_content - 1):
-            new_cache = new_cache[-(n_content - 1) :]
+            overflow = len(new_cache) - (n_content - 1)
+            if self.retain_fired_rows:
+                # Opt-in (see __init__'s own retain_fired_rows docstring):
+                # REM-fired rows get priority to stay -- prefer dropping
+                # non-fired, then oldest, rows. Still hard-bounded at
+                # n_content-1, no window growth -- if everything left is
+                # fired, the oldest fired ones go too. See JOURNAL.md's
+                # REM-token-retention entry.
+                drop = set(sorted(range(len(new_cache)), key=lambda i: (new_cache[i][3], i))[:overflow])
+                new_cache = [row for i, row in enumerate(new_cache) if i not in drop]
+            else:
+                new_cache = new_cache[-(n_content - 1) :]
+
+        # Fold in energy/sleep/balance aux losses, same as step()'s own fold.
+        if self._energy_aux_loss is not None:
+            aux_loss = self._energy_aux_loss if aux_loss is None else aux_loss + self._energy_aux_loss
+        if self._sleep_aux_loss is not None:
+            aux_loss = self._sleep_aux_loss if aux_loss is None else aux_loss + self._sleep_aux_loss
+        if self._balance_aux_loss is not None:
+            aux_loss = self._balance_aux_loss if aux_loss is None else aux_loss + self._balance_aux_loss
 
         return memory_new, logits, aux_loss, new_cache
